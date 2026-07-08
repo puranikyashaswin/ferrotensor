@@ -1,0 +1,54 @@
+# Build artifacts
+/target/
+**/*.rs.bk
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+.tmp/
+*.tmp
+*.temp
+
+# Model weights (too large for git)
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.gguf
+*.ggml
+
+# Data files
+data/
+checkpoints/
+outputs/
+
+# Environment
+.env
+.env.local
+
+# Python (if any)
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# Testing artifacts
+*.profraw
+*.profdata
+
+# Documentation build
+/docs/book/

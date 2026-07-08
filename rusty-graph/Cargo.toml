@@ -1,0 +1,16 @@
+[package]
+name = "rusty-graph"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rusty-backend = { path = "../rusty-backend" }
+rusty-autograd = { path = "../rusty-autograd" }
+rusty-loader = { path = "../rusty-loader" }
+env_logger = "0.11"
+pollster = "0.3"
+bytemuck = "1.14"
+
+[dev-dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

@@ -1,0 +1,9 @@
+[package]
+name = "rusty-autograd"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rusty-backend = { path = "../rusty-backend" }
+serde = { version = "1.0", features = ["derive"] }
+pollster = "0.3"

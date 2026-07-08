@@ -1,0 +1,32 @@
+[workspace]
+members = [
+    "rusty",
+    "rusty-loader",
+    "rusty-graph",
+    "rusty-backend",
+    "rusty-cli",
+    "rusty-autograd",
+    "rusty-trainer",
+    "rusty-hub",
+    "benchmarks",
+    "rusty-monitor",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+repository = "https://github.com/puranikyashaswin/rusty"
+authors = ["Yashaswin Puranik <puranikyashaswin@gmail.com>"]
+rust-version = "1.75"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+rust_2018_idioms = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"

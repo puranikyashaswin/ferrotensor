@@ -1,0 +1,61 @@
+[package]
+name = "rusty"
+version = "0.1.0"
+edition = "2021"
+description = "GPU-accelerated machine learning library for training and inference in Rust"
+license = "MIT"
+repository = "https://github.com/puranikyashaswin/rusty"
+documentation = "https://docs.rs/rusty"
+readme = "../README.md"
+keywords = ["machine-learning", "deep-learning", "gpu", "neural-networks", "transformer"]
+categories = ["science::ml", "algorithms"]
+
+[dependencies]
+# Internal crates
+rusty-backend = { path = "../rusty-backend" }
+rusty-autograd = { path = "../rusty-autograd" }
+rusty-graph = { path = "../rusty-graph" }
+rusty-trainer = { path = "../rusty-trainer" }
+rusty-loader = { path = "../rusty-loader" }
+
+# GPU Backend
+wgpu = "0.19"
+pollster = "0.3"
+bytemuck = { version = "1.18", features = ["derive"] }
+
+# Model Loading
+memmap2 = "0.9"
+safetensors = "0.4"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error Handling
+thiserror = "2.0"
+
+# Utilities
+rand = "0.8"
+log = "0.4"
+
+[dev-dependencies]
+env_logger = "0.11"
+criterion = "0.5"
+
+[features]
+default = ["metal"]
+metal = []
+vulkan = []
+
+# Examples
+[[example]]
+name = "basic_tensor"
+path = "examples/basic_tensor.rs"
+
+[[example]]
+name = "flash_attention"
+path = "examples/flash_attention.rs"
+
+[[example]]
+name = "lora_finetune"
+path = "examples/lora_finetune.rs"

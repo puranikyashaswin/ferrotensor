@@ -1,0 +1,15 @@
+[package]
+name = "rusty-benchmarks"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "bench"
+path = "src/main.rs"
+
+[dependencies]
+rusty-backend = { path = "../rusty-backend" }
+rusty-autograd = { path = "../rusty-autograd" }
+rusty-graph = { path = "../rusty-graph" }
+pollster = "0.3"
+wgpu = "0.19"
