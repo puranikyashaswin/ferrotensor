@@ -14,7 +14,7 @@ keywords = ["wgpu", "wgsl", "gpu", "tensor", "compute"]
 categories = ["science", "algorithms"]
 
 [dependencies]
-wgpu = "0.19"
+wgpu = "30.0"
 pollster = "0.3"
 log = "0.4"
 env_logger = "0.11"

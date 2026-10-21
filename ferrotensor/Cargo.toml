@@ -22,7 +22,7 @@ ferrotensor-trainer = { path = "../ferrotensor-trainer", version = "0.1.0" }
 ferrotensor-loader = { path = "../ferrotensor-loader", version = "0.1.0" }
 
 # GPU Backend
-wgpu = "0.19"
+wgpu = "30.0"
 pollster = "0.3"
 bytemuck = { version = "1.18", features = ["derive"] }
 

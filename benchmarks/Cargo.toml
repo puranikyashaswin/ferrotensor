@@ -33,4 +33,4 @@ harness = false
 [dependencies]
 ferrotensor-backend = { path = "../ferrotensor-backend", version = "0.1.0" }
 pollster = "0.3"
-wgpu = "0.19"
+wgpu = "30.0"
