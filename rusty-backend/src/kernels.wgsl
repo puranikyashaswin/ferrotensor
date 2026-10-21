@@ -66,7 +66,8 @@ fn rope(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let dim_idx = idx % half_dim;
     let seq_len = rope_params.y;
     let base_pos = rope_params.z;
-    let pos = f32(base_pos + ((token_idx % seq_len)));
+    let heads = max(rope_params.w, 1u); // head vectors per token
+    let pos = f32(base_pos + (token_idx / heads) % seq_len);
     let freq_exp = -2.0 * f32(dim_idx) / f32(head_dim);
     let angle = pos * pow(10000.0, freq_exp);
     let cos_a = cos(angle);
@@ -255,7 +256,7 @@ fn matmul_at(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let m = mm_bk_params.x; let k = mm_bk_params.y; let n = mm_bk_params.z;
     if (row >= m || col >= n) { return; }
     var acc = 0.0;
-    for (var i = 0u; i < k; i = i + 1u) { acc = acc + mm_bk_other[i * m + row] * mm_bk_grad[i * n + col]; }
+    for (var i = 0u; i < k; i = i + 1u) { acc = acc + mm_bk_grad[i * m + row] * mm_bk_other[i * n + col]; }
     mm_bk_out[row * n + col] = acc;
 }
 
@@ -395,8 +396,9 @@ fn softmax_backward(@builtin(global_invocation_id) global_id: vec3<u32>) {
 @group(0) @binding(3) var<storage, read_write> q_out: array<f32>;
 
 @compute @workgroup_size(64)
-fn affine_dequantize(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let out_idx = global_id.x;
+fn affine_dequantize(@builtin(global_invocation_id) global_id: vec3<u32>,
+                     @builtin(num_workgroups) num_wg: vec3<u32>) {
+    let out_idx = global_id.y * num_wg.x * 64u + global_id.x;
     if (out_idx >= arrayLength(&q_out)) { return; }
     
     let u32_idx = out_idx / 4u;

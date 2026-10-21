@@ -648,14 +648,23 @@ impl ComputeEngine {
     }
 
     pub fn rope(&self, ctx: &WgpuContext, tensor: &UnifiedTensor, head_dim: usize, pos: usize) {
+        // [batch, seq, ...] tensors: every head vector of token s gets
+        // position pos + s. 1-D/2-D tensors are a single token.
         let seq_len = if tensor.shape.len() >= 3 {
             tensor.shape[1]
         } else {
             1
         };
+        let total = tensor.shape.iter().product::<usize>();
+        let tokens = if tensor.shape.len() >= 3 {
+            tensor.shape[0] * tensor.shape[1]
+        } else {
+            1
+        };
+        let heads = total / (tokens * head_dim).max(1);
         let params = uniform(
             ctx,
-            bytemuck::cast_slice(&[head_dim as u32, seq_len as u32, pos as u32, 0]),
+            bytemuck::cast_slice(&[head_dim as u32, seq_len as u32, pos as u32, heads as u32]),
         );
         let pairs = tensor.shape.iter().product::<usize>() / 2;
         self.run(
@@ -826,7 +835,7 @@ impl ComputeEngine {
                 (4, final_out.buffer()),
                 (5, grad_in.buffer()),
             ],
-            (groups64(rows), 1, 1),
+            (rows as u32, 1, 1),
         );
     }
 
