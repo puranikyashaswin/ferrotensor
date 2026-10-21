@@ -303,7 +303,7 @@ impl Lfm2Model {
             let start = (id as usize) * hidden_dim;
             match w.get(start..start + hidden_dim) {
                 Some(row) => data.extend_from_slice(row),
-                None => data.extend(std::iter::repeat(0.0).take(hidden_dim)),
+                None => data.extend(std::iter::repeat_n(0.0, hidden_dim)),
             }
         }
         // The lookup is not differentiable, so its output is a constant.

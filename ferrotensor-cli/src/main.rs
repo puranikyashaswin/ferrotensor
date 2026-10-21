@@ -136,7 +136,7 @@ struct TrainArgs {
         default_value = "outputs/run"
     )]
     out: PathBuf,
-    /// Where to write the adapter [default: <out>/lora_adapters.safetensors].
+    /// Where to write the adapter [default: OUT/lora_adapters.safetensors].
     #[arg(long, value_name = "FILE")]
     save_lora: Option<PathBuf>,
     /// Resume from an adapter written by a previous run (its .state.json
@@ -214,7 +214,7 @@ struct TrainArgs {
     /// This process's rank in 0..world-size.
     #[arg(long, default_value_t = 0)]
     rank: usize,
-    /// Shared directory for gradient exchange [default: <out>/grad_sync].
+    /// Shared directory for gradient exchange [default: OUT/grad_sync].
     #[arg(long, value_name = "DIR")]
     sync_dir: Option<PathBuf>,
 }
@@ -980,7 +980,7 @@ async fn train(mut args: TrainArgs) -> Result<()> {
                     continue;
                 }
                 step += 1;
-                if step % args.log_every.max(1) == 0 || step == total_steps {
+                if step.is_multiple_of(args.log_every.max(1)) || step == total_steps {
                     let loss = (win_loss / win_tok.max(1) as f64) as f32;
                     let secs = win_start.elapsed().as_secs_f32();
                     let steps_in_win = win_seq as f32 / micro_per_step as f32;
@@ -1004,11 +1004,15 @@ async fn train(mut args: TrainArgs) -> Result<()> {
                     (win_loss, win_tok, win_seq) = (0.0, 0, 0);
                     win_start = Instant::now();
                 }
-                if args.save_every > 0 && step % args.save_every == 0 && step < total_steps {
+                if args.save_every > 0 && step.is_multiple_of(args.save_every) && step < total_steps
+                {
                     save(&trainer, step, best)?;
                 }
                 if let Some(ds) = &eval_ds {
-                    if args.eval_every > 0 && step % args.eval_every == 0 && step < total_steps {
+                    if args.eval_every > 0
+                        && step.is_multiple_of(args.eval_every)
+                        && step < total_steps
+                    {
                         let (loss, _) =
                             evaluate(&base, &trainer.model, ds, args.eval_samples).await;
                         eprintln!("eval @ {step}: loss {loss:.4} ppl {:.3}", loss.exp());

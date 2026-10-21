@@ -12,16 +12,22 @@ use ferrotensor_backend::{ComputeEngine, UnifiedTensor, WgpuContext};
 /// based on whether gradients contain inf/nan.
 ///
 /// # Example
-/// ```rust,ignore
+/// ```no_run
+/// # use ferrotensor_backend::{ComputeEngine, UnifiedTensor, WgpuContext};
+/// # use ferrotensor_trainer::GradScaler;
+/// # let ctx = pollster::block_on(WgpuContext::new());
+/// # let engine = ComputeEngine::new(&ctx);
+/// # let loss = UnifiedTensor::zeros(&ctx, &[1]);
+/// # let gradients: Vec<UnifiedTensor> = Vec::new();
 /// let mut scaler = GradScaler::new();
 ///
-/// // Training loop
-/// let scaled_loss = scaler.scale(&loss, &engine);
-/// scaled_loss.backward(&engine);
+/// // Scale the loss in place, then run the backward pass on it.
+/// scaler.scale_loss(&loss, &ctx, &engine);
+/// // ... backward pass fills `gradients` ...
 ///
-/// // Check for overflow and update scale
+/// // Unscale and skip the optimizer step if any gradient overflowed.
 /// if scaler.unscale_and_check(&gradients, &ctx, &engine) {
-///     optimizer.step(&params);
+///     // optimizer.step(...)
 /// }
 /// scaler.update();
 /// ```
@@ -106,7 +112,7 @@ impl GradScaler {
 
     /// Scale the loss value before backward pass.
     ///
-    /// Returns the scaled loss tensor (modifies in place for efficiency).
+    /// Scales `loss` in place (no new tensor is allocated).
     pub fn scale_loss(&self, loss: &UnifiedTensor, ctx: &WgpuContext, engine: &ComputeEngine) {
         if !self.enabled {
             return;

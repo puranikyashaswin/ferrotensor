@@ -4,6 +4,12 @@ all-features = true
 [advisories]
 version = 2
 yanked = "warn"
+ignore = [
+    # Both come in only through `tokenizers` (indicatif and
+    # macro_rules_attribute); there is no maintained replacement upstream yet.
+    { id = "RUSTSEC-2025-0119", reason = "number_prefix via tokenizers -> indicatif, no safe upgrade" },
+    { id = "RUSTSEC-2024-0436", reason = "paste (proc-macro) via tokenizers -> macro_rules_attribute, no safe upgrade" },
+]
 
 [licenses]
 version = 2

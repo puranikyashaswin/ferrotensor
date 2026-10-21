@@ -120,15 +120,15 @@ tested, incomplete, or only checked on one machine.
 flowchart TD
     cli[ferrotensor-cli] --> trainer[ferrotensor-trainer]
     cli --> monitor[ferrotensor-monitor]
-    hub[ferrotensor-hub] --> graph
-    trainer --> graph[ferrotensor-graph]
+    hub[ferrotensor-hub] --> graphc[ferrotensor-graph]
+    trainer --> graphc
     trainer --> autograd[ferrotensor-autograd]
     trainer --> loader[ferrotensor-loader]
-    graph --> autograd
-    graph --> loader
+    graphc --> autograd
+    graphc --> loader
     autograd --> backend[ferrotensor-backend]
     loader --> backend
-    graph --> backend
+    graphc --> backend
     backend --> wgpu[wgpu: Metal / Vulkan / DX12]
 
     ferrotensor["ferrotensor (Tensor, autograd, nn, optim)"] --> kernels["own WGSL kernels + CPU reference"]

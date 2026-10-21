@@ -3,12 +3,17 @@
 //! Download and load pre-trained models from HuggingFace with a single line of code.
 //!
 //! # Example
-//! ```rust,ignore
-//! use ferrotensor_hub::FerrotensorHub;
+//! ```no_run
+//! use ferrotensor_hub::{FerrotensorHub, ModelConfig};
 //!
-//! // Point to local model directory (downloaded from HuggingFace)
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! // Resolve a model already downloaded to the Hugging Face cache
+//! let hub = FerrotensorHub::new();
 //! let model_path = hub.get_model_path("meta-llama/Llama-3.2-1B");
 //! let config = ModelConfig::from_model_dir(&model_path)?;
+//! println!("{} layers", config.num_hidden_layers);
+//! # Ok(())
+//! # }
 //! ```
 
 #![warn(missing_docs)]
@@ -69,10 +74,14 @@ pub type HubResult<T> = Result<T, HubError>;
 /// Download models using `huggingface-cli download` or the Python `huggingface_hub` library.
 ///
 /// # Example
-/// ```rust,ignore
+/// ```no_run
+/// # use ferrotensor_hub::FerrotensorHub;
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let hub = FerrotensorHub::new();
 /// let config = hub.load_config("meta-llama/Llama-3.2-1B")?;
 /// println!("Model has {} layers", config.num_hidden_layers);
+/// # Ok(())
+/// # }
 /// ```
 pub struct FerrotensorHub {
     cache_dir: PathBuf,

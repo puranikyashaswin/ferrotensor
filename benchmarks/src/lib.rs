@@ -38,7 +38,7 @@ impl Config {
     }
 
     fn wants(&self, name: &str) -> bool {
-        self.filter.as_deref().map_or(true, |f| name.contains(f))
+        self.filter.as_deref().is_none_or(|f| name.contains(f))
     }
 }
 

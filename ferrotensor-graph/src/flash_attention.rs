@@ -12,8 +12,16 @@ use std::sync::Arc;
 /// Speed: 2-4x faster than naive implementation.
 ///
 /// # Example
-/// ```rust,ignore
-/// let flash_attn = FlashAttention::new(dim, num_heads, causal);
+/// ```no_run
+/// # use ferrotensor_backend::{ComputeEngine, UnifiedTensor, WgpuContext};
+/// # use ferrotensor_graph::flash_attention::{FlashAttention};
+/// let ctx = pollster::block_on(WgpuContext::new());
+/// let engine = ComputeEngine::new(&ctx);
+/// // [batch, seq_len, hidden]
+/// let q = UnifiedTensor::zeros(&ctx, &[1, 128, 768]);
+/// let k = UnifiedTensor::zeros(&ctx, &[1, 128, 768]);
+/// let v = UnifiedTensor::zeros(&ctx, &[1, 128, 768]);
+/// let flash_attn = FlashAttention::new(768, 12, true);
 /// let output = flash_attn.forward(&q, &k, &v, &ctx, &engine);
 /// ```
 pub struct FlashAttention {
@@ -272,10 +280,18 @@ mod tests {
 /// - GQA: `num_kv_heads` K and V projections (typically 2-8x fewer)
 ///
 /// # Example
-/// ```rust,ignore
-/// // Llama 3 8B uses 32 query heads and 8 KV heads
-/// let gqa = GroupedQueryAttention::new(4096, 32, 8, true);
-/// let output = gqa.forward(&q, &k, &v, &ctx, &engine);
+/// ```no_run
+/// # use ferrotensor_backend::{ComputeEngine, UnifiedTensor, WgpuContext};
+/// # use ferrotensor_graph::flash_attention::{GroupedQueryAttention};
+/// let ctx = pollster::block_on(WgpuContext::new());
+/// let engine = ComputeEngine::new(&ctx);
+/// // [batch, seq_len, hidden]
+/// let q = UnifiedTensor::zeros(&ctx, &[1, 128, 4096]);
+/// let k = UnifiedTensor::zeros(&ctx, &[1, 128, 1024]);
+/// let v = UnifiedTensor::zeros(&ctx, &[1, 128, 1024]);
+/// // Llama 3 8B: 32 query heads share 8 KV heads (no dropout, no mask)
+/// let gqa = GroupedQueryAttention::new(4096, 32, 8, true, 0.0);
+/// let output = gqa.forward(&q, &k, &v, None, &ctx, &engine);
 /// ```
 pub struct GroupedQueryAttention {
     /// Total hidden dimension
@@ -317,7 +333,7 @@ impl GroupedQueryAttention {
         dropout_prob: f32,
     ) -> Self {
         assert!(
-            num_heads % num_kv_heads == 0,
+            num_heads.is_multiple_of(num_kv_heads),
             "num_heads ({}) must be divisible by num_kv_heads ({})",
             num_heads,
             num_kv_heads
@@ -430,9 +446,18 @@ impl GroupedQueryAttention {
 /// - High-throughput serving
 ///
 /// # Example
-/// ```rust,ignore
-/// let mqa = MultiQueryAttention::new(768, 12, true);
-/// let output = mqa.forward(&q, &k, &v, &ctx, &engine);
+/// ```no_run
+/// # use ferrotensor_backend::{ComputeEngine, UnifiedTensor, WgpuContext};
+/// # use ferrotensor_graph::flash_attention::{MultiQueryAttention};
+/// let ctx = pollster::block_on(WgpuContext::new());
+/// let engine = ComputeEngine::new(&ctx);
+/// // [batch, seq_len, hidden]
+/// let q = UnifiedTensor::zeros(&ctx, &[1, 128, 768]);
+/// let k = UnifiedTensor::zeros(&ctx, &[1, 128, 64]);
+/// let v = UnifiedTensor::zeros(&ctx, &[1, 128, 64]);
+/// // 12 query heads share one KV head
+/// let mqa = MultiQueryAttention::new(768, 12, true, 0.0);
+/// let output = mqa.forward(&q, &k, &v, None, &ctx, &engine);
 /// ```
 pub struct MultiQueryAttention {
     /// Total hidden dimension
@@ -513,7 +538,15 @@ impl MultiQueryAttention {
 /// - Memory-efficient inference
 ///
 /// # Example
-/// ```rust,ignore
+/// ```no_run
+/// # use ferrotensor_backend::{ComputeEngine, UnifiedTensor, WgpuContext};
+/// # use ferrotensor_graph::flash_attention::{SlidingWindowAttention};
+/// let ctx = pollster::block_on(WgpuContext::new());
+/// let engine = ComputeEngine::new(&ctx);
+/// // [batch, seq_len, hidden]
+/// let q = UnifiedTensor::zeros(&ctx, &[1, 128, 768]);
+/// let k = UnifiedTensor::zeros(&ctx, &[1, 128, 768]);
+/// let v = UnifiedTensor::zeros(&ctx, &[1, 128, 768]);
 /// let swa = SlidingWindowAttention::new(768, 12, 4096, true);
 /// let output = swa.forward(&q, &k, &v, &ctx, &engine);
 /// ```

@@ -301,7 +301,7 @@ impl AttentionDims {
             dims.head_dim
         );
         assert!(
-            dims.kv_heads > 0 && dims.heads % dims.kv_heads == 0,
+            dims.kv_heads > 0 && dims.heads.is_multiple_of(dims.kv_heads),
             "num_heads ({}) must be a multiple of num_kv_heads ({})",
             dims.heads,
             dims.kv_heads

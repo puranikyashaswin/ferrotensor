@@ -244,7 +244,7 @@ impl<'a> Lfm2ModelBuilder<'a> {
             .config
             .head_dim
             .unwrap_or(self.config.hidden_size / n_heads.max(1));
-        if n_heads == 0 || num_kv_heads == 0 || n_heads % num_kv_heads != 0 {
+        if n_heads == 0 || num_kv_heads == 0 || !n_heads.is_multiple_of(num_kv_heads) {
             return Err(BuildError(format!(
                 "num_attention_heads ({n_heads}) must be a positive multiple of num_key_value_heads ({num_kv_heads})"
             )));

@@ -49,7 +49,7 @@ impl MultiHeadAttention {
     /// Panics unless `hidden_dim` is divisible by `n_heads`.
     pub fn new(hidden_dim: usize, n_heads: usize, device: &Device) -> Self {
         assert!(
-            n_heads > 0 && hidden_dim % n_heads == 0,
+            n_heads > 0 && hidden_dim.is_multiple_of(n_heads),
             "hidden_dim must be divisible by n_heads"
         );
         Self {

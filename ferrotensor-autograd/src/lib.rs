@@ -728,7 +728,7 @@ where
 ///
 /// Checkpointing each transformer block keeps one activation per block
 /// instead of every intermediate:
-/// ```rust,ignore
+/// ```text
 /// let mut x = input;
 /// for layer in &layers {
 ///     x = checkpoint_single(x, move |h, eng| layer.forward(h, eng), engine);
