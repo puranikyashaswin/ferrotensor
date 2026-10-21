@@ -8,6 +8,8 @@
 //! pretraining datasets, [`checkpoint`] saves and restores LoRA adapters and
 //! optimizer state.
 
+#![warn(missing_docs)]
+
 use rusty_autograd::{AutogradNode, LRScheduler, Optimizer, Tensor};
 use rusty_backend::{ComputeEngine, UnifiedTensor, WgpuContext};
 use rusty_graph::lfm::Lfm2Model;
@@ -74,8 +76,14 @@ pub struct Trainer {
     pub scaler: Option<GradScaler>,
     /// Multi-process gradient averaging through a shared directory.
     pub distributed_grad_sync: Option<FileGradSyncConfig>,
-    /// Learning-rate schedule, advanced once per optimizer step.
+    /// Learning-rate schedule, advanced once per optimizer step (before it
+    /// is read, so step `k` uses the schedule's rate at `k`).
     pub lr_scheduler: Option<Box<dyn LRScheduler>>,
+    /// Sequences are right-padded to a multiple of this many tokens (with
+    /// the padding excluded from the loss). Causal attention keeps real
+    /// tokens from seeing the padding, so results are unchanged, but GPU
+    /// buffer sizes repeat and can be reused. 1 disables padding.
+    pub length_bucket: usize,
     optimizer_step_count: usize,
 }
 
@@ -98,8 +106,16 @@ impl Trainer {
             scaler: None,
             distributed_grad_sync: None,
             lr_scheduler: None,
+            length_bucket: 32,
             optimizer_step_count: 0,
         }
+    }
+
+    /// Pad sequences to a multiple of `tokens` (see
+    /// [`length_bucket`](Self::length_bucket)).
+    pub fn with_length_bucket(mut self, tokens: usize) -> Self {
+        self.length_bucket = tokens.max(1);
+        self
     }
 
     /// Clip the global gradient L2 norm to `max_norm`.
@@ -172,15 +188,22 @@ impl Trainer {
         loss_mask: Option<&[u8]>,
         train_params: &[Tensor],
     ) -> Result<StepStats, TrainError> {
-        let logits = self.model.forward(&self.engine, input_ids, 0, None, None);
-        let ones;
-        let mask = match loss_mask {
-            Some(mask) => mask,
-            None => {
-                ones = vec![1u8; target_ids.len()];
-                &ones
-            }
+        let len = input_ids.len().min(target_ids.len());
+        let padded_len = len.div_ceil(self.length_bucket) * self.length_bucket;
+        let mut inputs = input_ids[..len].to_vec();
+        let mut targets = target_ids[..len].to_vec();
+        let mut mask = match loss_mask {
+            Some(mask) => (0..len)
+                .map(|i| mask.get(i).copied().unwrap_or(0))
+                .collect(),
+            None => vec![1u8; len],
         };
+        let pad = inputs.last().copied().unwrap_or(0);
+        inputs.resize(padded_len, pad);
+        targets.resize(padded_len, pad);
+        mask.resize(padded_len, 0);
+
+        let logits = self.model.forward(&self.engine, &inputs, 0, None, None);
 
         let mut stats = StepStats {
             loss: 0.0,
@@ -189,7 +212,7 @@ impl Trainer {
             grad_norm: None,
             lr: None,
         };
-        if let Some(loss) = masked_cross_entropy(&logits, target_ids, mask) {
+        if let Some(loss) = masked_cross_entropy(&logits, &targets, &mask) {
             stats.loss = loss.value;
             stats.tokens = loss.tokens;
             // Seed backward with d(total)/d(loss): the accumulation average
@@ -262,15 +285,15 @@ impl Trainer {
             }
         }
 
-        if let Some(s) = self.lr_scheduler.as_ref() {
+        // Step k (1-based) uses the schedule's value at k, so warmup starts
+        // above zero and the last step lands on the final rate.
+        if let Some(s) = self.lr_scheduler.as_mut() {
+            s.step();
             let lr = s.get_lr();
             self.optimizer.set_lr(lr);
             stats.lr = Some(lr);
         }
         self.optimizer.step(train_params);
-        if let Some(s) = self.lr_scheduler.as_mut() {
-            s.step();
-        }
         self.optimizer_step_count += 1;
         stats.optimizer_step = true;
         Ok(())
