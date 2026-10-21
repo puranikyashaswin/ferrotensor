@@ -1,17 +1,17 @@
 
 #[cfg(test)]
 mod tests {
-    use rusty_autograd::Tensor;
-    use rusty_backend::{ComputeEngine, UnifiedTensor, WgpuContext};
+    use ferrotensor_autograd::Tensor;
+    use ferrotensor_backend::{ComputeEngine, UnifiedTensor, WgpuContext};
     use std::sync::Arc;
 
     fn gpu_tests_enabled() -> bool {
-        std::env::var("RUSTY_RUN_GPU_TESTS").as_deref() == Ok("1")
+        std::env::var("FERROTENSOR_RUN_GPU_TESTS").as_deref() == Ok("1")
     }
 
     async fn run_grad_check() {
         if !gpu_tests_enabled() {
-            eprintln!("skipping flash grad check; set RUSTY_RUN_GPU_TESTS=1 to enable");
+            eprintln!("skipping flash grad check; set FERROTENSOR_RUN_GPU_TESTS=1 to enable");
             return;
         }
 

@@ -22,19 +22,19 @@ problem), then fix whatever warnings clippy shows once it can run.
 
 Done when `cargo clippy --workspace --all-targets` exits cleanly on stable.
 
-## 2. Remove unused dependencies and empty features from the `rusty` crate
+## 2. Remove unused dependencies and empty features from the `ferrotensor` crate
 
 *easy · `cleanup` · `good first issue`*
 
-`rusty/Cargo.toml` depends on `rusty-backend`, `rusty-autograd`, `rusty-graph`,
-`rusty-trainer`, `rusty-loader`, `serde`, `serde_json`, `memmap2` and `log`,
-but nothing under `rusty/src` appears to use them (a grep for each finds no
+`ferrotensor/Cargo.toml` depends on `ferrotensor-backend`, `ferrotensor-autograd`, `ferrotensor-graph`,
+`ferrotensor-trainer`, `ferrotensor-loader`, `serde`, `serde_json`, `memmap2` and `log`,
+but nothing under `ferrotensor/src` appears to use them (a grep for each finds no
 imports). It also declares `metal` and `vulkan` features that no code reads.
-Dropping them shortens builds a lot. Verify each with `cargo build -p rusty`
+Dropping them shortens builds a lot. Verify each with `cargo build -p ferrotensor`
 after removing it, and keep any that turn out to be needed (for example for
 re-exports the docs promise).
 
-Done when `cargo build -p rusty --all-targets` and `cargo test -p rusty` pass
+Done when `cargo build -p ferrotensor --all-targets` and `cargo test -p ferrotensor` pass
 with the smaller dependency list.
 
 ## 3. Fix rustdoc broken-link warnings
@@ -42,7 +42,7 @@ with the smaller dependency list.
 *easy · `docs` · `good first issue`*
 
 `cargo doc --workspace --no-deps` warns `unresolved link to 'target'` at
-`rusty-backend/src/lib.rs:5087`: the text `[target]` in a doc comment is read
+`ferrotensor-backend/src/lib.rs:5087`: the text `[target]` in a doc comment is read
 as an intra-doc link. Escape the brackets (`\[target\]`), then fix any other
 warnings the command prints. CI builds the docs, so this keeps the output
 clean.
@@ -51,14 +51,14 @@ clean.
 
 *medium · `performance`, `kernels`*
 
-In `rusty/src/backend/kernels.rs` the `softmax` entry point assigns one thread
+In `ferrotensor/src/backend/kernels.rs` the `softmax` entry point assigns one thread
 per row and loops over the whole axis three times (max, sum, normalise). For
 long rows (the attention softmax over a sequence) most of the GPU idles.
 Rewrite it as one workgroup per row with a shared-memory tree reduction for
 the max and the sum. Keep the op codes (`softmax` and `log_softmax`) and the
 CPU reference unchanged.
 
-Done when `RUSTY_RUN_GPU_TESTS=1 cargo test -p rusty --lib` passes and
+Done when `FERROTENSOR_RUN_GPU_TESTS=1 cargo test -p ferrotensor --lib` passes and
 `examples/gpu_matmul_attention.rs` (attention at seq 512) is no slower; report
 before/after numbers and the machine in the PR.
 
@@ -66,7 +66,7 @@ before/after numbers and the machine in the PR.
 
 *easy · `performance`*
 
-`rusty/src/nn/embedding.rs` implements `Module::forward` by calling
+`ferrotensor/src/nn/embedding.rs` implements `Module::forward` by calling
 `x.to_vec()` to turn the id tensor into indices, then `functional::embedding`
 uploads them again. On a GPU tensor that is a device-to-host copy plus a
 host-to-device copy per call, and it forces a sync. Either document that
@@ -75,13 +75,13 @@ gather path that keeps the ids on the device (the `gather_rows` kernel is the
 starting point).
 
 Done when a test shows both paths give identical output on CPU, and (with
-`RUSTY_RUN_GPU_TESTS=1`) on the GPU.
+`FERROTENSOR_RUN_GPU_TESTS=1`) on the GPU.
 
 ## 6. Make loss-function target types consistent
 
 *easy · `api`*
 
-In `rusty/src/functional.rs`, `cross_entropy` takes targets as an `f32`
+In `ferrotensor/src/functional.rs`, `cross_entropy` takes targets as an `f32`
 `Tensor` of class ids, `nll_loss` takes `&[i64]`, and `accuracy` and
 `one_hot` take `&[usize]`. Going from one to another needs conversions (see
 `examples/mlp_two_moons.rs`). Propose and implement one convention (for
@@ -95,7 +95,7 @@ working), update the doc examples, and note it in `CHANGELOG.md`.
 There is no way to build a lower-triangular mask with the tensor API; the
 causal attention path builds its mask internally. Add `Tensor::tril(diagonal)`
 and `triu(diagonal)` using `masked_fill` or a small kernel, with gradient
-checks via a new `case(...)` in `rusty/src/tensor/tests.rs`. Follow
+checks via a new `case(...)` in `ferrotensor/src/tensor/tests.rs`. Follow
 [writing-a-kernel.md](writing-a-kernel.md) if you choose the kernel route.
 
 Done when the new ops pass the CPU gradient check and the GPU parity test.
@@ -108,7 +108,7 @@ Done when the new ops pass the CPU gradient check and the GPU parity test.
 window for every new character, because `nn::MultiHeadAttention` has no
 cache. Add an incremental forward that appends the new key/value rows to a
 cache and attends from the new position only. The LLM stack already has a
-`KVCache` in `rusty-graph` to learn from.
+`KVCache` in `ferrotensor-graph` to learn from.
 
 Done when generating N tokens with the cache matches the uncached logits
 within 1e-5 (a test), and the example uses it.
@@ -117,13 +117,13 @@ within 1e-5 (a test), and the example uses it.
 
 *easy · `tests`, `good first issue`*
 
-`RUSTY_RUN_GPU_TESTS=1` runs GPU-vs-CPU checks for tensor ops, functional ops
+`FERROTENSOR_RUN_GPU_TESTS=1` runs GPU-vs-CPU checks for tensor ops, functional ops
 and the optimizers, but not for whole layers (`MultiHeadAttention`,
 `LayerNorm`, `Embedding`, `Sequential`) or for save/load of a GPU module.
 Add a test per layer that builds the layer, copies its weights to a GPU
 device (`Tensor::to_device`), and compares forward and gradients with the CPU
 result, gated the same way as `gpu_training_matches_cpu` in
-`rusty/src/optim/tests.rs`. Add a safetensors round trip from a GPU module.
+`ferrotensor/src/optim/tests.rs`. Add a safetensors round trip from a GPU module.
 
 ## 10. Cut per-op overhead on the GPU path
 
@@ -131,7 +131,7 @@ result, gated the same way as `gpu_training_matches_cpu` in
 
 Each op creates a uniform buffer, a bind group and a command encoder, and
 submits it on its own (`ComputeEngine::run` in
-`rusty/src/backend/compute.rs`, called from `rusty/src/tensor/raw.rs`). On
+`ferrotensor/src/backend/compute.rs`, called from `ferrotensor/src/tensor/raw.rs`). On
 this repo's M2, the 109k-parameter transformer in
 `examples/char_transformer.rs` trains 600 steps in about 47 s on the CPU and
 141 s on the GPU, and the 1.2k-parameter MLP takes about 0.5 s on the CPU and
@@ -142,16 +142,16 @@ encoder so they submit together. Needs a design note before a large PR.
 Done when the GPU run of `char_transformer` is measurably faster with
 identical results, with before/after numbers in the PR.
 
-## 11. Port the legacy `rusty_backend` examples and verify they run
+## 11. Port the legacy `ferrotensor_backend` examples and verify they run
 
 *medium · `examples`, `docs`*
 
-`rusty/examples/basic_tensor.rs`, `flash_attention.rs` and `lora_finetune.rs`
-are written against the low-level `rusty_backend` API, not the `rusty` tensor
+`ferrotensor/examples/basic_tensor.rs`, `flash_attention.rs` and `lora_finetune.rs`
+are written against the low-level `ferrotensor_backend` API, not the `ferrotensor` tensor
 API the rest of the docs use, and at the time of writing `basic_tensor`
 panics in `ComputeEngine::new` with a WGSL parse error. Once the backend fix
 lands, run each, fix what is broken, and put the real output in the example's
-doc comment and in `rusty/examples/README.md`. Delete or clearly mark any
+doc comment and in `ferrotensor/examples/README.md`. Delete or clearly mark any
 example that cannot be made to work.
 
 ## 12. `DataLoader` clones every sample and has no prefetching
@@ -159,7 +159,7 @@ example that cannot be made to work.
 *medium · `data`*
 
 `Dataset::get` returns owned `Sample`s, so `DataLoader::epoch` clones each
-sample's data once to read it and again into the batch (`rusty/src/data.rs`).
+sample's data once to read it and again into the batch (`ferrotensor/src/data.rs`).
 Look at borrowing samples (for example `get(&self, i) -> (&Sample, &Sample)`
 or a visitor), and optionally add a prefetch thread that prepares the next
 batch while the current step runs.

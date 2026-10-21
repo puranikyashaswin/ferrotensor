@@ -1,0 +1,28 @@
+[package]
+name = "ferrotensor-loader"
+version = "0.1.0"
+edition = "2021"
+description = "Safetensors model loading and tokenizer support for Ferrotensor"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+homepage = "https://github.com/puranikyashaswin/ferrotensor"
+documentation = "https://docs.rs/ferrotensor-loader"
+readme = "../README.md"
+keywords = ["safetensors", "tokenizer", "model-loading", "machine-learning", "llm"]
+categories = ["science", "algorithms"]
+
+[dependencies]
+safetensors = "0.4"
+memmap2 = "0.9"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+ferrotensor-backend = { path = "../ferrotensor-backend", version = "0.1.0" }
+env_logger = "0.11"
+pollster = "0.3"
+bytemuck = "1.14"
+rand = "0.8"
+half = "2"
+tokenizers = "0.19"

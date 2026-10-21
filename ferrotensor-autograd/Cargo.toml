@@ -1,0 +1,19 @@
+[package]
+name = "ferrotensor-autograd"
+version = "0.1.0"
+edition = "2021"
+description = "Reverse-mode automatic differentiation for the Ferrotensor GPU ML framework"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+homepage = "https://github.com/puranikyashaswin/ferrotensor"
+documentation = "https://docs.rs/ferrotensor-autograd"
+readme = "../README.md"
+keywords = ["autograd", "automatic-differentiation", "machine-learning", "gpu", "wgpu"]
+categories = ["science", "algorithms"]
+
+[dependencies]
+ferrotensor-backend = { path = "../ferrotensor-backend", version = "0.1.0" }
+serde = { version = "1.0", features = ["derive"] }
+pollster = "0.3"

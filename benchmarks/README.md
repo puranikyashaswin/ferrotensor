@@ -1,20 +1,20 @@
-# rusty-benchmarks
+# ferrotensor-benchmarks
 
-GPU kernel benchmarks for `rusty-backend`: matmul (square, LLM-shaped, odd
+GPU kernel benchmarks for `ferrotensor-backend`: matmul (square, LLM-shaped, odd
 sizes and the two transposed variants used in backward passes), flash
 attention forward and backward, softmax, RMSNorm and element-wise ops.
 
 ## Run
 
 ```bash
-cargo run -p rusty-benchmarks --release
+cargo run -p ferrotensor-benchmarks --release
 ```
 
-`cargo bench -p rusty-benchmarks` runs the same suite. Options go after `--`:
+`cargo bench -p ferrotensor-benchmarks` runs the same suite. Options go after `--`:
 
 ```bash
-cargo run -p rusty-benchmarks --release -- --quick            # smaller sizes, ~8 s
-cargo run -p rusty-benchmarks --release -- --filter attention  # cases whose name contains "attention"
+cargo run -p ferrotensor-benchmarks --release -- --quick            # smaller sizes, ~8 s
+cargo run -p ferrotensor-benchmarks --release -- --filter attention  # cases whose name contains "attention"
 ```
 
 A full run takes about 15 s on an Apple M2 and allocates at most a few hundred

@@ -1,26 +1,26 @@
 [workspace]
 members = [
-    "rusty",
-    "rusty-loader",
-    "rusty-graph",
-    "rusty-backend",
-    "rusty-cli",
-    "rusty-autograd",
-    "rusty-trainer",
-    "rusty-hub",
+    "ferrotensor",
+    "ferrotensor-loader",
+    "ferrotensor-graph",
+    "ferrotensor-backend",
+    "ferrotensor-cli",
+    "ferrotensor-autograd",
+    "ferrotensor-trainer",
+    "ferrotensor-hub",
     "benchmarks",
-    "rusty-monitor",
+    "ferrotensor-monitor",
 ]
 resolver = "2"
 
 [workspace.package]
 edition = "2021"
 version = "0.1.0"
-license = "MIT"
-repository = "https://github.com/puranikyashaswin/rusty"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/puranikyashaswin/ferrotensor"
 authors = ["Yashaswin Puranik <puranikyashaswinsharma@gmail.com>"]
 rust-version = "1.75"
-homepage = "https://github.com/puranikyashaswin/rusty"
+homepage = "https://github.com/puranikyashaswin/ferrotensor"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

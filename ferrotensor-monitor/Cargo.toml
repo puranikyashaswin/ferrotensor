@@ -1,0 +1,24 @@
+[package]
+name = "ferrotensor-monitor"
+version = "0.1.0"
+edition = "2021"
+description = "Terminal dashboard for monitoring Ferrotensor training runs"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+homepage = "https://github.com/puranikyashaswin/ferrotensor"
+documentation = "https://docs.rs/ferrotensor-monitor"
+readme = "../README.md"
+keywords = ["tui", "monitoring", "training", "machine-learning", "dashboard"]
+categories = ["science"]
+
+[dependencies]
+ratatui = "0.29.0"
+crossterm = "0.28.1"
+sysinfo = "0.33.1"
+tokio = { version = "1.43.0", features = ["full"] }
+anyhow = "1.0.95"
+chrono = "0.4.39"
+rand = "0.9.2"
+ferrotensor-trainer = { path = "../ferrotensor-trainer", version = "0.1.0" }

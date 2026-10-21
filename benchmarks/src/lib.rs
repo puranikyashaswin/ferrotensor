@@ -1,7 +1,7 @@
-//! GPU kernel benchmarks for the Rusty backend.
+//! GPU kernel benchmarks for the Ferrotensor backend.
 //!
-//! Run with `cargo run -p rusty-benchmarks --release` or
-//! `cargo bench -p rusty-benchmarks`. Pass `--quick` for smaller sizes and
+//! Run with `cargo run -p ferrotensor-benchmarks --release` or
+//! `cargo bench -p ferrotensor-benchmarks`. Pass `--quick` for smaller sizes and
 //! `--filter <text>` to run only cases whose name contains `text`.
 //!
 //! Each case dispatches the kernel `batch` times back to back and then waits
@@ -9,7 +9,7 @@
 //! submit) overlaps with GPU work. The reported time is the median per-call
 //! time over several such samples.
 
-use rusty_backend::{AttentionOptions, ComputeEngine, UnifiedTensor, WgpuContext};
+use ferrotensor_backend::{AttentionOptions, ComputeEngine, UnifiedTensor, WgpuContext};
 use std::time::{Duration, Instant};
 
 /// Benchmark settings parsed from the command line.

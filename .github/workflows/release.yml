@@ -28,18 +28,18 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2.7.5
-      - run: cargo build --release --locked -p rusty-cli --target ${{ matrix.target }}
+      - run: cargo build --release --locked -p ferrotensor-cli --target ${{ matrix.target }}
       - name: Package
         run: |
-          name="rusty-cli-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          name="ferrotensor-cli-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir "$name"
-          cp "target/${{ matrix.target }}/release/rusty-cli" LICENSE README.md "$name/"
+          cp "target/${{ matrix.target }}/release/ferrotensor" LICENSE-MIT LICENSE-APACHE README.md "$name/"
           tar czf "$name.tar.gz" "$name"
           shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
       - uses: actions/upload-artifact@v4.4.3
         with:
-          name: rusty-cli-${{ matrix.target }}
-          path: rusty-cli-*.tar.gz*
+          name: ferrotensor-cli-${{ matrix.target }}
+          path: ferrotensor-cli-*.tar.gz*
 
   release:
     name: Publish release

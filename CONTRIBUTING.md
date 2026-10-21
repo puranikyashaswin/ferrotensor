@@ -1,6 +1,6 @@
-# Contributing to Rusty
+# Contributing to Ferrotensor
 
-Thanks for your interest. Rusty is a young, one-maintainer project, so small,
+Thanks for your interest. Ferrotensor is a young, one-maintainer project, so small,
 focused pull requests that come with tests are the easiest to review and merge.
 
 ## Setup
@@ -9,8 +9,8 @@ You need Rust 1.75 or newer (stable). A GPU is optional: the default test
 suite runs on the CPU device.
 
 ```bash
-git clone https://github.com/puranikyashaswin/rusty.git
-cd rusty
+git clone https://github.com/puranikyashaswin/ferrotensor.git
+cd ferrotensor
 cargo build --workspace
 cargo test --workspace
 ```
@@ -18,11 +18,11 @@ cargo test --workspace
 Then try an example to check your GPU works:
 
 ```bash
-cargo run --release -p rusty --example quickstart
+cargo run --release -p ferrotensor --example quickstart
 ```
 
 Building the whole workspace needs a few GB of RAM; on small machines use
-`CARGO_BUILD_JOBS=2` and build one crate at a time (`-p rusty`).
+`CARGO_BUILD_JOBS=2` and build one crate at a time (`-p ferrotensor`).
 
 ## Where things are
 
@@ -33,9 +33,9 @@ Building the whole workspace needs a few GB of RAM; on small machines use
 | see what works today | [docs/use-cases.md](docs/use-cases.md) |
 | find something to work on | [docs/good-first-issues.md](docs/good-first-issues.md) |
 
-The crates: `rusty` is the tensor API (tensor, autograd, `nn`, `optim`, `data`,
-`serialize`); `rusty-backend`, `rusty-autograd`, `rusty-graph`, `rusty-loader`,
-`rusty-trainer`, `rusty-cli`, `rusty-monitor` and `rusty-hub` are the LLM
+The crates: `ferrotensor` is the tensor API (tensor, autograd, `nn`, `optim`, `data`,
+`serialize`); `ferrotensor-backend`, `ferrotensor-autograd`, `ferrotensor-graph`, `ferrotensor-loader`,
+`ferrotensor-trainer`, `ferrotensor-cli`, `ferrotensor-monitor` and `ferrotensor-hub` are the LLM
 fine-tuning stack; `benchmarks` holds the GPU benchmarks. Each crate has a
 README.
 
@@ -43,17 +43,17 @@ README.
 
 ```bash
 cargo test --workspace                      # everything; no GPU needed
-cargo test -p rusty                         # one crate
-cargo test -p rusty --lib tensor::tests     # one module
+cargo test -p ferrotensor                         # one crate
+cargo test -p ferrotensor --lib tensor::tests     # one module
 ```
 
 ### GPU tests are opt-in
 
 CI runners have no GPU, so tests that need one are skipped unless you set
-`RUSTY_RUN_GPU_TESTS=1`:
+`FERROTENSOR_RUN_GPU_TESTS=1`:
 
 ```bash
-RUSTY_RUN_GPU_TESTS=1 cargo test -p rusty --lib
+FERROTENSOR_RUN_GPU_TESTS=1 cargo test -p ferrotensor --lib
 ```
 
 With the variable set, the op test suite also runs every case on the GPU and
@@ -64,7 +64,7 @@ locally before opening the PR and say so in the description.
 
 Test types you will meet:
 
-- **Gradient checks** (`rusty/src/tensor/tests.rs`): add a `case(...)` line
+- **Gradient checks** (`ferrotensor/src/tensor/tests.rs`): add a `case(...)` line
   for a new op; it is checked against finite differences.
 - **Shader validation** (`kernels_pass_naga_validation`): parses and validates
   the WGSL with naga, so shader typos fail on any machine.
@@ -134,5 +134,6 @@ If you want to take one, comment on the issue so work is not duplicated.
 
 ## License
 
-By contributing, you agree that your contributions are licensed under the
-project's MIT license.
+By contributing, you agree that your contributions are dual licensed under
+MIT OR Apache-2.0, the same terms as the project, without any additional
+terms or conditions.

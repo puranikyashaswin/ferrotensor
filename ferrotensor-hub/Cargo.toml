@@ -1,0 +1,25 @@
+[package]
+name = "ferrotensor-hub"
+version = "0.1.0"
+edition = "2021"
+description = "HuggingFace Hub integration for the Ferrotensor ML framework"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+homepage = "https://github.com/puranikyashaswin/ferrotensor"
+documentation = "https://docs.rs/ferrotensor-hub"
+readme = "../README.md"
+keywords = ["huggingface", "machine-learning", "models", "download", "safetensors"]
+categories = ["science", "algorithms"]
+
+[dependencies]
+ferrotensor-backend = { path = "../ferrotensor-backend", version = "0.1.0" }
+ferrotensor-graph = { path = "../ferrotensor-graph", version = "0.1.0" }
+ferrotensor-loader = { path = "../ferrotensor-loader", version = "0.1.0" }
+ferrotensor-autograd = { path = "../ferrotensor-autograd", version = "0.1.0" }
+
+# Use existing workspace dependencies
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+log = "0.4"

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Rusty ML - Model Download Script
+# Ferrotensor ML - Model Download Script
 # Downloads popular models for testing and fine-tuning
 
 set -e
@@ -9,7 +9,7 @@ mkdir -p "$MODELS_DIR"
 
 print_header() {
     echo "================================================================"
-    echo "   Rusty ML - Model Downloader"
+    echo "   Ferrotensor ML - Model Downloader"
     echo "================================================================"
     echo ""
 }
@@ -84,7 +84,7 @@ print_usage() {
     echo "  ./scripts/download_model.sh phi2"
     echo ""
     echo "After downloading, run:"
-    echo "  cargo run -p rusty-cli --release -- generate --model ./models/tinyllama --prompt \"Hello\""
+    echo "  cargo run -p ferrotensor-cli --release -- generate --model ./models/tinyllama --prompt \"Hello\""
 }
 
 # Main
@@ -121,8 +121,8 @@ echo "1. Create a training dataset:"
 echo "   echo '[{\"prompt\": \"Hello\", \"response\": \"Hi there!\"}]' > data/train.json"
 echo ""
 echo "2. Run LoRA fine-tuning:"
-echo "   cargo run -p rusty-cli --release -- train --model $MODELS_DIR/tinyllama --data data/train.json --out outputs/run1"
+echo "   cargo run -p ferrotensor-cli --release -- train --model $MODELS_DIR/tinyllama --data data/train.json --out outputs/run1"
 echo ""
 echo "3. Generate with the adapter:"
-echo "   cargo run -p rusty-cli --release -- generate --model $MODELS_DIR/tinyllama --lora outputs/run1/lora_adapters.safetensors --prompt \"Hello\""
+echo "   cargo run -p ferrotensor-cli --release -- generate --model $MODELS_DIR/tinyllama --lora outputs/run1/lora_adapters.safetensors --prompt \"Hello\""
 echo "================================================================"

@@ -2,7 +2,7 @@
 
 This page follows one tensor op, `a.matmul(&b)`, from the Rust API to a WGSL
 kernel and back, then explains how the crates fit together. File references
-are to the `rusty` crate unless noted.
+are to the `ferrotensor` crate unless noted.
 
 ## Two stacks in one workspace
 
@@ -11,30 +11,30 @@ source level:
 
 | Stack | Crates | What it is |
 |-------|--------|------------|
-| **Tensor API** | `rusty` | A PyTorch-style `Tensor` with autograd, `nn`, `optim`, `serialize` and a CPU device. Has its own small set of generic WGSL kernels (`rusty/src/backend/kernels.rs`). |
-| **LLM fine-tuning stack** | `rusty-backend`, `rusty-autograd`, `rusty-graph`, `rusty-loader`, `rusty-trainer`, `rusty-cli`, `rusty-monitor`, `rusty-hub` | Hand-written kernels for Llama/LFM2-style models (RoPE, RMSNorm, flash attention, AdamW, int8 dequantisation), LoRA, safetensors loading, the training CLI. |
+| **Tensor API** | `ferrotensor` | A PyTorch-style `Tensor` with autograd, `nn`, `optim`, `serialize` and a CPU device. Has its own small set of generic WGSL kernels (`ferrotensor/src/backend/kernels.rs`). |
+| **LLM fine-tuning stack** | `ferrotensor-backend`, `ferrotensor-autograd`, `ferrotensor-graph`, `ferrotensor-loader`, `ferrotensor-trainer`, `ferrotensor-cli`, `ferrotensor-monitor`, `ferrotensor-hub` | Hand-written kernels for Llama/LFM2-style models (RoPE, RMSNorm, flash attention, AdamW, int8 dequantisation), LoRA, safetensors loading, the training CLI. |
 
-`rusty/Cargo.toml` lists the LLM crates as dependencies, but `rusty/src` does
+`ferrotensor/Cargo.toml` lists the LLM crates as dependencies, but `ferrotensor/src` does
 not call into them today (see [good-first-issues](good-first-issues.md)). The
-rest of this page is about the `rusty` tensor API; the LLM stack is described
+rest of this page is about the `ferrotensor` tensor API; the LLM stack is described
 in each crate's README.
 
 ```mermaid
 flowchart TD
-    cli[rusty-cli] --> trainer[rusty-trainer]
-    cli --> monitor[rusty-monitor]
-    hub[rusty-hub] --> graph
-    trainer --> graph[rusty-graph]
-    trainer --> autograd[rusty-autograd]
-    trainer --> loader[rusty-loader]
+    cli[ferrotensor-cli] --> trainer[ferrotensor-trainer]
+    cli --> monitor[ferrotensor-monitor]
+    hub[ferrotensor-hub] --> graph
+    trainer --> graph[ferrotensor-graph]
+    trainer --> autograd[ferrotensor-autograd]
+    trainer --> loader[ferrotensor-loader]
     graph --> autograd
     graph --> loader
-    autograd --> backend[rusty-backend]
+    autograd --> backend[ferrotensor-backend]
     loader --> backend
     graph --> backend
     backend --> wgpu[wgpu: Metal / Vulkan / DX12]
 
-    rusty["rusty (tensor API, autograd, nn, optim)"] --> kernels["own WGSL kernels + CPU reference"]
+    ferrotensor["ferrotensor (tensor API, autograd, nn, optim)"] --> kernels["own WGSL kernels + CPU reference"]
     kernels --> wgpu
 ```
 
@@ -129,7 +129,7 @@ reasons:
 
 - **Correctness oracle.** The test suite checks every op's gradient against
   central finite differences on the CPU (`tensor/tests.rs`), then, with
-  `RUSTY_RUN_GPU_TESTS=1`, checks that the GPU forward values and gradients
+  `FERROTENSOR_RUN_GPU_TESTS=1`, checks that the GPU forward values and gradients
   match the CPU.
 - **CI without a GPU.** GitHub runners have no GPU, so the default
   `cargo test` never touches wgpu.
@@ -151,10 +151,10 @@ reasons:
 
 ## The LLM stack in one paragraph
 
-`rusty-loader` reads safetensors and tokenizers into `rusty-backend` buffers.
-`rusty-graph` builds a Llama/LFM2-style model from backend kernels (RMSNorm,
+`ferrotensor-loader` reads safetensors and tokenizers into `ferrotensor-backend` buffers.
+`ferrotensor-graph` builds a Llama/LFM2-style model from backend kernels (RMSNorm,
 RoPE, flash attention, SwiGLU), with optional LoRA on the projections.
-`rusty-autograd` supplies the gradient tape and `rusty-trainer` the loops
+`ferrotensor-autograd` supplies the gradient tape and `ferrotensor-trainer` the loops
 (SFT with response-only loss, pretraining, mixed-precision loss scaling,
-checkpoint save/resume). `rusty-cli` is the front end. This stack is
+checkpoint save/resume). `ferrotensor-cli` is the front end. This stack is
 experimental; see the status table in the [README](../README.md).

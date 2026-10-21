@@ -1,6 +1,6 @@
-# Rusty GPU kernel benchmarks
+# Ferrotensor GPU kernel benchmarks
 
-Kernel-level GPU timings for `rusty-backend`. They are not end-to-end training
+Kernel-level GPU timings for `ferrotensor-backend`. They are not end-to-end training
 throughput: model loading, optimizer state, host/device copies and
 synchronisation are not included.
 
@@ -9,7 +9,7 @@ synchronisation are not included.
 - Hardware: Apple M2 (10-core GPU), 8 GB unified memory, MacBook Air
 - OS: macOS 27.2; backend: Metal via wgpu 0.19
 - Toolchain: rustc 1.99.1, `--release`
-- Command: `cargo run -p rusty-benchmarks --release`
+- Command: `cargo run -p ferrotensor-benchmarks --release`
 - Method: each case is dispatched in batches (about 20 ms per sample, at most
   64 calls) followed by one GPU wait; the table shows the median per-call time.
   "Before" and "after" binaries were run alternately three times each, and the
@@ -25,7 +25,7 @@ synchronisation are not included.
 bench targets": the original matmul, softmax and RMSNorm kernels, and the
 first correct flash attention kernels. The original flash attention computed
 wrong results, so it has no meaningful timing. "After" is the commit
-"Document every public item in rusty-graph", which has every kernel change
+"Document every public item in ferrotensor-graph", which has every kernel change
 below.
 
 | kernel | shape | before | after | speed-up |

@@ -1,22 +1,22 @@
 [package]
-name = "rusty-benchmarks"
+name = "ferrotensor-benchmarks"
 version = "0.1.0"
 edition = "2021"
-description = "Benchmarks for the Rusty GPU ML framework"
+description = "Benchmarks for the Ferrotensor GPU ML framework"
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 publish = false
-homepage = "https://github.com/puranikyashaswin/rusty"
-documentation = "https://docs.rs/rusty-benchmarks"
+homepage = "https://github.com/puranikyashaswin/ferrotensor"
+documentation = "https://docs.rs/ferrotensor-benchmarks"
 readme = "../README.md"
 keywords = ["benchmark", "machine-learning", "gpu", "wgpu", "performance"]
 categories = ["science"]
 default-run = "bench"
 
 [lib]
-name = "rusty_benchmarks"
+name = "ferrotensor_benchmarks"
 path = "src/lib.rs"
 bench = false
 
@@ -31,6 +31,6 @@ path = "benches/gpu.rs"
 harness = false
 
 [dependencies]
-rusty-backend = { path = "../rusty-backend", version = "0.1.0" }
+ferrotensor-backend = { path = "../ferrotensor-backend", version = "0.1.0" }
 pollster = "0.3"
 wgpu = "0.19"

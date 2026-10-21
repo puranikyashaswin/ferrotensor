@@ -7,32 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+First public version. Nothing has been published to crates.io yet.
+
 ### Added
-- CI workflows: rustfmt, clippy, tests on Linux and macOS, rustdoc with broken-link checks, MSRV check and `cargo-deny`.
-- Release workflow that builds `rusty-cli` for macOS arm64 and Linux x86_64 and attaches the binaries to a GitHub Release on `v*` tags.
-- Dependabot for Cargo and GitHub Actions.
-- Issue templates, pull request template, `SECURITY.md`, `CODE_OF_CONDUCT.md`.
-- Crates.io package metadata (description, keywords, categories, readme, homepage) for all crates.
+- `ferrotensor`: tensor API with a CPU device and a wgpu GPU device, reverse-mode autograd checked against finite differences, differentiable `nn` layers (Linear, Embedding, LayerNorm, RMSNorm, Dropout, activations), SGD/Adam/AdamW, gradient clipping, LR schedules (cosine with warmup), `Dataset`/`DataLoader`, and safetensors save/load of module state dicts.
+- `ferrotensor-backend`: wgpu compute backend (Metal / Vulkan / DX12) with hand-written WGSL kernels: register-blocked vec4 matmul, Flash Attention v2 forward and backward with causal offset, sliding window, masks and dropout, softmax, RMSNorm, RoPE, int8 dequantization, and a capped buffer pool. Every kernel is tested against a CPU reference.
+- `ferrotensor-autograd`: GPU autograd tape used by the trainer.
+- `ferrotensor-graph`: Llama / LFM2-style blocks (attention with RoPE, SwiGLU MLP, RMSNorm, KV cache, LoRA linear layers).
+- `ferrotensor-loader`: safetensors and tokenizer loading for Llama-style Hugging Face checkpoints.
+- `ferrotensor-trainer`: LoRA SFT with response-only loss and chat template, next-token pretraining, AdamW, FP16 loss scaling, gradient accumulation, checkpoint save and resume.
+- `ferrotensor` command-line tool (`ferrotensor-cli` crate): `train`, `eval` and `generate` with temperature, top-k and top-p sampling and a KV cache.
+- `ferrotensor-hub` (Hugging Face Hub downloads) and `ferrotensor-monitor` (terminal dashboard).
+- Benchmark suite with recorded results (`benchmarks/RESULTS.md`) and an end-to-end LoRA walkthrough on SmolLM2-135M (`docs/examples/lora-sft.md`).
+- CI (rustfmt, clippy with `-D warnings`, tests on Linux and macOS, rustdoc, MSRV, cargo-deny), release workflow for `v*` tags, Dependabot, issue and PR templates, `SECURITY.md`, `CODE_OF_CONDUCT.md`, `CONTRIBUTING.md`, architecture and kernel-writing guides.
 
 ### Changed
-- Workspace authors email corrected.
-- Applied rustfmt across the workspace.
+- Renamed the project from Rusty to Ferrotensor; crates are now `ferrotensor-*` and the CLI binary is `ferrotensor`.
+- Licensed under MIT OR Apache-2.0 (previously MIT only).
 
-## [0.1.0]
-
-Initial release of the Rusty workspace.
-
-### Added
-- `rusty-backend`: wgpu compute backend (Metal / Vulkan) with hand-written WGSL kernels, including Flash Attention v2 forward and backward, and a buffer pool.
-- `rusty-autograd`: reverse-mode automatic differentiation with a gradient tape.
-- `rusty-graph`: neural network modules (Embedding, Linear with optional LoRA, multi-head Attention with rotary embeddings, SwiGLU MLP, RMSNorm, KV cache) and a Llama / LFM2-style model builder (experimental).
-- `rusty-loader`: safetensors model loading and tokenizer support.
-- `rusty-trainer`: GPU AdamW, FP16 loss scaling, gradient accumulation and clipping, LoRA fine-tuning, SFT with response-only loss masking, next-token pretraining on `.txt` and packed `.bin` data, and checkpoint save and resume.
-- `rusty-cli`: command-line entry point for training, evaluation and generation.
-- `rusty-hub`: HuggingFace Hub integration.
-- `rusty-monitor`: terminal dashboard for training runs.
-- `rusty`: umbrella crate re-exporting the framework.
-- `benchmarks`: benchmark binary.
-
-[Unreleased]: https://github.com/puranikyashaswin/rusty/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/puranikyashaswin/rusty/releases/tag/v0.1.0
+[Unreleased]: https://github.com/puranikyashaswin/ferrotensor/commits/main

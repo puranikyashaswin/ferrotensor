@@ -145,8 +145,8 @@ loss.
 ### 3. Train
 
 ```bash
-cargo build --release -p rusty-cli
-/usr/bin/time -l ./target/release/rusty-cli train \
+cargo build --release -p ferrotensor-cli
+/usr/bin/time -l ./target/release/ferrotensor-cli train \
   --model data/models/SmolLM2-135M \
   --data data/alpaca/train.jsonl --eval-data data/alpaca/val.jsonl \
   --out data/runs/sft --seq-len 256 \
@@ -188,12 +188,12 @@ processed but not counted.
 ### 4. Reload the adapter: evaluate and generate
 
 ```bash
-./target/release/rusty-cli eval --model data/models/SmolLM2-135M \
+./target/release/ferrotensor-cli eval --model data/models/SmolLM2-135M \
   --data data/alpaca/val.jsonl \
   --lora data/runs/sft/lora_adapters.safetensors
 # eval: 64 examples, 2744 tokens, loss 1.6519, perplexity 5.217 (9.7s)
 
-./target/release/rusty-cli generate --model data/models/SmolLM2-135M \
+./target/release/ferrotensor-cli generate --model data/models/SmolLM2-135M \
   --lora data/runs/sft/lora_adapters.safetensors \
   --prompt "Translate 'good morning' into French." --temperature 0
 # Bonjour, bonne journe!
@@ -208,7 +208,7 @@ Without `--lora`, the same commands give the base-model rows above.
 ### 5. Resume
 
 ```bash
-./target/release/rusty-cli train --model data/models/SmolLM2-135M \
+./target/release/ferrotensor-cli train --model data/models/SmolLM2-135M \
   --data data/alpaca/train.jsonl --out data/runs/sft --seq-len 256 \
   --lr 5e-4 --warmup-steps 20 --grad-accum 8 --max-steps 300 \
   --resume data/runs/sft/lora_adapters.safetensors

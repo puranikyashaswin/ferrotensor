@@ -1,7 +1,7 @@
 # Writing a kernel
 
 This guide adds one element-wise op, **softplus** (`ln(1 + e^x)`), to the
-`rusty` crate: a WGSL case, a CPU reference, the public method with its
+`ferrotensor` crate: a WGSL case, a CPU reference, the public method with its
 gradient, and the tests. Every step below was applied to the repo and checked
 with the commands at the end.
 
@@ -10,7 +10,7 @@ Read [architecture.md](architecture.md) first for how an op reaches the GPU.
 ## The shape of a change
 
 Element-wise unary ops share one kernel (`unary`) that switches on an op code.
-A new op touches four files in `rusty/src`:
+A new op touches four files in `ferrotensor/src`:
 
 | File | What to add |
 |------|-------------|
@@ -101,17 +101,17 @@ That single line gives you:
 
 ```bash
 # WGSL still parses and validates (naga), no GPU needed
-cargo test -p rusty --lib kernels_pass_naga_validation
+cargo test -p ferrotensor --lib kernels_pass_naga_validation
 
 # CPU gradient checks
-cargo test -p rusty --lib gradients_match_finite_differences
+cargo test -p ferrotensor --lib gradients_match_finite_differences
 
 # GPU vs CPU parity (needs a GPU; skipped without the env var)
-RUSTY_RUN_GPU_TESTS=1 cargo test -p rusty --lib gpu_matches_cpu
+FERROTENSOR_RUN_GPU_TESTS=1 cargo test -p ferrotensor --lib gpu_matches_cpu
 ```
 
 The GPU tests are gated because CI runners have none: without
-`RUSTY_RUN_GPU_TESTS=1`, `gpu_matches_cpu` prints "skipping GPU parity" and
+`FERROTENSOR_RUN_GPU_TESTS=1`, `gpu_matches_cpu` prints "skipping GPU parity" and
 passes. With it set, a missing GPU is a hard failure.
 
 ## Gotchas

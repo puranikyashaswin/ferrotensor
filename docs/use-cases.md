@@ -1,7 +1,7 @@
 # Use cases
 
-Four small programs that show where the `rusty` crate fits today. Each lives
-in [`rusty/examples/`](../rusty/examples), runs with one command, and the
+Four small programs that show where the `ferrotensor` crate fits today. Each lives
+in [`ferrotensor/examples/`](../ferrotensor/examples), runs with one command, and the
 output below was captured from a real run on an Apple M2 (Metal) with Rust
 1.99.1. Numbers that depend on random initialisation vary from run to
 run; timings are single-machine snapshots, not benchmarks.
@@ -18,12 +18,12 @@ All commands assume you are in the repository root.
 ## 1. Train an MLP with a DataLoader
 
 **Where it fits:** classic small-model training with no Python and no GPU
-required. Everything here is the public `rusty` API: `Dataset` /
+required. Everything here is the public `ferrotensor` API: `Dataset` /
 `TensorDataset` / `DataLoader`, `nn::Sequential`, `F::cross_entropy`,
 `optim::AdamW` and a `WarmupCosineLr` schedule.
 
 ```bash
-cargo run --release -p rusty --example mlp_two_moons
+cargo run --release -p ferrotensor --example mlp_two_moons
 ```
 
 ```
@@ -43,7 +43,7 @@ The data are two noisy interleaved half-circles generated in the example, so
 this is a smoke test of the training stack, not a benchmark. The whole run
 takes about half a second on the CPU.
 
-`RUSTY_DEVICE=gpu` trains the same model on the GPU. It works (final test
+`FERROTENSOR_DEVICE=gpu` trains the same model on the GPU. It works (final test
 accuracy 99.5% in our run) but takes tens of seconds instead of half a second:
 a 1,218-parameter model gives the GPU nothing to amortise its per-op dispatch
 cost over. Use the CPU device for models this small.
@@ -54,11 +54,11 @@ cost over. Use the CPU device for models this small.
 Rust. The example builds a two-layer pre-norm GPT-style model out of
 `nn::Embedding`, `nn::LayerNorm`, `nn::MultiHeadAttention` (causal) and
 `nn::Linear`, trains it with AdamW, gradient clipping and warmup+cosine LR on
-[a few Shakespeare sonnets](../rusty/examples/data/sonnets.txt) (public
+[a few Shakespeare sonnets](../ferrotensor/examples/data/sonnets.txt) (public
 domain, 3.7 KB), then samples text.
 
 ```bash
-cargo run --release -p rusty --example char_transformer
+cargo run --release -p ferrotensor --example char_transformer
 ```
 
 ```
@@ -92,7 +92,7 @@ What this does and does not show:
   nothing about generalisation.
 - The samples are partly English-shaped, partly garbage. It is a working
   training loop, not a language model.
-- On this machine the GPU path (`RUSTY_DEVICE=gpu`) took 141 s for the same
+- On this machine the GPU path (`FERROTENSOR_DEVICE=gpu`) took 141 s for the same
   600 steps versus 44-48 s on the CPU. Each op is a separate GPU submission
   and tiny kernels do not pay for it. Improving that is a known open item (see
   [good-first-issues](good-first-issues.md)).
@@ -105,7 +105,7 @@ and a GPU tensor, checks they agree, and times both (best of several runs,
 including readback).
 
 ```bash
-cargo run --release -p rusty --example gpu_matmul_attention
+cargo run --release -p ferrotensor --example gpu_matmul_attention
 ```
 
 ```
@@ -142,7 +142,7 @@ shared words and typos match, synonyms do not. Swap in embeddings from a
 real model and the search code is unchanged.
 
 ```bash
-cargo run --release -p rusty --example similarity_search
+cargo run --release -p ferrotensor --example similarity_search
 ```
 
 ```
@@ -173,6 +173,6 @@ score 0.154 shows it), which is what a lexical embedding gives you.
 
 - **Large-model training or multi-GPU.** Not supported. The LoRA fine-tuning
   path for small Llama-style models is experimental; see the README.
-- **Big training jobs on the `rusty` tensor API.** Tensors are `f32` only, there
+- **Big training jobs on the `ferrotensor` tensor API.** Tensors are `f32` only, there
   are no convolutions, and per-op dispatch overhead makes small GPU workloads
   slower than the CPU.

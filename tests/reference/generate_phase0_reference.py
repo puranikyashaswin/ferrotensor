@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Generate tiny PyTorch reference fixtures for Rusty Phase 0 parity checks.
+Generate tiny PyTorch reference fixtures for Ferrotensor Phase 0 parity checks.
 
 Requires:
   pip install torch
