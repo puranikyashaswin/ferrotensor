@@ -35,7 +35,9 @@ pub mod prelude {
     pub use crate::data::{DataLoader, Dataset};
     pub use crate::functional as F;
     pub use crate::nn;
+    pub use crate::nn::Module;
     pub use crate::optim;
+    pub use crate::optim::Optimizer;
     pub use crate::tensor::Tensor;
     pub use crate::Device;
 }
