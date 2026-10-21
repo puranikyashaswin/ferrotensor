@@ -14,7 +14,7 @@ keywords = ["tui", "monitoring", "training", "machine-learning", "dashboard"]
 categories = ["science"]
 
 [dependencies]
-ratatui = "0.29.0"
+ratatui = "0.30.2"
 crossterm = "0.28.1"
 sysinfo = "0.33.1"
 tokio = { version = "1.43.0", features = ["full"] }
