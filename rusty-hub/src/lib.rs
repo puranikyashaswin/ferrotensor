@@ -11,6 +11,8 @@
 //! let config = ModelConfig::from_model_dir(&model_path)?;
 //! ```
 
+#![warn(missing_docs)]
+
 use std::fs;
 use std::path::PathBuf;
 
@@ -23,9 +25,13 @@ pub use models::ModelType;
 /// Errors that can occur when using RustyHub
 #[derive(Debug)]
 pub enum HubError {
+    /// Underlying I/O failure.
     Io(std::io::Error),
+    /// Failure parsing a JSON file.
     Json(serde_json::Error),
+    /// The model directory or file was not found.
     ModelNotFound(String),
+    /// The model type is not supported.
     UnsupportedModel(String),
 }
 
@@ -54,6 +60,7 @@ impl From<serde_json::Error> for HubError {
     }
 }
 
+/// Result type for hub operations.
 pub type HubResult<T> = Result<T, HubError>;
 
 /// Main entry point for loading models from HuggingFace Hub.
@@ -158,7 +165,7 @@ impl RustyHub {
         for entry in fs::read_dir(&snapshot)? {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().map_or(false, |e| e == "safetensors") {
+            if path.extension().is_some_and(|e| e == "safetensors") {
                 files.push(path);
             }
         }

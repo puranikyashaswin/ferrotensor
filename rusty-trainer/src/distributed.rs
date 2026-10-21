@@ -13,15 +13,22 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+/// Settings for averaging gradients across processes through files in a
+/// shared directory (a prototype for multi-process data parallelism).
 #[derive(Clone, Debug)]
 pub struct FileGradSyncConfig {
+    /// Number of processes.
     pub world_size: usize,
+    /// This process's index in `0..world_size`.
     pub rank: usize,
+    /// Directory every rank can read and write.
     pub sync_dir: PathBuf,
+    /// How long to wait for the other ranks before failing a step.
     pub max_wait: Duration,
 }
 
 impl FileGradSyncConfig {
+    /// Validate `rank < world_size` and build a config (10-minute wait).
     pub fn new(
         world_size: usize,
         rank: usize,
@@ -43,15 +50,18 @@ impl FileGradSyncConfig {
         })
     }
 
+    /// Override how long to wait for other ranks.
     pub fn with_max_wait(mut self, max_wait: Duration) -> Self {
         self.max_wait = max_wait;
         self
     }
 
+    /// Whether this is rank 0 (which averages and writes results).
     pub fn is_root(&self) -> bool {
         self.rank == 0
     }
 
+    /// Whether there is more than one process.
     pub fn enabled(&self) -> bool {
         self.world_size > 1
     }
@@ -162,13 +172,13 @@ pub fn average_grads_file_sync(
         }
     }
 
-    for param_idx in 0..param_count {
+    for (param_idx, grad) in grads.iter().enumerate() {
         let path = avg_grad_path(&step_dir, param_idx);
         if !wait_for_path(&path, cfg.max_wait) {
             return Err(format!("timed out waiting for {path:?}").into());
         }
         let bytes = fs::read(&path)?;
-        grads[param_idx].write_data(ctx, &bytes);
+        grad.write_data(ctx, &bytes);
     }
 
     Ok(())

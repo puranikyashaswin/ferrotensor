@@ -194,23 +194,37 @@ pub fn apply_checkpoint(
     Ok(tensors.len())
 }
 
-/// Training checkpoint containing step count and scheduler state
+/// Progress and settings of a training run (also read by `rusty-monitor`
+/// from `training_state.json`).
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TrainingState {
+    /// Optimizer steps completed.
     pub step: usize,
+    /// Planned optimizer steps.
     pub total_steps: usize,
+    /// Lowest logged training loss so far.
     pub best_loss: Option<f32>,
+    /// Peak learning rate.
     pub lr: f32,
+    /// Epochs completed.
     pub epoch: usize,
+    /// Sequences per batch.
     pub batch_size: usize,
+    /// Batches per optimizer step.
     pub grad_accum_steps: usize,
+    /// Maximum tokens per example.
     pub sequence_length: usize,
+    /// Whether loss scaling was enabled.
     pub fp16: bool,
+    /// What was trained (`lora`, `all`, `attn`, ...).
     pub train_modules: String,
+    /// Objective (`sft` or `pretrain`).
     #[serde(default = "default_task")]
     pub task: String,
+    /// Model directory.
     #[serde(default)]
     pub model_path: String,
+    /// Training data file.
     #[serde(default)]
     pub dataset_path: String,
     /// Data-order seed of the run, so a resume replays the same order.
@@ -223,6 +237,7 @@ fn default_task() -> String {
 }
 
 impl TrainingState {
+    /// A fresh state for a run of `total_steps` steps.
     pub fn new(total_steps: usize) -> Self {
         Self {
             step: 0,
@@ -242,12 +257,14 @@ impl TrainingState {
         }
     }
 
+    /// Write as pretty JSON.
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<(), Box<dyn std::error::Error>> {
         let json = serde_json::to_string_pretty(self)?;
         std::fs::write(path, json)?;
         Ok(())
     }
 
+    /// Read a state written by [`save`](Self::save).
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
         let json = std::fs::read_to_string(path)?;
         let state: Self = serde_json::from_str(&json)?;
@@ -290,20 +307,30 @@ impl TrainingState {
     }
 }
 
+/// Everything besides the adapter weights needed to resume a run.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TrainingCheckpoint {
+    /// Progress and settings.
     pub training_state: TrainingState,
+    /// Optimizer moments keyed by parameter name.
     pub optimizer_state: Option<OptimizerCheckpoint>,
+    /// Loss-scaler state, if a scaler was used.
     pub grad_scaler_state: Option<GradScalerCheckpoint>,
 }
 
 impl TrainingCheckpoint {
+    /// Write as JSON (via a temporary file, so a crash never leaves a
+    /// truncated checkpoint).
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<(), Box<dyn std::error::Error>> {
+        let path = path.as_ref();
         let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, json)?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, json)?;
+        std::fs::rename(&tmp, path)?;
         Ok(())
     }
 
+    /// Read a checkpoint written by [`save`](Self::save).
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
         let json = std::fs::read_to_string(path)?;
         let state: Self = serde_json::from_str(&json)?;

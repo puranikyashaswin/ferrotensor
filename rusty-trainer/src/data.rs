@@ -33,13 +33,17 @@ pub trait Dataset: Send + Sync {
 /// One training example with optional response-only loss mask.
 #[derive(Clone, Debug)]
 pub struct TrainingExample {
+    /// Tokens fed to the model.
     pub input_ids: Vec<u32>,
+    /// Next-token targets, aligned with `input_ids`.
     pub target_ids: Vec<u32>,
     /// 1 = compute loss, 0 = ignore. Same length as `target_ids`.
     pub loss_mask: Vec<u8>,
 }
 
 impl TrainingExample {
+    /// Next-token example over a whole sequence: inputs are all but the last
+    /// token, targets all but the first, every target supervised.
     pub fn from_next_token(sequence: Vec<u32>) -> Self {
         if sequence.len() < 2 {
             let len = sequence.len();
@@ -79,9 +83,7 @@ impl TrainingExample {
         let mut loss_mask = vec![0u8; target.len()];
         if !prompt_tokens.is_empty() && !response_tokens.is_empty() {
             let first_response_target = prompt_tokens.len().saturating_sub(1);
-            for idx in first_response_target..target.len() {
-                loss_mask[idx] = 1;
-            }
+            loss_mask[first_response_target..].fill(1);
         } else {
             loss_mask.fill(1);
         }
@@ -101,6 +103,7 @@ pub struct TextDataset {
 }
 
 impl TextDataset {
+    /// An empty dataset.
     pub fn new() -> Self {
         Self {
             samples: Vec::new(),
@@ -117,6 +120,7 @@ impl TextDataset {
         });
     }
 
+    /// Add a prepared example (with its loss mask).
     pub fn add_example(&mut self, example: TrainingExample) {
         self.samples.push(example);
     }
@@ -253,6 +257,7 @@ impl TextDataset {
         Self::from_sequences(packed)
     }
 
+    /// All examples, in insertion order.
     pub fn examples(&self) -> &[TrainingExample] {
         &self.samples
     }
@@ -328,14 +333,21 @@ impl Dataset for TextDataset {
 
 /// Batch of training data
 pub struct Batch {
+    /// Unpadded inputs, one per sequence.
     pub input_ids: Vec<Vec<u32>>,
+    /// Unpadded targets, one per sequence.
     pub target_ids: Vec<Vec<u32>>,
+    /// Inputs right-padded to `max_seq_len` with the pad token.
     pub padded_input_ids: Vec<Vec<u32>>,
+    /// Targets right-padded to `max_seq_len` with the pad token.
     pub padded_target_ids: Vec<Vec<u32>>,
+    /// 1 for real tokens, 0 for padding.
     pub attention_mask: Vec<Vec<u8>>,
     /// Per-sample loss masks aligned with padded targets (1 = train, 0 = ignore).
     pub loss_masks: Vec<Vec<u8>>,
+    /// Number of sequences.
     pub batch_size: usize,
+    /// Length of the longest sequence.
     pub max_seq_len: usize,
 }
 
@@ -353,10 +365,12 @@ pub struct DataLoader<D: Dataset> {
 }
 
 impl<D: Dataset> DataLoader<D> {
+    /// A loader over the whole dataset, padding with token 0.
     pub fn new(dataset: D, batch_size: usize, shuffle: bool) -> Self {
         Self::new_with_pad_token(dataset, batch_size, shuffle, 0)
     }
 
+    /// A loader over only `indices` of the dataset (e.g. one rank's shard).
     pub fn new_with_indices(
         dataset: D,
         batch_size: usize,
@@ -377,6 +391,7 @@ impl<D: Dataset> DataLoader<D> {
         }
     }
 
+    /// A loader over the whole dataset, padding with `pad_token_id`.
     pub fn new_with_pad_token(
         dataset: D,
         batch_size: usize,
@@ -615,7 +630,7 @@ mod tests {
         assert_eq!(batch.loss_masks[0].iter().filter(|&&m| m == 1).count(), 2);
         assert!(batch.loss_masks[0].iter().take(2).all(|&m| m == 0));
         // Second example response-only positions stay marked.
-        assert!(batch.loss_masks[1].iter().any(|&m| m == 1));
-        assert!(batch.loss_masks[1].iter().any(|&m| m == 0));
+        assert!(batch.loss_masks[1].contains(&1));
+        assert!(batch.loss_masks[1].contains(&0));
     }
 }

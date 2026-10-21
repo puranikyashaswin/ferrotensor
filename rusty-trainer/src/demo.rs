@@ -11,13 +11,21 @@ use std::time::Instant;
 
 /// Demo configuration for fine-tuning
 pub struct DemoConfig {
+    /// Model name shown in the banner.
     pub model_name: String,
+    /// Displayed batch size.
     pub batch_size: usize,
+    /// Starting learning rate of the simulated schedule.
     pub learning_rate: f32,
+    /// Simulated epochs.
     pub num_epochs: usize,
+    /// Displayed sequence length.
     pub max_seq_len: usize,
+    /// Show the loss-scaler line.
     pub use_fp16: bool,
+    /// Show LoRA settings.
     pub use_lora: bool,
+    /// Displayed LoRA rank.
     pub lora_rank: usize,
 }
 
@@ -110,7 +118,7 @@ pub fn print_epoch_summary(epoch: usize, avg_loss: f32, duration_secs: f32) {
 
 /// Sample training data for demo
 pub fn create_demo_data() -> Vec<(Vec<u32>, Vec<u32>)> {
-    let samples = vec![
+    let samples = [
         "Rusty is a GPU-accelerated ML framework written in Rust.",
         "Flash Attention provides memory-efficient attention computation.",
         "LoRA enables parameter-efficient fine-tuning of large models.",

@@ -1,3 +1,11 @@
+//! Model loading for Rusty: Hugging Face `config.json` parsing
+//! ([`Lfm2Config`]), memory-mapped safetensors weights (single file or
+//! sharded, F32/F16/BF16 read as F32, int-quantized weights dequantized on
+//! the GPU) through [`WeightsContext`], and a [`Tokenizer`] / [`Sampler`]
+//! pair for text in and out.
+
+#![warn(missing_docs)]
+
 use memmap2::MmapOptions;
 use safetensors::SafeTensors;
 use serde::Deserialize;
@@ -12,58 +20,93 @@ pub use tokenizer::{argmax, Sampler, Tokenizer};
 
 use rusty_backend::UnifiedTensor;
 
+/// Errors returned while loading model configs, weights and tensors.
 #[derive(Error, Debug)]
 pub enum LoaderError {
+    /// Underlying I/O failure.
     #[error("IO Error: {0}")]
     Io(#[from] std::io::Error),
+    /// Failure parsing a safetensors file.
     #[error("Safetensors Error: {0}")]
     Safetensors(#[from] safetensors::SafeTensorError),
+    /// Failure parsing a JSON file.
     #[error("JSON Error: {0}")]
     Json(#[from] serde_json::Error),
+    /// A requested tensor name is not present in any loaded file.
     #[error("Weight not found: {0}")]
     MissingWeight(String),
+    /// The tensor uses a dtype this loader cannot convert to f32.
     #[error("Unsupported dtype for tensor {name}: {dtype}")]
-    UnsupportedDtype { name: String, dtype: String },
+    UnsupportedDtype {
+        /// Tensor name.
+        name: String,
+        /// Dtype name as reported by safetensors.
+        dtype: String,
+    },
+    /// The tensor byte length does not match its shape and dtype.
     #[error("Invalid tensor byte length for {name}: expected {expected} bytes, got {actual}")]
     InvalidTensorLength {
+        /// Tensor name.
         name: String,
+        /// Byte length implied by shape and dtype.
         expected: usize,
+        /// Byte length found in the file.
         actual: usize,
     },
 }
 
+/// Quantization settings from the model config.
 #[derive(Debug, Deserialize, Clone)]
 pub struct QuantizationConfig {
+    /// Number of weights that share one scale and bias.
     pub group_size: usize,
+    /// Bits per quantized weight.
     pub bits: usize,
+    /// Quantization scheme name, e.g. `"affine"`.
     pub mode: String,
 }
 
+/// Model hyperparameters read from `config.json` (Llama and LFM2 layouts).
 #[derive(Debug, Deserialize, Clone)]
 pub struct Lfm2Config {
+    /// Width of the residual stream.
     pub hidden_size: usize,
+    /// Width of the feed-forward (MLP) hidden layer.
     pub intermediate_size: usize,
+    /// Number of attention heads.
     pub num_attention_heads: usize,
+    /// Number of transformer layers.
     pub num_hidden_layers: usize,
+    /// Number of tokens in the vocabulary.
     pub vocab_size: usize,
+    /// Epsilon added inside RMSNorm; defaults to 1e-5.
     #[serde(default = "default_norm_eps", alias = "rms_norm_eps")]
     pub norm_eps: f32,
+    /// Hidden width used by LFM2 blocks, if set.
     #[serde(default)]
     pub block_dim: Option<usize>,
+    /// Feed-forward width used by LFM2 blocks, if set.
     #[serde(default)]
     pub block_ff_dim: Option<usize>,
+    /// Per-layer block type names (LFM2); empty when not given.
     #[serde(default)]
     pub layer_types: Vec<String>,
+    /// Number of key/value heads for grouped-query attention, if set.
     #[serde(default)]
     pub num_key_value_heads: Option<usize>,
+    /// RoPE base frequency, if set.
     #[serde(default)]
     pub rope_theta: Option<f64>,
+    /// Quantization settings, present for quantized checkpoints.
     #[serde(default)]
     pub quantization: Option<QuantizationConfig>,
+    /// Beginning-of-sequence token id, if set.
     #[serde(default)]
     pub bos_token_id: Option<u32>,
+    /// End-of-sequence token id, if set.
     #[serde(default)]
     pub eos_token_id: Option<u32>,
+    /// Attention dropout probability, if set.
     #[serde(default)]
     pub attention_dropout: Option<f32>,
     /// Hugging Face `model_type`, e.g. `"llama"` or `"lfm2"`.
@@ -82,14 +125,17 @@ fn default_norm_eps() -> f32 {
 }
 
 // Backwards compat alias
+/// Alias kept for older code that used the Llama-specific config name.
 pub type LlamaConfig = Lfm2Config;
 
+/// Reads model config files and raw safetensors files.
 pub struct ModelLoader {
     // Map weight name -> (mmap_index, tensor_view) logic
     // For MVP, simplified to single file or manual lookup
 }
 
 impl ModelLoader {
+    /// Reads and parses a `config.json` file.
     pub fn load_config<P: AsRef<Path>>(path: P) -> Result<LlamaConfig, LoaderError> {
         let file = File::open(path)?;
         let config: LlamaConfig = serde_json::from_reader(file)?;
@@ -97,6 +143,7 @@ impl ModelLoader {
     }
 
     // Helper to load a single safetensors file
+    /// Memory-maps a single safetensors file.
     pub fn load_safetensors<P: AsRef<Path>>(path: P) -> Result<memmap2::Mmap, LoaderError> {
         let file = File::open(path)?;
         let mmap = unsafe { MmapOptions::new().map(&file)? };
@@ -111,6 +158,7 @@ impl ModelLoader {
 // Solution: "WeightsContext" that holds the Mmaps, and we pass `&WeightsContext`
 // to a function that extracts views on demand.
 
+/// Memory-mapped safetensors files and an index from tensor name to file.
 pub struct WeightsContext {
     mmaps: HashMap<String, memmap2::Mmap>, // filename -> mmap
     // We can also parse the index.json if it exists to know which file has which weight
@@ -122,13 +170,23 @@ struct SafetensorIndex {
     weight_map: HashMap<String, String>,
 }
 
+/// Shape and dtype of a stored tensor.
 #[derive(Debug, Clone)]
 pub struct TensorMetadata {
+    /// Tensor dimensions.
     pub shape: Vec<usize>,
+    /// Stored element type.
     pub dtype: safetensors::Dtype,
 }
 
+impl Default for WeightsContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WeightsContext {
+    /// Creates an empty context with no files loaded.
     pub fn new() -> Self {
         Self {
             mmaps: HashMap::new(),
@@ -136,9 +194,18 @@ impl WeightsContext {
         }
     }
 
+    /// Maps one safetensors file and indexes its tensor names.
     pub fn load_file<P: AsRef<Path>>(&mut self, path: P) -> Result<(), LoaderError> {
         let path = path.as_ref();
-        let filename = path.file_name().unwrap().to_str().unwrap().to_string();
+        let filename = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .ok_or_else(|| {
+                LoaderError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{} is not a file path", path.display()),
+                ))
+            })?;
         let mmap = ModelLoader::load_safetensors(path)?;
 
         // Pre-scan to populate weight_map
@@ -151,6 +218,7 @@ impl WeightsContext {
         Ok(())
     }
 
+    /// Loads a model directory: sharded files via the index, else `model.safetensors`, else `consolidated.safetensors`.
     pub fn load_model_dir<P: AsRef<Path>>(&mut self, model_dir: P) -> Result<(), LoaderError> {
         let model_dir = model_dir.as_ref();
         let index_path = model_dir.join("model.safetensors.index.json");
@@ -183,10 +251,11 @@ impl WeightsContext {
         )))
     }
 
+    /// Returns the shape and dtype name of a tensor, or `None` if it is missing.
     pub fn get_tensor_info(&self, name: &str) -> Option<(Vec<usize>, String)> {
         // Shape, Dtype(str)
         if let Some(filename) = self.weight_map.get(name) {
-            let mmap = self.mmaps.get(filename).unwrap();
+            let mmap = self.mmaps.get(filename)?;
             let st = SafeTensors::deserialize(mmap).ok()?;
             let view = st.tensor(name).ok()?;
             return Some((view.shape().to_vec(), format!("{:?}", view.dtype())));
@@ -194,6 +263,7 @@ impl WeightsContext {
         None
     }
 
+    /// Returns the shape and dtype of a tensor, or an error if it is missing.
     pub fn get_tensor_metadata(&self, name: &str) -> Result<TensorMetadata, LoaderError> {
         if let Some(filename) = self.weight_map.get(name) {
             let mmap = self
@@ -213,12 +283,16 @@ impl WeightsContext {
     // We can't return TensorView because it borrows from local mmap variable inside function
     // We must pass a closure or return raw data copy.
     // For our usage: We want to upload to GPU immediately.
+    /// Calls `callback` with the raw bytes and shape of a tensor.
     pub fn read_bytes<F>(&self, name: &str, callback: F) -> Result<(), LoaderError>
     where
         F: FnOnce(&[u8], &[usize]),
     {
         if let Some(filename) = self.weight_map.get(name) {
-            let mmap = self.mmaps.get(filename).unwrap();
+            let mmap = self
+                .mmaps
+                .get(filename)
+                .ok_or_else(|| LoaderError::MissingWeight(name.to_string()))?;
             let st = SafeTensors::deserialize(mmap)?;
             let view = st.tensor(name)?;
             callback(view.data(), view.shape());
@@ -228,6 +302,7 @@ impl WeightsContext {
         }
     }
 
+    /// Reads an F32, F16 or BF16 tensor as `f32` values plus its shape.
     pub fn read_f32_tensor(&self, name: &str) -> Result<(Vec<f32>, Vec<usize>), LoaderError> {
         let meta = self.get_tensor_metadata(name)?;
         let numel: usize = meta.shape.iter().product();
@@ -298,6 +373,7 @@ impl WeightsContext {
         Ok((out, meta.shape))
     }
 
+    /// Reads `<name>.weight`, `.scales` and `.biases` and uploads them as one quantized GPU tensor.
     pub fn upload_quantized(
         &self,
         name: &str,

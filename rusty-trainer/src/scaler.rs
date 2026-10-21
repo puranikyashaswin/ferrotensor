@@ -42,14 +42,22 @@ pub struct GradScaler {
     enabled: bool,
 }
 
+/// Serialized [`GradScaler`] state.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GradScalerCheckpoint {
+    /// Current loss scale.
     pub scale: f32,
+    /// Factor applied after `growth_interval` good steps.
     pub growth_factor: f32,
+    /// Factor applied after an overflow.
     pub backoff_factor: f32,
+    /// Good steps between scale increases.
     pub growth_interval: u32,
+    /// Good steps since the last change.
     pub consecutive_good_steps: u32,
+    /// Whether the last step overflowed.
     pub found_overflow: bool,
+    /// Whether scaling is on.
     pub enabled: bool,
 }
 
@@ -202,6 +210,7 @@ impl GradScaler {
         }
     }
 
+    /// Snapshot the scaler for a checkpoint.
     pub fn checkpoint(&self) -> GradScalerCheckpoint {
         GradScalerCheckpoint {
             scale: self.scale,
@@ -214,6 +223,7 @@ impl GradScaler {
         }
     }
 
+    /// Restore a snapshot taken by [`checkpoint`](Self::checkpoint).
     pub fn load_checkpoint(&mut self, checkpoint: &GradScalerCheckpoint) {
         self.scale = checkpoint.scale;
         self.growth_factor = checkpoint.growth_factor;
@@ -234,8 +244,11 @@ impl Default for GradScaler {
 /// Statistics from the GradScaler for logging/monitoring.
 #[derive(Debug, Clone)]
 pub struct GradScalerStats {
+    /// Current loss scale.
     pub scale: f32,
+    /// Good steps since the last change.
     pub consecutive_good_steps: u32,
+    /// Whether scaling is on.
     pub enabled: bool,
 }
 

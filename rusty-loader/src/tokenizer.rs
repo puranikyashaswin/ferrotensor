@@ -8,13 +8,20 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
+/// Wraps a Hugging Face `tokenizer.json` with special-token ids.
 #[derive(Debug, Clone)]
 pub struct Tokenizer {
+    /// Token string to id.
     pub vocab: HashMap<String, u32>,
+    /// Id to token string.
     pub id_to_token: HashMap<u32, String>,
+    /// Beginning-of-sequence token id.
     pub bos_token_id: u32,
+    /// End-of-sequence token id.
     pub eos_token_id: u32,
+    /// Padding token id.
     pub pad_token_id: u32,
+    /// Underlying Hugging Face tokenizer, if it loaded.
     pub hf_tokenizer: Option<Arc<tokenizers::Tokenizer>>,
 }
 
@@ -154,11 +161,11 @@ impl Tokenizer {
             }
             if let Some(token) = self.id_to_token.get(&id) {
                 // Handle Ġ prefix (space before word)
-                if token.starts_with('Ġ') {
+                if let Some(word) = token.strip_prefix('Ġ') {
                     if !result.is_empty() {
                         result.push(' ');
                     }
-                    result.push_str(&token[2..]); // Skip Ġ (2 bytes)
+                    result.push_str(word);
                 } else {
                     result.push_str(token);
                 }

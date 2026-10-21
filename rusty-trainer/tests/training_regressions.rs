@@ -21,8 +21,8 @@ fn sft_mask_ignores_prompt_tokens_in_host_loss() {
     // Poison a prompt position: if masking failed, flipping its target preference
     // would not matter because mask zeros it. Flip the preferred class away for pos0
     // and ensure masked loss still only counts response tokens.
-    for v in 0..vocab {
-        logits[v] = if v == 0 { 10.0 } else { 0.0 };
+    for (v, logit) in logits.iter_mut().take(vocab).enumerate() {
+        *logit = if v == 0 { 10.0 } else { 0.0 };
     }
     let (loss, count) =
         masked_cross_entropy_from_logits(&logits, vocab, &example.target_ids, &example.loss_mask)

@@ -1,3 +1,9 @@
+//! Terminal dashboard for Rusty training runs (`rusty-cli monitor`): GPU
+//! and system stats, loss charts read from a run's `training_state.json`,
+//! and a small model/chat panel.
+
+#![warn(missing_docs)]
+
 use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -27,91 +33,154 @@ const LOGO: &str = r#"
 // App State
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Tabs of the terminal UI.
 #[derive(PartialEq, Clone, Copy)]
 pub enum CurrentTab {
+    /// System overview with CPU, memory and GPU.
     Dashboard,
+    /// Training progress and settings.
     Training,
+    /// Chat with a loaded model.
     Chat,
+    /// List of available models.
     Models,
 }
 
+/// Whether keystrokes navigate or edit a text field.
 #[derive(PartialEq)]
 pub enum InputMode {
+    /// Keys act as commands.
     Normal,
+    /// Keys are typed into the active field.
     Editing,
 }
 
+/// Training settings entered by the user, kept as raw text.
 #[derive(Clone)]
 pub struct TrainingConfig {
+    /// Name of the model to train.
     pub model_name: String,
+    /// Number of epochs.
     pub epochs: String,
+    /// Batch size.
     pub batch_size: String,
+    /// Learning rate.
     pub learning_rate: String,
 }
 
+/// Latest training progress numbers.
 #[derive(Clone)]
 pub struct TrainingStats {
+    /// Current epoch, starting at 1.
     pub current_epoch: usize,
+    /// Total number of epochs.
     pub total_epochs: usize,
+    /// Current step within the run.
     pub current_step: usize,
+    /// Total number of steps.
     pub total_steps: usize,
+    /// Latest loss value.
     pub loss: f64,
+    /// Latest accuracy value.
     pub accuracy: f64,
+    /// Estimated seconds until training finishes.
     pub eta_seconds: f64,
+    /// Throughput in tokens per second.
     pub tokens_per_sec: f64,
 }
 
+/// State of the terminal UI.
 pub struct App {
+    /// Set to false to exit the main loop.
     pub running: bool,
+    /// Tab currently shown.
     pub active_tab: CurrentTab,
+    /// System information handle used for CPU and memory readings.
     pub sys: System,
+    /// Whether the help overlay is shown.
     pub show_help: bool,
 
     // System history for sparklines
+    /// Recent CPU usage samples for the sparkline.
     pub cpu_history: Vec<u64>,
+    /// Recent memory usage samples for the sparkline.
     pub ram_history: Vec<u64>,
-    pub gpu_usage: f64,         // Simulated GPU
+    /// GPU usage percentage (simulated).
+    pub gpu_usage: f64, // Simulated GPU
+    /// GPU memory as (used, total) in GB.
     pub gpu_memory: (f64, f64), // (used, total) in GB
 
     // Chat state
+    /// Text currently typed in the chat box.
     pub chat_input: String,
+    /// Messages shown in the chat tab.
     pub chat_history: Vec<ChatMessage>,
+    /// Scroll offset of the chat view.
     pub chat_scroll: usize,
 
     // Training state
+    /// Training settings being edited.
     pub training_config: TrainingConfig,
+    /// Description of where training state is read from.
     pub state_source: String,
+    /// Index of the training field being edited.
     pub active_input: usize,
+    /// Current input mode.
     pub input_mode: InputMode,
+    /// Whether a training run is active.
     pub is_training: bool,
+    /// Whether the active run is paused.
     pub training_paused: bool,
+    /// Loss values as (step, loss) points for the chart.
     pub loss_history: Vec<(f64, f64)>,
+    /// Accuracy values as (step, accuracy) points for the chart.
     pub accuracy_history: Vec<(f64, f64)>,
+    /// Latest training progress numbers.
     pub training_stats: TrainingStats,
+    /// Current step as a float, used as the chart x value.
     pub training_step: f64,
 
     // Models
+    /// Models listed in the models tab.
     pub available_models: Vec<ModelInfo>,
+    /// Index of the selected model.
     pub selected_model: usize,
+    /// Path of the training state JSON file that is polled for progress.
     pub state_path: PathBuf,
 }
 
+/// One message in the chat tab.
 #[derive(Clone)]
 pub struct ChatMessage {
+    /// Name of the sender.
     pub sender: String,
+    /// Message text.
     pub content: String,
+    /// Time the message was created, formatted `HH:MM`.
     pub timestamp: String,
+    /// Whether the sender is still typing.
     pub is_typing: bool,
 }
 
+/// A model entry shown in the models tab.
 #[derive(Clone)]
 pub struct ModelInfo {
+    /// Model name.
     pub name: String,
+    /// Model size as display text.
     pub size: String,
+    /// Status as display text.
     pub status: String,
 }
 
+impl Default for App {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl App {
+    /// Creates the app state with system readings and default values.
     pub fn new() -> Self {
         let mut sys = System::new_all();
         sys.refresh_all();
@@ -205,6 +274,7 @@ impl App {
         }
     }
 
+    /// Refreshes system readings and training progress; called on every tick.
     pub fn on_tick(&mut self) {
         self.sys.refresh_cpu_all();
         self.sys.refresh_memory();
@@ -316,10 +386,12 @@ impl App {
         }
     }
 
+    /// Moves focus to the next training field, wrapping after four.
     pub fn next_input(&mut self) {
         self.active_input = (self.active_input + 1) % 4;
     }
 
+    /// Starts a run, or toggles pause if one is active.
     pub fn toggle_training(&mut self) {
         if self.is_training {
             self.training_paused = !self.training_paused;
@@ -332,6 +404,7 @@ impl App {
         }
     }
 
+    /// Stops the active run and clears the paused flag.
     pub fn stop_training(&mut self) {
         self.is_training = false;
         self.training_paused = false;
@@ -342,6 +415,7 @@ impl App {
 // Main Loop
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Runs the terminal UI until the user quits.
 pub fn run() -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -457,7 +531,7 @@ pub fn run() -> Result<()> {
                             }
                             KeyCode::Enter if !app.chat_input.is_empty() => {
                                 let now = chrono::Local::now().format("%H:%M").to_string();
-                                let msg = app.chat_input.drain(..).collect::<String>();
+                                let msg = std::mem::take(&mut app.chat_input);
                                 app.chat_history.push(ChatMessage {
                                     sender: "You".to_string(),
                                     content: msg,
