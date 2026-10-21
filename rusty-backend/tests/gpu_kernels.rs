@@ -9,7 +9,7 @@
 //! All tests share one device (creating several wgpu devices concurrently is
 //! unreliable on some drivers).
 
-use rusty_backend::{AdamParams, ComputeEngine, UnifiedTensor, WgpuContext};
+use rusty_backend::{AdamParams, AttentionOptions, ComputeEngine, UnifiedTensor, WgpuContext};
 use std::sync::OnceLock;
 
 struct Gpu {
@@ -119,8 +119,8 @@ fn sigmoid(x: f32) -> f32 {
 }
 
 /// Reference attention for [batch, seq, heads, dim] tensors with GQA, an
-/// optional additive mask of shape [batch, heads, seq_q, seq_k] and causal
-/// masking where key j is visible to query i when j <= i.
+/// optional additive mask of shape [batch, heads, seq_q, seq_k] and a
+/// visibility rule `visible(i, j)` for query i and key j.
 #[allow(clippy::too_many_arguments)]
 fn cpu_attention(
     q: &[f32],
@@ -128,7 +128,7 @@ fn cpu_attention(
     v: &[f32],
     mask: Option<&[f32]>,
     (b, sq, sk, h, hkv, d): (usize, usize, usize, usize, usize, usize),
-    causal: bool,
+    visible: impl Fn(usize, usize) -> bool,
 ) -> (Vec<f32>, Vec<Vec<f32>>) {
     let scale = 1.0 / (d as f32).sqrt();
     let mut out = vec![0.0f32; b * sq * h * d];
@@ -141,7 +141,7 @@ fn cpu_attention(
                 let qo = ((bi * sq + i) * h + hi) * d;
                 let mut s = vec![f32::NEG_INFINITY; sk];
                 for (j, sj) in s.iter_mut().enumerate() {
-                    if causal && j > i {
+                    if !visible(i, j) {
                         continue;
                     }
                     let ko = ((bi * sk + j) * hkv + kh) * d;
@@ -214,6 +214,10 @@ fn cpu_attention_backward(
         }
     }
     (dq, dk, dv)
+}
+
+fn causal_rule(causal: bool) -> impl Fn(usize, usize) -> bool {
+    move |i, j| !causal || j <= i
 }
 
 // ---------------------------------------------------------------------------
@@ -588,7 +592,14 @@ fn flash_attention_single_head_matches_cpu() {
             &out,
             causal,
         );
-        let (want, _) = cpu_attention(&q, &k, &v, None, (1, seq, seq, 1, 1, d), causal);
+        let (want, _) = cpu_attention(
+            &q,
+            &k,
+            &v,
+            None,
+            (1, seq, seq, 1, 1, d),
+            causal_rule(causal),
+        );
         assert_close(
             &format!("flash_attention s{seq} d{d} causal={causal}"),
             &read(&out),
@@ -629,7 +640,14 @@ fn flash_attention_v2_matches_cpu() {
             0,
             None,
         );
-        let (want, _) = cpu_attention(&q, &k, &v, None, (b, sq, sk, h, hkv, d), causal);
+        let (want, _) = cpu_attention(
+            &q,
+            &k,
+            &v,
+            None,
+            (b, sq, sk, h, hkv, d),
+            causal_rule(causal),
+        );
         assert_close(
             &format!("flash_v2 b{b} q{sq} k{sk} h{h}/{hkv} d{d} causal={causal}"),
             &read(&out),
@@ -676,7 +694,14 @@ fn flash_attention_v2_mask_matches_cpu() {
         0,
         Some(&upload(&mask, &[b, h, sq, sk])),
     );
-    let (want, _) = cpu_attention(&q, &k, &v, Some(&mask), (b, sq, sk, h, h, d), false);
+    let (want, _) = cpu_attention(
+        &q,
+        &k,
+        &v,
+        Some(&mask),
+        (b, sq, sk, h, h, d),
+        causal_rule(false),
+    );
     assert_close("flash_v2 mask", &read(&out), &want, 1e-5, 1e-3);
 }
 
@@ -721,7 +746,7 @@ fn flash_attention_v2_backward_matches_cpu() {
         let k = rand_vec(b * sk * hkv * d, 25);
         let v = rand_vec(b * sk * hkv * d, 26);
         let dout = rand_vec(b * sq * h * d, 27);
-        let (out, probs) = cpu_attention(&q, &k, &v, None, dims, causal);
+        let (out, probs) = cpu_attention(&q, &k, &v, None, dims, causal_rule(causal));
         let (want_dq, want_dk, want_dv) = cpu_attention_backward(&q, &k, &v, &dout, &probs, dims);
 
         let (gq, gk, gv) = (
@@ -758,7 +783,7 @@ fn flash_attention_single_head_backward_matches_cpu() {
     let k = rand_vec(s * d, 29);
     let v = rand_vec(s * d, 30);
     let dout = rand_vec(s * d, 31);
-    let (out, probs) = cpu_attention(&q, &k, &v, None, dims, true);
+    let (out, probs) = cpu_attention(&q, &k, &v, None, dims, causal_rule(true));
     let (want_dq, want_dk, want_dv) = cpu_attention_backward(&q, &k, &v, &dout, &probs, dims);
     let (gq, gk, gv) = (zeros(&[s, d]), zeros(&[s, d]), zeros(&[s, d]));
     g.engine.flash_attention_backward(
@@ -1018,7 +1043,14 @@ fn flash_attention_v2_mask_and_dropout_forward_backward_match_cpu() {
         .map(|i| mask[(i / (h * sq * sk)) * sk + i % sk])
         .collect();
 
-    let (_, probs) = cpu_attention(&q, &k, &v, Some(&mask_full), (b, sq, sk, h, hkv, d), true);
+    let (_, probs) = cpu_attention(
+        &q,
+        &k,
+        &v,
+        Some(&mask_full),
+        (b, sq, sk, h, hkv, d),
+        causal_rule(true),
+    );
     let scale = 1.0 / (d as f32).sqrt();
     let keep = |bh: usize, i: usize, j: usize| {
         if hash3(bh as u32, i as u32, j as u32 + seed as u32) >= prob {
@@ -1079,7 +1111,13 @@ fn flash_attention_v2_mask_and_dropout_forward_backward_match_cpu() {
         zeros(&[b, sk, hkv, d]),
         zeros(&[b, sk, hkv, d]),
     );
-    g.engine.flash_attention_v2_backward_full(
+    let opts = AttentionOptions {
+        causal: true,
+        dropout_prob: prob,
+        seed,
+        ..AttentionOptions::default()
+    };
+    g.engine.flash_attention_v2_backward_with(
         &g.ctx,
         &tq,
         &tk,
@@ -1089,12 +1127,77 @@ fn flash_attention_v2_mask_and_dropout_forward_backward_match_cpu() {
         &gq,
         &gk,
         &gv,
-        true,
-        prob,
-        seed,
+        &opts,
         Some(&tmask),
     );
     assert_close("dropout dq", &read(&gq), &dq, 1e-4, 1e-3);
     assert_close("dropout dk", &read(&gk), &dk, 1e-4, 1e-3);
     assert_close("dropout dv", &read(&gv), &dv, 1e-4, 1e-3);
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn flash_attention_v2_offset_and_window_match_cpu() {
+    let g = gpu();
+    // (seq_q, seq_k, causal, causal_offset, window)
+    let cases = [
+        (1, 40, true, 39, 0),   // decode one token against a filled cache
+        (5, 64, true, 20, 0),   // chunk at positions 20..25 of a 64-slot cache
+        (50, 50, true, 0, 8),   // causal sliding window
+        (37, 37, false, 0, 5),  // two-sided window
+        (70, 90, true, 10, 33), // offset + window, several key tiles
+    ];
+    let (b, h, hkv, d) = (1, 4, 2, 32);
+    for (sq, sk, causal, offset, window) in cases {
+        let dims = (b, sq, sk, h, hkv, d);
+        let q = rand_vec(b * sq * h * d, 48);
+        let k = rand_vec(b * sk * hkv * d, 49);
+        let v = rand_vec(b * sk * hkv * d, 50);
+        let dout = rand_vec(b * sq * h * d, 51);
+        let visible = |i: usize, j: usize| {
+            let qa = i + offset as usize;
+            (!causal || j <= qa) && (window == 0 || qa.abs_diff(j) < window as usize)
+        };
+        let (want, probs) = cpu_attention(&q, &k, &v, None, dims, visible);
+        let (want_dq, want_dk, want_dv) = cpu_attention_backward(&q, &k, &v, &dout, &probs, dims);
+
+        let opts = AttentionOptions {
+            causal,
+            causal_offset: offset,
+            window,
+            ..AttentionOptions::default()
+        };
+        let (tq, tk, tv) = (
+            upload(&q, &[b, sq, h, d]),
+            upload(&k, &[b, sk, hkv, d]),
+            upload(&v, &[b, sk, hkv, d]),
+        );
+        let out = zeros(&[b, sq, h, d]);
+        g.engine
+            .flash_attention_v2_with(&g.ctx, &tq, &tk, &tv, &out, &opts, None);
+        let name = format!("q{sq} k{sk} causal={causal} offset={offset} window={window}");
+        assert_close(&format!("fwd {name}"), &read(&out), &want, 1e-5, 1e-3);
+
+        let (gq, gk, gv) = (
+            zeros(&[b, sq, h, d]),
+            zeros(&[b, sk, hkv, d]),
+            zeros(&[b, sk, hkv, d]),
+        );
+        g.engine.flash_attention_v2_backward_with(
+            &g.ctx,
+            &tq,
+            &tk,
+            &tv,
+            &out,
+            &upload(&dout, &[b, sq, h, d]),
+            &gq,
+            &gk,
+            &gv,
+            &opts,
+            None,
+        );
+        assert_close(&format!("dq {name}"), &read(&gq), &want_dq, 1e-4, 1e-3);
+        assert_close(&format!("dk {name}"), &read(&gk), &want_dk, 1e-4, 1e-3);
+        assert_close(&format!("dv {name}"), &read(&gv), &want_dv, 1e-4, 1e-3);
+    }
 }

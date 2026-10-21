@@ -3,8 +3,11 @@
 // ============================================================================
 // Layout: q/out [batch, seq_q, num_heads, head_dim],
 //         k/v   [batch, seq_k, num_kv_heads, head_dim] (GQA when kv < heads).
-// Supports causal masking (key j visible to query i when j <= i), an additive
-// mask with broadcast strides, and attention dropout. head_dim <= 128.
+// Query i sits at absolute position i + causal_offset (for decoding against
+// a KV cache). Key j is visible when j < seq_k, j <= i + causal_offset if
+// causal, and |i + causal_offset - j| < window if window > 0. An additive mask
+// with broadcast strides and attention dropout are also supported.
+// head_dim <= 128.
 //
 // One thread owns one query row; a workgroup covers FA_TILE_Q queries of one
 // (batch, head) and streams K/V through workgroup memory FA_TILE_K keys at a
@@ -34,12 +37,16 @@ struct FlashV2Params {
     dropout_prob: f32,
     seed_val: u32,
     has_mask: u32,
-    _pad: u32,
+    causal_offset: u32,
     // Mask strides; 0 broadcasts that dimension.
     mask_stride_b: u32,
     mask_stride_h: u32,
     mask_stride_q: u32,
     mask_stride_k: u32,
+    window: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 };
 @group(0) @binding(4) var<uniform> flash_v2_params: FlashV2Params;
 @group(0) @binding(5) var<storage, read> flash_v2_mask: array<f32>;
@@ -66,6 +73,18 @@ fn dropout_scale(prob: f32, seed: u32, bh: u32, q_idx: u32, k_idx: u32) -> f32 {
     if (prob <= 0.0) { return 1.0; }
     let r = hash3(bh, q_idx, k_idx + seed);
     return select(0.0, 1.0 / (1.0 - prob), r >= prob);
+}
+
+// Whether key `kp` is visible to query `q_idx` (causal, window, bounds).
+fn fa_visible(p: FlashV2Params, q_idx: u32, kp: u32) -> bool {
+    let qa = q_idx + p.causal_offset;
+    if (kp >= p.seq_k) { return false; }
+    if (p.causal == 1u && kp > qa) { return false; }
+    if (p.window > 0u) {
+        let dist = select(kp - qa, qa - kp, qa >= kp);
+        if (dist >= p.window) { return false; }
+    }
+    return true;
 }
 
 var<workgroup> fa_k_tile: array<f32, 2048>; // FA_TILE_K * FA_MAX_D
@@ -97,17 +116,21 @@ fn flash_attention_v2_metal(
     var m_run = FA_MASKED; // running max
     var l_run = 0.0;       // running sum of exp(score - m_run)
 
-    // Keys this workgroup can see (uniform across the workgroup).
+    // Range of keys this workgroup can see (uniform across the workgroup).
+    let q_first_abs = q_start + p.causal_offset;
+    let q_last_abs = min(q_start + FA_TILE_Q, p.seq_q) - 1u + p.causal_offset;
     var k_end = p.seq_k;
-    if (p.causal == 1u) {
-        let q_last = min(q_start + FA_TILE_Q, p.seq_q) - 1u;
-        k_end = min(p.seq_k, q_last + 1u);
+    if (p.causal == 1u) { k_end = min(p.seq_k, q_last_abs + 1u); }
+    var k_begin = 0u;
+    if (p.window > 0u) {
+        if (q_first_abs + 1u > p.window) { k_begin = q_first_abs + 1u - p.window; }
+        if (p.causal == 0u) { k_end = min(k_end, q_last_abs + p.window); }
     }
 
     let bh = batch_idx * p.num_heads + head_idx;
     let mask_base = batch_idx * p.mask_stride_b + head_idx * p.mask_stride_h + q_idx * p.mask_stride_q;
 
-    for (var k_start = 0u; k_start < k_end; k_start += FA_TILE_K) {
+    for (var k_start = k_begin; k_start < k_end; k_start += FA_TILE_K) {
         // Cooperative load of FA_TILE_K rows of K and V.
         let n = FA_TILE_K * d_len;
         for (var i = local_id.x; i < n; i += 64u) {
@@ -132,7 +155,7 @@ fn flash_attention_v2_metal(
             for (var j = 0u; j < FA_TILE_K; j++) {
                 let kp = k_start + j;
                 var sc = FA_MASKED;
-                if (kp < p.seq_k && !(p.causal == 1u && kp > q_idx)) {
+                if (fa_visible(p, q_idx, kp)) {
                     var dot = 0.0;
                     for (var d = 0u; d < d_len; d++) {
                         dot += q_reg[d] * fa_k_tile[j * FA_MAX_D + d];

@@ -1086,7 +1086,9 @@ impl ComputeEngine {
     /// * `mask` - additive mask `[batch, heads, seq_q, seq_k]`, where size-1
     ///   dimensions broadcast
     ///
-    /// `head_dim` must be at most 128.
+    /// `head_dim` must be at most 128. See
+    /// [`flash_attention_v2_with`](Self::flash_attention_v2_with) for
+    /// KV-cache offsets and sliding windows.
     #[allow(clippy::too_many_arguments)]
     pub fn flash_attention_v2(
         &self,
@@ -1100,8 +1102,29 @@ impl ComputeEngine {
         seed: u64,
         mask: Option<&UnifiedTensor>,
     ) {
+        let opts = AttentionOptions {
+            causal,
+            dropout_prob,
+            seed,
+            ..AttentionOptions::default()
+        };
+        self.flash_attention_v2_with(ctx, q, k, v, out, &opts, mask);
+    }
+
+    /// [`flash_attention_v2`](Self::flash_attention_v2) with every option.
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attention_v2_with(
+        &self,
+        ctx: &WgpuContext,
+        q: &UnifiedTensor,
+        k: &UnifiedTensor,
+        v: &UnifiedTensor,
+        out: &UnifiedTensor,
+        opts: &AttentionOptions,
+        mask: Option<&UnifiedTensor>,
+    ) {
         let dims = AttentionDims::new(q, k);
-        let params = dims.params(ctx, causal, dropout_prob, seed, mask);
+        let params = dims.params(ctx, opts, mask);
         let dummy;
         let mask_buf = match mask {
             Some(m) => m.buffer(),
@@ -1148,7 +1171,7 @@ impl ComputeEngine {
 
     /// Backward pass of [`flash_attention_v2`](Self::flash_attention_v2)
     /// without mask or dropout. See
-    /// [`flash_attention_v2_backward_full`](Self::flash_attention_v2_backward_full).
+    /// [`flash_attention_v2_backward_with`](Self::flash_attention_v2_backward_with).
     #[allow(clippy::too_many_arguments)]
     pub fn flash_attention_v2_backward(
         &self,
@@ -1163,20 +1186,24 @@ impl ComputeEngine {
         grad_v: &UnifiedTensor,
         causal: bool,
     ) {
-        self.flash_attention_v2_backward_full(
-            ctx, q, k, v, out, grad_out, grad_q, grad_k, grad_v, causal, 0.0, 0, None,
+        let opts = AttentionOptions {
+            causal,
+            ..AttentionOptions::default()
+        };
+        self.flash_attention_v2_backward_with(
+            ctx, q, k, v, out, grad_out, grad_q, grad_k, grad_v, &opts, None,
         );
     }
 
     /// Backward pass of [`flash_attention_v2`](Self::flash_attention_v2).
     ///
-    /// `out` is the forward output for the same inputs, `causal`,
-    /// `dropout_prob`, `seed` and `mask` must match the forward call (dropout
-    /// decisions are regenerated from `seed`). Writes `grad_q`, `grad_k` and
+    /// `out` is the forward output for the same inputs; `opts` and `mask`
+    /// must match the forward call (dropout decisions are regenerated from
+    /// `opts.seed`). Writes `grad_q`, `grad_k` and
     /// `grad_v` (same shapes as `q`, `k`, `v`); no gradient is produced for
     /// the mask.
     #[allow(clippy::too_many_arguments)]
-    pub fn flash_attention_v2_backward_full(
+    pub fn flash_attention_v2_backward_with(
         &self,
         ctx: &WgpuContext,
         q: &UnifiedTensor,
@@ -1187,13 +1214,11 @@ impl ComputeEngine {
         grad_q: &UnifiedTensor,
         grad_k: &UnifiedTensor,
         grad_v: &UnifiedTensor,
-        causal: bool,
-        dropout_prob: f32,
-        seed: u64,
+        opts: &AttentionOptions,
         mask: Option<&UnifiedTensor>,
     ) {
         let dims = AttentionDims::new(q, k);
-        let params = dims.params_bwd(ctx, causal, dropout_prob, seed, mask);
+        let params = dims.params_bwd(ctx, opts, mask);
         let dummy;
         let mask_buf = match mask {
             Some(m) => m.buffer(),
@@ -1312,29 +1337,31 @@ impl AttentionDims {
     fn params(
         &self,
         ctx: &WgpuContext,
-        causal: bool,
-        dropout_prob: f32,
-        seed: u64,
+        opts: &AttentionOptions,
         mask: Option<&UnifiedTensor>,
     ) -> Buffer {
         let (has_mask, s) = mask_strides(mask);
-        let params: [u32; 16] = [
+        let params: [u32; 20] = [
             self.batch,
             self.heads,
             self.seq_q,
             self.seq_k,
             self.head_dim,
-            causal as u32,
+            opts.causal as u32,
             self.scale().to_bits(),
             self.kv_heads,
-            dropout_prob.to_bits(),
-            seed as u32,
+            opts.dropout_prob.to_bits(),
+            opts.seed as u32,
             has_mask,
-            0,
+            opts.causal_offset,
             s[0],
             s[1],
             s[2],
             s[3],
+            opts.window,
+            0,
+            0,
+            0,
         ];
         uniform(ctx, bytemuck::cast_slice(&params))
     }
@@ -1343,13 +1370,11 @@ impl AttentionDims {
     fn params_bwd(
         &self,
         ctx: &WgpuContext,
-        causal: bool,
-        dropout_prob: f32,
-        seed: u64,
+        opts: &AttentionOptions,
         mask: Option<&UnifiedTensor>,
     ) -> Buffer {
         let (has_mask, s) = mask_strides(mask);
-        let params: [u32; 16] = [
+        let params: [u32; 20] = [
             self.batch,
             self.heads,
             self.seq_q,
@@ -1357,18 +1382,43 @@ impl AttentionDims {
             self.head_dim,
             self.kv_heads,
             self.scale().to_bits(),
-            dropout_prob.to_bits(),
-            seed as u32,
-            causal as u32,
+            opts.dropout_prob.to_bits(),
+            opts.seed as u32,
+            opts.causal as u32,
             has_mask,
-            0,
+            opts.causal_offset,
             s[0],
             s[1],
             s[2],
             s[3],
+            opts.window,
+            0,
+            0,
+            0,
         ];
         uniform(ctx, bytemuck::cast_slice(&params))
     }
+}
+
+/// Options for [`ComputeEngine::flash_attention_v2_with`] and
+/// [`ComputeEngine::flash_attention_v2_backward_with`].
+///
+/// Query `i` sits at absolute position `i + causal_offset`; key `j` is
+/// visible when `j <= i + causal_offset` (if `causal`) and
+/// `|i + causal_offset - j| < window` (if `window > 0`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AttentionOptions {
+    /// Hide keys after each query's absolute position.
+    pub causal: bool,
+    /// Absolute position of the first query, e.g. the number of tokens
+    /// already in a KV cache when decoding.
+    pub causal_offset: u32,
+    /// Sliding-window size in tokens; 0 means unlimited.
+    pub window: u32,
+    /// Attention dropout probability; 0.0 disables dropout.
+    pub dropout_prob: f32,
+    /// Seed for the dropout pattern (only the low 32 bits are used).
+    pub seed: u64,
 }
 
 /// Broadcast strides `[b, h, q, k]` for an additive attention mask of shape

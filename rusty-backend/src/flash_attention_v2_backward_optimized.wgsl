@@ -34,11 +34,15 @@ struct FlashBwdParams {
     seed: u32,
     causal: u32,
     has_mask: u32,
-    _pad: u32,
+    causal_offset: u32,
     mask_stride_b: u32,
     mask_stride_h: u32,
     mask_stride_q: u32,
     mask_stride_k: u32,
+    window: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 };
 @group(0) @binding(8) var<uniform> fab2_params: FlashBwdParams;
 @group(0) @binding(9) var<storage, read> fab2_mask: array<f32>;
@@ -51,7 +55,12 @@ const FAB_MASKED: f32 = -1.0e30;
 // key is not visible.
 fn fab2_score(q_off: u32, k_off: u32, b: u32, h: u32, qi: u32, kj: u32) -> f32 {
     let p = fab2_params;
-    if (p.causal == 1u && kj > qi) { return FAB_MASKED; }
+    let qa = qi + p.causal_offset;
+    if (p.causal == 1u && kj > qa) { return FAB_MASKED; }
+    if (p.window > 0u) {
+        let dist = select(kj - qa, qa - kj, qa >= kj);
+        if (dist >= p.window) { return FAB_MASKED; }
+    }
     var dot = 0.0;
     for (var d = 0u; d < p.head_dim; d++) {
         dot += fab2_q[q_off + d] * fab2_k[k_off + d];
@@ -167,7 +176,7 @@ fn flash_bwd_dk_dv(@builtin(global_invocation_id) gid: vec3<u32>) {
         let bh = b * p.num_heads + h;
         // Causal: only queries at or after this key see it.
         var q_first = 0u;
-        if (p.causal == 1u) { q_first = kj; }
+        if (p.causal == 1u && kj > p.causal_offset) { q_first = kj - p.causal_offset; }
         for (var qi = q_first; qi < p.seq_q; qi++) {
             let q_off = fab2_q_off(b, qi, h);
             let s = fab2_score(q_off, kv_off, b, h, qi, kj);
