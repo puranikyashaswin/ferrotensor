@@ -1,6 +1,6 @@
 //! Normalisation and softmax kernels.
 
-use super::{grid, groups64, uniform, ComputeEngine};
+use super::{grid, uniform, ComputeEngine};
 use crate::{UnifiedTensor, WgpuContext};
 
 impl ComputeEngine {
@@ -40,7 +40,7 @@ impl ComputeEngine {
                 (2, out.buffer()),
                 (3, &params),
             ],
-            groups64(rows),
+            grid(rows as u32),
         );
     }
 

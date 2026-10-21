@@ -5,6 +5,40 @@
 // --- Bindings ---
 // We use generic bindings (0,1,2,3) to reuse layouts across pipelines where possible
 
+// --- Row reductions ---
+// Row kernels run one 256-thread workgroup per row (row = wg.x + wg.y *
+// grid width) and reduce through workgroup memory.
+const ROW_WG: u32 = 256u;
+var<workgroup> row_red: array<f32, 256>;
+
+fn row_index(wg: vec3<u32>, nwg: vec3<u32>) -> u32 {
+    return wg.x + wg.y * nwg.x;
+}
+
+fn row_sum(lid: u32, v: f32) -> f32 {
+    row_red[lid] = v;
+    workgroupBarrier();
+    for (var s = ROW_WG / 2u; s > 0u; s = s >> 1u) {
+        if (lid < s) { row_red[lid] += row_red[lid + s]; }
+        workgroupBarrier();
+    }
+    let r = row_red[0];
+    workgroupBarrier();
+    return r;
+}
+
+fn row_max(lid: u32, v: f32) -> f32 {
+    row_red[lid] = v;
+    workgroupBarrier();
+    for (var s = ROW_WG / 2u; s > 0u; s = s >> 1u) {
+        if (lid < s) { row_red[lid] = max(row_red[lid], row_red[lid + s]); }
+        workgroupBarrier();
+    }
+    let r = row_red[0];
+    workgroupBarrier();
+    return r;
+}
+
 // --- 1. Matrix multiplication lives in matmul.wgsl ---
 
 // --- 2. Rotary Positional Embeddings (RoPE) ---
@@ -42,26 +76,24 @@ fn rope(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 @group(0) @binding(2) var<storage, read_write> rms_out: array<f32>;
 @group(0) @binding(3) var<uniform> rms_params: vec4<u32>; // size, rows, eps bits, 0
 
-@compute @workgroup_size(64)
-fn rms_norm(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
-    let global_id = vec3<u32>(gid.x + gid.y * nwg.x * 64u, 0u, 0u);
-    let row = global_id.x;
+@compute @workgroup_size(256)
+fn rms_norm(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wg: vec3<u32>,
+            @builtin(num_workgroups) nwg: vec3<u32>) {
+    let row = row_index(wg, nwg);
     let size = rms_params.x;
-    let rows = rms_params.y;
-    if (row >= rows) { return; }
-    let row_offset = row * size;
+    if (row >= rms_params.y) { return; } // uniform: whole workgroup exits
+    let off = row * size;
     var ss = 0.0;
-    for (var i = 0u; i < size; i = i + 1u) {
-        let val = rms_input[row_offset + i];
-        ss = ss + val * val;
+    for (var i = lid; i < size; i += ROW_WG) {
+        let v = rms_input[off + i];
+        ss += v * v;
     }
-    ss = ss / f32(size);
-    let inv_rms = 1.0 / sqrt(ss + bitcast<f32>(rms_params.z));
-    for (var i = 0u; i < size; i = i + 1u) {
-        rms_out[row_offset + i] = rms_input[row_offset + i] * inv_rms * rms_weight[i];
+    ss = row_sum(lid, ss);
+    let inv_rms = 1.0 / sqrt(ss / f32(size) + bitcast<f32>(rms_params.z));
+    for (var i = lid; i < size; i += ROW_WG) {
+        rms_out[off + i] = rms_input[off + i] * inv_rms * rms_weight[i];
     }
 }
-
 // --- 4. SiLU ---
 @group(0) @binding(0) var<storage, read> silu_input: array<f32>;
 @group(0) @binding(1) var<storage, read_write> silu_out: array<f32>;
@@ -79,25 +111,21 @@ fn silu(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 @group(0) @binding(1) var<storage, read_write> sm_out: array<f32>;
 @group(0) @binding(2) var<uniform> sm_params: vec2<u32>;
 
-@compute @workgroup_size(1)
-fn softmax(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
-    let global_id = vec3<u32>(gid.x + gid.y * nwg.x * 1u, 0u, 0u);
-    let row = global_id.x;
+@compute @workgroup_size(256)
+fn softmax(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wg: vec3<u32>,
+           @builtin(num_workgroups) nwg: vec3<u32>) {
+    let row = row_index(wg, nwg);
     let len = sm_params.x;
-    let rows = sm_params.y;
-    if (row >= rows) { return; }
-    let row_offset = row * len;
-    var max_val = -1e9;
-    for (var i = 0u; i < len; i = i + 1u) { max_val = max(max_val, sm_input[row_offset + i]); }
-    var sum_exp = 0.0;
-    for (var i = 0u; i < len; i = i + 1u) {
-        let val = exp(sm_input[row_offset + i] - max_val);
-        sm_out[row_offset + i] = val;
-        sum_exp = sum_exp + val;
-    }
-    for (var i = 0u; i < len; i = i + 1u) { sm_out[row_offset + i] = sm_out[row_offset + i] / sum_exp; }
+    if (row >= sm_params.y) { return; } // uniform: whole workgroup exits
+    let off = row * len;
+    var mx = -3.0e38;
+    for (var i = lid; i < len; i += ROW_WG) { mx = max(mx, sm_input[off + i]); }
+    mx = row_max(lid, mx);
+    var sum = 0.0;
+    for (var i = lid; i < len; i += ROW_WG) { sum += exp(sm_input[off + i] - mx); }
+    let inv = 1.0 / row_sum(lid, sum);
+    for (var i = lid; i < len; i += ROW_WG) { sm_out[off + i] = exp(sm_input[off + i] - mx) * inv; }
 }
-
 // --- 6. Add & Mul ---
 @group(0) @binding(0) var<storage, read> bin_a: array<f32>;
 @group(0) @binding(1) var<storage, read> bin_b: array<f32>;
@@ -319,24 +347,21 @@ fn relu_backward(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_wor
 @group(0) @binding(4) var<storage, read> sm_final_out: array<f32>;
 @group(0) @binding(5) var<storage, read_write> sm_grad_in: array<f32>;
 // sm_size is at binding 2
-@compute @workgroup_size(1)
-fn softmax_backward(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
-    let global_id = vec3<u32>(gid.x + gid.y * nwg.x * 1u, 0u, 0u);
-    let row = global_id.x;
+@compute @workgroup_size(256)
+fn softmax_backward(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wg: vec3<u32>,
+                    @builtin(num_workgroups) nwg: vec3<u32>) {
+    let row = row_index(wg, nwg);
     let len = sm_params.x;
-    let rows = sm_params.y;
-    if (row >= rows) { return; }
-    let row_offset = row * len;
-    var sum_g_s = 0.0;
-    for (var i = 0u; i < len; i = i + 1u) {
-        sum_g_s = sum_g_s + sm_grad_out[row_offset + i] * sm_final_out[row_offset + i];
-    }
-    for (var i = 0u; i < len; i = i + 1u) {
-        let s = sm_final_out[row_offset + i];
-        sm_grad_in[row_offset + i] = s * (sm_grad_out[row_offset + i] - sum_g_s);
+    if (row >= sm_params.y) { return; } // uniform: whole workgroup exits
+    let off = row * len;
+    var dot = 0.0;
+    for (var i = lid; i < len; i += ROW_WG) { dot += sm_grad_out[off + i] * sm_final_out[off + i]; }
+    dot = row_sum(lid, dot);
+    for (var i = lid; i < len; i += ROW_WG) {
+        let sv = sm_final_out[off + i];
+        sm_grad_in[off + i] = sv * (sm_grad_out[off + i] - dot);
     }
 }
-
 // --- 13. Affine Dequantize (8-bit) ---
 @group(0) @binding(0) var<storage, read> q_weight: array<u32>;
 @group(0) @binding(1) var<storage, read> q_scales: array<f32>;
