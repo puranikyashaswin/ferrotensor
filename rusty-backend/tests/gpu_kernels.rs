@@ -980,3 +980,121 @@ fn gradient_utilities_match_cpu() {
     want.extend_from_slice(&a);
     assert_close("copy_tensor", &read(&dst), &want, 0.0, 0.0);
 }
+
+/// CPU copy of the WGSL `hash3` used for attention dropout.
+fn hash3(x: u32, y: u32, z: u32) -> f32 {
+    let lcg = |v: u32| v.wrapping_mul(1664525).wrapping_add(1013904223);
+    let (mut a, mut b, mut c) = (lcg(x), lcg(y), lcg(z));
+    a = a.wrapping_add(b.wrapping_mul(c));
+    b = b.wrapping_add(c.wrapping_mul(a));
+    c = c.wrapping_add(a.wrapping_mul(b));
+    a ^= a >> 16;
+    b ^= b >> 16;
+    c ^= c >> 16;
+    a.wrapping_add(b).wrapping_add(c) as f32 * 2.328_306_4e-10
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn flash_attention_v2_mask_and_dropout_forward_backward_match_cpu() {
+    let g = gpu();
+    let (b, sq, sk, h, hkv, d) = (2, 21, 21, 4, 2, 32);
+    let (prob, seed) = (0.2f32, 77u64);
+    let q = rand_vec(b * sq * h * d, 44);
+    let k = rand_vec(b * sk * hkv * d, 45);
+    let v = rand_vec(b * sk * hkv * d, 46);
+    let dout = rand_vec(b * sq * h * d, 47);
+    // [batch, 1, 1, seq_k] padding mask, broadcast over heads and queries.
+    let mask: Vec<f32> = (0..b * sk)
+        .map(|i| {
+            if i / sk == 1 && i % sk >= 17 {
+                -1e9
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let mask_full: Vec<f32> = (0..b * h * sq * sk)
+        .map(|i| mask[(i / (h * sq * sk)) * sk + i % sk])
+        .collect();
+
+    let (_, probs) = cpu_attention(&q, &k, &v, Some(&mask_full), (b, sq, sk, h, hkv, d), true);
+    let scale = 1.0 / (d as f32).sqrt();
+    let keep = |bh: usize, i: usize, j: usize| {
+        if hash3(bh as u32, i as u32, j as u32 + seed as u32) >= prob {
+            1.0 / (1.0 - prob)
+        } else {
+            0.0
+        }
+    };
+    let mut out = vec![0.0f32; q.len()];
+    let (mut dq, mut dk, mut dv) = (
+        vec![0.0f32; q.len()],
+        vec![0.0; k.len()],
+        vec![0.0; v.len()],
+    );
+    let mut row = 0;
+    for bi in 0..b {
+        for hi in 0..h {
+            let kh = hi / (h / hkv);
+            for i in 0..sq {
+                let p = &probs[row];
+                row += 1;
+                let qo = ((bi * sq + i) * h + hi) * d;
+                let kvo = |j: usize| ((bi * sk + j) * hkv + kh) * d;
+                for (j, pj) in p.iter().enumerate() {
+                    let m = keep(bi * h + hi, i, j);
+                    for x in 0..d {
+                        out[qo + x] += pj * m * v[kvo(j) + x];
+                    }
+                }
+                let delta: f32 = (0..d).map(|x| dout[qo + x] * out[qo + x]).sum();
+                for (j, pj) in p.iter().enumerate() {
+                    let m = keep(bi * h + hi, i, j);
+                    let dov: f32 = (0..d).map(|x| dout[qo + x] * v[kvo(j) + x]).sum();
+                    let ds = pj * (m * dov - delta) * scale;
+                    for x in 0..d {
+                        dv[kvo(j) + x] += pj * m * dout[qo + x];
+                        dq[qo + x] += ds * k[kvo(j) + x];
+                        dk[kvo(j) + x] += ds * q[qo + x];
+                    }
+                }
+            }
+        }
+    }
+
+    let (tq, tk, tv) = (
+        upload(&q, &[b, sq, h, d]),
+        upload(&k, &[b, sk, hkv, d]),
+        upload(&v, &[b, sk, hkv, d]),
+    );
+    let tmask = upload(&mask, &[b, 1, 1, sk]);
+    let tout = zeros(&[b, sq, h, d]);
+    g.engine
+        .flash_attention_v2(&g.ctx, &tq, &tk, &tv, &tout, true, prob, seed, Some(&tmask));
+    assert_close("dropout fwd", &read(&tout), &out, 1e-5, 1e-3);
+
+    let (gq, gk, gv) = (
+        zeros(&[b, sq, h, d]),
+        zeros(&[b, sk, hkv, d]),
+        zeros(&[b, sk, hkv, d]),
+    );
+    g.engine.flash_attention_v2_backward_full(
+        &g.ctx,
+        &tq,
+        &tk,
+        &tv,
+        &tout,
+        &upload(&dout, &[b, sq, h, d]),
+        &gq,
+        &gk,
+        &gv,
+        true,
+        prob,
+        seed,
+        Some(&tmask),
+    );
+    assert_close("dropout dq", &read(&gq), &dq, 1e-4, 1e-3);
+    assert_close("dropout dk", &read(&gk), &dk, 1e-4, 1e-3);
+    assert_close("dropout dv", &read(&gv), &dv, 1e-4, 1e-3);
+}

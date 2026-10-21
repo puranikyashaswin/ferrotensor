@@ -337,8 +337,6 @@ pub struct ComputeEngine {
     rms_residual: Kernel,
     grad_accum: Kernel,
     grad_scale: Kernel,
-    flash_attn: Kernel,
-    flash_attn_bw: Kernel,
     flash_attn_v2: Kernel,
     flash_attn_v2_bw_preprocess: Kernel,
     flash_attn_v2_bw_dq: Kernel,
@@ -403,8 +401,6 @@ impl ComputeEngine {
             rms_residual: k("rms_norm_residual"),
             grad_accum: k("gradient_accumulate"),
             grad_scale: k("gradient_scale"),
-            flash_attn: k("flash_attention_simple"),
-            flash_attn_bw: k("flash_attention_backward"),
             flash_attn_v2: k("flash_attention_v2_metal"),
             flash_attn_v2_bw_preprocess: k("flash_bwd_preprocess"),
             flash_attn_v2_bw_dq: k("flash_bwd_dq"),
@@ -1063,15 +1059,9 @@ impl ComputeEngine {
         );
     }
 
-    /// Flash Attention forward pass with online softmax
-    /// Memory efficient: O(N) instead of O(N^2) for standard attention
+    /// Single-head attention: `q`, `k`, `v`, `out` are `[seq_len, head_dim]`.
     ///
-    /// # Arguments
-    /// * `q` - Query tensor [seq_len, head_dim]
-    /// * `k` - Key tensor [seq_len, head_dim]
-    /// * `v` - Value tensor [seq_len, head_dim]
-    /// * `out` - Output tensor [seq_len, head_dim]
-    /// * `causal` - Whether to apply causal masking
+    /// Runs the v2 kernel on `[1, seq_len, 1, head_dim]` views of the inputs.
     pub fn flash_attention(
         &self,
         ctx: &WgpuContext,
@@ -1081,34 +1071,22 @@ impl ComputeEngine {
         out: &UnifiedTensor,
         causal: bool,
     ) {
-        let seq_len = q.shape[0] as u32;
-        let head_dim = q.shape[1] as u32;
-        let params = uniform(
-            ctx,
-            bytemuck::cast_slice(&[seq_len, head_dim, causal as u32, 0u32]),
-        );
-        self.run(
-            ctx,
-            &self.flash_attn,
-            &[
-                (0, q.buffer()),
-                (1, k.buffer()),
-                (2, v.buffer()),
-                (3, out.buffer()),
-                (4, &params),
-            ],
-            (seq_len.div_ceil(64), 1, 1),
-        );
+        let [q4, k4, v4, o4] = [q, k, v, out].map(single_head_view);
+        self.flash_attention_v2(ctx, &q4, &k4, &v4, &o4, causal, 0.0, 0, None);
     }
 
-    /// Flash Attention V2 forward pass with Native GQA Support
+    /// Fused attention forward pass with grouped-query attention, causal
+    /// masking, an optional additive mask and attention dropout.
     ///
-    /// # Arguments
-    /// * `q` - Query tensor [batch, seq_q, num_heads, head_dim]
-    /// * `k` - Key tensor [batch, seq_k, num_kv_heads, head_dim]
-    /// * `v` - Value tensor [batch, seq_k, num_kv_heads, head_dim]
-    /// * `out` - Output tensor [batch, seq_q, num_heads, head_dim]
-    /// * `causal` - Whether to apply causal masking
+    /// * `q`, `out` - `[batch, seq_q, num_heads, head_dim]`
+    /// * `k`, `v` - `[batch, seq_k, num_kv_heads, head_dim]`; `num_heads`
+    ///   must be a multiple of `num_kv_heads`
+    /// * `causal` - key `j` is visible to query `i` only when `j <= i`
+    /// * `dropout_prob`, `seed` - attention dropout; pass `0.0` to disable
+    /// * `mask` - additive mask `[batch, heads, seq_q, seq_k]`, where size-1
+    ///   dimensions broadcast
+    ///
+    /// `head_dim` must be at most 128.
     #[allow(clippy::too_many_arguments)]
     pub fn flash_attention_v2(
         &self,
@@ -1122,52 +1100,16 @@ impl ComputeEngine {
         seed: u64,
         mask: Option<&UnifiedTensor>,
     ) {
-        // Assume 4D shapes: [batch, seq, heads, dim]
-        let batch_size = q.shape[0] as u32;
-        let seq_q = q.shape[1] as u32;
-        let num_heads = q.shape[2] as u32;
-        let head_dim = q.shape[3] as u32;
-        let seq_k = k.shape[1] as u32;
-        let num_kv_heads = k.shape[2] as u32;
-        let scale = 1.0 / (head_dim as f32).sqrt();
-
-        let (has_mask, strides) = mask_strides(mask);
-        let dummy_mask;
+        let dims = AttentionDims::new(q, k);
+        let params = dims.params(ctx, causal, dropout_prob, seed, mask);
+        let dummy;
         let mask_buf = match mask {
             Some(m) => m.buffer(),
             None => {
-                dummy_mask = dummy_storage(ctx);
-                &dummy_mask
+                dummy = dummy_storage(ctx);
+                &dummy
             }
         };
-
-        // flash_v2_params struct alignment:
-        // vec4: batch_size, num_heads, seq_q, seq_k
-        // vec4: head_dim, causal, scale, num_kv_heads
-        // vec4: dropout_prob, seed_val, has_mask, pad
-        // vec4: mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k
-        let params: [u32; 16] = [
-            batch_size,
-            num_heads,
-            seq_q,
-            seq_k,
-            head_dim,
-            causal as u32,
-            scale.to_bits(),
-            num_kv_heads,
-            dropout_prob.to_bits(),
-            (seed & 0xFFFFFFFF) as u32,
-            has_mask,
-            0,
-            strides[0],
-            strides[1],
-            strides[2],
-            strides[3],
-        ];
-        let params_buf = uniform(ctx, bytemuck::cast_slice(&params));
-
-        // TILE_Q = 32 in the kernel
-        let tile_q = 32u32;
         self.run(
             ctx,
             &self.flash_attn_v2,
@@ -1176,21 +1118,15 @@ impl ComputeEngine {
                 (1, k.buffer()),
                 (2, v.buffer()),
                 (3, out.buffer()),
-                (4, &params_buf),
+                (4, &params),
                 (5, mask_buf),
             ],
-            (1, seq_q.div_ceil(tile_q), batch_size * num_heads),
+            (1, dims.seq_q.div_ceil(64), dims.batch * dims.heads),
         );
     }
 
-    /// Flash Attention backward pass - computes dQ, dK, dV gradients
-    ///
-    /// # Arguments
-    /// * `q`, `k`, `v` - Original inputs
-    /// * `out` - Forward output
-    /// * `grad_out` - Gradient of loss w.r.t. output
-    /// * `grad_q`, `grad_k`, `grad_v` - Output gradient tensors
-    /// * `causal` - Whether causal mask was used
+    /// Single-head attention backward pass for `[seq_len, head_dim]` tensors.
+    /// Writes (does not accumulate into) `grad_q`, `grad_k` and `grad_v`.
     #[allow(clippy::too_many_arguments)]
     pub fn flash_attention_backward(
         &self,
@@ -1205,32 +1141,14 @@ impl ComputeEngine {
         grad_v: &UnifiedTensor,
         causal: bool,
     ) {
-        let seq_len = q.shape[0] as u32;
-        let head_dim = q.shape[1] as u32;
-        let params = uniform(
-            ctx,
-            bytemuck::cast_slice(&[seq_len, head_dim, causal as u32, 0u32]),
-        );
-        self.run(
-            ctx,
-            &self.flash_attn_bw,
-            &[
-                (0, q.buffer()),
-                (1, k.buffer()),
-                (2, v.buffer()),
-                (3, out.buffer()),
-                (4, grad_out.buffer()),
-                (5, grad_q.buffer()),
-                (6, grad_k.buffer()),
-                (7, grad_v.buffer()),
-                (8, &params),
-            ],
-            (seq_len.div_ceil(64), 1, 1),
-        );
+        let views = [q, k, v, out, grad_out, grad_q, grad_k, grad_v].map(single_head_view);
+        let [q4, k4, v4, o4, go4, gq4, gk4, gv4] = &views;
+        self.flash_attention_v2_backward(ctx, q4, k4, v4, o4, go4, gq4, gk4, gv4, causal);
     }
 
-    /// Flash Attention V2 Backward (Optimized Tiled 2-Pass)
-    /// Computes dQ, dK, dV without atomic adds.
+    /// Backward pass of [`flash_attention_v2`](Self::flash_attention_v2)
+    /// without mask or dropout. See
+    /// [`flash_attention_v2_backward_full`](Self::flash_attention_v2_backward_full).
     #[allow(clippy::too_many_arguments)]
     pub fn flash_attention_v2_backward(
         &self,
@@ -1245,92 +1163,211 @@ impl ComputeEngine {
         grad_v: &UnifiedTensor,
         causal: bool,
     ) {
-        // Assuming q, k, v are [batch, seq, heads, dim]
-        let dim4 = |t: &UnifiedTensor, i: usize, fallback: u32| {
-            if t.shape.len() >= 4 {
-                t.shape[i] as u32
-            } else {
-                fallback
+        self.flash_attention_v2_backward_full(
+            ctx, q, k, v, out, grad_out, grad_q, grad_k, grad_v, causal, 0.0, 0, None,
+        );
+    }
+
+    /// Backward pass of [`flash_attention_v2`](Self::flash_attention_v2).
+    ///
+    /// `out` is the forward output for the same inputs, `causal`,
+    /// `dropout_prob`, `seed` and `mask` must match the forward call (dropout
+    /// decisions are regenerated from `seed`). Writes `grad_q`, `grad_k` and
+    /// `grad_v` (same shapes as `q`, `k`, `v`); no gradient is produced for
+    /// the mask.
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attention_v2_backward_full(
+        &self,
+        ctx: &WgpuContext,
+        q: &UnifiedTensor,
+        k: &UnifiedTensor,
+        v: &UnifiedTensor,
+        out: &UnifiedTensor,
+        grad_out: &UnifiedTensor,
+        grad_q: &UnifiedTensor,
+        grad_k: &UnifiedTensor,
+        grad_v: &UnifiedTensor,
+        causal: bool,
+        dropout_prob: f32,
+        seed: u64,
+        mask: Option<&UnifiedTensor>,
+    ) {
+        let dims = AttentionDims::new(q, k);
+        let params = dims.params_bwd(ctx, causal, dropout_prob, seed, mask);
+        let dummy;
+        let mask_buf = match mask {
+            Some(m) => m.buffer(),
+            None => {
+                dummy = dummy_storage(ctx);
+                &dummy
             }
         };
-        let batch_size = dim4(q, 0, 1);
-        let seq_q = dim4(q, 1, q.shape[0] as u32);
-        let num_heads = dim4(q, 2, 1);
-        let head_dim = q.shape.last().copied().unwrap_or(64) as u32;
-        let seq_k = dim4(k, 1, k.shape[0] as u32);
-        let num_kv_heads = dim4(k, 2, 1);
-        let scale = 1.0 / (head_dim as f32).sqrt();
-
-        let params: [u32; 10] = [
-            batch_size,
-            num_heads,
-            seq_q,
-            seq_k,
-            head_dim,
-            num_kv_heads,
-            scale.to_bits(),
-            0,
-            0, // No dropout/seed passed in this API yet
-            causal as u32,
-        ];
-        let params_buf = uniform(ctx, bytemuck::cast_slice(&params));
-        let mask_p_buf = uniform(ctx, bytemuck::cast_slice(&[0u32; 5]));
-        let dummy_mask = dummy_storage(ctx);
-
-        // Intermediate Buffers: Delta and LSE, shape [Batch, Heads, Seq_Q]
-        let inter_size = (batch_size * num_heads * seq_q) as u64 * 4;
-        let scratch = |label| {
-            ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(label),
-                size: inter_size,
-                usage: wgpu::BufferUsages::STORAGE,
-                mapped_at_creation: false,
-            })
-        };
-        let delta_buf = scratch("Delta Buffer");
-        let lse_buf = scratch("LSE Buffer");
-
-        let entries: [(u32, &Buffer); 13] = [
-            (3, q.buffer()),
-            (4, k.buffer()),
-            (5, v.buffer()),
-            (6, out.buffer()),
-            (7, grad_out.buffer()),
-            (8, grad_q.buffer()),
-            (9, grad_k.buffer()),
-            (10, grad_v.buffer()),
-            (11, &params_buf),
-            (12, &dummy_mask),
-            (13, &mask_p_buf),
-            (14, &delta_buf),
-            (15, &lse_buf),
-        ];
-        // Each pass only binds what its entry point uses.
-        let used = |bindings: &[u32]| {
-            entries
-                .iter()
-                .filter(|(b, _)| bindings.contains(b))
-                .copied()
-                .collect::<Vec<_>>()
-        };
+        // Per (batch, head, query) row: [Delta, LSE].
+        let stats = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Flash Bwd Stats"),
+            size: (dims.batch * dims.heads * dims.seq_q).max(1) as u64 * 8,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let (b, h, hkv) = (dims.batch, dims.heads, dims.kv_heads);
         self.run(
             ctx,
             &self.flash_attn_v2_bw_preprocess,
-            &used(&[3, 4, 6, 7, 11, 12, 13, 14, 15]),
-            (seq_q.div_ceil(64), num_heads, batch_size),
+            &[
+                (0, q.buffer()),
+                (1, k.buffer()),
+                (3, out.buffer()),
+                (4, grad_out.buffer()),
+                (8, &params),
+                (9, mask_buf),
+                (10, &stats),
+            ],
+            (dims.seq_q.div_ceil(64), h, b),
         );
         self.run(
             ctx,
             &self.flash_attn_v2_bw_dq,
-            &used(&[3, 4, 5, 7, 8, 11, 12, 13, 14, 15]),
-            (seq_q, num_heads, batch_size),
+            &[
+                (0, q.buffer()),
+                (1, k.buffer()),
+                (2, v.buffer()),
+                (4, grad_out.buffer()),
+                (5, grad_q.buffer()),
+                (8, &params),
+                (9, mask_buf),
+                (10, &stats),
+            ],
+            (dims.seq_q.div_ceil(64), h, b),
         );
         self.run(
             ctx,
             &self.flash_attn_v2_bw_dkdv,
-            &used(&[3, 4, 5, 7, 9, 10, 11, 12, 13, 14, 15]),
-            (seq_k, num_kv_heads, batch_size),
+            &[
+                (0, q.buffer()),
+                (1, k.buffer()),
+                (2, v.buffer()),
+                (4, grad_out.buffer()),
+                (6, grad_k.buffer()),
+                (7, grad_v.buffer()),
+                (8, &params),
+                (9, mask_buf),
+                (10, &stats),
+            ],
+            (dims.seq_k.div_ceil(64), hkv, b),
         );
+    }
+}
+
+/// `[seq, dim]` tensor viewed as `[1, seq, 1, dim]`.
+fn single_head_view(t: &UnifiedTensor) -> UnifiedTensor {
+    assert_eq!(t.shape.len(), 2, "expected a [seq_len, head_dim] tensor");
+    t.reshaped(&[1, t.shape[0], 1, t.shape[1]])
+}
+
+/// Shapes of a `[batch, seq, heads, head_dim]` attention call.
+struct AttentionDims {
+    batch: u32,
+    seq_q: u32,
+    seq_k: u32,
+    heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+}
+
+impl AttentionDims {
+    fn new(q: &UnifiedTensor, k: &UnifiedTensor) -> Self {
+        assert_eq!(q.shape.len(), 4, "q must be [batch, seq, heads, head_dim]");
+        assert_eq!(
+            k.shape.len(),
+            4,
+            "k must be [batch, seq, kv_heads, head_dim]"
+        );
+        let dims = Self {
+            batch: q.shape[0] as u32,
+            seq_q: q.shape[1] as u32,
+            heads: q.shape[2] as u32,
+            head_dim: q.shape[3] as u32,
+            seq_k: k.shape[1] as u32,
+            kv_heads: k.shape[2] as u32,
+        };
+        assert!(
+            dims.head_dim <= 128,
+            "flash attention supports head_dim <= 128, got {}",
+            dims.head_dim
+        );
+        assert!(
+            dims.kv_heads > 0 && dims.heads % dims.kv_heads == 0,
+            "num_heads ({}) must be a multiple of num_kv_heads ({})",
+            dims.heads,
+            dims.kv_heads
+        );
+        dims
+    }
+
+    fn scale(&self) -> f32 {
+        1.0 / (self.head_dim as f32).sqrt()
+    }
+
+    /// Uniform for the forward kernel (`FlashV2Params`).
+    fn params(
+        &self,
+        ctx: &WgpuContext,
+        causal: bool,
+        dropout_prob: f32,
+        seed: u64,
+        mask: Option<&UnifiedTensor>,
+    ) -> Buffer {
+        let (has_mask, s) = mask_strides(mask);
+        let params: [u32; 16] = [
+            self.batch,
+            self.heads,
+            self.seq_q,
+            self.seq_k,
+            self.head_dim,
+            causal as u32,
+            self.scale().to_bits(),
+            self.kv_heads,
+            dropout_prob.to_bits(),
+            seed as u32,
+            has_mask,
+            0,
+            s[0],
+            s[1],
+            s[2],
+            s[3],
+        ];
+        uniform(ctx, bytemuck::cast_slice(&params))
+    }
+
+    /// Uniform for the backward kernels (`FlashBwdParams`).
+    fn params_bwd(
+        &self,
+        ctx: &WgpuContext,
+        causal: bool,
+        dropout_prob: f32,
+        seed: u64,
+        mask: Option<&UnifiedTensor>,
+    ) -> Buffer {
+        let (has_mask, s) = mask_strides(mask);
+        let params: [u32; 16] = [
+            self.batch,
+            self.heads,
+            self.seq_q,
+            self.seq_k,
+            self.head_dim,
+            self.kv_heads,
+            self.scale().to_bits(),
+            dropout_prob.to_bits(),
+            seed as u32,
+            causal as u32,
+            has_mask,
+            0,
+            s[0],
+            s[1],
+            s[2],
+            s[3],
+        ];
+        uniform(ctx, bytemuck::cast_slice(&params))
     }
 }
 
