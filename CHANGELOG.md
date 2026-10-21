@@ -7,7 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-First public version. Nothing has been published to crates.io yet.
+## [0.1.0] - 2026-10-21
+
+First public version.
 
 ### Added
 - `ferrotensor`: tensor API with a CPU device and a wgpu GPU device, reverse-mode autograd checked against finite differences, differentiable `nn` layers (Linear, Embedding, LayerNorm, RMSNorm, Dropout, activations), SGD/Adam/AdamW, gradient clipping, LR schedules (cosine with warmup), `Dataset`/`DataLoader`, and safetensors save/load of module state dicts.
@@ -25,4 +27,5 @@ First public version. Nothing has been published to crates.io yet.
 - Renamed the project from Rusty to Ferrotensor; crates are now `ferrotensor-*` and the CLI binary is `ferrotensor`.
 - Licensed under MIT OR Apache-2.0 (previously MIT only).
 
-[Unreleased]: https://github.com/puranikyashaswin/ferrotensor/commits/main
+[Unreleased]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/puranikyashaswin/ferrotensor/releases/tag/v0.1.0
