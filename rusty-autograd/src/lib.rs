@@ -40,6 +40,11 @@ pub struct Tensor {
     pub ctx: Arc<WgpuContext>,
     /// The op that produced this tensor (`None` for leaves).
     pub creator: Option<Arc<dyn AutogradNode>>,
+    /// Whether backward computes a gradient for this tensor. Leaves made
+    /// with [`Tensor::new`] require one; [`Tensor::frozen`] leaves (e.g.
+    /// pretrained weights under LoRA) do not, and an op's output requires
+    /// one only if some input does, so frozen subgraphs are skipped.
+    pub requires_grad: bool,
 }
 
 impl std::fmt::Debug for Tensor {
@@ -58,6 +63,16 @@ impl Tensor {
             grad: Arc::new(RefCell::new(None)),
             ctx,
             creator: None,
+            requires_grad: true,
+        }
+    }
+
+    /// A leaf tensor that never receives a gradient (a constant or a frozen
+    /// weight).
+    pub fn frozen(ctx: Arc<WgpuContext>, data: UnifiedTensor) -> Self {
+        Self {
+            requires_grad: false,
+            ..Self::new(ctx, data)
         }
     }
 
@@ -67,11 +82,13 @@ impl Tensor {
         data: UnifiedTensor,
         creator: Arc<dyn AutogradNode>,
     ) -> Tensor {
+        let requires_grad = creator.inputs().iter().any(|t| t.requires_grad);
         Tensor {
             data: Arc::new(data),
             grad: Arc::new(RefCell::new(None)),
             ctx,
             creator: Some(creator),
+            requires_grad,
         }
     }
 
@@ -112,13 +129,18 @@ impl Tensor {
 
         // Iterate backwards
         for tensor in sorted_tensors.into_iter().rev() {
+            if !tensor.requires_grad {
+                continue;
+            }
             let grad_option = tensor.grad.borrow().clone();
             if let Some(grad) = grad_option {
                 if let Some(creator) = &tensor.creator {
                     let input_grads = creator.backward(&grad, engine);
                     let inputs = creator.inputs();
                     for (input, input_grad) in inputs.iter().zip(input_grads) {
-                        input.accumulate_grad(engine, &input_grad);
+                        if input.requires_grad {
+                            input.accumulate_grad(engine, &input_grad);
+                        }
                     }
                 }
             }
@@ -187,10 +209,22 @@ impl AutogradNode for MatMulNode {
     }
     /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
     fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
-        let grad_a = UnifiedTensor::empty(&self.a.ctx, &self.a.data.shape);
-        engine.matmul_bt(&self.a.ctx, grad, &self.b.data, &grad_a);
-        let grad_b = UnifiedTensor::empty(&self.b.ctx, &self.b.data.shape);
-        engine.matmul_at(&self.a.ctx, &self.a.data, grad, &grad_b);
+        // Inputs that need no gradient get a placeholder that backward
+        // never reads, which skips a matmul per frozen weight.
+        let grad_a = if self.a.requires_grad {
+            let g = UnifiedTensor::empty(&self.a.ctx, &self.a.data.shape);
+            engine.matmul_bt(&self.a.ctx, grad, &self.b.data, &g);
+            g
+        } else {
+            UnifiedTensor::empty(&self.a.ctx, &[1])
+        };
+        let grad_b = if self.b.requires_grad {
+            let g = UnifiedTensor::empty(&self.b.ctx, &self.b.data.shape);
+            engine.matmul_at(&self.a.ctx, &self.a.data, grad, &g);
+            g
+        } else {
+            UnifiedTensor::empty(&self.b.ctx, &[1])
+        };
         vec![grad_a, grad_b]
     }
 }
@@ -343,6 +377,18 @@ pub fn apply_rope_in_place(
     pos: usize,
     inverse: bool,
 ) {
+    apply_rope_theta_in_place(data, shape, head_dim, pos, 10000.0, inverse);
+}
+
+/// [`apply_rope_in_place`] with base frequency `theta`.
+pub fn apply_rope_theta_in_place(
+    data: &mut [f32],
+    shape: &[usize],
+    head_dim: usize,
+    pos: usize,
+    theta: f32,
+    inverse: bool,
+) {
     let (batch, seq_len, hidden) = match shape {
         [batch, seq_len, hidden] => (*batch, *seq_len, *hidden),
         [seq_len, hidden] => (1, *seq_len, *hidden),
@@ -360,7 +406,7 @@ pub fn apply_rope_in_place(
                 let head_base = token_base + head_idx * head_dim;
                 for dim_idx in 0..half_dim {
                     let freq_exp = -2.0 * dim_idx as f32 / head_dim as f32;
-                    let angle = sign * token_pos * 10000.0_f32.powf(freq_exp);
+                    let angle = sign * token_pos * theta.powf(freq_exp);
                     let cos_a = angle.cos();
                     let sin_a = angle.sin();
                     let idx1 = head_base + dim_idx;
@@ -383,6 +429,8 @@ pub struct RoPENode {
     pub head_dim: usize,
     /// Position of the first token.
     pub pos: usize,
+    /// RoPE base frequency.
+    pub theta: f32,
 }
 impl AutogradNode for RoPENode {
     fn inputs(&self) -> Vec<Tensor> {
@@ -391,11 +439,12 @@ impl AutogradNode for RoPENode {
     /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
     fn backward(&self, grad: &UnifiedTensor, _engine: &ComputeEngine) -> Vec<UnifiedTensor> {
         let mut grad_cpu = pollster::block_on(grad.to_vec(&self.input.ctx));
-        apply_rope_in_place(
+        apply_rope_theta_in_place(
             &mut grad_cpu,
             &self.input.data.shape,
             self.head_dim,
             self.pos,
+            self.theta,
             true,
         );
         vec![UnifiedTensor::new(
@@ -818,13 +867,25 @@ impl Tensor {
     /// Rotary position embedding for tokens at positions `pos..pos + seq`
     /// (`[batch, seq, hidden]` or `[seq, hidden]`).
     pub fn rope(input: &Tensor, head_dim: usize, pos: usize, engine: &ComputeEngine) -> Tensor {
+        Tensor::rope_theta(input, head_dim, pos, 10000.0, engine)
+    }
+
+    /// [`rope`](Tensor::rope) with base frequency `theta`.
+    pub fn rope_theta(
+        input: &Tensor,
+        head_dim: usize,
+        pos: usize,
+        theta: f32,
+        engine: &ComputeEngine,
+    ) -> Tensor {
         let out_data = UnifiedTensor::empty(&input.ctx, &input.data.shape);
         engine.copy_tensor(&input.ctx, &input.data, &out_data, 0);
-        engine.rope(&input.ctx, &out_data, head_dim, pos);
+        engine.rope_theta(&input.ctx, &out_data, head_dim, pos, theta);
         let node = Arc::new(RoPENode {
             input: input.clone(),
             head_dim,
             pos,
+            theta,
         });
         Tensor::with_creator(input.ctx.clone(), out_data, node)
     }
@@ -1010,6 +1071,9 @@ pub trait Optimizer: Send + Sync {
     fn step(&mut self, params: &[Tensor]);
     /// Clear the gradients of `params`.
     fn zero_grad(&mut self, params: &[Tensor]);
+    /// Set the learning rate used by the next [`step`](Optimizer::step)
+    /// (for schedules). The default ignores it.
+    fn set_lr(&mut self, _lr: f32) {}
     /// Serialize optimizer state keyed by parameter name (`None` if unsupported).
     fn save_state(
         &self,
@@ -1155,6 +1219,9 @@ impl AdamW {
 impl Optimizer for AdamW {
     fn step(&mut self, params: &[Tensor]) {
         self.apply_step(params);
+    }
+    fn set_lr(&mut self, lr: f32) {
+        self.lr = lr;
     }
     fn zero_grad(&mut self, params: &[Tensor]) {
         self.clear_grads(params);
