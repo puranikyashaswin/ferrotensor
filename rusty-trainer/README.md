@@ -1,20 +1,29 @@
 # rusty-trainer
 
-Training loops for [Rusty](../README.md)'s LLM stack: `Trainer` (gradient
-accumulation, gradient clipping, optional `GradScaler` for FP16 loss scaling),
-masked cross-entropy for response-only SFT loss, text and packed-token
-datasets with a `DataLoader`, checkpoint save/resume, and a file-based
-gradient sync prototype for multi-process runs. **Experimental.**
+Training loops for [Rusty](../README.md)'s LLM stack: `Trainer` (response-masked
+cross-entropy, gradient accumulation averaged over the window, global
+gradient-norm clipping, learning-rate schedules, optional `GradScaler`),
+SFT and pretraining datasets with a seeded `DataLoader`, LoRA adapter
+save/load (safetensors with rank/alpha/targets metadata) and resumable
+training checkpoints, plus a file-based gradient sync prototype for
+multi-process runs. **Experimental.**
 
 Most people use it through `rusty-cli`:
 
 ```bash
 cargo run -p rusty-cli --release -- train \
-  --lite --task sft --model ./models/tinyllama \
-  --data ./data/train.jsonl --out ./outputs/run1
+  --model ./data/models/SmolLM2-135M \
+  --data ./data/alpaca/train.jsonl --out ./data/runs/sft
 ```
 
-A walkthrough with real output is planned at
-[docs/examples/lora-sft.md](../docs/examples/lora-sft.md) (written by another
-branch). For the library API see `Trainer::new`, `Trainer::train_step_masked`
-and `Trainer::train_batch`.
+A walkthrough with measured numbers is in
+[docs/examples/lora-sft.md](../docs/examples/lora-sft.md). For the library API
+see `Trainer::new`, `Trainer::train_step_masked`, `masked_cross_entropy` and
+the `checkpoint` module.
+
+GPU tests (a tiny random model trained for a few steps, resume round trip,
+KV-cache decoding) are ignored by default:
+
+```bash
+cargo test -p rusty-trainer --test gpu_training -- --ignored --test-threads=1
+```
