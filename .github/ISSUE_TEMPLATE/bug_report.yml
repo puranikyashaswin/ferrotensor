@@ -1,0 +1,38 @@
+name: Bug report
+description: Something is broken or behaves unexpectedly
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you expect, and what did you get instead?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: A minimal command or code snippet.
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Rusty version or commit
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: OS, GPU and backend
+      description: For example macOS 15 / Apple M2 / Metal, or Ubuntu 24.04 / RTX 3060 / Vulkan.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Output with `RUST_BACKTRACE=1` if it panics.
+      render: shell
