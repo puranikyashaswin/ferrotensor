@@ -1201,3 +1201,48 @@ fn flash_attention_v2_offset_and_window_match_cpu() {
         assert_close(&format!("dv {name}"), &read(&gv), &want_dv, 1e-4, 1e-3);
     }
 }
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn large_dispatches_use_a_2d_grid() {
+    let g = gpu();
+    // More than 65535 workgroups of 64 threads.
+    let n = 65535 * 64 * 2 + 3;
+    let a = rand_vec(n, 52);
+    let b = rand_vec(n, 53);
+    let out = zeros(&[n]);
+    g.engine
+        .add(&g.ctx, &upload(&a, &[n]), &upload(&b, &[n]), &out);
+    let got = read(&out);
+    for i in [0, n / 2, n - 1] {
+        assert_eq!(got[i], a[i] + b[i], "add[{i}]");
+    }
+    g.engine.silu(&g.ctx, &upload(&a, &[n]), &out);
+    let got = read(&out);
+    for i in [0, n / 3, n - 1] {
+        assert!((got[i] - a[i] * sigmoid(a[i])).abs() < 1e-6, "silu[{i}]");
+    }
+
+    // More than 65535 rows for the row-wise kernels.
+    let (rows, len) = (70_000, 3);
+    let x = rand_vec(rows * len, 54);
+    let out = zeros(&[rows, len]);
+    g.engine.softmax(&g.ctx, &upload(&x, &[rows, len]), &out);
+    assert_close(
+        "softmax 70k rows",
+        &read(&out),
+        &cpu_softmax_rows(&x, len),
+        1e-6,
+        1e-4,
+    );
+    let w = vec![1.0f32; len];
+    g.engine
+        .rms_norm(&g.ctx, &upload(&x, &[rows, len]), &upload(&w, &[len]), &out);
+    assert_close(
+        "rms_norm 70k rows",
+        &read(&out),
+        &cpu_rms_norm(&x, &w, len, 1e-5),
+        1e-5,
+        1e-4,
+    );
+}

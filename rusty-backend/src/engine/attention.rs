@@ -29,7 +29,7 @@ impl ComputeEngine {
             ctx,
             &self.rope,
             &[(0, tensor.buffer()), (1, &params)],
-            (groups64(pairs), 1, 1),
+            groups64(pairs),
         );
     }
 

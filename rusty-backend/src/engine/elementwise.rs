@@ -46,7 +46,7 @@ impl ComputeEngine {
             ctx,
             kernel,
             &[(0, a.buffer()), (1, b.buffer()), (2, out.buffer())],
-            (groups64(a.shape.iter().product()), 1, 1),
+            groups64(a.shape.iter().product()),
         );
     }
 
@@ -65,7 +65,7 @@ impl ComputeEngine {
                 (4, grad_a.buffer()),
                 (5, grad_b.buffer()),
             ],
-            (groups64(grad_out.shape.iter().product()), 1, 1),
+            groups64(grad_out.shape.iter().product()),
         );
     }
 
@@ -84,7 +84,7 @@ impl ComputeEngine {
                 (4, grad_a.buffer()),
                 (5, grad_b.buffer()),
             ],
-            (groups64(grad_out.shape.iter().product()), 1, 1),
+            groups64(grad_out.shape.iter().product()),
         );
     }
 
@@ -107,7 +107,7 @@ impl ComputeEngine {
                 (6, grad_a.buffer()),
                 (7, grad_b.buffer()),
             ],
-            (groups64(grad_out.shape.iter().product()), 1, 1),
+            groups64(grad_out.shape.iter().product()),
         );
     }
 
@@ -116,7 +116,7 @@ impl ComputeEngine {
             ctx,
             &self.silu,
             &[(0, input.buffer()), (1, out.buffer())],
-            (groups64(input.shape.iter().product()), 1, 1),
+            groups64(input.shape.iter().product()),
         );
     }
 
@@ -135,7 +135,7 @@ impl ComputeEngine {
                 (4, input.buffer()),
                 (5, grad_in.buffer()),
             ],
-            (groups64(grad_out.shape.iter().product()), 1, 1),
+            groups64(grad_out.shape.iter().product()),
         );
     }
 
@@ -144,7 +144,7 @@ impl ComputeEngine {
             ctx,
             &self.relu,
             &[(0, input.buffer()), (1, out.buffer())],
-            (groups64(input.shape.iter().product()), 1, 1),
+            groups64(input.shape.iter().product()),
         );
     }
 
@@ -163,7 +163,7 @@ impl ComputeEngine {
                 (4, input.buffer()),
                 (5, grad_in.buffer()),
             ],
-            (groups64(grad_out.shape.iter().product()), 1, 1),
+            groups64(grad_out.shape.iter().product()),
         );
     }
 
@@ -199,7 +199,7 @@ impl ComputeEngine {
                 (4, grad_up.buffer()),
                 (5, grad_gate.buffer()),
             ],
-            (groups64(up.shape.iter().product()), 1, 1),
+            groups64(up.shape.iter().product()),
         );
     }
 }

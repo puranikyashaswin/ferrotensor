@@ -1,6 +1,6 @@
 //! Normalisation and softmax kernels.
 
-use super::{uniform, ComputeEngine};
+use super::{grid, groups64, uniform, ComputeEngine};
 use crate::{UnifiedTensor, WgpuContext};
 
 impl ComputeEngine {
@@ -23,7 +23,7 @@ impl ComputeEngine {
                 (2, out.buffer()),
                 (3, &params),
             ],
-            (rows as u32, 1, 1),
+            groups64(rows),
         );
     }
 
@@ -60,7 +60,7 @@ impl ComputeEngine {
             ctx,
             &self.softmax,
             &[(0, input.buffer()), (1, out.buffer()), (2, &params)],
-            (rows as u32, 1, 1),
+            grid(rows as u32),
         );
     }
 
@@ -83,7 +83,7 @@ impl ComputeEngine {
                 (4, final_out.buffer()),
                 (5, grad_in.buffer()),
             ],
-            (rows as u32, 1, 1),
+            grid(rows as u32),
         );
     }
 }

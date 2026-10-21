@@ -28,7 +28,7 @@ impl ComputeEngine {
             ctx,
             &self.sgd,
             &[(0, weight.buffer()), (1, grad.buffer()), (2, &lr_buf)],
-            (groups64(weight.shape.iter().product()), 1, 1),
+            groups64(weight.shape.iter().product()),
         );
     }
 
@@ -52,7 +52,7 @@ impl ComputeEngine {
                 (4, v.buffer()),
                 (5, &params_buf),
             ],
-            (groups64(weight.shape.iter().product()), 1, 1),
+            groups64(weight.shape.iter().product()),
         );
     }
 
@@ -81,7 +81,7 @@ impl ComputeEngine {
                 (1, target.buffer()),
                 (3, grad_in.buffer()),
             ],
-            (groups64(pred.shape.iter().product()), 1, 1),
+            groups64(pred.shape.iter().product()),
         );
     }
 
@@ -117,7 +117,7 @@ impl ComputeEngine {
             ctx,
             &self.ce_loss_bw,
             &[(0, logits.buffer()), (1, grad_out.buffer()), (2, &params)],
-            (vocab_size.div_ceil(64), 1, 1),
+            groups64(vocab_size as usize),
         );
     }
 
@@ -132,7 +132,7 @@ impl ComputeEngine {
             ctx,
             &self.grad_norm,
             &[(0, input.buffer()), (1, out.buffer())],
-            (groups64(input.shape.iter().product()), 1, 1),
+            groups64(input.shape.iter().product()),
         );
     }
 
@@ -143,7 +143,7 @@ impl ComputeEngine {
             ctx,
             &self.grad_clip,
             &[(0, grad.buffer()), (1, &params)],
-            (groups64(grad.shape.iter().product()), 1, 1),
+            groups64(grad.shape.iter().product()),
         );
     }
 
@@ -159,7 +159,7 @@ impl ComputeEngine {
             ctx,
             &self.grad_accum,
             &[(0, accum_grad.buffer()), (1, new_grad.buffer())],
-            (groups64(accum_grad.shape.iter().product()), 1, 1),
+            groups64(accum_grad.shape.iter().product()),
         );
     }
 
@@ -171,7 +171,7 @@ impl ComputeEngine {
             ctx,
             &self.grad_scale,
             &[(0, grad.buffer()), (1, &params)],
-            (groups64(grad.shape.iter().product()), 1, 1),
+            groups64(grad.shape.iter().product()),
         );
     }
 }

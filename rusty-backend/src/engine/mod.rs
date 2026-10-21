@@ -45,9 +45,20 @@ impl Kernel {
     }
 }
 
-/// Number of 64-wide workgroups needed to cover `n` elements.
-fn groups64(n: usize) -> u32 {
-    (n as u32).div_ceil(64)
+/// Workgroup grid for `groups` 1-D workgroups. Grids wider than 65535 (the
+/// per-dimension limit) spill into y; the kernels rebuild a linear index.
+fn grid(groups: u32) -> (u32, u32, u32) {
+    const MAX: u32 = 65535;
+    if groups <= MAX {
+        (groups, 1, 1)
+    } else {
+        (MAX, groups.div_ceil(MAX), 1)
+    }
+}
+
+/// Grid of 64-wide workgroups covering `n` elements.
+fn groups64(n: usize) -> (u32, u32, u32) {
+    grid((n as u32).div_ceil(64))
 }
 
 /// Creates a uniform buffer holding `bytes`.

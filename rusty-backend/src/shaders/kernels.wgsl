@@ -1,6 +1,10 @@
 // --- Constants ---
 const TILE_SIZE: u32 = 16u; // Workgroup tile size for MatMul
 
+// --- Dispatch ---
+// 1-D kernels may be launched on a 2-D grid when they need more than 65535
+// workgroups; they rebuild a linear index from gid.x + gid.y * grid width.
+
 // --- Bindings ---
 // We use generic bindings (0,1,2,3) to reuse layouts across pipelines where possible
 
@@ -58,7 +62,8 @@ fn matmul_tiled(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(lo
 @group(0) @binding(1) var<uniform> rope_params: vec4<u32>;
 
 @compute @workgroup_size(64)
-fn rope(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn rope(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let global_id = vec3<u32>(gid.x + gid.y * nwg.x * 64u, 0u, 0u);
     let idx = global_id.x;
     let head_dim = rope_params.x;
     let half_dim = head_dim / 2u;
@@ -88,7 +93,8 @@ fn rope(@builtin(global_invocation_id) global_id: vec3<u32>) {
 @group(0) @binding(3) var<uniform> rms_params: vec2<u32>;
 
 @compute @workgroup_size(64)
-fn rms_norm(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn rms_norm(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let global_id = vec3<u32>(gid.x + gid.y * nwg.x * 64u, 0u, 0u);
     let row = global_id.x;
     let size = rms_params.x;
     let rows = rms_params.y;
@@ -110,7 +116,8 @@ fn rms_norm(@builtin(global_invocation_id) global_id: vec3<u32>) {
 @group(0) @binding(0) var<storage, read> silu_input: array<f32>;
 @group(0) @binding(1) var<storage, read_write> silu_out: array<f32>;
 @compute @workgroup_size(64)
-fn silu(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn silu(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let global_id = vec3<u32>(gid.x + gid.y * nwg.x * 64u, 0u, 0u);
     let i = global_id.x;
     if (i >= arrayLength(&silu_out)) { return; }
     let x = silu_input[i];
@@ -123,7 +130,8 @@ fn silu(@builtin(global_invocation_id) global_id: vec3<u32>) {
 @group(0) @binding(2) var<uniform> sm_params: vec2<u32>;
 
 @compute @workgroup_size(1)
-fn softmax(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn softmax(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let global_id = vec3<u32>(gid.x + gid.y * nwg.x * 1u, 0u, 0u);
     let row = global_id.x;
     let len = sm_params.x;
     let rows = sm_params.y;
@@ -146,14 +154,16 @@ fn softmax(@builtin(global_invocation_id) global_id: vec3<u32>) {
 @group(0) @binding(2) var<storage, read_write> bin_out: array<f32>;
 
 @compute @workgroup_size(64)
-fn add(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn add(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let global_id = vec3<u32>(gid.x + gid.y * nwg.x * 64u, 0u, 0u);
     let i = global_id.x;
     if (i >= arrayLength(&bin_out)) { return; }
     bin_out[i] = bin_a[i] + bin_b[i];
 }
 
 @compute @workgroup_size(64)
-fn mul(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn mul(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let global_id = vec3<u32>(gid.x + gid.y * nwg.x * 64u, 0u, 0u);
     let i = global_id.x;
     if (i >= arrayLength(&bin_out)) { return; }
     bin_out[i] = bin_a[i] * bin_b[i];
@@ -163,7 +173,8 @@ fn mul(@builtin(global_invocation_id) global_id: vec3<u32>) {
 @group(0) @binding(0) var<storage, read> deq_in: array<u32>;
 @group(0) @binding(1) var<storage, read_write> deq_out: array<f32>;
 @compute @workgroup_size(64)
-fn dequantize(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn dequantize(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let global_id = vec3<u32>(gid.x + gid.y * nwg.x * 64u, 0u, 0u);
     let i = global_id.x;
     let base = i * 4u;
     if (i >= arrayLength(&deq_in)) { return; }
@@ -201,7 +212,8 @@ fn top_k(@builtin(global_invocation_id) global_id: vec3<u32>) {
 @group(0) @binding(4) var<storage, read_write> add_grad_a: array<f32>;
 @group(0) @binding(5) var<storage, read_write> add_grad_b: array<f32>;
 @compute @workgroup_size(64)
-fn add_backward(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn add_backward(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let global_id = vec3<u32>(gid.x + gid.y * nwg.x * 64u, 0u, 0u);
     let i = global_id.x;
     if (i >= arrayLength(&add_grad_out)) { return; }
     let g = add_grad_out[i];
@@ -215,7 +227,8 @@ fn add_backward(@builtin(global_invocation_id) global_id: vec3<u32>) {
 @group(0) @binding(6) var<storage, read_write> mul_grad_a: array<f32>;
 @group(0) @binding(7) var<storage, read_write> mul_grad_b: array<f32>;
 @compute @workgroup_size(64)
-fn mul_backward(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn mul_backward(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let global_id = vec3<u32>(gid.x + gid.y * nwg.x * 64u, 0u, 0u);
     let i = global_id.x;
     if (i >= arrayLength(&mul_grad_out)) { return; }
     let g = mul_grad_out[i];
@@ -227,7 +240,8 @@ fn mul_backward(@builtin(global_invocation_id) global_id: vec3<u32>) {
 @group(0) @binding(4) var<storage, read> silu_bk_input: array<f32>;
 @group(0) @binding(5) var<storage, read_write> silu_bk_grad_in: array<f32>;
 @compute @workgroup_size(64)
-fn silu_backward_real(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn silu_backward_real(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let global_id = vec3<u32>(gid.x + gid.y * nwg.x * 64u, 0u, 0u);
     let i = global_id.x;
     if (i >= arrayLength(&silu_bk_grad_out)) { return; }
     let x = silu_bk_input[i];
@@ -266,7 +280,8 @@ fn matmul_at(@builtin(global_invocation_id) global_id: vec3<u32>) {
 @group(0) @binding(2) var<uniform> opt_lr: f32;
 
 @compute @workgroup_size(64)
-fn sgd_update(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn sgd_update(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let global_id = vec3<u32>(gid.x + gid.y * nwg.x * 64u, 0u, 0u);
     let i = global_id.x;
     if (i >= arrayLength(&opt_weight)) { return; }
     opt_weight[i] = opt_weight[i] - (opt_lr * opt_grad[i]);
@@ -285,7 +300,8 @@ struct AdamParams {
 @group(0) @binding(5) var<uniform> adam_params: AdamParams;
 
 @compute @workgroup_size(64)
-fn adamw_update(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn adamw_update(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let global_id = vec3<u32>(gid.x + gid.y * nwg.x * 64u, 0u, 0u);
     let i = global_id.x;
     if (i >= arrayLength(&opt_weight)) { return; }
     
@@ -306,7 +322,8 @@ fn adamw_update(@builtin(global_invocation_id) global_id: vec3<u32>) {
 }
 
 @compute @workgroup_size(64)
-fn sub(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn sub(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let global_id = vec3<u32>(gid.x + gid.y * nwg.x * 64u, 0u, 0u);
     let i = global_id.x;
     if (i >= arrayLength(&bin_out)) { return; }
     bin_out[i] = bin_a[i] - bin_b[i];
@@ -316,7 +333,8 @@ fn sub(@builtin(global_invocation_id) global_id: vec3<u32>) {
 @group(0) @binding(4) var<storage, read_write> sub_grad_a: array<f32>;
 @group(0) @binding(5) var<storage, read_write> sub_grad_b: array<f32>;
 @compute @workgroup_size(64)
-fn sub_backward(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn sub_backward(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let global_id = vec3<u32>(gid.x + gid.y * nwg.x * 64u, 0u, 0u);
     let i = global_id.x;
     if (i >= arrayLength(&sub_grad_out)) { return; }
     let g = sub_grad_out[i];
@@ -329,7 +347,8 @@ fn sub_backward(@builtin(global_invocation_id) global_id: vec3<u32>) {
 @group(0) @binding(1) var<storage, read> mse_target: array<f32>;
 @group(0) @binding(2) var<storage, read_write> mse_out: array<f32>;
 @compute @workgroup_size(64)
-fn mse_loss(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn mse_loss(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let global_id = vec3<u32>(gid.x + gid.y * nwg.x * 64u, 0u, 0u);
     let i = global_id.x;
     if (i >= arrayLength(&mse_out)) { return; }
     let diff = mse_pred[i] - mse_target[i];
@@ -338,7 +357,8 @@ fn mse_loss(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
 @group(0) @binding(3) var<storage, read_write> mse_grad_in: array<f32>;
 @compute @workgroup_size(64)
-fn mse_loss_backward(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn mse_loss_backward(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let global_id = vec3<u32>(gid.x + gid.y * nwg.x * 64u, 0u, 0u);
     let i = global_id.x;
     if (i >= arrayLength(&mse_pred)) { return; }
     mse_grad_in[i] = mse_pred[i] - mse_target[i];
@@ -348,7 +368,8 @@ fn mse_loss_backward(@builtin(global_invocation_id) global_id: vec3<u32>) {
 @group(0) @binding(0) var<storage, read> relu_input_f: array<f32>;
 @group(0) @binding(1) var<storage, read_write> relu_out_f: array<f32>;
 @compute @workgroup_size(64)
-fn relu(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn relu(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let global_id = vec3<u32>(gid.x + gid.y * nwg.x * 64u, 0u, 0u);
     let i = global_id.x;
     if (i >= arrayLength(&relu_out_f)) { return; }
     relu_out_f[i] = max(0.0, relu_input_f[i]);
@@ -358,7 +379,8 @@ fn relu(@builtin(global_invocation_id) global_id: vec3<u32>) {
 @group(0) @binding(4) var<storage, read> relu_in: array<f32>;
 @group(0) @binding(5) var<storage, read_write> relu_grad_in: array<f32>;
 @compute @workgroup_size(64)
-fn relu_backward(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn relu_backward(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let global_id = vec3<u32>(gid.x + gid.y * nwg.x * 64u, 0u, 0u);
     let i = global_id.x;
     if (i >= arrayLength(&relu_grad_out)) { return; }
     if (relu_in[i] > 0.0) {
@@ -372,8 +394,9 @@ fn relu_backward(@builtin(global_invocation_id) global_id: vec3<u32>) {
 @group(0) @binding(4) var<storage, read> sm_final_out: array<f32>;
 @group(0) @binding(5) var<storage, read_write> sm_grad_in: array<f32>;
 // sm_size is at binding 2
-@compute @workgroup_size(1) 
-fn softmax_backward(@builtin(global_invocation_id) global_id: vec3<u32>) {
+@compute @workgroup_size(1)
+fn softmax_backward(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let global_id = vec3<u32>(gid.x + gid.y * nwg.x * 1u, 0u, 0u);
     let row = global_id.x;
     let len = sm_params.x;
     let rows = sm_params.y;
@@ -426,7 +449,8 @@ struct ConvParams {
 @group(0) @binding(4) var<uniform> conv_p: ConvParams;
 
 @compute @workgroup_size(64)
-fn conv1d(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn conv1d(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let global_id = vec3<u32>(gid.x + gid.y * nwg.x * 64u, 0u, 0u);
     let idx = global_id.x;
     let total = conv_p.dim * conv_p.seq_len;
     if (idx >= total) { return; }
@@ -486,7 +510,8 @@ fn cross_entropy_loss(@builtin(global_invocation_id) global_id: vec3<u32>) {
 @group(0) @binding(2) var<uniform> ce_bw_params: vec4<u32>; // [target_idx, vocab_size, 0, 0]
 
 @compute @workgroup_size(64)
-fn cross_entropy_backward(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn cross_entropy_backward(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let global_id = vec3<u32>(gid.x + gid.y * nwg.x * 64u, 0u, 0u);
     let idx = global_id.x;
     let target_idx = ce_bw_params.x;
     let vocab_size = ce_bw_params.y;
@@ -520,7 +545,8 @@ fn cross_entropy_backward(@builtin(global_invocation_id) global_id: vec3<u32>) {
 @group(0) @binding(1) var<storage, read_write> gnorm_out: array<f32>;
 
 @compute @workgroup_size(64)
-fn gradient_norm_squared(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn gradient_norm_squared(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let global_id = vec3<u32>(gid.x + gid.y * nwg.x * 64u, 0u, 0u);
     let idx = global_id.x;
     if (idx >= arrayLength(&gnorm_in)) { return; }
     let val = gnorm_in[idx];
@@ -532,7 +558,8 @@ fn gradient_norm_squared(@builtin(global_invocation_id) global_id: vec3<u32>) {
 @group(0) @binding(1) var<uniform> gclip_scale: f32; // min(1.0, max_norm / actual_norm)
 
 @compute @workgroup_size(64)
-fn clip_grad_by_norm(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn clip_grad_by_norm(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let global_id = vec3<u32>(gid.x + gid.y * nwg.x * 64u, 0u, 0u);
     let idx = global_id.x;
     if (idx >= arrayLength(&gclip_grad)) { return; }
     gclip_grad[idx] = gclip_grad[idx] * gclip_scale;
@@ -546,7 +573,8 @@ fn clip_grad_by_norm(@builtin(global_invocation_id) global_id: vec3<u32>) {
 @group(0) @binding(2) var<storage, read_write> fused_silu_gate_out: array<f32>;
 
 @compute @workgroup_size(64)
-fn silu_gate_fused(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn silu_gate_fused(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let global_id = vec3<u32>(gid.x + gid.y * nwg.x * 64u, 0u, 0u);
     let i = global_id.x;
     if (i >= arrayLength(&fused_silu_gate_out)) { return; }
     let up = fused_up[i];
@@ -561,7 +589,8 @@ fn silu_gate_fused(@builtin(global_invocation_id) global_id: vec3<u32>) {
 @group(0) @binding(5) var<storage, read_write> fused_grad_gate: array<f32>;
 
 @compute @workgroup_size(64)
-fn silu_gate_backward(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn silu_gate_backward(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let global_id = vec3<u32>(gid.x + gid.y * nwg.x * 64u, 0u, 0u);
     let i = global_id.x;
     if (i >= arrayLength(&fused_grad_out)) { return; }
     
@@ -617,7 +646,8 @@ fn rms_norm_residual(@builtin(global_invocation_id) global_id: vec3<u32>) {
 @group(0) @binding(1) var<storage, read> accum_new_grad: array<f32>;
 
 @compute @workgroup_size(64)
-fn gradient_accumulate(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn gradient_accumulate(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let global_id = vec3<u32>(gid.x + gid.y * nwg.x * 64u, 0u, 0u);
     let i = global_id.x;
     if (i >= arrayLength(&accum_grad)) { return; }
     accum_grad[i] = accum_grad[i] + accum_new_grad[i];
@@ -628,7 +658,8 @@ fn gradient_accumulate(@builtin(global_invocation_id) global_id: vec3<u32>) {
 @group(0) @binding(1) var<uniform> scale_factor: f32;
 
 @compute @workgroup_size(64)
-fn gradient_scale(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn gradient_scale(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let global_id = vec3<u32>(gid.x + gid.y * nwg.x * 64u, 0u, 0u);
     let i = global_id.x;
     if (i >= arrayLength(&scale_grad)) { return; }
     scale_grad[i] = scale_grad[i] * scale_factor;
@@ -661,7 +692,8 @@ fn f32_to_f16_bits(val: f32) -> u32 {
 }
 
 @compute @workgroup_size(64)
-fn fp32_to_fp16(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn fp32_to_fp16(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let global_id = vec3<u32>(gid.x + gid.y * nwg.x * 64u, 0u, 0u);
     let i = global_id.x;
     if (i >= arrayLength(&cast_fp16_out)) { return; }
     
@@ -695,7 +727,8 @@ fn f16_bits_to_f32(bits: u32) -> f32 {
 }
 
 @compute @workgroup_size(64)
-fn fp16_to_fp32(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn fp16_to_fp32(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let global_id = vec3<u32>(gid.x + gid.y * nwg.x * 64u, 0u, 0u);
     let i = global_id.x;
     if (i >= arrayLength(&cast_fp32_out)) { return; }
     

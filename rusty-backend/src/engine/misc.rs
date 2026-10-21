@@ -35,7 +35,7 @@ impl ComputeEngine {
                 (3, bias.buffer()),
                 (4, &params),
             ],
-            (groups64(dim * seq_len), 1, 1),
+            groups64(dim * seq_len),
         );
     }
 }
