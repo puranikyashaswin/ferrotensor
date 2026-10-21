@@ -1,1113 +1,843 @@
 //! Tensor Operations
 //!
-//! Math operations on tensors with automatic differentiation.
+//! Differentiable math on tensors. Binary ops broadcast NumPy-style; every
+//! op records a backward closure when an input requires grad (see
+//! `autograd.rs`). Gradients of every op here are checked against finite
+//! differences in `tensor/tests.rs`.
 
-use std::sync::Arc;
-use wgpu::util::DeviceExt;
-use wgpu::BufferUsages;
-
-use super::autograd::*;
+use super::shape::{broadcast_shapes, contiguous_strides, normalize_dim};
 use super::Tensor;
-use crate::backend::ComputeEngine;
+use crate::backend::{binary_op, reduce_op, unary_op};
+
+/// Sum `grad` down to `shape`, undoing a broadcast.
+pub(crate) fn sum_to_shape(grad: &Tensor, shape: &[usize]) -> Tensor {
+    if grad.shape == shape {
+        return grad.clone();
+    }
+    let mut g = grad.clone();
+    while g.ndim() > shape.len() {
+        g = g.reduce_raw(0, reduce_op::SUM);
+    }
+    for (d, &size) in shape.iter().enumerate() {
+        if size == 1 && g.shape[d] != 1 {
+            let mut keep = g.shape.clone();
+            keep[d] = 1;
+            g = g.reduce_raw(d, reduce_op::SUM).view_raw(&keep);
+        }
+    }
+    g.view_raw(shape)
+}
 
 impl Tensor {
     // ========================================================================
-    // BINARY OPERATIONS
+    // BINARY OPERATIONS (broadcasting)
     // ========================================================================
 
-    /// Element-wise addition: self + other
+    /// Element-wise `self + other`.
     pub fn add(&self, other: &Tensor) -> Tensor {
-        assert_eq!(self.shape, other.shape, "Shapes must match for add");
-
-        let device = &self.device;
-        let engine = device.engine();
-        let size = self.numel();
-
-        let out_buffer = device.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Add Output"),
-            size: (size * 4) as u64,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let pipeline = engine.get_pipeline("add").unwrap();
-        let bind_group = engine.create_binary_bind_group(
-            &device.device,
-            pipeline,
-            &self.buffer,
-            &other.buffer,
-            &out_buffer,
-        );
-        engine.dispatch(
-            &device.device,
-            &device.queue,
-            "add",
-            &bind_group,
-            (ComputeEngine::workgroups_1d(size as u32), 1, 1),
-        );
-
-        let requires_grad = self.requires_grad || other.requires_grad;
-        let creator: Option<Arc<dyn AutogradNode>> = if requires_grad {
-            Some(Arc::new(AddNode {
-                a: self.clone(),
-                b: other.clone(),
-            }))
-        } else {
-            None
-        };
-
-        Tensor {
-            buffer: Arc::new(out_buffer),
-            shape: self.shape.clone(),
-            device: device.clone(),
-            grad: Arc::new(GradCell::new()),
-            requires_grad,
-            creator,
-        }
+        let out = self.binary_raw(other, binary_op::ADD);
+        let (sa, sb) = (self.shape.clone(), other.shape.clone());
+        out.with_node("add", vec![self.clone(), other.clone()], move |g| {
+            vec![Some(sum_to_shape(g, &sa)), Some(sum_to_shape(g, &sb))]
+        })
     }
 
-    /// Element-wise subtraction: self - other
+    /// Element-wise `self - other`.
     pub fn sub(&self, other: &Tensor) -> Tensor {
-        assert_eq!(self.shape, other.shape, "Shapes must match for sub");
-
-        let device = &self.device;
-        let engine = device.engine();
-        let size = self.numel();
-
-        let out_buffer = device.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Sub Output"),
-            size: (size * 4) as u64,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let pipeline = engine.get_pipeline("sub").unwrap();
-        let bind_group = engine.create_binary_bind_group(
-            &device.device,
-            pipeline,
-            &self.buffer,
-            &other.buffer,
-            &out_buffer,
-        );
-        engine.dispatch(
-            &device.device,
-            &device.queue,
-            "sub",
-            &bind_group,
-            (ComputeEngine::workgroups_1d(size as u32), 1, 1),
-        );
-
-        let requires_grad = self.requires_grad || other.requires_grad;
-        let creator: Option<Arc<dyn AutogradNode>> = if requires_grad {
-            Some(Arc::new(SubNode {
-                a: self.clone(),
-                b: other.clone(),
-            }))
-        } else {
-            None
-        };
-
-        Tensor {
-            buffer: Arc::new(out_buffer),
-            shape: self.shape.clone(),
-            device: device.clone(),
-            grad: Arc::new(GradCell::new()),
-            requires_grad,
-            creator,
-        }
+        let out = self.binary_raw(other, binary_op::SUB);
+        let (sa, sb) = (self.shape.clone(), other.shape.clone());
+        out.with_node("sub", vec![self.clone(), other.clone()], move |g| {
+            vec![
+                Some(sum_to_shape(g, &sa)),
+                Some(sum_to_shape(&g.neg(), &sb)),
+            ]
+        })
     }
 
-    /// Element-wise multiplication: self * other
+    /// Element-wise `self * other`.
     pub fn mul(&self, other: &Tensor) -> Tensor {
-        assert_eq!(self.shape, other.shape, "Shapes must match for mul");
-
-        let device = &self.device;
-        let engine = device.engine();
-        let size = self.numel();
-
-        let out_buffer = device.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Mul Output"),
-            size: (size * 4) as u64,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let pipeline = engine.get_pipeline("mul").unwrap();
-        let bind_group = engine.create_binary_bind_group(
-            &device.device,
-            pipeline,
-            &self.buffer,
-            &other.buffer,
-            &out_buffer,
-        );
-        engine.dispatch(
-            &device.device,
-            &device.queue,
-            "mul",
-            &bind_group,
-            (ComputeEngine::workgroups_1d(size as u32), 1, 1),
-        );
-
-        let requires_grad = self.requires_grad || other.requires_grad;
-        let creator: Option<Arc<dyn AutogradNode>> = if requires_grad {
-            Some(Arc::new(MulNode {
-                a: self.clone(),
-                b: other.clone(),
-            }))
-        } else {
-            None
-        };
-
-        Tensor {
-            buffer: Arc::new(out_buffer),
-            shape: self.shape.clone(),
-            device: device.clone(),
-            grad: Arc::new(GradCell::new()),
-            requires_grad,
-            creator,
-        }
+        let out = self.binary_raw(other, binary_op::MUL);
+        let (a, b) = (self.detach(), other.detach());
+        let need = (self.requires_grad, other.requires_grad);
+        out.with_node("mul", vec![self.clone(), other.clone()], move |g| {
+            vec![
+                need.0.then(|| sum_to_shape(&g.mul(&b), &a.shape)),
+                need.1.then(|| sum_to_shape(&g.mul(&a), &b.shape)),
+            ]
+        })
     }
 
-    /// Matrix multiplication: self @ other
-    /// self: [M, K], other: [K, N] -> output: [M, N]
-    pub fn matmul(&self, other: &Tensor) -> Tensor {
-        assert_eq!(self.ndim(), 2, "matmul requires 2D tensors");
-        assert_eq!(other.ndim(), 2, "matmul requires 2D tensors");
-        assert_eq!(
-            self.shape[1], other.shape[0],
-            "Inner dimensions must match for matmul"
-        );
-
-        let m = self.shape[0];
-        let k = self.shape[1];
-        let n = other.shape[1];
-
-        let device = &self.device;
-        let engine = device.engine();
-
-        let out_buffer = device.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("MatMul Output"),
-            size: (m * n * 4) as u64,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        // Create params buffer [M, K, N, padding]
-        let params = device
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("MatMul Params"),
-                contents: bytemuck::cast_slice(&[m as u32, k as u32, n as u32, 0u32]),
-                usage: BufferUsages::UNIFORM,
-            });
-
-        let pipeline = engine.get_pipeline("matmul").unwrap();
-        let bind_group = engine.create_matmul_bind_group(
-            &device.device,
-            pipeline,
-            &self.buffer,
-            &other.buffer,
-            &out_buffer,
-            &params,
-        );
-        let (wx, wy) = ComputeEngine::workgroups_2d(m as u32, n as u32);
-        engine.dispatch(
-            &device.device,
-            &device.queue,
-            "matmul",
-            &bind_group,
-            (wx, wy, 1),
-        );
-
-        let requires_grad = self.requires_grad || other.requires_grad;
-        let creator: Option<Arc<dyn AutogradNode>> = if requires_grad {
-            Some(Arc::new(MatMulNode {
-                a: self.clone(),
-                b: other.clone(),
-            }))
-        } else {
-            None
-        };
-
-        Tensor {
-            buffer: Arc::new(out_buffer),
-            shape: vec![m, n],
-            device: device.clone(),
-            grad: Arc::new(GradCell::new()),
-            requires_grad,
-            creator,
-        }
+    /// Element-wise `self / other`.
+    pub fn div(&self, other: &Tensor) -> Tensor {
+        let out = self.binary_raw(other, binary_op::DIV);
+        let (a, b) = (self.detach(), other.detach());
+        let need = (self.requires_grad, other.requires_grad);
+        out.with_node("div", vec![self.clone(), other.clone()], move |g| {
+            vec![
+                need.0.then(|| sum_to_shape(&g.div(&b), &a.shape)),
+                need.1.then(|| {
+                    let gb = g.mul(&a).div(&b.square()).neg();
+                    sum_to_shape(&gb, &b.shape)
+                }),
+            ]
+        })
     }
 
-    // ========================================================================
-    // ACTIVATION FUNCTIONS
-    // ========================================================================
-
-    /// ReLU activation: max(0, x)
-    pub fn relu(&self) -> Tensor {
-        let device = &self.device;
-        let engine = device.engine();
-        let size = self.numel();
-
-        let out_buffer = device.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("ReLU Output"),
-            size: (size * 4) as u64,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let pipeline = engine.get_pipeline("relu").unwrap();
-        let bind_group =
-            engine.create_unary_bind_group(&device.device, pipeline, &self.buffer, &out_buffer);
-        engine.dispatch(
-            &device.device,
-            &device.queue,
-            "relu",
-            &bind_group,
-            (ComputeEngine::workgroups_1d(size as u32), 1, 1),
-        );
-
-        let creator: Option<Arc<dyn AutogradNode>> = if self.requires_grad {
-            Some(Arc::new(ReLUNode {
-                input: self.clone(),
-            }))
-        } else {
-            None
-        };
-
-        Tensor {
-            buffer: Arc::new(out_buffer),
-            shape: self.shape.clone(),
-            device: device.clone(),
-            grad: Arc::new(GradCell::new()),
-            requires_grad: self.requires_grad,
-            creator,
-        }
+    /// Element-wise maximum. Where equal, the gradient goes to `self`.
+    pub fn maximum(&self, other: &Tensor) -> Tensor {
+        let out = self.binary_raw(other, binary_op::MAX);
+        let (a, b) = (self.detach(), other.detach());
+        out.with_node("maximum", vec![self.clone(), other.clone()], move |g| {
+            let mask = a.binary_raw(&b, binary_op::GE);
+            vec![
+                Some(sum_to_shape(&g.mul(&mask), &a.shape)),
+                Some(sum_to_shape(&g.mul(&mask.rsub_scalar(1.0)), &b.shape)),
+            ]
+        })
     }
 
-    /// SiLU activation: x * sigmoid(x)
-    pub fn silu(&self) -> Tensor {
-        let device = &self.device;
-        let engine = device.engine();
-        let size = self.numel();
-
-        let out_buffer = device.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("SiLU Output"),
-            size: (size * 4) as u64,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let pipeline = engine.get_pipeline("silu").unwrap();
-        let bind_group =
-            engine.create_unary_bind_group(&device.device, pipeline, &self.buffer, &out_buffer);
-        engine.dispatch(
-            &device.device,
-            &device.queue,
-            "silu",
-            &bind_group,
-            (ComputeEngine::workgroups_1d(size as u32), 1, 1),
-        );
-
-        let creator: Option<Arc<dyn AutogradNode>> = if self.requires_grad {
-            Some(Arc::new(SiLUNode {
-                input: self.clone(),
-            }))
-        } else {
-            None
-        };
-
-        Tensor {
-            buffer: Arc::new(out_buffer),
-            shape: self.shape.clone(),
-            device: device.clone(),
-            grad: Arc::new(GradCell::new()),
-            requires_grad: self.requires_grad,
-            creator,
-        }
+    /// Element-wise minimum. Where equal, the gradient goes to `self`.
+    pub fn minimum(&self, other: &Tensor) -> Tensor {
+        let out = self.binary_raw(other, binary_op::MIN);
+        let (a, b) = (self.detach(), other.detach());
+        out.with_node("minimum", vec![self.clone(), other.clone()], move |g| {
+            let mask = a.binary_raw(&b, binary_op::LE);
+            vec![
+                Some(sum_to_shape(&g.mul(&mask), &a.shape)),
+                Some(sum_to_shape(&g.mul(&mask.rsub_scalar(1.0)), &b.shape)),
+            ]
+        })
     }
 
-    /// GELU activation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-    pub fn gelu(&self) -> Tensor {
-        let device = &self.device;
-        let engine = device.engine();
-        let size = self.numel();
-
-        let out_buffer = device.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("GELU Output"),
-            size: (size * 4) as u64,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let pipeline = engine.get_pipeline("gelu").unwrap();
-        let bind_group =
-            engine.create_unary_bind_group(&device.device, pipeline, &self.buffer, &out_buffer);
-        engine.dispatch(
-            &device.device,
-            &device.queue,
-            "gelu",
-            &bind_group,
-            (ComputeEngine::workgroups_1d(size as u32), 1, 1),
-        );
-
-        let creator: Option<Arc<dyn AutogradNode>> = if self.requires_grad {
-            Some(Arc::new(GELUNode {
-                input: self.clone(),
-            }))
-        } else {
-            None
-        };
-
-        Tensor {
-            buffer: Arc::new(out_buffer),
-            shape: self.shape.clone(),
-            device: device.clone(),
-            grad: Arc::new(GradCell::new()),
-            requires_grad: self.requires_grad,
-            creator,
-        }
+    /// `1.0` where `self > other`, else `0.0` (not differentiable).
+    pub fn gt(&self, other: &Tensor) -> Tensor {
+        self.binary_raw(other, binary_op::GT)
     }
 
-    /// Sigmoid activation: 1 / (1 + exp(-x))
-    pub fn sigmoid(&self) -> Tensor {
-        let device = &self.device;
-        let engine = device.engine();
-        let size = self.numel();
-
-        let out_buffer = device.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Sigmoid Output"),
-            size: (size * 4) as u64,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let pipeline = engine.get_pipeline("sigmoid").unwrap();
-        let bind_group =
-            engine.create_unary_bind_group(&device.device, pipeline, &self.buffer, &out_buffer);
-        engine.dispatch(
-            &device.device,
-            &device.queue,
-            "sigmoid",
-            &bind_group,
-            (ComputeEngine::workgroups_1d(size as u32), 1, 1),
-        );
-
-        Tensor {
-            buffer: Arc::new(out_buffer),
-            shape: self.shape.clone(),
-            device: device.clone(),
-            grad: Arc::new(GradCell::new()),
-            requires_grad: self.requires_grad,
-            creator: if self.requires_grad {
-                Some(Arc::new(SigmoidNode {
-                    input: self.clone(),
-                }))
-            } else {
-                None
-            },
-        }
+    /// `1.0` where `self < other`, else `0.0` (not differentiable).
+    pub fn lt(&self, other: &Tensor) -> Tensor {
+        self.binary_raw(other, binary_op::LT)
     }
 
-    /// Tanh activation
-    pub fn tanh(&self) -> Tensor {
-        let device = &self.device;
-        let engine = device.engine();
-        let size = self.numel();
-
-        let out_buffer = device.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Tanh Output"),
-            size: (size * 4) as u64,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let pipeline = engine.get_pipeline("tanh_act").unwrap();
-        let bind_group =
-            engine.create_unary_bind_group(&device.device, pipeline, &self.buffer, &out_buffer);
-        engine.dispatch(
-            &device.device,
-            &device.queue,
-            "tanh_act",
-            &bind_group,
-            (ComputeEngine::workgroups_1d(size as u32), 1, 1),
-        );
-
-        Tensor {
-            buffer: Arc::new(out_buffer),
-            shape: self.shape.clone(),
-            device: device.clone(),
-            grad: Arc::new(GradCell::new()),
-            requires_grad: self.requires_grad,
-            creator: if self.requires_grad {
-                Some(Arc::new(TanhNode {
-                    input: self.clone(),
-                }))
-            } else {
-                None
-            },
-        }
+    /// `1.0` where `self >= other`, else `0.0` (not differentiable).
+    pub fn ge(&self, other: &Tensor) -> Tensor {
+        self.binary_raw(other, binary_op::GE)
     }
 
-    /// Softmax: exp(x) / sum(exp(x))
-    pub fn softmax(&self, _dim: i32) -> Tensor {
-        let device = &self.device;
-        let engine = device.engine();
-        let size = self.numel();
+    /// `1.0` where `self <= other`, else `0.0` (not differentiable).
+    pub fn le(&self, other: &Tensor) -> Tensor {
+        self.binary_raw(other, binary_op::LE)
+    }
 
-        let out_buffer = device.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Softmax Output"),
-            size: (size * 4) as u64,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+    /// `1.0` where `self == other`, else `0.0` (not differentiable).
+    pub fn eq_elem(&self, other: &Tensor) -> Tensor {
+        self.binary_raw(other, binary_op::EQ)
+    }
 
-        let size_buffer = device
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Softmax Size"),
-                contents: bytemuck::cast_slice(&[size as u32]),
-                usage: BufferUsages::UNIFORM,
-            });
+    /// Alias of [`Tensor::lt`].
+    pub fn less_than(&self, other: &Tensor) -> Tensor {
+        self.lt(other)
+    }
 
-        let pipeline = engine.get_pipeline("softmax").unwrap();
-        let layout = pipeline.get_bind_group_layout(0);
-        let bind_group = device.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: out_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: size_buffer.as_entire_binding(),
-                },
-            ],
-        });
-        engine.dispatch(
-            &device.device,
-            &device.queue,
-            "softmax",
-            &bind_group,
-            (1, 1, 1),
-        );
+    /// Pick `a` where `cond` is non-zero, else `b` (broadcasting).
+    ///
+    /// `cond` is a 0/1 mask, e.g. from [`Tensor::gt`]. Differentiable in `a`
+    /// and `b`.
+    pub fn where_cond(cond: &Tensor, a: &Tensor, b: &Tensor) -> Tensor {
+        let zero = Tensor::zeros(&[], &cond.device);
+        let keep = cond
+            .unary_raw(unary_op::ABS, 0.0, 0.0)
+            .binary_raw(&zero, binary_op::GT);
+        a.mul(&keep).add(&b.mul(&keep.rsub_scalar(1.0)))
+    }
 
-        Tensor {
-            buffer: Arc::new(out_buffer),
-            shape: self.shape.clone(),
-            device: device.clone(),
-            grad: Arc::new(GradCell::new()),
-            requires_grad: self.requires_grad,
-            creator: if self.requires_grad {
-                Some(Arc::new(SoftmaxNode {
-                    input: self.clone(),
-                }))
-            } else {
-                None
-            },
-        }
+    /// Replace elements where `mask` is non-zero with `value` (broadcasting).
+    ///
+    /// # Panics
+    /// Panics when `value` is not finite; use a large finite value such as
+    /// `-1e9` for attention masks.
+    pub fn masked_fill(&self, mask: &Tensor, value: f32) -> Tensor {
+        assert!(value.is_finite(), "masked_fill needs a finite value");
+        let fill = Tensor::full(&[], value, &self.device);
+        Tensor::where_cond(mask, &fill, self)
     }
 
     // ========================================================================
     // SCALAR OPERATIONS
     // ========================================================================
 
-    /// Add a scalar: self + scalar
+    fn unary_with_grad(
+        &self,
+        name: &'static str,
+        op: u32,
+        a: f32,
+        b: f32,
+        backward: impl Fn(&Tensor, &Tensor, &Tensor) -> Tensor + Send + Sync + 'static,
+    ) -> Tensor {
+        let out = self.unary_raw(op, a, b);
+        let x = self.detach();
+        let y = out.detach();
+        out.with_node(name, vec![self.clone()], move |g| {
+            vec![Some(backward(g, &x, &y))]
+        })
+    }
+
+    /// `self + scalar`.
     pub fn add_scalar(&self, scalar: f32) -> Tensor {
-        let device = &self.device;
-        let engine = device.engine();
-        let size = self.numel();
-
-        let out_buffer = device.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Add Scalar Output"),
-            size: (size * 4) as u64,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let scalar_buffer = device
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Scalar"),
-                contents: bytemuck::cast_slice(&[scalar]),
-                usage: BufferUsages::UNIFORM,
-            });
-
-        let pipeline = engine.get_pipeline("add_scalar").unwrap();
-        let layout = pipeline.get_bind_group_layout(0);
-        let bind_group = device.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: out_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: scalar_buffer.as_entire_binding(),
-                },
-            ],
-        });
-        engine.dispatch(
-            &device.device,
-            &device.queue,
+        self.unary_with_grad(
             "add_scalar",
-            &bind_group,
-            (ComputeEngine::workgroups_1d(size as u32), 1, 1),
-        );
-
-        Tensor {
-            buffer: Arc::new(out_buffer),
-            shape: self.shape.clone(),
-            device: device.clone(),
-            grad: Arc::new(GradCell::new()),
-            requires_grad: self.requires_grad,
-            creator: None,
-        }
+            unary_op::ADD_SCALAR,
+            scalar,
+            0.0,
+            |g, _, _| g.clone(),
+        )
     }
 
-    /// Multiply by a scalar: self * scalar
+    /// `self - scalar`.
+    pub fn sub_scalar(&self, scalar: f32) -> Tensor {
+        self.add_scalar(-scalar)
+    }
+
+    /// `scalar - self`.
+    pub fn rsub_scalar(&self, scalar: f32) -> Tensor {
+        self.unary_with_grad(
+            "rsub_scalar",
+            unary_op::RSUB_SCALAR,
+            scalar,
+            0.0,
+            |g, _, _| g.neg(),
+        )
+    }
+
+    /// `self * scalar`.
     pub fn mul_scalar(&self, scalar: f32) -> Tensor {
-        let device = &self.device;
-        let engine = device.engine();
-        let size = self.numel();
-
-        let out_buffer = device.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Mul Scalar Output"),
-            size: (size * 4) as u64,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let scalar_buffer = device
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Scalar"),
-                contents: bytemuck::cast_slice(&[scalar]),
-                usage: BufferUsages::UNIFORM,
-            });
-
-        let pipeline = engine.get_pipeline("mul_scalar").unwrap();
-        let layout = pipeline.get_bind_group_layout(0);
-        let bind_group = device.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: out_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: scalar_buffer.as_entire_binding(),
-                },
-            ],
-        });
-        engine.dispatch(
-            &device.device,
-            &device.queue,
+        self.unary_with_grad(
             "mul_scalar",
-            &bind_group,
-            (ComputeEngine::workgroups_1d(size as u32), 1, 1),
-        );
-
-        Tensor {
-            buffer: Arc::new(out_buffer),
-            shape: self.shape.clone(),
-            device: device.clone(),
-            grad: Arc::new(GradCell::new()),
-            requires_grad: self.requires_grad,
-            creator: None,
-        }
+            unary_op::MUL_SCALAR,
+            scalar,
+            0.0,
+            move |g, _, _| g.mul_scalar(scalar),
+        )
     }
 
-    /// Negate: -self
+    /// `self / scalar`.
+    pub fn div_scalar(&self, scalar: f32) -> Tensor {
+        self.mul_scalar(1.0 / scalar)
+    }
+
+    /// `self ^ exponent` element-wise.
+    pub fn pow_scalar(&self, exponent: f32) -> Tensor {
+        self.unary_with_grad(
+            "pow_scalar",
+            unary_op::POW_SCALAR,
+            exponent,
+            0.0,
+            move |g, x, _| g.mul(&x.pow_scalar(exponent - 1.0).mul_scalar(exponent)),
+        )
+    }
+
+    /// `-self`.
     pub fn neg(&self) -> Tensor {
-        self.mul_scalar(-1.0)
+        self.unary_with_grad("neg", unary_op::NEG, 0.0, 0.0, |g, _, _| g.neg())
     }
 
     // ========================================================================
-    // ELEMENT-WISE OPERATIONS
+    // ELEMENT-WISE FUNCTIONS
     // ========================================================================
 
-    /// Absolute value: |x|
-    pub fn abs(&self) -> Tensor {
-        let device = &self.device;
-        let engine = device.engine();
-        let size = self.numel();
-
-        let out_buffer = device.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Abs Output"),
-            size: (size * 4) as u64,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let pipeline = engine.get_pipeline("abs").unwrap();
-        let bind_group =
-            engine.create_unary_bind_group(&device.device, pipeline, &self.buffer, &out_buffer);
-        engine.dispatch(
-            &device.device,
-            &device.queue,
-            "abs",
-            &bind_group,
-            (ComputeEngine::workgroups_1d(size as u32), 1, 1),
-        );
-
-        Tensor {
-            buffer: Arc::new(out_buffer),
-            shape: self.shape.clone(),
-            device: device.clone(),
-            grad: Arc::new(GradCell::new()),
-            requires_grad: self.requires_grad,
-            creator: None,
-        }
+    /// ReLU: `max(0, x)`.
+    pub fn relu(&self) -> Tensor {
+        self.unary_with_grad("relu", unary_op::RELU, 0.0, 0.0, |g, x, _| {
+            g.mul(&x.unary_raw(unary_op::STEP, 0.0, 0.0))
+        })
     }
 
-    /// Natural exponential: e^x
+    /// Leaky ReLU: `x` for `x > 0`, else `slope * x`.
+    pub fn leaky_relu(&self, slope: f32) -> Tensor {
+        self.unary_with_grad(
+            "leaky_relu",
+            unary_op::LEAKY_RELU,
+            slope,
+            0.0,
+            move |g, x, _| g.mul(&x.unary_raw(unary_op::LEAKY_RELU_GRAD, slope, 0.0)),
+        )
+    }
+
+    /// SiLU (swish): `x * sigmoid(x)`.
+    pub fn silu(&self) -> Tensor {
+        self.unary_with_grad("silu", unary_op::SILU, 0.0, 0.0, |g, x, _| {
+            g.mul(&x.unary_raw(unary_op::SILU_GRAD, 0.0, 0.0))
+        })
+    }
+
+    /// GELU, tanh approximation (as in GPT-2 and most LLMs).
+    pub fn gelu(&self) -> Tensor {
+        self.unary_with_grad("gelu", unary_op::GELU, 0.0, 0.0, |g, x, _| {
+            g.mul(&x.unary_raw(unary_op::GELU_GRAD, 0.0, 0.0))
+        })
+    }
+
+    /// Logistic sigmoid.
+    pub fn sigmoid(&self) -> Tensor {
+        self.unary_with_grad("sigmoid", unary_op::SIGMOID, 0.0, 0.0, |g, _, y| {
+            g.mul(&y.mul(&y.rsub_scalar(1.0)))
+        })
+    }
+
+    /// Hyperbolic tangent.
+    pub fn tanh(&self) -> Tensor {
+        self.unary_with_grad("tanh", unary_op::TANH, 0.0, 0.0, |g, _, y| {
+            g.mul(&y.square().rsub_scalar(1.0))
+        })
+    }
+
+    /// `e^x`.
     pub fn exp(&self) -> Tensor {
-        let device = &self.device;
-        let engine = device.engine();
-        let size = self.numel();
-
-        let out_buffer = device.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Exp Output"),
-            size: (size * 4) as u64,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let pipeline = engine.get_pipeline("exp").unwrap();
-        let bind_group =
-            engine.create_unary_bind_group(&device.device, pipeline, &self.buffer, &out_buffer);
-        engine.dispatch(
-            &device.device,
-            &device.queue,
-            "exp",
-            &bind_group,
-            (ComputeEngine::workgroups_1d(size as u32), 1, 1),
-        );
-
-        Tensor {
-            buffer: Arc::new(out_buffer),
-            shape: self.shape.clone(),
-            device: device.clone(),
-            grad: Arc::new(GradCell::new()),
-            requires_grad: self.requires_grad,
-            creator: None,
-        }
+        self.unary_with_grad("exp", unary_op::EXP, 0.0, 0.0, |g, _, y| g.mul(y))
     }
 
-    /// Natural logarithm: ln(x)
+    /// Natural logarithm.
     pub fn log(&self) -> Tensor {
-        let device = &self.device;
-        let engine = device.engine();
-        let size = self.numel();
-
-        let out_buffer = device.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Log Output"),
-            size: (size * 4) as u64,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let pipeline = engine.get_pipeline("log").unwrap();
-        let bind_group =
-            engine.create_unary_bind_group(&device.device, pipeline, &self.buffer, &out_buffer);
-        engine.dispatch(
-            &device.device,
-            &device.queue,
-            "log",
-            &bind_group,
-            (ComputeEngine::workgroups_1d(size as u32), 1, 1),
-        );
-
-        Tensor {
-            buffer: Arc::new(out_buffer),
-            shape: self.shape.clone(),
-            device: device.clone(),
-            grad: Arc::new(GradCell::new()),
-            requires_grad: self.requires_grad,
-            creator: None,
-        }
+        self.unary_with_grad("log", unary_op::LOG, 0.0, 0.0, |g, x, _| g.div(x))
     }
 
-    /// Clamp tensor values between min and max.
+    /// Absolute value (subgradient 0 at 0).
+    pub fn abs(&self) -> Tensor {
+        self.unary_with_grad("abs", unary_op::ABS, 0.0, 0.0, |g, x, _| {
+            g.mul(&x.unary_raw(unary_op::SIGN, 0.0, 0.0))
+        })
+    }
+
+    /// Square root.
+    pub fn sqrt(&self) -> Tensor {
+        self.unary_with_grad("sqrt", unary_op::SQRT, 0.0, 0.0, |g, _, y| {
+            g.div(y).mul_scalar(0.5)
+        })
+    }
+
+    /// `1 / sqrt(x)`.
+    pub fn rsqrt(&self) -> Tensor {
+        self.sqrt().recip()
+    }
+
+    /// `1 / x`.
+    pub fn recip(&self) -> Tensor {
+        self.unary_with_grad("recip", unary_op::RECIP, 0.0, 0.0, |g, _, y| {
+            g.mul(&y.square()).neg()
+        })
+    }
+
+    /// `x * x`.
+    pub fn square(&self) -> Tensor {
+        self.unary_with_grad("square", unary_op::SQUARE, 0.0, 0.0, |g, x, _| {
+            g.mul(x).mul_scalar(2.0)
+        })
+    }
+
+    /// Sine.
+    pub fn sin(&self) -> Tensor {
+        self.unary_with_grad("sin", unary_op::SIN, 0.0, 0.0, |g, x, _| g.mul(&x.cos()))
+    }
+
+    /// Cosine.
+    pub fn cos(&self) -> Tensor {
+        self.unary_with_grad("cos", unary_op::COS, 0.0, 0.0, |g, x, _| {
+            g.mul(&x.sin()).neg()
+        })
+    }
+
+    /// Clamp to `[min, max]`; the gradient passes only inside the range.
     pub fn clamp(&self, min: f32, max: f32) -> Tensor {
-        let device = &self.device;
-        let engine = device.engine();
-        let size = self.numel();
-
-        let out_buffer = device.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Clamp Output"),
-            size: (size * 4) as u64,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let params = device
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Clamp Params"),
-                contents: bytemuck::cast_slice(&[min, max]),
-                usage: BufferUsages::UNIFORM,
-            });
-
-        let pipeline = engine.get_pipeline("clamp").unwrap();
-        let layout = pipeline.get_bind_group_layout(0);
-        let bind_group = device.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: out_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: params.as_entire_binding(),
-                },
-            ],
-        });
-        engine.dispatch(
-            &device.device,
-            &device.queue,
-            "clamp",
-            &bind_group,
-            (ComputeEngine::workgroups_1d(size as u32), 1, 1),
-        );
-
-        Tensor {
-            buffer: Arc::new(out_buffer),
-            shape: self.shape.clone(),
-            device: device.clone(),
-            grad: Arc::new(GradCell::new()),
-            requires_grad: self.requires_grad,
-            creator: None,
-        }
+        self.unary_with_grad("clamp", unary_op::CLAMP, min, max, move |g, x, _| {
+            g.mul(&x.unary_raw(unary_op::IN_RANGE, min, max))
+        })
     }
 
-    /// Element-wise maximum: max(self, other)
-    pub fn maximum(&self, other: &Tensor) -> Tensor {
-        assert_eq!(self.shape, other.shape, "Shapes must match for maximum");
-
-        let device = &self.device;
-        let engine = device.engine();
-        let size = self.numel();
-
-        let out_buffer = device.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Maximum Output"),
-            size: (size * 4) as u64,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let pipeline = engine.get_pipeline("maximum").unwrap();
-        let bind_group = engine.create_binary_bind_group(
-            &device.device,
-            pipeline,
-            &self.buffer,
-            &other.buffer,
-            &out_buffer,
-        );
-        engine.dispatch(
-            &device.device,
-            &device.queue,
-            "maximum",
-            &bind_group,
-            (ComputeEngine::workgroups_1d(size as u32), 1, 1),
-        );
-
-        Tensor {
-            buffer: Arc::new(out_buffer),
-            shape: self.shape.clone(),
-            device: device.clone(),
-            grad: Arc::new(GradCell::new()),
-            requires_grad: self.requires_grad || other.requires_grad,
-            creator: None,
-        }
-    }
-
-    /// Element-wise minimum: min(self, other)
-    pub fn minimum(&self, other: &Tensor) -> Tensor {
-        assert_eq!(self.shape, other.shape, "Shapes must match for minimum");
-
-        let device = &self.device;
-        let engine = device.engine();
-        let size = self.numel();
-
-        let out_buffer = device.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Minimum Output"),
-            size: (size * 4) as u64,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let pipeline = engine.get_pipeline("minimum").unwrap();
-        let bind_group = engine.create_binary_bind_group(
-            &device.device,
-            pipeline,
-            &self.buffer,
-            &other.buffer,
-            &out_buffer,
-        );
-        engine.dispatch(
-            &device.device,
-            &device.queue,
-            "minimum",
-            &bind_group,
-            (ComputeEngine::workgroups_1d(size as u32), 1, 1),
-        );
-
-        Tensor {
-            buffer: Arc::new(out_buffer),
-            shape: self.shape.clone(),
-            device: device.clone(),
-            grad: Arc::new(GradCell::new()),
-            requires_grad: self.requires_grad || other.requires_grad,
-            creator: None,
-        }
-    }
-
-    /// Element-wise less than: self < other (returns 1.0 if true, 0.0 if false)
-    pub fn less_than(&self, other: &Tensor) -> Tensor {
-        assert_eq!(self.shape, other.shape, "Shapes must match for less_than");
-
-        let device = &self.device;
-        let engine = device.engine();
-        let size = self.numel();
-
-        let out_buffer = device.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Less Than Output"),
-            size: (size * 4) as u64,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let pipeline = engine.get_pipeline("less_than").unwrap();
-        let bind_group = engine.create_binary_bind_group(
-            &device.device,
-            pipeline,
-            &self.buffer,
-            &other.buffer,
-            &out_buffer,
-        );
-        engine.dispatch(
-            &device.device,
-            &device.queue,
-            "less_than",
-            &bind_group,
-            (ComputeEngine::workgroups_1d(size as u32), 1, 1),
-        );
-
-        Tensor {
-            buffer: Arc::new(out_buffer),
-            shape: self.shape.clone(),
-            device: device.clone(),
-            grad: Arc::new(GradCell::new()),
-            requires_grad: false, // Comparison ops don't need gradients
-            creator: None,
-        }
+    /// Sign: -1, 0 or 1 (not differentiable).
+    pub fn sign(&self) -> Tensor {
+        self.unary_raw(unary_op::SIGN, 0.0, 0.0)
     }
 
     // ========================================================================
-    // REDUCTION OPERATIONS
+    // REDUCTIONS
     // ========================================================================
 
-    /// Sum all elements.
+    /// Sum of all elements, as a 0-dimensional tensor.
     pub fn sum(&self) -> Tensor {
-        // CPU fallback for now - can optimize with parallel reduction later
-        let data = self.to_vec();
-        let sum: f32 = data.iter().sum();
-        Tensor::from_data(&[sum], &[1], &self.device)
+        let out = self.view_raw(&[self.numel()]).reduce_raw(0, reduce_op::SUM);
+        let shape = self.shape.clone();
+        out.with_node("sum", vec![self.clone()], move |g| {
+            vec![Some(g.expand_raw(&shape))]
+        })
     }
 
-    /// Mean of all elements.
+    /// Mean of all elements, as a 0-dimensional tensor.
     pub fn mean(&self) -> Tensor {
-        let data = self.to_vec();
-        let mean: f32 = data.iter().sum::<f32>() / data.len() as f32;
-        Tensor::from_data(&[mean], &[1], &self.device)
+        self.sum().div_scalar(self.numel() as f32)
     }
 
-    /// Maximum value.
+    /// Sum over `dim` (negative counts from the end).
+    pub fn sum_dim(&self, dim: isize, keepdim: bool) -> Tensor {
+        let d = normalize_dim(dim, self.ndim());
+        let reduced = self.reduce_raw(d, reduce_op::SUM);
+        let mut keep_shape = self.shape.clone();
+        keep_shape[d] = 1;
+        let out = if keepdim {
+            reduced.view_raw(&keep_shape)
+        } else {
+            reduced
+        };
+        let shape = self.shape.clone();
+        out.with_node("sum_dim", vec![self.clone()], move |g| {
+            vec![Some(g.view_raw(&keep_shape).expand_raw(&shape))]
+        })
+    }
+
+    /// Mean over `dim`.
+    pub fn mean_dim(&self, dim: isize, keepdim: bool) -> Tensor {
+        let d = normalize_dim(dim, self.ndim());
+        self.sum_dim(dim, keepdim).div_scalar(self.shape[d] as f32)
+    }
+
+    /// Population variance over `dim`.
+    pub fn var_dim(&self, dim: isize, keepdim: bool) -> Tensor {
+        let centered = self.sub(&self.mean_dim(dim, true));
+        centered.square().mean_dim(dim, keepdim)
+    }
+
+    fn extreme(&self, op: u32, name: &'static str) -> Tensor {
+        assert!(self.numel() > 0, "{name} of an empty tensor");
+        let out = self.view_raw(&[self.numel()]).reduce_raw(0, op);
+        let (x, y) = (self.detach(), out.detach());
+        out.with_node(name, vec![self.clone()], move |g| {
+            // Split the gradient evenly among tied extreme elements.
+            let mask = x.binary_raw(&y, binary_op::EQ);
+            let count = mask.view_raw(&[mask.numel()]).reduce_raw(0, reduce_op::SUM);
+            vec![Some(mask.mul(&g.div(&count)))]
+        })
+    }
+
+    fn extreme_dim(&self, dim: isize, keepdim: bool, op: u32, name: &'static str) -> Tensor {
+        let d = normalize_dim(dim, self.ndim());
+        let mut keep_shape = self.shape.clone();
+        keep_shape[d] = 1;
+        let reduced = self.reduce_raw(d, op).view_raw(&keep_shape);
+        let (x, y) = (self.detach(), reduced.detach());
+        let out = if keepdim {
+            reduced
+        } else {
+            reduced.view_raw(&[&self.shape[..d], &self.shape[d + 1..]].concat())
+        };
+        out.with_node(name, vec![self.clone()], move |g| {
+            let mask = x.binary_raw(&y, binary_op::EQ);
+            let count = mask.reduce_raw(d, reduce_op::SUM).view_raw(&keep_shape);
+            vec![Some(mask.mul(&g.view_raw(&keep_shape).div(&count)))]
+        })
+    }
+
+    /// Largest element, as a 0-dimensional tensor.
     pub fn max(&self) -> Tensor {
-        let data = self.to_vec();
-        let max = data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        Tensor::from_data(&[max], &[1], &self.device)
+        self.extreme(reduce_op::MAX, "max")
     }
 
-    /// Minimum value.
+    /// Smallest element, as a 0-dimensional tensor.
     pub fn min(&self) -> Tensor {
-        let data = self.to_vec();
-        let min = data.iter().cloned().fold(f32::INFINITY, f32::min);
-        Tensor::from_data(&[min], &[1], &self.device)
+        self.extreme(reduce_op::MIN, "min")
     }
 
-    /// Argmax - index of maximum value.
-    ///
-    /// Returns the index of the first maximum element.
-    /// Handles NaN values safely (NaN is treated as greater than any number).
+    /// Maximum over `dim`.
+    pub fn max_dim(&self, dim: isize, keepdim: bool) -> Tensor {
+        self.extreme_dim(dim, keepdim, reduce_op::MAX, "max_dim")
+    }
+
+    /// Minimum over `dim`.
+    pub fn min_dim(&self, dim: isize, keepdim: bool) -> Tensor {
+        self.extreme_dim(dim, keepdim, reduce_op::MIN, "min_dim")
+    }
+
+    /// Index of the first largest element (NaN counts as largest).
     pub fn argmax(&self) -> usize {
-        let data = self.to_vec();
-        data.iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| {
-                a.partial_cmp(b).unwrap_or_else(|| {
-                    // Handle NaN: treat NaN as greater
-                    if a.is_nan() {
-                        std::cmp::Ordering::Greater
-                    } else if b.is_nan() {
-                        std::cmp::Ordering::Less
-                    } else {
-                        std::cmp::Ordering::Equal
-                    }
-                })
-            })
-            .map(|(i, _)| i)
-            .unwrap_or(0)
+        arg_extreme(&self.to_vec(), |a, b| a > b || (a.is_nan() && !b.is_nan()))
     }
 
-    /// Argmin - index of minimum value.
-    ///
-    /// Returns the index of the first minimum element.
-    /// Handles NaN values safely.
+    /// Index of the first smallest element (NaN counts as largest).
     pub fn argmin(&self) -> usize {
+        arg_extreme(&self.to_vec(), |a, b| a < b || (b.is_nan() && !a.is_nan()))
+    }
+
+    /// Indices of the largest elements along `dim`, as an `f32` tensor with
+    /// `dim` removed.
+    pub fn argmax_dim(&self, dim: isize) -> Tensor {
+        let d = normalize_dim(dim, self.ndim());
+        let (outer, size, inner) = super::shape::split_at_dim(&self.shape, d);
         let data = self.to_vec();
-        data.iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| {
-                a.partial_cmp(b).unwrap_or_else(|| {
-                    if a.is_nan() {
-                        std::cmp::Ordering::Greater
-                    } else if b.is_nan() {
-                        std::cmp::Ordering::Less
-                    } else {
-                        std::cmp::Ordering::Equal
-                    }
-                })
-            })
-            .map(|(i, _)| i)
-            .unwrap_or(0)
+        let mut out = Vec::with_capacity(outer * inner);
+        for o in 0..outer {
+            for k in 0..inner {
+                let column: Vec<f32> = (0..size)
+                    .map(|j| data[(o * size + j) * inner + k])
+                    .collect();
+                out.push(arg_extreme(&column, |a, b| a > b || (a.is_nan() && !b.is_nan())) as f32);
+            }
+        }
+        let mut shape = self.shape.clone();
+        shape.remove(d);
+        self.host_output(out, &shape)
     }
 
     // ========================================================================
-    // BROADCASTING AND SHAPE MANIPULATION
+    // SHAPE MANIPULATION
     // ========================================================================
 
-    /// Reshape tensor to new shape (total elements must match).
+    /// Reshape (element count must match). Shares storage with `self`.
     pub fn reshape(&self, new_shape: &[usize]) -> Tensor {
         let new_size: usize = new_shape.iter().product();
         assert_eq!(
             new_size,
             self.numel(),
-            "Cannot reshape tensor of size {} to shape {:?}",
+            "cannot reshape tensor of size {} to shape {:?}",
             self.numel(),
             new_shape
         );
-
-        Tensor {
-            buffer: self.buffer.clone(),
-            shape: new_shape.to_vec(),
-            device: self.device.clone(),
-            grad: Arc::new(GradCell::new()),
-            requires_grad: self.requires_grad,
-            creator: None, // Reshape doesn't change data, just interpretation
-        }
+        let out = self.view_raw(new_shape);
+        let shape = self.shape.clone();
+        out.with_node("reshape", vec![self.clone()], move |g| {
+            vec![Some(g.view_raw(&shape))]
+        })
     }
 
-    /// Flatten tensor to 1D.
+    /// Flatten to 1-D.
     pub fn flatten(&self) -> Tensor {
         self.reshape(&[self.numel()])
     }
 
-    /// Squeeze tensor - remove dimensions of size 1.
+    /// Remove every dimension of size 1.
     pub fn squeeze(&self) -> Tensor {
-        let new_shape: Vec<usize> = self.shape.iter().filter(|&&d| d != 1).copied().collect();
-        if new_shape.len() == self.shape.len() {
-            self.clone()
-        } else {
-            self.reshape(&new_shape)
-        }
+        let new_shape: Vec<usize> = self.shape.iter().copied().filter(|&d| d != 1).collect();
+        self.reshape(&new_shape)
     }
 
-    /// Unsqueeze tensor - add dimension of size 1 at position.
+    /// Remove dimension `dim`, which must have size 1.
+    pub fn squeeze_dim(&self, dim: isize) -> Tensor {
+        let d = normalize_dim(dim, self.ndim());
+        assert_eq!(
+            self.shape[d], 1,
+            "squeeze_dim on a dimension of size {}",
+            self.shape[d]
+        );
+        let mut new_shape = self.shape.clone();
+        new_shape.remove(d);
+        self.reshape(&new_shape)
+    }
+
+    /// Insert a dimension of size 1 at `dim`.
     pub fn unsqueeze(&self, dim: usize) -> Tensor {
         assert!(
             dim <= self.ndim(),
-            "Dimension {} out of range for {}D tensor",
+            "dimension {} out of range for a {}-D tensor",
             dim,
             self.ndim()
         );
-
         let mut new_shape = self.shape.clone();
         new_shape.insert(dim, 1);
         self.reshape(&new_shape)
     }
 
-    /// Transpose 2D tensor.
-    pub fn transpose(&self) -> Tensor {
-        assert_eq!(self.ndim(), 2, "transpose requires 2D tensor");
-        let data = self.to_vec();
-        let (rows, cols) = (self.shape[0], self.shape[1]);
+    /// Reorder dimensions: output dim `d` is input dim `perm[d]`.
+    pub fn permute(&self, perm: &[usize]) -> Tensor {
+        let mut seen = vec![false; self.ndim()];
+        assert_eq!(
+            perm.len(),
+            self.ndim(),
+            "permute needs one entry per dimension"
+        );
+        for &p in perm {
+            assert!(p < self.ndim() && !seen[p], "invalid permutation {perm:?}");
+            seen[p] = true;
+        }
+        let out = self.permute_raw(perm);
+        let mut inverse = vec![0; perm.len()];
+        for (i, &p) in perm.iter().enumerate() {
+            inverse[p] = i;
+        }
+        out.with_node("permute", vec![self.clone()], move |g| {
+            vec![Some(g.permute_raw(&inverse))]
+        })
+    }
 
-        let mut transposed = vec![0.0f32; rows * cols];
-        for i in 0..rows {
-            for j in 0..cols {
-                transposed[j * rows + i] = data[i * cols + j];
+    /// Swap dimensions `dim0` and `dim1`.
+    pub fn transpose_dims(&self, dim0: isize, dim1: isize) -> Tensor {
+        let (a, b) = (
+            normalize_dim(dim0, self.ndim()),
+            normalize_dim(dim1, self.ndim()),
+        );
+        let mut perm: Vec<usize> = (0..self.ndim()).collect();
+        perm.swap(a, b);
+        self.permute(&perm)
+    }
+
+    /// Swap the last two dimensions (matrix transpose).
+    pub fn transpose(&self) -> Tensor {
+        assert!(self.ndim() >= 2, "transpose needs at least 2 dims");
+        self.transpose_dims(-2, -1)
+    }
+
+    /// Broadcast to `shape` (materialised copy).
+    pub fn expand(&self, shape: &[usize]) -> Tensor {
+        assert_eq!(
+            broadcast_shapes(&self.shape, shape).as_deref(),
+            Some(shape),
+            "cannot expand {:?} to {:?}",
+            self.shape,
+            shape
+        );
+        let out = self.expand_raw(shape);
+        let orig = self.shape.clone();
+        out.with_node("expand", vec![self.clone()], move |g| {
+            vec![Some(sum_to_shape(g, &orig))]
+        })
+    }
+
+    /// The slice `start..start + len` of dimension `dim`.
+    pub fn narrow(&self, dim: isize, start: usize, len: usize) -> Tensor {
+        let d = normalize_dim(dim, self.ndim());
+        assert!(
+            start + len <= self.shape[d],
+            "narrow {}..{} out of range for dimension of size {}",
+            start,
+            start + len,
+            self.shape[d]
+        );
+        let strides = contiguous_strides(&self.shape);
+        let mut out_shape = self.shape.clone();
+        out_shape[d] = len;
+        let out = self.strided_copy_raw(&out_shape, &strides, start * strides[d]);
+        let shape = self.shape.clone();
+        out.with_node("narrow", vec![self.clone()], move |g| {
+            let mut parts = Vec::new();
+            let mut before = shape.clone();
+            before[d] = start;
+            let mut after = shape.clone();
+            after[d] = shape[d] - start - len;
+            if start > 0 {
+                parts.push(Tensor::zeros(&before, &g.device));
+            }
+            parts.push(g.clone());
+            if after[d] > 0 {
+                parts.push(Tensor::zeros(&after, &g.device));
+            }
+            vec![Some(Tensor::cat(&parts, d as isize))]
+        })
+    }
+
+    /// Split into `chunks` pieces along `dim` (the last may be smaller).
+    pub fn chunk(&self, chunks: usize, dim: isize) -> Vec<Tensor> {
+        assert!(chunks > 0, "chunk count must be positive");
+        let d = normalize_dim(dim, self.ndim());
+        let size = self.shape[d].div_ceil(chunks).max(1);
+        self.split(size, dim)
+    }
+
+    /// Split into pieces of `size` along `dim` (the last may be smaller).
+    pub fn split(&self, size: usize, dim: isize) -> Vec<Tensor> {
+        assert!(size > 0, "split size must be positive");
+        let d = normalize_dim(dim, self.ndim());
+        (0..self.shape[d])
+            .step_by(size)
+            .map(|start| self.narrow(dim, start, size.min(self.shape[d] - start)))
+            .collect()
+    }
+
+    /// Concatenate tensors along `dim`; all other dims must match.
+    pub fn cat(tensors: &[Tensor], dim: isize) -> Tensor {
+        assert!(!tensors.is_empty(), "cat needs at least one tensor");
+        let first = &tensors[0];
+        let d = normalize_dim(dim, first.ndim());
+        for t in tensors {
+            first.assert_same_device(t);
+            assert_eq!(t.ndim(), first.ndim(), "cat needs tensors of equal rank");
+            for (i, (&a, &b)) in t.shape.iter().zip(&first.shape).enumerate() {
+                assert!(
+                    i == d || a == b,
+                    "cat shapes differ: {:?} vs {:?}",
+                    t.shape,
+                    first.shape
+                );
             }
         }
-
-        Tensor::from_data(&transposed, &[cols, rows], &self.device)
+        let mut out_shape = first.shape.clone();
+        out_shape[d] = tensors.iter().map(|t| t.shape[d]).sum();
+        let outer: usize = first.shape[..d].iter().product();
+        let inner: usize = first.shape[d + 1..].iter().product();
+        let datas: Vec<Vec<f32>> = tensors.iter().map(Tensor::to_vec).collect();
+        let mut data = Vec::with_capacity(out_shape.iter().product());
+        for o in 0..outer {
+            for (t, values) in tensors.iter().zip(&datas) {
+                let block = t.shape[d] * inner;
+                data.extend_from_slice(&values[o * block..(o + 1) * block]);
+            }
+        }
+        let out = first.host_output(data, &out_shape);
+        let sizes: Vec<usize> = tensors.iter().map(|t| t.shape[d]).collect();
+        out.with_node("cat", tensors.to_vec(), move |g| {
+            let mut start = 0;
+            sizes
+                .iter()
+                .map(|&len| {
+                    let piece = g.narrow(d as isize, start, len);
+                    start += len;
+                    Some(piece)
+                })
+                .collect()
+        })
     }
+
+    /// Stack equally shaped tensors along a new dimension `dim`.
+    pub fn stack(tensors: &[Tensor], dim: usize) -> Tensor {
+        let expanded: Vec<Tensor> = tensors.iter().map(|t| t.unsqueeze(dim)).collect();
+        Tensor::cat(&expanded, dim as isize)
+    }
+
+    /// Select entries `indices` along `dim`.
+    ///
+    /// With `dim = 0` on a `[vocab, dim]` table this is an embedding lookup.
+    pub fn index_select(&self, dim: isize, indices: &[usize]) -> Tensor {
+        let d = normalize_dim(dim, self.ndim());
+        let out = if d == 0 {
+            self.gather_rows_raw(indices)
+        } else {
+            let mut perm: Vec<usize> = (0..self.ndim()).collect();
+            perm.swap(0, d);
+            self.permute_raw(&perm)
+                .gather_rows_raw(indices)
+                .permute_raw(&perm)
+        };
+        let shape = self.shape.clone();
+        let indices = indices.to_vec();
+        out.with_node("index_select", vec![self.clone()], move |g| {
+            vec![Some(index_add(g, d, &indices, &shape))]
+        })
+    }
+
+    // ========================================================================
+    // MATRIX PRODUCT AND SOFTMAX
+    // ========================================================================
+
+    /// Matrix product over the last two dims.
+    ///
+    /// Supports `[.., M, K] @ [K, N]`, `[M, K] @ [.., K, N]` and batched
+    /// `[B.., M, K] @ [B.., K, N]` with equal batch dims.
+    pub fn matmul(&self, other: &Tensor) -> Tensor {
+        let out = self.matmul_raw(other);
+        let (a, b) = (self.detach(), other.detach());
+        let need = (self.requires_grad, other.requires_grad);
+        out.with_node("matmul", vec![self.clone(), other.clone()], move |g| {
+            vec![
+                need.0
+                    .then(|| sum_to_shape(&g.matmul_raw(&b.transpose()), &a.shape)),
+                need.1
+                    .then(|| sum_to_shape(&a.transpose().matmul_raw(g), &b.shape)),
+            ]
+        })
+    }
+
+    /// Softmax over `dim` (negative counts from the end).
+    pub fn softmax(&self, dim: isize) -> Tensor {
+        let d = normalize_dim(dim, self.ndim());
+        let out = self.softmax_raw(d, false);
+        let y = out.detach();
+        out.with_node("softmax", vec![self.clone()], move |g| {
+            let dot = g.mul(&y).sum_dim(d as isize, true);
+            vec![Some(y.mul(&g.sub(&dot)))]
+        })
+    }
+
+    /// Log-softmax over `dim` (numerically stable).
+    pub fn log_softmax(&self, dim: isize) -> Tensor {
+        let d = normalize_dim(dim, self.ndim());
+        let out = self.softmax_raw(d, true);
+        let y = out.detach();
+        out.with_node("log_softmax", vec![self.clone()], move |g| {
+            let total = g.sum_dim(d as isize, true);
+            vec![Some(g.sub(&y.exp().mul(&total)))]
+        })
+    }
+}
+
+/// Gradient of `index_select`: scatter-add `grad` back into a zero tensor of
+/// `shape` along `dim`.
+fn index_add(grad: &Tensor, dim: usize, indices: &[usize], shape: &[usize]) -> Tensor {
+    let (outer, size, inner) = super::shape::split_at_dim(shape, dim);
+    let g = grad.to_vec();
+    let mut out = vec![0.0f32; shape.iter().product()];
+    let n_idx = indices.len();
+    for o in 0..outer {
+        for (j, &idx) in indices.iter().enumerate() {
+            let src = (o * n_idx + j) * inner;
+            let dst = (o * size + idx) * inner;
+            for k in 0..inner {
+                out[dst + k] += g[src + k];
+            }
+        }
+    }
+    grad.host_output(out, shape)
+}
+
+fn arg_extreme(data: &[f32], better: impl Fn(f32, f32) -> bool) -> usize {
+    let mut best = 0;
+    for (i, &v) in data.iter().enumerate().skip(1) {
+        if better(v, data[best]) {
+            best = i;
+        }
+    }
+    best
 }
 
 // ============================================================================
 // OPERATOR OVERLOADS
 // ============================================================================
 
-impl std::ops::Add for &Tensor {
-    type Output = Tensor;
-    fn add(self, other: &Tensor) -> Tensor {
-        Tensor::add(self, other)
-    }
+macro_rules! binary_operator {
+    ($trait:ident, $method:ident, $scalar_fn:expr) => {
+        impl std::ops::$trait<&Tensor> for &Tensor {
+            type Output = Tensor;
+            fn $method(self, other: &Tensor) -> Tensor {
+                Tensor::$method(self, other)
+            }
+        }
+
+        impl std::ops::$trait<Tensor> for Tensor {
+            type Output = Tensor;
+            fn $method(self, other: Tensor) -> Tensor {
+                Tensor::$method(&self, &other)
+            }
+        }
+
+        impl std::ops::$trait<f32> for &Tensor {
+            type Output = Tensor;
+            fn $method(self, scalar: f32) -> Tensor {
+                let f: fn(&Tensor, f32) -> Tensor = $scalar_fn;
+                f(self, scalar)
+            }
+        }
+    };
 }
 
-impl std::ops::Sub for &Tensor {
-    type Output = Tensor;
-    fn sub(self, other: &Tensor) -> Tensor {
-        Tensor::sub(self, other)
-    }
-}
-
-impl std::ops::Mul for &Tensor {
-    type Output = Tensor;
-    fn mul(self, other: &Tensor) -> Tensor {
-        Tensor::mul(self, other)
-    }
-}
+binary_operator!(Add, add, Tensor::add_scalar);
+binary_operator!(Sub, sub, Tensor::sub_scalar);
+binary_operator!(Mul, mul, Tensor::mul_scalar);
+binary_operator!(Div, div, Tensor::div_scalar);
 
 impl std::ops::Neg for &Tensor {
     type Output = Tensor;
     fn neg(self) -> Tensor {
-        self.mul_scalar(-1.0)
+        Tensor::neg(self)
+    }
+}
+
+impl std::ops::Neg for Tensor {
+    type Output = Tensor;
+    fn neg(self) -> Tensor {
+        Tensor::neg(&self)
     }
 }

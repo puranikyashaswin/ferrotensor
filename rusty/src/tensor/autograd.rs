@@ -1,1059 +1,224 @@
 //! Autograd - Automatic Differentiation Engine
 //!
-//! This module provides gradient computation through reverse-mode autodiff.
+//! Reverse-mode autodiff over a graph recorded during the forward pass. Each
+//! tracked op attaches a [`Node`] to its output holding the op's inputs and a
+//! closure that maps the output gradient to input gradients. The closures are
+//! written with ordinary tensor ops, run with gradient tracking disabled, so
+//! the backward pass runs on the same device (GPU kernels or CPU) as the
+//! forward pass.
 
-use std::sync::{Arc, RwLock};
-use wgpu::{Buffer, BufferUsages};
+use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use super::Tensor;
-use crate::Device;
 
-/// Gradient storage cell (thread-safe).
-pub struct GradCell {
-    inner: RwLock<Option<Arc<Buffer>>>,
+thread_local! {
+    static GRAD_ENABLED: Cell<bool> = const { Cell::new(true) };
 }
 
-impl GradCell {
+/// True unless inside [`no_grad`] (per thread).
+pub fn is_grad_enabled() -> bool {
+    GRAD_ENABLED.with(Cell::get)
+}
+
+/// Run `f` without recording ops for autograd (inference, optimizer
+/// updates, metric computation).
+///
+/// # Example
+/// ```rust
+/// use rusty::prelude::*;
+///
+/// let device = Device::cpu();
+/// let w = Tensor::ones(&[2], &device).requires_grad_();
+/// let y = rusty::no_grad(|| w.mul_scalar(2.0));
+/// assert!(!y.requires_grad);
+/// ```
+pub fn no_grad<R>(f: impl FnOnce() -> R) -> R {
+    let _guard = NoGradGuard::new();
+    f()
+}
+
+/// Disables gradient tracking on this thread until dropped.
+pub struct NoGradGuard {
+    previous: bool,
+}
+
+impl NoGradGuard {
+    /// Disable tracking; the previous state is restored on drop.
     pub fn new() -> Self {
-        Self {
-            inner: RwLock::new(None),
-        }
+        let previous = GRAD_ENABLED.with(|g| g.replace(false));
+        Self { previous }
     }
+}
 
-    pub fn set(&self, device: &Device, data: &[f32], _shape: &[usize]) {
-        let buffer = device
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Gradient Buffer"),
-                contents: bytemuck::cast_slice(data),
-                usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            });
-        *self.inner.write().unwrap() = Some(Arc::new(buffer));
+impl Default for NoGradGuard {
+    fn default() -> Self {
+        Self::new()
     }
+}
 
-    pub fn set_buffer(&self, buffer: Buffer) {
-        *self.inner.write().unwrap() = Some(Arc::new(buffer));
+impl Drop for NoGradGuard {
+    fn drop(&mut self) {
+        GRAD_ENABLED.with(|g| g.set(self.previous));
     }
+}
 
-    pub fn get(&self) -> Option<Arc<Buffer>> {
-        self.inner.read().unwrap().clone()
-    }
+/// Maps the gradient of an op's output to the gradients of its inputs
+/// (`None` for an input that needs none).
+pub(crate) type BackwardFn = Box<dyn Fn(&Tensor) -> Vec<Option<Tensor>> + Send + Sync>;
 
-    pub fn clear(&self) {
-        *self.inner.write().unwrap() = None;
-    }
+/// One recorded op in the autograd graph.
+pub(crate) struct Node {
+    pub(crate) name: &'static str,
+    pub(crate) inputs: Vec<Tensor>,
+    pub(crate) backward: BackwardFn,
+}
 
-    pub fn accumulate(
-        &self,
-        device: &Device,
-        engine: &crate::backend::ComputeEngine,
-        new_grad: &Buffer,
-        shape: &[usize],
-    ) {
-        let size: usize = shape.iter().product();
-        let mut inner = self.inner.write().unwrap();
-
-        if let Some(ref existing) = *inner {
-            // Create output buffer for accumulated gradient
-            let out_buffer = device.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Accumulated Gradient"),
-                size: (size * 4) as u64,
-                usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-
-            // Dispatch add kernel
-            let pipeline = engine.get_pipeline("add").unwrap();
-            let bind_group = engine.create_binary_bind_group(
-                &device.device,
-                pipeline,
-                existing,
-                new_grad,
-                &out_buffer,
-            );
-            engine.dispatch(
-                &device.device,
-                &device.queue,
-                "add",
-                &bind_group,
-                (
-                    crate::backend::ComputeEngine::workgroups_1d(size as u32),
-                    1,
-                    1,
-                ),
-            );
-
-            *inner = Some(Arc::new(out_buffer));
-        } else {
-            // Copy new_grad to this cell
-            let out_buffer = device.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Gradient Copy"),
-                size: (size * 4) as u64,
-                usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-
-            let mut encoder =
-                device
-                    .device
-                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("Grad Copy Encoder"),
-                    });
-            encoder.copy_buffer_to_buffer(new_grad, 0, &out_buffer, 0, (size * 4) as u64);
-            device.queue.submit(std::iter::once(encoder.finish()));
-
-            *inner = Some(Arc::new(out_buffer));
+impl Drop for Node {
+    /// Unlink the graph iteratively: dropping a long chain of nodes
+    /// recursively would overflow the stack. Backward closures capture only
+    /// detached tensors, so `inputs` holds every link to earlier nodes.
+    fn drop(&mut self) {
+        let mut stack: Vec<Arc<Node>> = self
+            .inputs
+            .iter_mut()
+            .filter_map(|t| t.node.take())
+            .collect();
+        while let Some(node) = stack.pop() {
+            if let Ok(mut node) = Arc::try_unwrap(node) {
+                stack.extend(node.inputs.iter_mut().filter_map(|t| t.node.take()));
+            }
         }
     }
 }
 
-use wgpu::util::DeviceExt;
-
-/// Trait for autograd computation nodes.
-pub trait AutogradNode: Send + Sync {
-    /// Get input tensors to this node.
-    fn inputs(&self) -> Vec<Tensor>;
-
-    /// Compute gradients for inputs given output gradient.
-    fn backward(&self, grad_output: &Tensor, device: &Device);
-}
-
-// ============================================================================
-// BINARY OPERATION NODES
-// ============================================================================
-
-/// Addition backward node.
-pub struct AddNode {
-    pub a: Tensor,
-    pub b: Tensor,
-}
-
-impl AutogradNode for AddNode {
-    fn inputs(&self) -> Vec<Tensor> {
-        vec![self.a.clone(), self.b.clone()]
-    }
-
-    fn backward(&self, grad_output: &Tensor, device: &Device) {
-        // grad_a = grad_out, grad_b = grad_out
-        if self.a.requires_grad {
-            self.a
-                .grad
-                .accumulate(device, device.engine(), &grad_output.buffer, &self.a.shape);
+impl Tensor {
+    /// Attach a backward node to a freshly computed `self` when gradient
+    /// tracking is on and any input requires grad.
+    ///
+    /// Closures must capture [`Tensor::detach`]ed copies, never graph-carrying
+    /// tensors: capturing the output would form a reference cycle, and
+    /// capturing inputs would defeat the iterative `Drop` of [`Node`].
+    pub(crate) fn with_node(
+        mut self,
+        name: &'static str,
+        inputs: Vec<Tensor>,
+        backward: impl Fn(&Tensor) -> Vec<Option<Tensor>> + Send + Sync + 'static,
+    ) -> Tensor {
+        if is_grad_enabled() && inputs.iter().any(|t| t.requires_grad) {
+            self.requires_grad = true;
+            self.node = Some(Arc::new(Node {
+                name,
+                inputs,
+                backward: Box::new(backward),
+            }));
         }
-        if self.b.requires_grad {
-            self.b
-                .grad
-                .accumulate(device, device.engine(), &grad_output.buffer, &self.b.shape);
-        }
-    }
-}
-
-/// Subtraction backward node.
-pub struct SubNode {
-    pub a: Tensor,
-    pub b: Tensor,
-}
-
-impl AutogradNode for SubNode {
-    fn inputs(&self) -> Vec<Tensor> {
-        vec![self.a.clone(), self.b.clone()]
+        self
     }
 
-    fn backward(&self, grad_output: &Tensor, device: &Device) {
-        let engine = device.engine();
-        let size = self.a.numel();
-
-        if self.a.requires_grad {
-            self.a
-                .grad
-                .accumulate(device, engine, &grad_output.buffer, &self.a.shape);
-        }
-        if self.b.requires_grad {
-            // grad_b = -grad_out
-            let neg_grad = device.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Neg Grad"),
-                size: (size * 4) as u64,
-                usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-
-            // Use mul_scalar with -1.0
-            let neg_one = device
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("Neg One"),
-                    contents: bytemuck::cast_slice(&[-1.0f32]),
-                    usage: BufferUsages::UNIFORM,
-                });
-
-            let pipeline = engine.get_pipeline("mul_scalar").unwrap();
-            let layout = pipeline.get_bind_group_layout(0);
-            let bind_group = device.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: grad_output.buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: neg_grad.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: neg_one.as_entire_binding(),
-                    },
-                ],
-            });
-            engine.dispatch(
-                &device.device,
-                &device.queue,
-                "mul_scalar",
-                &bind_group,
-                (
-                    crate::backend::ComputeEngine::workgroups_1d(size as u32),
-                    1,
-                    1,
-                ),
-            );
-
-            self.b
-                .grad
-                .accumulate(device, engine, &neg_grad, &self.b.shape);
-        }
-    }
-}
-
-/// Multiplication backward node.
-pub struct MulNode {
-    pub a: Tensor,
-    pub b: Tensor,
-}
-
-impl AutogradNode for MulNode {
-    fn inputs(&self) -> Vec<Tensor> {
-        vec![self.a.clone(), self.b.clone()]
+    /// Name of the op that produced this tensor (`None` for leaves).
+    pub fn grad_fn_name(&self) -> Option<&'static str> {
+        self.node.as_ref().map(|n| n.name)
     }
 
-    fn backward(&self, grad_output: &Tensor, device: &Device) {
-        let engine = device.engine();
-        let size = self.a.numel();
-
-        // grad_a = grad_out * b
-        if self.a.requires_grad {
-            let grad_a = device.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Grad A"),
-                size: (size * 4) as u64,
-                usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            let pipeline = engine.get_pipeline("mul").unwrap();
-            let bind_group = engine.create_binary_bind_group(
-                &device.device,
-                pipeline,
-                &grad_output.buffer,
-                &self.b.buffer,
-                &grad_a,
-            );
-            engine.dispatch(
-                &device.device,
-                &device.queue,
-                "mul",
-                &bind_group,
-                (
-                    crate::backend::ComputeEngine::workgroups_1d(size as u32),
-                    1,
-                    1,
-                ),
-            );
-            self.a
-                .grad
-                .accumulate(device, engine, &grad_a, &self.a.shape);
-        }
-
-        // grad_b = grad_out * a
-        if self.b.requires_grad {
-            let grad_b = device.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Grad B"),
-                size: (size * 4) as u64,
-                usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            let pipeline = engine.get_pipeline("mul").unwrap();
-            let bind_group = engine.create_binary_bind_group(
-                &device.device,
-                pipeline,
-                &grad_output.buffer,
-                &self.a.buffer,
-                &grad_b,
-            );
-            engine.dispatch(
-                &device.device,
-                &device.queue,
-                "mul",
-                &bind_group,
-                (
-                    crate::backend::ComputeEngine::workgroups_1d(size as u32),
-                    1,
-                    1,
-                ),
-            );
-            self.b
-                .grad
-                .accumulate(device, engine, &grad_b, &self.b.shape);
-        }
-    }
-}
-
-/// Matrix multiplication backward node.
-pub struct MatMulNode {
-    pub a: Tensor, // [M, K]
-    pub b: Tensor, // [K, N]
-}
-
-impl AutogradNode for MatMulNode {
-    fn inputs(&self) -> Vec<Tensor> {
-        vec![self.a.clone(), self.b.clone()]
+    /// Backpropagate from this tensor, seeding its gradient with ones.
+    ///
+    /// For a one-element loss this is the usual `loss.backward()`; for a
+    /// larger tensor it differentiates the sum of its elements. Gradients
+    /// accumulate into the `.grad()` of every leaf that requires grad, so
+    /// call `zero_grad` between steps.
+    pub fn backward(&self) {
+        let seed = Tensor::ones(&self.shape, &self.device);
+        self.backward_with(&seed);
     }
 
-    fn backward(&self, grad_output: &Tensor, device: &Device) {
-        let engine = device.engine();
-        let m = self.a.shape[0];
-        let k = self.a.shape[1];
-        let n = self.b.shape[1];
-
-        // grad_a = grad_out @ b.T  [M, N] @ [N, K] = [M, K]
-        if self.a.requires_grad {
-            let grad_a = device.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Grad A MatMul"),
-                size: (m * k * 4) as u64,
-                usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-
-            let params = device
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("MatMul BT Params"),
-                    contents: bytemuck::cast_slice(&[m as u32, n as u32, k as u32, 0u32]),
-                    usage: BufferUsages::UNIFORM,
-                });
-
-            let pipeline = engine.get_pipeline("matmul_bt").unwrap();
-            let bind_group = engine.create_matmul_bind_group(
-                &device.device,
-                pipeline,
-                &grad_output.buffer,
-                &self.b.buffer,
-                &grad_a,
-                &params,
-            );
-            let (wx, wy) = crate::backend::ComputeEngine::workgroups_2d(m as u32, k as u32);
-            engine.dispatch(
-                &device.device,
-                &device.queue,
-                "matmul_bt",
-                &bind_group,
-                (wx, wy, 1),
-            );
-
-            self.a
-                .grad
-                .accumulate(device, engine, &grad_a, &self.a.shape);
-        }
-
-        // grad_b = a.T @ grad_out  [K, M] @ [M, N] = [K, N]
-        if self.b.requires_grad {
-            let grad_b = device.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Grad B MatMul"),
-                size: (k * n * 4) as u64,
-                usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-
-            let params = device
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("MatMul AT Params"),
-                    contents: bytemuck::cast_slice(&[k as u32, m as u32, n as u32, 0u32]),
-                    usage: BufferUsages::UNIFORM,
-                });
-
-            let pipeline = engine.get_pipeline("matmul_at").unwrap();
-            let bind_group = engine.create_matmul_bind_group(
-                &device.device,
-                pipeline,
-                &self.a.buffer,
-                &grad_output.buffer,
-                &grad_b,
-                &params,
-            );
-            let (wx, wy) = crate::backend::ComputeEngine::workgroups_2d(k as u32, n as u32);
-            engine.dispatch(
-                &device.device,
-                &device.queue,
-                "matmul_at",
-                &bind_group,
-                (wx, wy, 1),
-            );
-
-            self.b
-                .grad
-                .accumulate(device, engine, &grad_b, &self.b.shape);
-        }
-    }
-}
-
-// ============================================================================
-// ACTIVATION NODES
-// ============================================================================
-
-/// ReLU backward node.
-pub struct ReLUNode {
-    pub input: Tensor,
-}
-
-impl AutogradNode for ReLUNode {
-    fn inputs(&self) -> Vec<Tensor> {
-        vec![self.input.clone()]
-    }
-
-    fn backward(&self, grad_output: &Tensor, device: &Device) {
-        if !self.input.requires_grad {
+    /// Backpropagate from this tensor with an explicit output gradient.
+    ///
+    /// # Panics
+    /// Panics when `grad` does not have this tensor's shape.
+    pub fn backward_with(&self, grad: &Tensor) {
+        assert_eq!(
+            grad.shape, self.shape,
+            "gradient shape must match the tensor"
+        );
+        if !self.requires_grad {
             return;
         }
+        let _guard = NoGradGuard::new();
 
-        let engine = device.engine();
-        let size = self.input.numel();
+        let order = topological_order(self);
+        let mut pending: HashMap<usize, Tensor> = HashMap::new();
+        pending.insert(self.id(), grad.detach());
 
-        let grad_in = device.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("ReLU Grad"),
-            size: (size * 4) as u64,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let pipeline = engine.get_pipeline("relu_backward").unwrap();
-        let layout = pipeline.get_bind_group_layout(0);
-        let bind_group = device.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.input.buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: grad_in.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: grad_output.buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: self.input.buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: grad_in.as_entire_binding(),
-                },
-            ],
-        });
-        engine.dispatch(
-            &device.device,
-            &device.queue,
-            "relu_backward",
-            &bind_group,
-            (
-                crate::backend::ComputeEngine::workgroups_1d(size as u32),
-                1,
-                1,
-            ),
-        );
-
-        self.input
-            .grad
-            .accumulate(device, engine, &grad_in, &self.input.shape);
-    }
-}
-
-/// SiLU backward node.
-pub struct SiLUNode {
-    pub input: Tensor,
-}
-
-impl AutogradNode for SiLUNode {
-    fn inputs(&self) -> Vec<Tensor> {
-        vec![self.input.clone()]
-    }
-
-    fn backward(&self, grad_output: &Tensor, device: &Device) {
-        if !self.input.requires_grad {
-            return;
+        for tensor in order.iter().rev() {
+            let Some(g) = pending.remove(&tensor.id()) else {
+                continue;
+            };
+            match &tensor.node {
+                Some(node) => {
+                    let input_grads = (node.backward)(&g);
+                    debug_assert_eq!(input_grads.len(), node.inputs.len());
+                    for (input, input_grad) in node.inputs.iter().zip(input_grads) {
+                        let Some(input_grad) = input_grad else {
+                            continue;
+                        };
+                        if !input.requires_grad {
+                            continue;
+                        }
+                        assert_eq!(
+                            input_grad.shape, input.shape,
+                            "backward of '{}' produced a gradient of the wrong shape",
+                            node.name
+                        );
+                        let merged = match pending.remove(&input.id()) {
+                            Some(existing) => existing.add(&input_grad),
+                            None => input_grad,
+                        };
+                        pending.insert(input.id(), merged);
+                    }
+                }
+                None => {
+                    let mut slot = tensor.grad.write().expect("grad lock poisoned");
+                    // A fresh copy: backward closures may hand the same storage
+                    // to several inputs, and optimizers update grads in place.
+                    let total = match slot.take() {
+                        Some(existing) => existing.add(&g),
+                        None => g.deep_clone(),
+                    };
+                    *slot = Some(total);
+                }
+            }
         }
-
-        let engine = device.engine();
-        let size = self.input.numel();
-
-        let grad_in = device.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("SiLU Grad"),
-            size: (size * 4) as u64,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let pipeline = engine.get_pipeline("silu_backward").unwrap();
-        let layout = pipeline.get_bind_group_layout(0);
-        let bind_group = device.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.input.buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: grad_in.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: grad_output.buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: self.input.buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: grad_in.as_entire_binding(),
-                },
-            ],
-        });
-        engine.dispatch(
-            &device.device,
-            &device.queue,
-            "silu_backward",
-            &bind_group,
-            (
-                crate::backend::ComputeEngine::workgroups_1d(size as u32),
-                1,
-                1,
-            ),
-        );
-
-        self.input
-            .grad
-            .accumulate(device, engine, &grad_in, &self.input.shape);
     }
 }
 
-/// GELU backward node.
-pub struct GELUNode {
-    pub input: Tensor,
-}
-
-impl AutogradNode for GELUNode {
-    fn inputs(&self) -> Vec<Tensor> {
-        vec![self.input.clone()]
-    }
-
-    fn backward(&self, grad_output: &Tensor, device: &Device) {
-        if !self.input.requires_grad {
-            return;
+/// Tensors reachable from `root` through grad-requiring inputs, inputs
+/// before the ops that consume them. Iterative, so deep graphs cannot
+/// overflow the stack.
+fn topological_order(root: &Tensor) -> Vec<Tensor> {
+    let mut order = Vec::new();
+    let mut visited = HashSet::new();
+    let mut stack = vec![(root.clone(), false)];
+    while let Some((tensor, expanded)) = stack.pop() {
+        if expanded {
+            order.push(tensor);
+            continue;
         }
-
-        let engine = device.engine();
-        let size = self.input.numel();
-
-        let grad_in = device.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("GELU Grad"),
-            size: (size * 4) as u64,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let pipeline = engine.get_pipeline("gelu_backward").unwrap();
-        let layout = pipeline.get_bind_group_layout(0);
-        let bind_group = device.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.input.buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: grad_in.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: grad_output.buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: self.input.buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: grad_in.as_entire_binding(),
-                },
-            ],
-        });
-        engine.dispatch(
-            &device.device,
-            &device.queue,
-            "gelu_backward",
-            &bind_group,
-            (
-                crate::backend::ComputeEngine::workgroups_1d(size as u32),
-                1,
-                1,
-            ),
-        );
-
-        self.input
-            .grad
-            .accumulate(device, engine, &grad_in, &self.input.shape);
-    }
-}
-
-/// Sigmoid backward node.
-pub struct SigmoidNode {
-    pub input: Tensor,
-}
-
-impl AutogradNode for SigmoidNode {
-    fn inputs(&self) -> Vec<Tensor> {
-        vec![self.input.clone()]
-    }
-
-    fn backward(&self, grad_output: &Tensor, device: &Device) {
-        if !self.input.requires_grad {
-            return;
+        if !visited.insert(tensor.id()) {
+            continue;
         }
-
-        let engine = device.engine();
-        let size = self.input.numel();
-
-        // sigmoid'(x) = sigmoid(x) * (1 - sigmoid(x))
-        // We need to recompute sigmoid(input)
-        let sigmoid_out = device.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Sigmoid Recompute"),
-            size: (size * 4) as u64,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let pipeline = engine.get_pipeline("sigmoid").unwrap();
-        let bind_group = engine.create_unary_bind_group(
-            &device.device,
-            pipeline,
-            &self.input.buffer,
-            &sigmoid_out,
-        );
-        engine.dispatch(
-            &device.device,
-            &device.queue,
-            "sigmoid",
-            &bind_group,
-            (
-                crate::backend::ComputeEngine::workgroups_1d(size as u32),
-                1,
-                1,
-            ),
-        );
-
-        // grad_input = grad_output * sigmoid_out * (1 - sigmoid_out)
-        let one_minus_sigmoid = device.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("1 - sigmoid"),
-            size: (size * 4) as u64,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let one_buffer = device
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("One"),
-                contents: bytemuck::cast_slice(&[1.0f32]),
-                usage: BufferUsages::UNIFORM,
-            });
-
-        let pipeline = engine.get_pipeline("sub_scalar").unwrap();
-        let layout = pipeline.get_bind_group_layout(0);
-        let bind_group = device.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: sigmoid_out.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: one_minus_sigmoid.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: one_buffer.as_entire_binding(),
-                },
-            ],
-        });
-        engine.dispatch(
-            &device.device,
-            &device.queue,
-            "sub_scalar",
-            &bind_group,
-            (
-                crate::backend::ComputeEngine::workgroups_1d(size as u32),
-                1,
-                1,
-            ),
-        );
-
-        let sigmoid_deriv = device.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Sigmoid Deriv"),
-            size: (size * 4) as u64,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let pipeline = engine.get_pipeline("mul").unwrap();
-        let bind_group = engine.create_binary_bind_group(
-            &device.device,
-            pipeline,
-            &sigmoid_out,
-            &one_minus_sigmoid,
-            &sigmoid_deriv,
-        );
-        engine.dispatch(
-            &device.device,
-            &device.queue,
-            "mul",
-            &bind_group,
-            (
-                crate::backend::ComputeEngine::workgroups_1d(size as u32),
-                1,
-                1,
-            ),
-        );
-
-        let grad_in = device.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Sigmoid Grad Input"),
-            size: (size * 4) as u64,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let pipeline = engine.get_pipeline("mul").unwrap();
-        let bind_group = engine.create_binary_bind_group(
-            &device.device,
-            pipeline,
-            &grad_output.buffer,
-            &sigmoid_deriv,
-            &grad_in,
-        );
-        engine.dispatch(
-            &device.device,
-            &device.queue,
-            "mul",
-            &bind_group,
-            (
-                crate::backend::ComputeEngine::workgroups_1d(size as u32),
-                1,
-                1,
-            ),
-        );
-
-        self.input
-            .grad
-            .accumulate(device, engine, &grad_in, &self.input.shape);
-    }
-}
-
-/// Tanh backward node.
-pub struct TanhNode {
-    pub input: Tensor,
-}
-
-impl AutogradNode for TanhNode {
-    fn inputs(&self) -> Vec<Tensor> {
-        vec![self.input.clone()]
-    }
-
-    fn backward(&self, grad_output: &Tensor, device: &Device) {
-        if !self.input.requires_grad {
-            return;
+        let inputs: Vec<Tensor> = tensor
+            .node
+            .as_ref()
+            .map(|n| n.inputs.clone())
+            .unwrap_or_default();
+        stack.push((tensor, true));
+        for input in inputs {
+            if input.requires_grad && !visited.contains(&input.id()) {
+                stack.push((input, false));
+            }
         }
-
-        let engine = device.engine();
-        let size = self.input.numel();
-
-        // tanh'(x) = 1 - tanh(x)^2
-        // Recompute tanh(input)
-        let tanh_out = device.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Tanh Recompute"),
-            size: (size * 4) as u64,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let pipeline = engine.get_pipeline("tanh_act").unwrap();
-        let bind_group =
-            engine.create_unary_bind_group(&device.device, pipeline, &self.input.buffer, &tanh_out);
-        engine.dispatch(
-            &device.device,
-            &device.queue,
-            "tanh_act",
-            &bind_group,
-            (
-                crate::backend::ComputeEngine::workgroups_1d(size as u32),
-                1,
-                1,
-            ),
-        );
-
-        // tanh^2
-        let tanh_sq = device.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Tanh Squared"),
-            size: (size * 4) as u64,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let pipeline = engine.get_pipeline("mul").unwrap();
-        let bind_group = engine.create_binary_bind_group(
-            &device.device,
-            pipeline,
-            &tanh_out,
-            &tanh_out,
-            &tanh_sq,
-        );
-        engine.dispatch(
-            &device.device,
-            &device.queue,
-            "mul",
-            &bind_group,
-            (
-                crate::backend::ComputeEngine::workgroups_1d(size as u32),
-                1,
-                1,
-            ),
-        );
-
-        // 1 - tanh^2
-        let one_buffer = device
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("One"),
-                contents: bytemuck::cast_slice(&[1.0f32]),
-                usage: BufferUsages::UNIFORM,
-            });
-
-        let one_minus_tanh_sq = device.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("1 - tanh^2"),
-            size: (size * 4) as u64,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let pipeline = engine.get_pipeline("sub_scalar").unwrap();
-        let layout = pipeline.get_bind_group_layout(0);
-        let bind_group = device.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: one_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: one_minus_tanh_sq.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: tanh_sq.as_entire_binding(),
-                },
-            ],
-        });
-        engine.dispatch(
-            &device.device,
-            &device.queue,
-            "sub_scalar",
-            &bind_group,
-            (
-                crate::backend::ComputeEngine::workgroups_1d(size as u32),
-                1,
-                1,
-            ),
-        );
-
-        // grad_input = grad_output * (1 - tanh^2)
-        let grad_in = device.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Tanh Grad Input"),
-            size: (size * 4) as u64,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let pipeline = engine.get_pipeline("mul").unwrap();
-        let bind_group = engine.create_binary_bind_group(
-            &device.device,
-            pipeline,
-            &grad_output.buffer,
-            &one_minus_tanh_sq,
-            &grad_in,
-        );
-        engine.dispatch(
-            &device.device,
-            &device.queue,
-            "mul",
-            &bind_group,
-            (
-                crate::backend::ComputeEngine::workgroups_1d(size as u32),
-                1,
-                1,
-            ),
-        );
-
-        self.input
-            .grad
-            .accumulate(device, engine, &grad_in, &self.input.shape);
     }
-}
-
-/// Softmax backward node.
-pub struct SoftmaxNode {
-    pub input: Tensor,
-}
-
-impl AutogradNode for SoftmaxNode {
-    fn inputs(&self) -> Vec<Tensor> {
-        vec![self.input.clone()]
-    }
-
-    fn backward(&self, grad_output: &Tensor, device: &Device) {
-        if !self.input.requires_grad {
-            return;
-        }
-
-        let engine = device.engine();
-        let size = self.input.numel();
-
-        // softmax'(x) = softmax(x) * (grad_output - sum(grad_output * softmax(x)))
-        // Recompute softmax
-        let softmax_out = device.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Softmax Recompute"),
-            size: (size * 4) as u64,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let size_buffer = device
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Softmax Size"),
-                contents: bytemuck::cast_slice(&[size as u32]),
-                usage: BufferUsages::UNIFORM,
-            });
-
-        let pipeline = engine.get_pipeline("softmax").unwrap();
-        let layout = pipeline.get_bind_group_layout(0);
-        let bind_group = device.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.input.buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: softmax_out.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: size_buffer.as_entire_binding(),
-                },
-            ],
-        });
-        engine.dispatch(
-            &device.device,
-            &device.queue,
-            "softmax",
-            &bind_group,
-            (1, 1, 1),
-        );
-
-        // grad_output * softmax
-        let grad_softmax = device.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Grad * Softmax"),
-            size: (size * 4) as u64,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let pipeline = engine.get_pipeline("mul").unwrap();
-        let bind_group = engine.create_binary_bind_group(
-            &device.device,
-            pipeline,
-            &grad_output.buffer,
-            &softmax_out,
-            &grad_softmax,
-        );
-        engine.dispatch(
-            &device.device,
-            &device.queue,
-            "mul",
-            &bind_group,
-            (
-                crate::backend::ComputeEngine::workgroups_1d(size as u32),
-                1,
-                1,
-            ),
-        );
-
-        // sum(grad_output * softmax) - simplified CPU fallback
-        // For production, implement proper GPU reduction kernel
-
-        // Simple passthrough: grad_input = grad_output * softmax * (1 - softmax)
-        // This is an approximation - full softmax backward needs sum reduction
-        let grad_in = device.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Softmax Grad Input"),
-            size: (size * 4) as u64,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        // Use: grad_input = grad_output * softmax (simplified)
-        let pipeline = engine.get_pipeline("mul").unwrap();
-        let bind_group = engine.create_binary_bind_group(
-            &device.device,
-            pipeline,
-            &grad_output.buffer,
-            &softmax_out,
-            &grad_in,
-        );
-        engine.dispatch(
-            &device.device,
-            &device.queue,
-            "mul",
-            &bind_group,
-            (
-                crate::backend::ComputeEngine::workgroups_1d(size as u32),
-                1,
-                1,
-            ),
-        );
-
-        self.input
-            .grad
-            .accumulate(device, engine, &grad_in, &self.input.shape);
-    }
+    order
 }

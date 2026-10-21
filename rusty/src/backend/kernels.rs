@@ -1,644 +1,394 @@
 //! GPU Compute Kernels (WGSL)
 //!
-//! All GPU compute shaders are defined here in WebGPU Shading Language.
+//! The `rusty` tensor API dispatches a small set of generic kernels. Each one
+//! selects its operation through an op code in a uniform, so adding an
+//! element-wise op means adding one `case` here and one entry in
+//! `tensor::cpu`, which holds the reference implementation the GPU result is
+//! tested against.
+//!
+//! 1-D kernels are dispatched on a 2-D grid (`x + y * nx * 256`) so tensors
+//! larger than 65535 workgroups still fit in one dispatch.
 
-pub const KERNELS_WGSL: &str = r#"
+/// Op codes shared by the `unary` kernel and the CPU reference implementation.
+pub(crate) mod unary_op {
+    pub const RELU: u32 = 0;
+    pub const SILU: u32 = 1;
+    pub const GELU: u32 = 2;
+    pub const SIGMOID: u32 = 3;
+    pub const TANH: u32 = 4;
+    pub const EXP: u32 = 5;
+    pub const LOG: u32 = 6;
+    pub const ABS: u32 = 7;
+    pub const SQRT: u32 = 8;
+    pub const NEG: u32 = 9;
+    pub const ADD_SCALAR: u32 = 10;
+    pub const MUL_SCALAR: u32 = 11;
+    pub const POW_SCALAR: u32 = 12;
+    pub const CLAMP: u32 = 13;
+    pub const LEAKY_RELU: u32 = 14;
+    pub const STEP: u32 = 15;
+    pub const SIGN: u32 = 16;
+    pub const RECIP: u32 = 17;
+    pub const SILU_GRAD: u32 = 18;
+    pub const GELU_GRAD: u32 = 19;
+    pub const RSUB_SCALAR: u32 = 20;
+    pub const SQUARE: u32 = 21;
+    pub const IN_RANGE: u32 = 22;
+    pub const SIN: u32 = 23;
+    pub const COS: u32 = 24;
+    pub const LEAKY_RELU_GRAD: u32 = 25;
+}
+
+/// Op codes for the broadcasting `binary` kernel.
+pub(crate) mod binary_op {
+    pub const ADD: u32 = 0;
+    pub const SUB: u32 = 1;
+    pub const MUL: u32 = 2;
+    pub const DIV: u32 = 3;
+    pub const MAX: u32 = 4;
+    pub const MIN: u32 = 5;
+    pub const GT: u32 = 6;
+    pub const LT: u32 = 7;
+    pub const EQ: u32 = 8;
+    pub const GE: u32 = 9;
+    pub const LE: u32 = 10;
+}
+
+/// Op codes for the axis `reduce` kernel.
+pub(crate) mod reduce_op {
+    pub const SUM: u32 = 0;
+    pub const MAX: u32 = 1;
+    pub const MIN: u32 = 2;
+}
+
+/// WGSL source for every kernel in [`ComputeEngine`](super::ComputeEngine).
+pub(crate) const KERNELS_WGSL: &str = r#"
 // ============================================================================
-// RUSTY ML LIBRARY - GPU COMPUTE KERNELS
-// ============================================================================
-// High-performance compute shaders for neural network operations.
-// Optimized for Apple Metal via wgpu.
+// RUSTY TENSOR KERNELS
 // ============================================================================
 
-// --- Constants ---
-const TILE_SIZE: u32 = 16u;
-const WORKGROUP_SIZE: u32 = 64u;
+fn flat_index(gid: vec3<u32>, nwg: vec3<u32>) -> u32 {
+    return gid.x + gid.y * nwg.x * 256u;
+}
 
-// ============================================================================
-// SECTION 1: TENSOR OPERATIONS
-// ============================================================================
+fn gelu_tanh(x: f32) -> f32 {
+    let c = 0.7978845608;
+    return 0.5 * x * (1.0 + tanh(c * (x + 0.044715 * x * x * x)));
+}
 
-// --- 1.1 Element-wise Binary Operations ---
+fn gelu_tanh_grad(x: f32) -> f32 {
+    let c = 0.7978845608;
+    let t = tanh(c * (x + 0.044715 * x * x * x));
+    let dt = (1.0 - t * t) * c * (1.0 + 3.0 * 0.044715 * x * x);
+    return 0.5 * (1.0 + t) + 0.5 * x * dt;
+}
+
+fn sigmoid_f(x: f32) -> f32 {
+    return 1.0 / (1.0 + exp(-x));
+}
+
+// --- Element-wise unary ops -------------------------------------------------
+
+struct UnaryParams {
+    op: u32,
+    n: u32,
+    a: f32,
+    b: f32,
+};
+
+@group(0) @binding(0) var<storage, read> un_in: array<f32>;
+@group(0) @binding(1) var<storage, read_write> un_out: array<f32>;
+@group(0) @binding(2) var<uniform> un_p: UnaryParams;
+
+@compute @workgroup_size(256)
+fn unary(@builtin(global_invocation_id) gid: vec3<u32>,
+         @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = flat_index(gid, nwg);
+    if (i >= un_p.n) { return; }
+    let x = un_in[i];
+    let a = un_p.a;
+    let b = un_p.b;
+    var y = x;
+    switch un_p.op {
+        case 0u: { y = max(x, 0.0); }
+        case 1u: { y = x * sigmoid_f(x); }
+        case 2u: { y = gelu_tanh(x); }
+        case 3u: { y = sigmoid_f(x); }
+        case 4u: { y = tanh(x); }
+        case 5u: { y = exp(x); }
+        case 6u: { y = log(x); }
+        case 7u: { y = abs(x); }
+        case 8u: { y = sqrt(x); }
+        case 9u: { y = -x; }
+        case 10u: { y = x + a; }
+        case 11u: { y = x * a; }
+        case 12u: {
+            // pow is undefined for negative bases in WGSL; handle integer exponents.
+            let ai = round(a);
+            if (x < 0.0 && ai == a) {
+                let r = pow(-x, a);
+                y = select(r, -r, (i32(ai) & 1) == 1);
+            } else if (x == 0.0 && a > 0.0) {
+                y = 0.0;
+            } else {
+                y = pow(x, a);
+            }
+        }
+        case 13u: { y = clamp(x, a, b); }
+        case 14u: { y = select(a * x, x, x > 0.0); }
+        case 15u: { y = select(0.0, 1.0, x > 0.0); }
+        case 16u: { y = sign(x); }
+        case 17u: { y = 1.0 / x; }
+        case 18u: {
+            let s = sigmoid_f(x);
+            y = s * (1.0 + x * (1.0 - s));
+        }
+        case 19u: { y = gelu_tanh_grad(x); }
+        case 20u: { y = a - x; }
+        case 21u: { y = x * x; }
+        case 22u: { y = select(0.0, 1.0, x >= a && x <= b); }
+        case 23u: { y = sin(x); }
+        case 24u: { y = cos(x); }
+        case 25u: { y = select(a, 1.0, x > 0.0); }
+        default: { y = x; }
+    }
+    un_out[i] = y;
+}
+
+// --- Broadcasting binary ops ------------------------------------------------
+// meta = [out_shape(ndim), a_strides(ndim), b_strides(ndim)]; a broadcast
+// dimension has stride 0.
+
+struct BinaryParams {
+    op: u32,
+    n: u32,
+    ndim: u32,
+    _pad: u32,
+};
+
 @group(0) @binding(0) var<storage, read> bin_a: array<f32>;
 @group(0) @binding(1) var<storage, read> bin_b: array<f32>;
 @group(0) @binding(2) var<storage, read_write> bin_out: array<f32>;
+@group(0) @binding(3) var<uniform> bin_p: BinaryParams;
+@group(0) @binding(4) var<storage, read> bin_meta: array<u32>;
 
-@compute @workgroup_size(64)
-fn add(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let i = global_id.x;
-    if (i >= arrayLength(&bin_out)) { return; }
-    bin_out[i] = bin_a[i] + bin_b[i];
+@compute @workgroup_size(256)
+fn binary(@builtin(global_invocation_id) gid: vec3<u32>,
+          @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = flat_index(gid, nwg);
+    if (i >= bin_p.n) { return; }
+    let nd = bin_p.ndim;
+    var rem = i;
+    var ia = 0u;
+    var ib = 0u;
+    for (var d = 0u; d < nd; d = d + 1u) {
+        let axis = nd - 1u - d;
+        let size = bin_meta[axis];
+        let idx = rem % size;
+        rem = rem / size;
+        ia = ia + idx * bin_meta[nd + axis];
+        ib = ib + idx * bin_meta[2u * nd + axis];
+    }
+    let x = bin_a[ia];
+    let y = bin_b[ib];
+    var r = 0.0;
+    switch bin_p.op {
+        case 0u: { r = x + y; }
+        case 1u: { r = x - y; }
+        case 2u: { r = x * y; }
+        case 3u: { r = x / y; }
+        case 4u: { r = max(x, y); }
+        case 5u: { r = min(x, y); }
+        case 6u: { r = select(0.0, 1.0, x > y); }
+        case 7u: { r = select(0.0, 1.0, x < y); }
+        case 8u: { r = select(0.0, 1.0, x == y); }
+        case 9u: { r = select(0.0, 1.0, x >= y); }
+        case 10u: { r = select(0.0, 1.0, x <= y); }
+        default: { r = x; }
+    }
+    bin_out[i] = r;
 }
 
-@compute @workgroup_size(64)
-fn sub(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let i = global_id.x;
-    if (i >= arrayLength(&bin_out)) { return; }
-    bin_out[i] = bin_a[i] - bin_b[i];
+// --- Axis reductions --------------------------------------------------------
+// The input is viewed as [outer, dim, inner]; one thread per (outer, inner).
+
+struct AxisParams {
+    op: u32,
+    outer: u32,
+    dim: u32,
+    inner: u32,
+};
+
+@group(0) @binding(0) var<storage, read> red_in: array<f32>;
+@group(0) @binding(1) var<storage, read_write> red_out: array<f32>;
+@group(0) @binding(2) var<uniform> red_p: AxisParams;
+
+@compute @workgroup_size(256)
+fn reduce(@builtin(global_invocation_id) gid: vec3<u32>,
+          @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = flat_index(gid, nwg);
+    if (i >= red_p.outer * red_p.inner) { return; }
+    let o = i / red_p.inner;
+    let k = i % red_p.inner;
+    let base = o * red_p.dim * red_p.inner + k;
+    var acc = red_in[base];
+    for (var j = 1u; j < red_p.dim; j = j + 1u) {
+        let v = red_in[base + j * red_p.inner];
+        switch red_p.op {
+            case 1u: { acc = max(acc, v); }
+            case 2u: { acc = min(acc, v); }
+            default: { acc = acc + v; }
+        }
+    }
+    red_out[i] = acc;
 }
 
-@compute @workgroup_size(64)
-fn mul(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let i = global_id.x;
-    if (i >= arrayLength(&bin_out)) { return; }
-    bin_out[i] = bin_a[i] * bin_b[i];
+// --- Softmax / log-softmax along an axis -------------------------------------
+// op 0 = softmax, op 1 = log_softmax.
+
+@group(0) @binding(0) var<storage, read> sm_in: array<f32>;
+@group(0) @binding(1) var<storage, read_write> sm_out: array<f32>;
+@group(0) @binding(2) var<uniform> sm_p: AxisParams;
+
+@compute @workgroup_size(256)
+fn softmax(@builtin(global_invocation_id) gid: vec3<u32>,
+           @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = flat_index(gid, nwg);
+    if (i >= sm_p.outer * sm_p.inner) { return; }
+    let o = i / sm_p.inner;
+    let k = i % sm_p.inner;
+    let base = o * sm_p.dim * sm_p.inner + k;
+    var m = sm_in[base];
+    for (var j = 1u; j < sm_p.dim; j = j + 1u) {
+        m = max(m, sm_in[base + j * sm_p.inner]);
+    }
+    var s = 0.0;
+    for (var j = 0u; j < sm_p.dim; j = j + 1u) {
+        s = s + exp(sm_in[base + j * sm_p.inner] - m);
+    }
+    let log_s = log(s);
+    for (var j = 0u; j < sm_p.dim; j = j + 1u) {
+        let idx = base + j * sm_p.inner;
+        let z = sm_in[idx] - m;
+        if (sm_p.op == 1u) {
+            sm_out[idx] = z - log_s;
+        } else {
+            sm_out[idx] = exp(z) / s;
+        }
+    }
 }
 
-@compute @workgroup_size(64)
-fn div_kernel(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let i = global_id.x;
-    if (i >= arrayLength(&bin_out)) { return; }
-    bin_out[i] = bin_a[i] / bin_b[i];
-}
+// --- Batched tiled matrix multiplication -----------------------------------
+// out[b] = a[b] @ b[b]; flags bit 0: a is batched, bit 1: b is batched.
 
-// --- 1.2 Scalar Operations ---
-@group(0) @binding(0) var<storage, read> scalar_in: array<f32>;
-@group(0) @binding(1) var<storage, read_write> scalar_out: array<f32>;
-@group(0) @binding(2) var<uniform> scalar_val: f32;
+struct MatmulParams {
+    m: u32,
+    k: u32,
+    n: u32,
+    flags: u32,
+};
 
-@compute @workgroup_size(64)
-fn add_scalar(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let i = global_id.x;
-    if (i >= arrayLength(&scalar_out)) { return; }
-    scalar_out[i] = scalar_in[i] + scalar_val;
-}
-
-@compute @workgroup_size(64)
-fn mul_scalar(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let i = global_id.x;
-    if (i >= arrayLength(&scalar_out)) { return; }
-    scalar_out[i] = scalar_in[i] * scalar_val;
-}
-
-// --- 1.3 Tiled Matrix Multiplication ---
 @group(0) @binding(0) var<storage, read> mm_a: array<f32>;
 @group(0) @binding(1) var<storage, read> mm_b: array<f32>;
 @group(0) @binding(2) var<storage, read_write> mm_out: array<f32>;
-@group(0) @binding(3) var<uniform> mm_params: vec4<u32>; // M, K, N, padding
+@group(0) @binding(3) var<uniform> mm_p: MatmulParams;
 
 var<workgroup> tile_a: array<array<f32, 16>, 16>;
 var<workgroup> tile_b: array<array<f32, 16>, 16>;
 
 @compute @workgroup_size(16, 16, 1)
-fn matmul(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(local_invocation_id) local_id: vec3<u32>) {
-    let row = global_id.y;
-    let col = global_id.x;
-    let m = mm_params.x;
-    let k = mm_params.y;
-    let n = mm_params.z;
+fn matmul(@builtin(global_invocation_id) gid: vec3<u32>,
+          @builtin(local_invocation_id) lid: vec3<u32>) {
+    let row = gid.y;
+    let col = gid.x;
+    let batch = gid.z;
+    let m = mm_p.m;
+    let k = mm_p.k;
+    let n = mm_p.n;
+    let a_off = select(0u, batch * m * k, (mm_p.flags & 1u) != 0u);
+    let b_off = select(0u, batch * k * n, (mm_p.flags & 2u) != 0u);
+    let o_off = batch * m * n;
 
     var acc = 0.0;
     let num_tiles = (k + 15u) / 16u;
-
     for (var t = 0u; t < num_tiles; t = t + 1u) {
-        let r = row;
-        let c = t * 16u + local_id.x;
-        if (r < m && c < k) {
-            tile_a[local_id.y][local_id.x] = mm_a[r * k + c];
+        let ac = t * 16u + lid.x;
+        if (row < m && ac < k) {
+            tile_a[lid.y][lid.x] = mm_a[a_off + row * k + ac];
         } else {
-            tile_a[local_id.y][local_id.x] = 0.0;
+            tile_a[lid.y][lid.x] = 0.0;
         }
-
-        let r_b = t * 16u + local_id.y;
-        let c_b = col;
-        if (r_b < k && c_b < n) {
-            tile_b[local_id.y][local_id.x] = mm_b[r_b * n + c_b];
+        let br = t * 16u + lid.y;
+        if (br < k && col < n) {
+            tile_b[lid.y][lid.x] = mm_b[b_off + br * n + col];
         } else {
-            tile_b[local_id.y][local_id.x] = 0.0;
+            tile_b[lid.y][lid.x] = 0.0;
         }
-
         workgroupBarrier();
         for (var i = 0u; i < 16u; i = i + 1u) {
-            acc = acc + tile_a[local_id.y][i] * tile_b[i][local_id.x];
+            acc = acc + tile_a[lid.y][i] * tile_b[i][lid.x];
         }
         workgroupBarrier();
     }
-
     if (row < m && col < n) {
-        mm_out[row * n + col] = acc;
+        mm_out[o_off + row * n + col] = acc;
     }
 }
 
-// ============================================================================
-// SECTION 2: ACTIVATION FUNCTIONS
-// ============================================================================
+// --- Strided copy (permute, expand, narrow) ---------------------------------
+// meta = [out_shape(ndim), source stride of each output dim(ndim)]; reads
+// start at `offset`. Stride 0 broadcasts, permuted strides transpose.
 
-@group(0) @binding(0) var<storage, read> act_in: array<f32>;
-@group(0) @binding(1) var<storage, read_write> act_out: array<f32>;
-
-@compute @workgroup_size(64)
-fn relu(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let i = global_id.x;
-    if (i >= arrayLength(&act_out)) { return; }
-    act_out[i] = max(0.0, act_in[i]);
-}
-
-@compute @workgroup_size(64)
-fn silu(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let i = global_id.x;
-    if (i >= arrayLength(&act_out)) { return; }
-    let x = act_in[i];
-    act_out[i] = x / (1.0 + exp(-x));
-}
-
-@compute @workgroup_size(64)
-fn gelu(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let i = global_id.x;
-    if (i >= arrayLength(&act_out)) { return; }
-    let x = act_in[i];
-    // GELU approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-    let sqrt_2_over_pi = 0.7978845608;
-    let coeff = 0.044715;
-    let inner = sqrt_2_over_pi * (x + coeff * x * x * x);
-    act_out[i] = 0.5 * x * (1.0 + tanh(inner));
-}
-
-@compute @workgroup_size(64)
-fn sigmoid(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let i = global_id.x;
-    if (i >= arrayLength(&act_out)) { return; }
-    act_out[i] = 1.0 / (1.0 + exp(-act_in[i]));
-}
-
-@compute @workgroup_size(64)
-fn tanh_act(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let i = global_id.x;
-    if (i >= arrayLength(&act_out)) { return; }
-    act_out[i] = tanh(act_in[i]);
-}
-
-// ============================================================================
-// SECTION 3: NORMALIZATION
-// ============================================================================
-
-// --- 3.1 RMS Normalization ---
-@group(0) @binding(0) var<storage, read> rms_input: array<f32>;
-@group(0) @binding(1) var<storage, read> rms_weight: array<f32>;
-@group(0) @binding(2) var<storage, read_write> rms_out: array<f32>;
-@group(0) @binding(3) var<uniform> rms_params: vec2<u32>; // size, eps_bits
-
-@compute @workgroup_size(64)
-fn rms_norm(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let row = global_id.x;
-    let size = rms_params.x;
-    if (row >= 1u) { return; }
-    
-    var ss = 0.0;
-    for (var i = 0u; i < size; i = i + 1u) {
-        let val = rms_input[i];
-        ss = ss + val * val;
-    }
-    ss = ss / f32(size);
-    let inv_rms = 1.0 / sqrt(ss + 1e-5);
-    
-    for (var i = 0u; i < size; i = i + 1u) {
-        rms_out[i] = rms_input[i] * inv_rms * rms_weight[i];
-    }
-}
-
-// --- 3.2 Layer Normalization ---
-@group(0) @binding(0) var<storage, read> ln_input: array<f32>;
-@group(0) @binding(1) var<storage, read> ln_gamma: array<f32>;
-@group(0) @binding(2) var<storage, read> ln_beta: array<f32>;
-@group(0) @binding(3) var<storage, read_write> ln_out: array<f32>;
-@group(0) @binding(4) var<uniform> ln_params: vec2<u32>; // size, eps_bits
-
-@compute @workgroup_size(1)
-fn layer_norm(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let size = ln_params.x;
-    let eps = 1e-5;
-    
-    // Compute mean
-    var mean = 0.0;
-    for (var i = 0u; i < size; i = i + 1u) {
-        mean = mean + ln_input[i];
-    }
-    mean = mean / f32(size);
-    
-    // Compute variance
-    var variance = 0.0;
-    for (var i = 0u; i < size; i = i + 1u) {
-        let diff = ln_input[i] - mean;
-        variance = variance + diff * diff;
-    }
-    variance = variance / f32(size);
-    
-    // Normalize
-    let inv_std = 1.0 / sqrt(variance + eps);
-    for (var i = 0u; i < size; i = i + 1u) {
-        let normalized = (ln_input[i] - mean) * inv_std;
-        ln_out[i] = normalized * ln_gamma[i] + ln_beta[i];
-    }
-}
-
-// ============================================================================
-// SECTION 4: SOFTMAX & CROSS-ENTROPY
-// ============================================================================
-
-// --- 4.1 Softmax ---
-@group(0) @binding(0) var<storage, read> sm_input: array<f32>;
-@group(0) @binding(1) var<storage, read_write> sm_out: array<f32>;
-@group(0) @binding(2) var<uniform> sm_size: u32;
-
-@compute @workgroup_size(1)
-fn softmax(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let len = sm_size;
-    
-    // Find max for numerical stability
-    var max_val = -1e9;
-    for (var i = 0u; i < len; i = i + 1u) {
-        max_val = max(max_val, sm_input[i]);
-    }
-    
-    // Compute exp and sum
-    var sum_exp = 0.0;
-    for (var i = 0u; i < len; i = i + 1u) {
-        let val = exp(sm_input[i] - max_val);
-        sm_out[i] = val;
-        sum_exp = sum_exp + val;
-    }
-    
-    // Normalize
-    for (var i = 0u; i < len; i = i + 1u) {
-        sm_out[i] = sm_out[i] / sum_exp;
-    }
-}
-
-// --- 4.2 Log Softmax ---
-@compute @workgroup_size(1)
-fn log_softmax(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let len = sm_size;
-    
-    // Find max for numerical stability
-    var max_val = -1e9;
-    for (var i = 0u; i < len; i = i + 1u) {
-        max_val = max(max_val, sm_input[i]);
-    }
-    
-    // Compute log(sum(exp(x - max)))
-    var sum_exp = 0.0;
-    for (var i = 0u; i < len; i = i + 1u) {
-        sum_exp = sum_exp + exp(sm_input[i] - max_val);
-    }
-    let log_sum_exp = log(sum_exp) + max_val;
-    
-    // log_softmax = x - log_sum_exp
-    for (var i = 0u; i < len; i = i + 1u) {
-        sm_out[i] = sm_input[i] - log_sum_exp;
-    }
-}
-
-// --- 4.3 Cross-Entropy Loss ---
-@group(0) @binding(0) var<storage, read> ce_logits: array<f32>;  // [batch, vocab]
-@group(0) @binding(1) var<storage, read> ce_targets: array<u32>; // [batch]
-@group(0) @binding(2) var<storage, read_write> ce_loss: array<f32>; // [batch]
-@group(0) @binding(3) var<uniform> ce_params: vec2<u32>; // batch_size, vocab_size
-
-@compute @workgroup_size(64)
-fn cross_entropy(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let batch_idx = global_id.x;
-    let batch_size = ce_params.x;
-    let vocab_size = ce_params.y;
-    
-    if (batch_idx >= batch_size) { return; }
-    
-    let offset = batch_idx * vocab_size;
-    let target = ce_targets[batch_idx];
-    
-    // Find max for numerical stability
-    var max_val = -1e9;
-    for (var i = 0u; i < vocab_size; i = i + 1u) {
-        max_val = max(max_val, ce_logits[offset + i]);
-    }
-    
-    // Compute log_sum_exp
-    var sum_exp = 0.0;
-    for (var i = 0u; i < vocab_size; i = i + 1u) {
-        sum_exp = sum_exp + exp(ce_logits[offset + i] - max_val);
-    }
-    let log_sum_exp = log(sum_exp) + max_val;
-    
-    // Cross-entropy = -log_softmax[target]
-    ce_loss[batch_idx] = log_sum_exp - ce_logits[offset + target];
-}
-
-// ============================================================================
-// SECTION 5: POSITIONAL ENCODINGS
-// ============================================================================
-
-// --- 5.1 Rotary Position Embeddings (RoPE) ---
-@group(0) @binding(0) var<storage, read_write> rope_data: array<f32>;
-@group(0) @binding(1) var<uniform> rope_params: vec4<u32>; // head_dim, n_heads, pos, padding
-
-@compute @workgroup_size(64)
-fn rope(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let idx = global_id.x;
-    let head_dim = rope_params.x;
-    let half_dim = head_dim / 2u;
-    let token_idx = idx / half_dim;
-    let dim_idx = idx % half_dim;
-    let pos = f32(rope_params.z);
-    
-    let freq_exp = -2.0 * f32(dim_idx) / f32(head_dim);
-    let angle = pos * pow(10000.0, freq_exp);
-    let cos_a = cos(angle);
-    let sin_a = sin(angle);
-    
-    let idx1 = token_idx * head_dim + dim_idx;
-    let idx2 = idx1 + half_dim;
-    
-    if (idx1 >= arrayLength(&rope_data)) { return; }
-    
-    let v1 = rope_data[idx1];
-    let v2 = rope_data[idx2];
-    rope_data[idx1] = v1 * cos_a - v2 * sin_a;
-    rope_data[idx2] = v1 * sin_a + v2 * cos_a;
-}
-
-// ============================================================================
-// SECTION 6: EMBEDDING OPERATIONS
-// ============================================================================
-
-@group(0) @binding(0) var<storage, read> emb_table: array<f32>;  // [vocab, dim]
-@group(0) @binding(1) var<storage, read> emb_indices: array<u32>; // [seq_len]
-@group(0) @binding(2) var<storage, read_write> emb_out: array<f32>; // [seq_len, dim]
-@group(0) @binding(3) var<uniform> emb_params: vec2<u32>; // seq_len, dim
-
-@compute @workgroup_size(64)
-fn embedding_lookup(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let idx = global_id.x;
-    let seq_len = emb_params.x;
-    let dim = emb_params.y;
-    let total = seq_len * dim;
-    
-    if (idx >= total) { return; }
-    
-    let seq_idx = idx / dim;
-    let dim_idx = idx % dim;
-    let token_id = emb_indices[seq_idx];
-    
-    emb_out[idx] = emb_table[token_id * dim + dim_idx];
-}
-
-// ============================================================================
-// SECTION 7: BACKWARD KERNELS (AUTOGRAD)
-// ============================================================================
-
-// --- 7.1 Binary Op Backwards ---
-@group(0) @binding(3) var<storage, read> bk_grad_out: array<f32>;
-@group(0) @binding(4) var<storage, read_write> bk_grad_a: array<f32>;
-@group(0) @binding(5) var<storage, read_write> bk_grad_b: array<f32>;
-
-@compute @workgroup_size(64)
-fn add_backward(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let i = global_id.x;
-    if (i >= arrayLength(&bk_grad_out)) { return; }
-    let g = bk_grad_out[i];
-    bk_grad_a[i] = g;
-    bk_grad_b[i] = g;
-}
-
-@compute @workgroup_size(64)
-fn sub_backward(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let i = global_id.x;
-    if (i >= arrayLength(&bk_grad_out)) { return; }
-    let g = bk_grad_out[i];
-    bk_grad_a[i] = g;
-    bk_grad_b[i] = -g;
-}
-
-@group(0) @binding(3) var<storage, read> mul_bk_grad: array<f32>;
-@group(0) @binding(4) var<storage, read> mul_bk_a: array<f32>;
-@group(0) @binding(5) var<storage, read> mul_bk_b: array<f32>;
-@group(0) @binding(6) var<storage, read_write> mul_bk_grad_a: array<f32>;
-@group(0) @binding(7) var<storage, read_write> mul_bk_grad_b: array<f32>;
-
-@compute @workgroup_size(64)
-fn mul_backward(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let i = global_id.x;
-    if (i >= arrayLength(&mul_bk_grad)) { return; }
-    let g = mul_bk_grad[i];
-    mul_bk_grad_a[i] = g * mul_bk_b[i];
-    mul_bk_grad_b[i] = g * mul_bk_a[i];
-}
-
-// --- 7.2 Activation Backwards ---
-@group(0) @binding(3) var<storage, read> act_bk_grad: array<f32>;
-@group(0) @binding(4) var<storage, read> act_bk_input: array<f32>;
-@group(0) @binding(5) var<storage, read_write> act_bk_grad_in: array<f32>;
-
-@compute @workgroup_size(64)
-fn relu_backward(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let i = global_id.x;
-    if (i >= arrayLength(&act_bk_grad)) { return; }
-    if (act_bk_input[i] > 0.0) {
-        act_bk_grad_in[i] = act_bk_grad[i];
-    } else {
-        act_bk_grad_in[i] = 0.0;
-    }
-}
-
-@compute @workgroup_size(64)
-fn silu_backward(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let i = global_id.x;
-    if (i >= arrayLength(&act_bk_grad)) { return; }
-    let x = act_bk_input[i];
-    let s = 1.0 / (1.0 + exp(-x));
-    act_bk_grad_in[i] = act_bk_grad[i] * s * (1.0 + x * (1.0 - s));
-}
-
-@compute @workgroup_size(64)
-fn gelu_backward(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let i = global_id.x;
-    if (i >= arrayLength(&act_bk_grad)) { return; }
-    let x = act_bk_input[i];
-    // GELU derivative approximation
-    let sqrt_2_over_pi = 0.7978845608;
-    let coeff = 0.044715;
-    let inner = sqrt_2_over_pi * (x + coeff * x * x * x);
-    let tanh_inner = tanh(inner);
-    let sech2 = 1.0 - tanh_inner * tanh_inner;
-    let inner_deriv = sqrt_2_over_pi * (1.0 + 3.0 * coeff * x * x);
-    let gelu_deriv = 0.5 * (1.0 + tanh_inner) + 0.5 * x * sech2 * inner_deriv;
-    act_bk_grad_in[i] = act_bk_grad[i] * gelu_deriv;
-}
-
-// --- 7.3 MatMul Backwards ---
-@group(0) @binding(0) var<storage, read> mm_bk_grad: array<f32>;
-@group(0) @binding(1) var<storage, read> mm_bk_other: array<f32>;
-@group(0) @binding(2) var<storage, read_write> mm_bk_out: array<f32>;
-@group(0) @binding(3) var<uniform> mm_bk_params: vec4<u32>; // M, K, N, padding
-
-@compute @workgroup_size(16, 16, 1)
-fn matmul_bt(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let row = global_id.y;
-    let col = global_id.x;
-    let m = mm_bk_params.x;
-    let k = mm_bk_params.y;
-    let n = mm_bk_params.z;
-    if (row >= m || col >= n) { return; }
-    var acc = 0.0;
-    for (var i = 0u; i < k; i = i + 1u) {
-        acc = acc + mm_bk_grad[row * k + i] * mm_bk_other[col * k + i];
-    }
-    mm_bk_out[row * n + col] = acc;
-}
-
-@compute @workgroup_size(16, 16, 1)
-fn matmul_at(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let row = global_id.y;
-    let col = global_id.x;
-    let m = mm_bk_params.x;
-    let k = mm_bk_params.y;
-    let n = mm_bk_params.z;
-    if (row >= m || col >= n) { return; }
-    var acc = 0.0;
-    for (var i = 0u; i < k; i = i + 1u) {
-        acc = acc + mm_bk_other[i * m + row] * mm_bk_grad[i * n + col];
-    }
-    mm_bk_out[row * n + col] = acc;
-}
-
-// --- 7.4 Softmax Backward ---
-@group(0) @binding(3) var<storage, read> sm_bk_grad: array<f32>;
-@group(0) @binding(4) var<storage, read> sm_bk_out: array<f32>;
-@group(0) @binding(5) var<storage, read_write> sm_bk_grad_in: array<f32>;
-
-@compute @workgroup_size(1)
-fn softmax_backward(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let len = sm_size;
-    var sum_g_s = 0.0;
-    for (var i = 0u; i < len; i = i + 1u) {
-        sum_g_s = sum_g_s + sm_bk_grad[i] * sm_bk_out[i];
-    }
-    for (var i = 0u; i < len; i = i + 1u) {
-        let s = sm_bk_out[i];
-        sm_bk_grad_in[i] = s * (sm_bk_grad[i] - sum_g_s);
-    }
-}
-
-// ============================================================================
-// SECTION 8: OPTIMIZER KERNELS
-// ============================================================================
-
-@group(0) @binding(0) var<storage, read_write> opt_weight: array<f32>;
-@group(0) @binding(1) var<storage, read> opt_grad: array<f32>;
-@group(0) @binding(2) var<uniform> opt_lr: f32;
-
-@compute @workgroup_size(64)
-fn sgd_update(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let i = global_id.x;
-    if (i >= arrayLength(&opt_weight)) { return; }
-    opt_weight[i] = opt_weight[i] - opt_lr * opt_grad[i];
-}
-
-struct AdamParams {
-    lr: f32,
-    beta1: f32,
-    beta2: f32,
-    eps: f32,
-    weight_decay: f32,
-    t: f32,
-    _pad0: f32,
-    _pad1: f32,
+struct PermuteParams {
+    n: u32,
+    ndim: u32,
+    offset: u32,
+    _pad: u32,
 };
 
-@group(0) @binding(3) var<storage, read_write> adam_m: array<f32>;
-@group(0) @binding(4) var<storage, read_write> adam_v: array<f32>;
-@group(0) @binding(5) var<uniform> adam_params: AdamParams;
+@group(0) @binding(0) var<storage, read> perm_in: array<f32>;
+@group(0) @binding(1) var<storage, read_write> perm_out: array<f32>;
+@group(0) @binding(2) var<uniform> perm_p: PermuteParams;
+@group(0) @binding(3) var<storage, read> perm_meta: array<u32>;
 
-@compute @workgroup_size(64)
-fn adamw_update(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let i = global_id.x;
-    if (i >= arrayLength(&opt_weight)) { return; }
-    
-    let g = opt_grad[i];
-    let m = adam_m[i] * adam_params.beta1 + (1.0 - adam_params.beta1) * g;
-    let v = adam_v[i] * adam_params.beta2 + (1.0 - adam_params.beta2) * g * g;
-    
-    adam_m[i] = m;
-    adam_v[i] = v;
-    
-    let m_hat = m / (1.0 - pow(adam_params.beta1, adam_params.t));
-    let v_hat = v / (1.0 - pow(adam_params.beta2, adam_params.t));
-    
-    var w = opt_weight[i];
-    w = w - adam_params.lr * (m_hat / (sqrt(v_hat) + adam_params.eps) + adam_params.weight_decay * w);
-    opt_weight[i] = w;
+@compute @workgroup_size(256)
+fn permute(@builtin(global_invocation_id) gid: vec3<u32>,
+           @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = flat_index(gid, nwg);
+    if (i >= perm_p.n) { return; }
+    let nd = perm_p.ndim;
+    var rem = i;
+    var src = perm_p.offset;
+    for (var d = 0u; d < nd; d = d + 1u) {
+        let axis = nd - 1u - d;
+        let size = perm_meta[axis];
+        src = src + (rem % size) * perm_meta[nd + axis];
+        rem = rem / size;
+    }
+    perm_out[i] = perm_in[src];
 }
 
-// ============================================================================
-// SECTION 9: LOSS FUNCTIONS
-// ============================================================================
+// --- Row gather (embedding lookup / index_select on dim 0) -------------------
 
-@group(0) @binding(0) var<storage, read> mse_pred: array<f32>;
-@group(0) @binding(1) var<storage, read> mse_target: array<f32>;
-@group(0) @binding(2) var<storage, read_write> mse_out: array<f32>;
+struct GatherParams {
+    n_idx: u32,
+    row: u32,
+    _pad0: u32,
+    _pad1: u32,
+};
 
-@compute @workgroup_size(64)
-fn mse_loss(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let i = global_id.x;
-    if (i >= arrayLength(&mse_out)) { return; }
-    let diff = mse_pred[i] - mse_target[i];
-    mse_out[i] = diff * diff;
-}
+@group(0) @binding(0) var<storage, read> gat_table: array<f32>;
+@group(0) @binding(1) var<storage, read> gat_idx: array<u32>;
+@group(0) @binding(2) var<storage, read_write> gat_out: array<f32>;
+@group(0) @binding(3) var<uniform> gat_p: GatherParams;
 
-@group(0) @binding(3) var<storage, read_write> mse_grad: array<f32>;
-
-@compute @workgroup_size(64)
-fn mse_loss_backward(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let i = global_id.x;
-    if (i >= arrayLength(&mse_pred)) { return; }
-    mse_grad[i] = 2.0 * (mse_pred[i] - mse_target[i]);
-}
-
-// ============================================================================
-// SECTION 10: QUANTIZATION
-// ============================================================================
-
-@group(0) @binding(0) var<storage, read> q_weight: array<u32>;
-@group(0) @binding(1) var<storage, read> q_scales: array<f32>;
-@group(0) @binding(2) var<storage, read> q_biases: array<f32>;
-@group(0) @binding(3) var<storage, read_write> q_out: array<f32>;
-
-@compute @workgroup_size(64)
-fn affine_dequantize(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let out_idx = global_id.x;
-    if (out_idx >= arrayLength(&q_out)) { return; }
-    
-    let u32_idx = out_idx / 4u;
-    let byte_inner = out_idx % 4u;
-    let val_u32 = q_weight[u32_idx];
-    let val_u8 = f32((val_u32 >> (byte_inner * 8u)) & 0xFFu);
-    
-    let group_idx = out_idx / 64u;
-    let scale = q_scales[group_idx];
-    let bias = q_biases[group_idx];
-    
-    q_out[out_idx] = val_u8 * scale + bias;
-}
-
-// ============================================================================
-// SECTION 11: TENSOR UTILITIES
-// ============================================================================
-
-@group(0) @binding(0) var<storage, read> copy_src: array<f32>;
-@group(0) @binding(1) var<storage, read_write> copy_dst: array<f32>;
-
-@compute @workgroup_size(64)
-fn copy(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let i = global_id.x;
-    if (i >= arrayLength(&copy_dst)) { return; }
-    copy_dst[i] = copy_src[i];
-}
-
-@group(0) @binding(0) var<storage, read_write> fill_buf: array<f32>;
-@group(0) @binding(1) var<uniform> fill_val: f32;
-
-@compute @workgroup_size(64)
-fn fill(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let i = global_id.x;
-    if (i >= arrayLength(&fill_buf)) { return; }
-    fill_buf[i] = fill_val;
+@compute @workgroup_size(256)
+fn gather_rows(@builtin(global_invocation_id) gid: vec3<u32>,
+               @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = flat_index(gid, nwg);
+    if (i >= gat_p.n_idx * gat_p.row) { return; }
+    let r = i / gat_p.row;
+    let c = i % gat_p.row;
+    gat_out[i] = gat_table[gat_idx[r] * gat_p.row + c];
 }
 "#;

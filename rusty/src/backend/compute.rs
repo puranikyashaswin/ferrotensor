@@ -1,261 +1,127 @@
 //! Compute Engine - GPU Kernel Dispatch
 //!
-//! This module handles compilation and dispatch of GPU compute kernels.
+//! Compiles the WGSL kernels once per device and dispatches them.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use wgpu::{BindGroup, BindGroupLayout, Buffer, ComputePipeline, Device, ShaderModule};
+use wgpu::{Buffer, ComputePipeline, Device, Queue};
 
 use super::KERNELS_WGSL;
 
-/// Parameters for AdamW optimizer (must match WGSL struct layout)
-#[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct AdamParams {
-    pub lr: f32,
-    pub beta1: f32,
-    pub beta2: f32,
-    pub eps: f32,
-    pub weight_decay: f32,
-    pub t: f32,
-    pub _pad: [f32; 2],
-}
+/// Entry points compiled from [`KERNELS_WGSL`].
+pub(crate) const KERNEL_NAMES: [&str; 7] = [
+    "unary",
+    "binary",
+    "reduce",
+    "softmax",
+    "matmul",
+    "permute",
+    "gather_rows",
+];
 
-impl Default for AdamParams {
-    fn default() -> Self {
-        Self {
-            lr: 1e-4,
-            beta1: 0.9,
-            beta2: 0.999,
-            eps: 1e-8,
-            weight_decay: 0.01,
-            t: 1.0,
-            _pad: [0.0; 2],
-        }
-    }
-}
+/// Threads per workgroup of the 1-D kernels.
+const WORKGROUP_1D: u32 = 256;
+/// Largest workgroup count allowed in one grid dimension.
+const MAX_GROUPS_PER_DIM: u32 = 65_535;
 
-/// GPU Compute Engine for kernel dispatch
+/// GPU compute engine: one compiled pipeline per kernel entry point.
 pub struct ComputeEngine {
-    shader_module: ShaderModule,
-    pipelines: HashMap<String, ComputePipeline>,
-    bind_group_layouts: HashMap<String, BindGroupLayout>,
+    pipelines: HashMap<&'static str, ComputePipeline>,
 }
 
 impl ComputeEngine {
-    /// Create a new compute engine with all kernels compiled.
+    /// Compile all kernels for `device`.
     pub fn new(device: &Device) -> Self {
-        let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Rusty Kernels"),
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(KERNELS_WGSL)),
         });
 
-        let mut pipelines = HashMap::new();
-        let bind_group_layouts = HashMap::new();
+        let pipelines = KERNEL_NAMES
+            .iter()
+            .map(|&name| {
+                let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(name),
+                    layout: None,
+                    module: &module,
+                    entry_point: name,
+                });
+                (name, pipeline)
+            })
+            .collect();
 
-        // Compile all kernels
-        let kernel_names = [
-            // Binary ops
-            "add",
-            "sub",
-            "mul",
-            "div_kernel",
-            // Scalar ops
-            "add_scalar",
-            "mul_scalar",
-            // MatMul
-            "matmul",
-            "matmul_bt",
-            "matmul_at",
-            // Activations
-            "relu",
-            "silu",
-            "gelu",
-            "sigmoid",
-            "tanh_act",
-            // Normalization
-            "rms_norm",
-            "layer_norm",
-            // Softmax & Loss
-            "softmax",
-            "log_softmax",
-            "cross_entropy",
-            // Positional
-            "rope",
-            // Embedding
-            "embedding_lookup",
-            // Backward ops
-            "add_backward",
-            "sub_backward",
-            "mul_backward",
-            "relu_backward",
-            "silu_backward",
-            "gelu_backward",
-            "softmax_backward",
-            // Optimizer
-            "sgd_update",
-            "adamw_update",
-            // Loss
-            "mse_loss",
-            "mse_loss_backward",
-            // Quantization
-            "affine_dequantize",
-            // Utilities
-            "copy",
-            "fill",
-        ];
-
-        for name in kernel_names {
-            let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some(name),
-                layout: None,
-                module: &shader_module,
-                entry_point: name,
-            });
-            pipelines.insert(name.to_string(), pipeline);
-        }
-
-        Self {
-            shader_module,
-            pipelines,
-            bind_group_layouts,
-        }
+        Self { pipelines }
     }
 
-    /// Get a compute pipeline by name.
+    /// Get a compiled pipeline by entry point name.
     pub fn get_pipeline(&self, name: &str) -> Option<&ComputePipeline> {
         self.pipelines.get(name)
     }
 
-    /// Create a bind group for binary operations (a, b, out).
-    pub fn create_binary_bind_group(
+    /// Dispatch `kernel`, binding `buffers[i]` to `@binding(i)` of group 0.
+    pub(crate) fn run(
         &self,
         device: &Device,
-        pipeline: &ComputePipeline,
-        a: &Buffer,
-        b: &Buffer,
-        out: &Buffer,
-    ) -> BindGroup {
-        let layout = pipeline.get_bind_group_layout(0);
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Binary Op Bind Group"),
-            layout: &layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: a.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: b.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: out.as_entire_binding(),
-                },
-            ],
-        })
-    }
-
-    /// Create a bind group for unary operations (in, out).
-    pub fn create_unary_bind_group(
-        &self,
-        device: &Device,
-        pipeline: &ComputePipeline,
-        input: &Buffer,
-        output: &Buffer,
-    ) -> BindGroup {
-        let layout = pipeline.get_bind_group_layout(0);
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Unary Op Bind Group"),
-            layout: &layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: input.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: output.as_entire_binding(),
-                },
-            ],
-        })
-    }
-
-    /// Create a bind group for matrix multiplication.
-    pub fn create_matmul_bind_group(
-        &self,
-        device: &Device,
-        pipeline: &ComputePipeline,
-        a: &Buffer,
-        b: &Buffer,
-        out: &Buffer,
-        params: &Buffer,
-    ) -> BindGroup {
-        let layout = pipeline.get_bind_group_layout(0);
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("MatMul Bind Group"),
-            layout: &layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: a.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: b.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: out.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: params.as_entire_binding(),
-                },
-            ],
-        })
-    }
-
-    /// Dispatch a compute shader.
-    pub fn dispatch(
-        &self,
-        device: &Device,
-        queue: &wgpu::Queue,
-        pipeline_name: &str,
-        bind_group: &BindGroup,
+        queue: &Queue,
+        kernel: &str,
+        buffers: &[&Buffer],
         workgroups: (u32, u32, u32),
     ) {
         let pipeline = self
             .pipelines
-            .get(pipeline_name)
-            .unwrap_or_else(|| panic!("Pipeline '{}' not found", pipeline_name));
-
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Compute Encoder"),
+            .get(kernel)
+            .unwrap_or_else(|| panic!("kernel '{kernel}' is not compiled"));
+        let layout = pipeline.get_bind_group_layout(0);
+        let entries: Vec<wgpu::BindGroupEntry<'_>> = buffers
+            .iter()
+            .enumerate()
+            .map(|(i, buffer)| wgpu::BindGroupEntry {
+                binding: i as u32,
+                resource: buffer.as_entire_binding(),
+            })
+            .collect();
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(kernel),
+            layout: &layout,
+            entries: &entries,
         });
 
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some(kernel),
+        });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some(pipeline_name),
+                label: Some(kernel),
                 timestamp_writes: None,
             });
             pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, bind_group, &[]);
+            pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(workgroups.0, workgroups.1, workgroups.2);
         }
-
         queue.submit(std::iter::once(encoder.finish()));
     }
 
-    /// Calculate workgroup size for 1D dispatch.
-    pub fn workgroups_1d(size: u32) -> u32 {
-        (size + 63) / 64
+    /// Workgroup grid for a 1-D kernel over `n` elements.
+    ///
+    /// Spills into the y dimension past 65535 workgroups; the kernels rebuild
+    /// the flat index as `x + y * nx * 256`.
+    pub fn workgroups_1d(n: usize) -> (u32, u32, u32) {
+        let groups = (n as u32).div_ceil(WORKGROUP_1D).max(1);
+        if groups <= MAX_GROUPS_PER_DIM {
+            (groups, 1, 1)
+        } else {
+            let y = groups.div_ceil(MAX_GROUPS_PER_DIM);
+            (MAX_GROUPS_PER_DIM, y, 1)
+        }
     }
 
-    /// Calculate workgroup size for 2D dispatch (16x16 tiles).
-    pub fn workgroups_2d(rows: u32, cols: u32) -> (u32, u32) {
-        ((cols + 15) / 16, (rows + 15) / 16)
+    /// Workgroup grid for the 16x16 tiled matmul kernel.
+    pub fn workgroups_matmul(rows: usize, cols: usize, batch: usize) -> (u32, u32, u32) {
+        (
+            (cols as u32).div_ceil(16),
+            (rows as u32).div_ceil(16),
+            batch as u32,
+        )
     }
 }
 
@@ -264,5 +130,41 @@ impl std::fmt::Debug for ComputeEngine {
         f.debug_struct("ComputeEngine")
             .field("num_pipelines", &self.pipelines.len())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parse and validate the WGSL with naga: catches shader errors on
+    /// machines (and CI runners) without a GPU.
+    #[test]
+    fn kernels_pass_naga_validation() {
+        let module = naga::front::wgsl::parse_str(KERNELS_WGSL)
+            .unwrap_or_else(|e| panic!("{}", e.emit_to_string(KERNELS_WGSL)));
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        )
+        .validate(&module)
+        .unwrap_or_else(|e| panic!("{:?}", e));
+
+        for name in KERNEL_NAMES {
+            assert!(
+                module.entry_points.iter().any(|ep| ep.name == name),
+                "missing entry point {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn workgroups_split_large_dispatches() {
+        assert_eq!(ComputeEngine::workgroups_1d(0), (1, 1, 1));
+        assert_eq!(ComputeEngine::workgroups_1d(256), (1, 1, 1));
+        assert_eq!(ComputeEngine::workgroups_1d(257), (2, 1, 1));
+        let (x, y, _) = ComputeEngine::workgroups_1d(256 * 70_000);
+        assert_eq!(x, 65_535);
+        assert!(x as usize * y as usize * 256 >= 256 * 70_000);
     }
 }

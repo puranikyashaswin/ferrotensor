@@ -78,11 +78,11 @@ impl Module for Tanh {
 /// Softmax activation along a dimension
 #[derive(Debug, Clone, Copy)]
 pub struct Softmax {
-    pub dim: i32,
+    pub dim: isize,
 }
 
 impl Softmax {
-    pub fn new(dim: i32) -> Self {
+    pub fn new(dim: isize) -> Self {
         Self { dim }
     }
 }

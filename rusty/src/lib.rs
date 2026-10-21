@@ -29,6 +29,7 @@ pub mod tensor;
 mod device;
 
 pub use device::Device;
+pub use tensor::{no_grad, Tensor};
 
 /// Prelude module - import everything you need with `use rusty::prelude::*`
 pub mod prelude {

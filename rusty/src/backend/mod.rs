@@ -1,10 +1,10 @@
 //! GPU Backend Module
 //!
-//! This module provides low-level GPU compute functionality via wgpu.
-//! It includes the compute engine for kernel dispatch and GPU buffer management.
+//! Low-level GPU compute via wgpu: the WGSL kernels and the engine that
+//! compiles and dispatches them.
 
 mod compute;
 mod kernels;
 
 pub use compute::ComputeEngine;
-pub(crate) use kernels::KERNELS_WGSL;
+pub(crate) use kernels::{binary_op, reduce_op, unary_op, KERNELS_WGSL};

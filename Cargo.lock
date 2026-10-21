@@ -1735,6 +1735,7 @@ dependencies = [
  "env_logger",
  "log",
  "memmap2",
+ "naga",
  "pollster",
  "rand 0.8.5",
  "rusty-autograd",
