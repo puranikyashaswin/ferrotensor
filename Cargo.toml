@@ -25,7 +25,7 @@ homepage = "https://github.com/puranikyashaswin/rusty"
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"
-rust_2018_idioms = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
 
 [workspace.lints.clippy]
 unwrap_used = "warn"
