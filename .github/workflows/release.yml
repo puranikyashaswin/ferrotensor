@@ -36,7 +36,7 @@ jobs:
           cp "target/${{ matrix.target }}/release/ferrotensor" LICENSE-MIT LICENSE-APACHE README.md "$name/"
           tar czf "$name.tar.gz" "$name"
           shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
-      - uses: actions/upload-artifact@v4.4.3
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: ferrotensor-cli-${{ matrix.target }}
           path: ferrotensor-cli-*.tar.gz*
