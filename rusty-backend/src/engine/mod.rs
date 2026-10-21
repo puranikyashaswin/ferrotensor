@@ -19,7 +19,7 @@ pub use training::AdamParams;
 fn shader_source() -> String {
     let kernels_src = include_str!("../shaders/kernels.wgsl");
     let flash_v2_src = include_str!("../shaders/flash_attention_v2.wgsl");
-    let flash_v2_bw_src = include_str!("../shaders/flash_attention_v2_backward_optimized.wgsl");
+    let flash_v2_bw_src = include_str!("../shaders/flash_attention_v2_backward.wgsl");
     format!("{}\n{}\n{}", kernels_src, flash_v2_src, flash_v2_bw_src)
 }
 
