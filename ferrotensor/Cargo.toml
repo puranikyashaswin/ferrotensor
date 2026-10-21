@@ -11,7 +11,7 @@ documentation = "https://docs.rs/ferrotensor"
 homepage = "https://github.com/puranikyashaswin/ferrotensor"
 readme = "README.md"
 keywords = ["machine-learning", "deep-learning", "gpu", "neural-networks", "transformer"]
-categories = ["science::ml", "algorithms"]
+categories = ["science", "algorithms"]
 
 [dependencies]
 # Internal crates
