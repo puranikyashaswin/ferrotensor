@@ -26,7 +26,7 @@ ferrotensor-autograd = { path = "../ferrotensor-autograd", version = "0.1.0" }
 ferrotensor-trainer = { path = "../ferrotensor-trainer", version = "0.1.0" }
 ferrotensor-monitor = { path = "../ferrotensor-monitor", version = "0.1.0" }
 clap = { version = "4.5", features = ["derive"] }
-pollster = "0.3"
+pollster = "1.0"
 env_logger = "0.11"
 log = "0.4"
 serde = { version = "1.0", features = ["derive"] }
