@@ -14,7 +14,7 @@
 // rusty-graph and rusty-trainer.
 #![allow(clippy::arc_with_non_send_sync)]
 
-use rusty_backend::{AdamParams, ComputeEngine, UnifiedTensor, WgpuContext};
+use rusty_backend::{AdamParams, AttentionOptions, ComputeEngine, UnifiedTensor, WgpuContext};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -832,7 +832,7 @@ impl Tensor {
     /// RMS normalization over the last dimension, scaled by `weight`.
     pub fn rms_norm(input: &Tensor, weight: &Tensor, eps: f32, engine: &ComputeEngine) -> Tensor {
         let out_data = UnifiedTensor::empty(&input.ctx, &input.data.shape);
-        engine.rms_norm(&input.ctx, &input.data, &weight.data, &out_data);
+        engine.rms_norm_eps(&input.ctx, &input.data, &weight.data, &out_data, eps);
         let node = Arc::new(RMSNormNode {
             input: input.clone(),
             weight: weight.clone(),
@@ -973,7 +973,13 @@ impl AutogradNode for FlashAttentionNode {
             mask_data,
         );
 
-        engine.flash_attention_v2_backward(
+        let opts = AttentionOptions {
+            causal: self.causal,
+            dropout_prob: self.dropout_prob,
+            seed: self.seed,
+            ..Default::default()
+        };
+        engine.flash_attention_v2_backward_with(
             &self.q.ctx,
             &self.q.data,
             &self.k.data,
@@ -983,7 +989,8 @@ impl AutogradNode for FlashAttentionNode {
             &grad_q,
             &grad_k,
             &grad_v,
-            self.causal,
+            &opts,
+            mask_data,
         );
 
         let mut grads = vec![grad_q, grad_k, grad_v];

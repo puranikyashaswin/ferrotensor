@@ -71,7 +71,7 @@ fn cases() -> Vec<Case> {
         case(
             "rms_norm",
             vec![input(&[2, 6], 5), input(&[6], 6)],
-            |x, e| Tensor::rms_norm(&x[0], &x[1], 1e-5, e),
+            |x, e| Tensor::rms_norm(&x[0], &x[1], 0.1, e),
         ),
         case("rope_one_head", vec![input(&[1, 3, 4], 7)], |x, e| {
             Tensor::rope(&x[0], 4, 2, e)
@@ -97,6 +97,44 @@ fn cases() -> Vec<Case> {
             let r = Tensor::reshape(&x[0], &[3, 2]);
             Tensor::mul(&r, &r, e)
         }),
+        case(
+            "flash_attention_causal",
+            vec![
+                input(&[1, 4, 2, 8], 16),
+                input(&[1, 4, 2, 8], 17),
+                input(&[1, 4, 2, 8], 18),
+            ],
+            |x, e| Tensor::flash_attention(&x[0], &x[1], &x[2], None, true, 0.0, 0, e),
+        ),
+        case(
+            "flash_attention_mask",
+            vec![
+                input(&[1, 4, 2, 8], 19),
+                input(&[1, 4, 2, 8], 20),
+                input(&[1, 4, 2, 8], 21),
+            ],
+            |x, e| {
+                // Additive [1, 1, q, k] mask, a constant (not a checked input).
+                let mask_values: Vec<f32> = (0..16)
+                    .map(|i| if (i / 4 + i % 4) % 3 == 0 { -1e4 } else { 0.0 })
+                    .collect();
+                let ctx = x[0].ctx.clone();
+                let mask = Tensor::new(
+                    ctx.clone(),
+                    UnifiedTensor::new(&ctx, &mask_values, &[1, 1, 4, 4]),
+                );
+                Tensor::flash_attention(&x[0], &x[1], &x[2], Some(&mask), false, 0.0, 0, e)
+            },
+        ),
+        case(
+            "flash_attention_dropout",
+            vec![
+                input(&[1, 4, 2, 8], 22),
+                input(&[1, 4, 2, 8], 23),
+                input(&[1, 4, 2, 8], 24),
+            ],
+            |x, e| Tensor::flash_attention(&x[0], &x[1], &x[2], None, false, 0.3, 7, e),
+        ),
         case("checkpoint", vec![input(&[6], 15)], |x, e| {
             checkpoint_single(
                 x[0].clone(),
