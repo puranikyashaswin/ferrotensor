@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="https://github.com/puranikyashaswin/ferrotensor/actions/workflows/ci.yml"><img src="https://github.com/puranikyashaswin/ferrotensor/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/rust-1.75+-orange" alt="Rust 1.75+">
+  <img src="https://img.shields.io/badge/rust-1.88+-orange" alt="Rust 1.88+">
   <img src="https://img.shields.io/badge/GPU-Metal%20%7C%20Vulkan%20%7C%20DX12-purple" alt="GPU backends">
   <img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="MIT OR Apache-2.0">
   <img src="https://img.shields.io/badge/status-pre--1.0-yellow" alt="pre-1.0">
@@ -41,7 +41,7 @@ Measured on a MacBook Air (Apple M2, 8 GB unified memory) through Metal:
 
 ## Quickstart
 
-You need Rust 1.75+ (`rustup` is enough). On macOS no other setup is needed.
+You need Rust 1.88+ (`rustup` is enough). On macOS no other setup is needed.
 
 ```bash
 git clone https://github.com/puranikyashaswin/ferrotensor.git

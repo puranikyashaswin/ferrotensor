@@ -9,7 +9,7 @@ repository.workspace = true
 rust-version.workspace = true
 homepage = "https://github.com/puranikyashaswin/ferrotensor"
 documentation = "https://docs.rs/ferrotensor-autograd"
-readme = "../README.md"
+readme = "README.md"
 keywords = ["autograd", "automatic-differentiation", "machine-learning", "gpu", "wgpu"]
 categories = ["science", "algorithms"]
 

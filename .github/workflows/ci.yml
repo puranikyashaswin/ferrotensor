@@ -38,7 +38,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2.7.5
+      - uses: Swatinem/rust-cache@v2.9.2
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
@@ -51,7 +51,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4.2.2
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.7.5
+      - uses: Swatinem/rust-cache@v2.9.2
       # Hosted runners have no GPU: GPU tests are #[ignore]d and skipped here.
       - run: cargo test --workspace
 
@@ -63,7 +63,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4.2.2
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.7.5
+      - uses: Swatinem/rust-cache@v2.9.2
       - run: cargo doc --workspace --no-deps
 
   msrv:
@@ -77,7 +77,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
-      - uses: Swatinem/rust-cache@v2.7.5
+      - uses: Swatinem/rust-cache@v2.9.2
       - run: cargo check --workspace --locked
 
   deny:
@@ -85,6 +85,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4.2.2
-      - uses: EmbarkStudios/cargo-deny-action@v2.0.1
+      - uses: EmbarkStudios/cargo-deny-action@v2.1.1
         with:
           command: check advisories licenses bans sources

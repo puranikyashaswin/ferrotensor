@@ -5,7 +5,7 @@ focused pull requests that come with tests are the easiest to review and merge.
 
 ## Setup
 
-You need Rust 1.75 or newer (stable). A GPU is optional: the default test
+You need Rust 1.88 or newer (stable). A GPU is optional: the default test
 suite runs on the CPU device.
 
 ```bash

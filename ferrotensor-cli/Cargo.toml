@@ -9,7 +9,7 @@ repository.workspace = true
 rust-version.workspace = true
 homepage = "https://github.com/puranikyashaswin/ferrotensor"
 documentation = "https://docs.rs/ferrotensor-cli"
-readme = "../README.md"
+readme = "README.md"
 keywords = ["machine-learning", "cli", "lora", "llm", "gpu"]
 categories = ["science"]
 

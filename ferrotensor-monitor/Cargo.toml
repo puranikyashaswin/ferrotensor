@@ -9,7 +9,7 @@ repository.workspace = true
 rust-version.workspace = true
 homepage = "https://github.com/puranikyashaswin/ferrotensor"
 documentation = "https://docs.rs/ferrotensor-monitor"
-readme = "../README.md"
+readme = "README.md"
 keywords = ["tui", "monitoring", "training", "machine-learning", "dashboard"]
 categories = ["science"]
 

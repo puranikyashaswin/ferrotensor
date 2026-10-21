@@ -19,7 +19,7 @@ First public version. Nothing has been published to crates.io yet.
 - `ferrotensor` command-line tool (`ferrotensor-cli` crate): `train`, `eval` and `generate` with temperature, top-k and top-p sampling and a KV cache.
 - `ferrotensor-hub` (Hugging Face Hub downloads) and `ferrotensor-monitor` (terminal dashboard).
 - Benchmark suite with recorded results (`benchmarks/RESULTS.md`) and an end-to-end LoRA walkthrough on SmolLM2-135M (`docs/examples/lora-sft.md`).
-- CI (rustfmt, clippy with `-D warnings`, tests on Linux and macOS, rustdoc, MSRV, cargo-deny), release workflow for `v*` tags, Dependabot, issue and PR templates, `SECURITY.md`, `CODE_OF_CONDUCT.md`, `CONTRIBUTING.md`, architecture and kernel-writing guides.
+- CI (rustfmt, clippy with `-D warnings`, tests on Linux and macOS, rustdoc, MSRV, cargo-deny), release workflow for `v*` tags, issue and PR templates, `SECURITY.md`, `CODE_OF_CONDUCT.md`, `CONTRIBUTING.md`, architecture and kernel-writing guides.
 
 ### Changed
 - Renamed the project from Rusty to Ferrotensor; crates are now `ferrotensor-*` and the CLI binary is `ferrotensor`.
