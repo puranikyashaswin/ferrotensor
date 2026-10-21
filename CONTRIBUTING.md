@@ -1,149 +1,138 @@
 # Contributing to Rusty
 
-Thank you for your interest in contributing to Rusty! This document provides guidelines and instructions for contributing.
+Thanks for your interest. Rusty is a young, one-maintainer project, so small,
+focused pull requests that come with tests are the easiest to review and merge.
 
-## Development Setup
+## Setup
 
-### Prerequisites
-
-- Rust 1.75 or later (stable channel)
-- Git
-- A GPU with WebGPU support is recommended for most training, tests, and benchmarks
-
-### Setup
+You need Rust 1.75 or newer (stable). A GPU is optional: the default test
+suite runs on the CPU device.
 
 ```bash
-# Clone the repository
 git clone https://github.com/puranikyashaswin/rusty.git
 cd rusty
-
-# Build the project
 cargo build --workspace
-
-# Run tests
 cargo test --workspace
-
-# Run clippy for linting
-cargo clippy --workspace -- -D warnings
-
-# Format code
-cargo fmt --all
 ```
 
-## Code Style
-
-We follow standard Rust formatting conventions. Before submitting a PR:
+Then try an example to check your GPU works:
 
 ```bash
-cargo fmt --all
-cargo clippy --workspace -- -D warnings
+cargo run --release -p rusty --example quickstart
 ```
 
-### Guidelines
+Building the whole workspace needs a few GB of RAM; on small machines use
+`CARGO_BUILD_JOBS=2` and build one crate at a time (`-p rusty`).
 
-- Use descriptive variable names (avoid single-letter names except in iterators)
-- Document all public items with doc comments
-- Write tests for new functionality
-- Handle errors gracefully (avoid `.unwrap()` in user-facing code)
-- Follow the existing code structure and patterns
+## Where things are
 
-## Pull Request Process
+| You want to... | Read |
+|----------------|------|
+| understand how a tensor op becomes a GPU kernel | [docs/architecture.md](docs/architecture.md) |
+| add a GPU op, with tests | [docs/writing-a-kernel.md](docs/writing-a-kernel.md) |
+| see what works today | [docs/use-cases.md](docs/use-cases.md) |
+| find something to work on | [docs/good-first-issues.md](docs/good-first-issues.md) |
 
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Make your changes
-4. Add tests for new functionality
-5. Ensure all tests pass (`cargo test --workspace`)
-6. Run clippy and fix any warnings (`cargo clippy --workspace -- -D warnings`)
-7. Format your code (`cargo fmt --all`)
-8. Commit your changes with clear commit messages
-9. Push to your fork
-10. Open a Pull Request
+The crates: `rusty` is the tensor API (tensor, autograd, `nn`, `optim`, `data`,
+`serialize`); `rusty-backend`, `rusty-autograd`, `rusty-graph`, `rusty-loader`,
+`rusty-trainer`, `rusty-cli`, `rusty-monitor` and `rusty-hub` are the LLM
+fine-tuning stack; `benchmarks` holds the GPU benchmarks. Each crate has a
+README.
 
-### Commit Messages
-
-Follow [Conventional Commits](https://www.conventionalcommits.org/) specification:
-
-- `feat:` - New features
-- `fix:` - Bug fixes
-- `docs:` - Documentation changes
-- `refactor:` - Code refactoring
-- `test:` - Adding or updating tests
-- `chore:` - Maintenance tasks
-
-Examples:
-```
-feat: add tensor broadcasting support
-fix: prevent NaN panic in argmax
-docs: add installation guide
-refactor: simplify gradient computation
-```
-
-## Architecture Overview
-
-Rusty is organized as a Cargo workspace with the following crates:
-
-- `rusty` - Core library (tensors, autograd, neural network modules)
-- `rusty-backend` - GPU compute engine and WGSL kernels
-- `rusty-autograd` - Automatic differentiation engine
-- `rusty-cli` - Command-line interface
-- `rusty-trainer` - Training utilities and abstractions
-- `rusty-graph` - Model loading and graph construction
-- `rusty-loader` - Model file loading (safetensors, tokenizer)
-- `rusty-monitor` - Training metrics and monitoring TUI
-- `rusty-hub` - Model hub helpers
-- `benchmarks` - GPU performance benchmarks (`rusty-benchmarks`)
-
-## Testing
-
-### Training Scope
-
-The main user-facing priority is lightweight fine-tuning on consumer hardware. Contributions that improve the following are especially valuable:
-
-- LoRA fine-tuning correctness and resume safety
-- Small-model memory use and predictable CLI defaults
-- Packed dataset handling and lightweight evaluation workflows
-- Honest monitoring and reproducible benchmark reporting
-
-### Unit Tests
-
-Add unit tests alongside your code:
-
-```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_my_function() {
-        // ...
-    }
-}
-```
-
-### Integration Tests
-
-Add integration tests in the `tests/` directory of each crate.
-
-### Running Tests
+## Tests
 
 ```bash
-# All tests
-cargo test --workspace
-
-# Specific crate
-cargo test -p rusty
-
-# Specific test
-cargo test test_name
+cargo test --workspace                      # everything; no GPU needed
+cargo test -p rusty                         # one crate
+cargo test -p rusty --lib tensor::tests     # one module
 ```
 
-## Reporting Issues
+### GPU tests are opt-in
 
-- **Bug reports**: Include Rust version, OS, and steps to reproduce
-- **Feature requests**: Describe the use case and proposed solution
-- **Security issues**: Report privately via security email
+CI runners have no GPU, so tests that need one are skipped unless you set
+`RUSTY_RUN_GPU_TESTS=1`:
+
+```bash
+RUSTY_RUN_GPU_TESTS=1 cargo test -p rusty --lib
+```
+
+With the variable set, the op test suite also runs every case on the GPU and
+requires its forward values and gradients to match the CPU result, and a
+missing GPU is a failure. Without it, those tests print "skipping GPU parity"
+and pass. If you change a kernel or a backward formula, run the GPU tests
+locally before opening the PR and say so in the description.
+
+Test types you will meet:
+
+- **Gradient checks** (`rusty/src/tensor/tests.rs`): add a `case(...)` line
+  for a new op; it is checked against finite differences.
+- **Shader validation** (`kernels_pass_naga_validation`): parses and validates
+  the WGSL with naga, so shader typos fail on any machine.
+- **Doc tests**: public items carry runnable examples; `cargo test` runs them.
+
+## Style and checks
+
+Run these before pushing; they are what CI runs:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets
+cargo test --workspace
+cargo doc --workspace --no-deps
+```
+
+> Known issue: on recent stable toolchains `cargo clippy` currently stops at a
+> lint-priority error in the workspace `Cargo.toml`
+> ([issue 1](docs/good-first-issues.md#1-cargo-clippy-fails-on-a-workspace-lint-priority-error)).
+> Fixing it is a good first PR.
+
+- Document every public item (`missing_docs` is a warning).
+- No `unsafe` (the workspace forbids it).
+- Avoid `unwrap()`, `expect()` and `panic!` in library code except for
+  documented precondition panics (the lints warn on them).
+- Match the surrounding code: naming, comment density, error handling.
+- Do not add benchmark or performance claims to docs without a measurement you
+  can reproduce, and say which machine produced it.
+
+## Pull requests
+
+1. Open or comment on an issue first for anything larger than a small fix.
+2. Branch from `main`, keep the change focused, and add tests.
+3. Make sure fmt, clippy, tests and docs pass as above.
+4. Write a clear commit message: a short imperative subject (about 50
+   characters), and a body saying why when it is not obvious. Conventional
+   prefixes (`fix:`, `feat:`, `docs:`) are fine but not required.
+5. Open the PR with what changed, how you tested it (including whether you ran
+   the GPU tests, and on what hardware), and anything you are unsure about.
+6. Expect review comments; push fixes as new commits and they will be squashed
+   or rebased on merge.
+
+Docs follow the same rule as code: every command and number in them must be
+something you ran.
+
+## Good first issues
+
+[docs/good-first-issues.md](docs/good-first-issues.md) lists concrete, small
+tasks with the files involved. Typical entry points:
+
+- add a missing element-wise op or loss (follow
+  [writing-a-kernel.md](docs/writing-a-kernel.md); the test is one line);
+- add a GPU/CPU parity test for a layer that only has CPU tests;
+- fix a documented API inconsistency;
+- improve a doc page or add a runnable example (it must run, and its output
+  goes in the page).
+
+If you want to take one, comment on the issue so work is not duplicated.
+
+## Reporting issues
+
+- **Bugs:** include `rustc --version`, OS, GPU (`Device::best().name()`), and
+  the smallest program that reproduces it. Say whether it also fails on
+  `Device::cpu()`, which tells us if the bug is in a kernel or in the op logic.
+- **Features:** describe the use case first, then the proposed API.
+- **Security issues:** see [SECURITY.md](SECURITY.md); do not open a public issue.
 
 ## License
 
-By contributing, you agree that your contributions will be licensed under the project's license.
+By contributing, you agree that your contributions are licensed under the
+project's MIT license.
