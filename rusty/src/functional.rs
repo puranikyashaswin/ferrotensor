@@ -1,225 +1,456 @@
 //! Functional Module
 //!
-//! Stateless functions for common operations (like PyTorch's F namespace).
+//! Stateless functions for common operations (like PyTorch's `F` namespace).
+//! Every function is built from differentiable tensor ops, so gradients flow
+//! through all of them; `functional::tests` checks each against finite
+//! differences.
 
 use crate::tensor::Tensor;
+use crate::Device;
 
-/// Mean Squared Error loss.
-///
-/// MSE = mean((pred - target)^2)
-///
-/// This function maintains the autograd graph, so calling `.backward()` on the
-/// result will compute gradients for `pred`.
-pub fn mse_loss(pred: &Tensor, target: &Tensor) -> Tensor {
-    assert_eq!(pred.shape, target.shape, "Shapes must match for MSE loss");
-    let diff = pred.sub(target);
-    let sq = diff.mul(&diff);
-    sq.mean()
+// ============================================================================
+// ACTIVATIONS
+// ============================================================================
+
+/// ReLU: `max(0, x)`.
+pub fn relu(x: &Tensor) -> Tensor {
+    x.relu()
 }
 
-/// Cross-entropy loss for classification.
-///
-/// CE = -sum(target * log(softmax(pred)))
-///
-/// This function maintains the autograd graph. Supports both one-hot encoded
-/// targets and class indices.
-pub fn cross_entropy(logits: &Tensor, targets: &Tensor) -> Tensor {
-    // Softmax with autograd tracking
-    let probs = logits.softmax(-1);
+/// GELU (tanh approximation).
+pub fn gelu(x: &Tensor) -> Tensor {
+    x.gelu()
+}
 
-    // Log of probabilities (maintains autograd)
-    let log_probs = probs.log();
+/// SiLU (swish): `x * sigmoid(x)`.
+pub fn silu(x: &Tensor) -> Tensor {
+    x.silu()
+}
 
-    if targets.shape == logits.shape {
-        // One-hot encoded targets
-        let neg_log_probs = log_probs.mul(targets);
-        neg_log_probs.sum().neg()
-    } else {
-        // Class indices - simplified version (CPU fallback for indexing)
-        // For production, implement GPU indexing kernel
-        let log_probs_data = log_probs.to_vec();
-        let target_data = targets.to_vec();
+/// Logistic sigmoid.
+pub fn sigmoid(x: &Tensor) -> Tensor {
+    x.sigmoid()
+}
 
-        let batch_size = logits.shape[0];
-        let num_classes = logits.shape[1];
+/// Softmax over `dim`.
+pub fn softmax(x: &Tensor, dim: isize) -> Tensor {
+    x.softmax(dim)
+}
 
-        let mut loss = 0.0f32;
-        for i in 0..batch_size {
-            let target_class = target_data[i] as usize;
-            if target_class < num_classes {
-                let log_prob = log_probs_data[i * num_classes + target_class];
-                loss -= log_prob;
-            }
-        }
-        loss /= batch_size as f32;
+/// Log-softmax over `dim`.
+pub fn log_softmax(x: &Tensor, dim: isize) -> Tensor {
+    x.log_softmax(dim)
+}
 
-        // Create tensor that maintains gradient flow
-        // Note: This breaks autograd - use one-hot encoding for training
-        Tensor::from_data(&[loss], &[1], &logits.device)
+// ============================================================================
+// LAYERS
+// ============================================================================
+
+/// Affine map `x @ weight + bias` with `weight` of shape `[in, out]`.
+pub fn linear(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Tensor {
+    let out = x.matmul(weight);
+    match bias {
+        Some(b) => out.add(b),
+        None => out,
     }
 }
 
-/// Binary Cross-entropy loss.
+/// Embedding lookup: rows of `weight` (`[vocab, dim]`) for each id.
 ///
-/// BCE = -mean(target * log(pred) + (1 - target) * log(1 - pred))
-///
-/// This function maintains the autograd graph.
-pub fn binary_cross_entropy(pred: &Tensor, target: &Tensor) -> Tensor {
-    assert_eq!(pred.shape, target.shape, "Shapes must match for BCE loss");
-
-    // Clamp pred to avoid log(0) - maintains autograd
-    let pred_clamped = pred.clamp(1e-7, 1.0 - 1e-7);
-
-    // log(pred)
-    let log_pred = pred_clamped.log();
-
-    // log(1 - pred)
-    let one = Tensor::ones(&pred.shape, &pred.device);
-    let one_minus_pred = one.sub(&pred_clamped);
-    let log_one_minus_pred = one_minus_pred.log();
-
-    // target * log(pred)
-    let term1 = target.mul(&log_pred);
-
-    // (1 - target) * log(1 - pred)
-    let term2 = one_minus_pred.mul(&log_one_minus_pred);
-
-    // -mean(term1 + term2)
-    let loss = term1.add(&term2);
-    loss.mean().neg()
+/// The result has shape `[ids.len(), dim]`; the gradient scatters back into
+/// the looked-up rows.
+pub fn embedding(weight: &Tensor, ids: &[usize]) -> Tensor {
+    weight.index_select(0, ids)
 }
 
-/// Binary Cross-entropy with logits (more numerically stable).
-///
-/// Combines sigmoid and BCE in one function for numerical stability.
-///
-/// This function maintains the autograd graph.
-pub fn binary_cross_entropy_with_logits(logits: &Tensor, target: &Tensor) -> Tensor {
-    assert_eq!(
-        logits.shape, target.shape,
-        "Shapes must match for BCE with logits"
-    );
-
-    // max(logits, 0) - logits * target + log(1 + exp(-|logits|))
-    let zeros = Tensor::zeros(&logits.shape, &logits.device);
-
-    // max(logits, 0)
-    let max_logits = logits.maximum(&zeros);
-
-    // logits * target
-    let logits_target = logits.mul(target);
-
-    // log(1 + exp(-|logits|))
-    let abs_logits = logits.abs();
-    let neg_abs_logits = abs_logits.neg();
-    let exp_neg_abs = neg_abs_logits.exp();
-    let one_plus_exp = Tensor::ones(&exp_neg_abs.shape, &exp_neg_abs.device).add(&exp_neg_abs);
-    let log_term = one_plus_exp.log();
-
-    // Combine: max_logits - logits_target + log_term
-    let loss = max_logits.sub(&logits_target).add(&log_term);
-    loss.mean()
-}
-
-/// Smooth L1 (Huber) loss.
-///
-/// Less sensitive to outliers than MSE.
-///
-/// This function maintains the autograd graph.
-pub fn smooth_l1_loss(pred: &Tensor, target: &Tensor, beta: f32) -> Tensor {
-    assert_eq!(
-        pred.shape, target.shape,
-        "Shapes must match for Smooth L1 loss"
-    );
-
-    let diff = pred.sub(target);
-    let abs_diff = diff.abs();
-
-    // Create beta tensor
-    let beta_tensor = Tensor::from_data(&[beta], &[1], &pred.device);
-
-    // Where |diff| < beta: 0.5 * diff^2 / beta
-    // Else: |diff| - 0.5 * beta
-    let mask = abs_diff.less_than(&beta_tensor);
-
-    let sq_term = diff.mul(&diff).mul_scalar(0.5 / beta);
-    let linear_term = abs_diff.sub(&beta_tensor.mul_scalar(0.5));
-
-    // Simplified: just use the formula directly for all elements
-    // For production, implement proper where/select kernel
-    let abs_diff_data = abs_diff.to_vec();
-    let diff_data = diff.to_vec();
-
-    let mut loss = 0.0f32;
-    for (&abs_d, &d) in abs_diff_data.iter().zip(diff_data.iter()) {
-        if abs_d < beta {
-            loss += 0.5 * d * d / beta;
-        } else {
-            loss += abs_d - 0.5 * beta;
-        }
+/// Layer normalization over the last dimension, with optional affine
+/// `weight` and `bias` of that dimension's size.
+pub fn layer_norm(x: &Tensor, weight: Option<&Tensor>, bias: Option<&Tensor>, eps: f32) -> Tensor {
+    let mean = x.mean_dim(-1, true);
+    let centered = x.sub(&mean);
+    let var = centered.square().mean_dim(-1, true);
+    let mut out = centered.mul(&var.add_scalar(eps).rsqrt());
+    if let Some(w) = weight {
+        out = out.mul(w);
     }
-    loss /= diff_data.len() as f32;
-
-    // Note: This breaks autograd - CPU fallback
-    Tensor::from_data(&[loss], &[1], &pred.device)
+    if let Some(b) = bias {
+        out = out.add(b);
+    }
+    out
 }
 
-/// Cosine similarity between two tensors.
-///
-/// Returns a value in [-1, 1]. This is an evaluation metric,
-/// not intended for training (doesn't maintain autograd).
-pub fn cosine_similarity(a: &Tensor, b: &Tensor) -> f32 {
-    let a_data = a.to_vec();
-    let b_data = b.to_vec();
-
-    let dot: f32 = a_data.iter().zip(b_data.iter()).map(|(x, y)| x * y).sum();
-    let norm_a: f32 = a_data.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let norm_b: f32 = b_data.iter().map(|x| x * x).sum::<f32>().sqrt();
-
-    dot / (norm_a * norm_b + 1e-8)
+/// RMS normalization over the last dimension (Llama-style):
+/// `x / sqrt(mean(x^2) + eps) * weight`.
+pub fn rms_norm(x: &Tensor, weight: Option<&Tensor>, eps: f32) -> Tensor {
+    let inv_rms = x.square().mean_dim(-1, true).add_scalar(eps).rsqrt();
+    let out = x.mul(&inv_rms);
+    match weight {
+        Some(w) => out.mul(w),
+        None => out,
+    }
 }
 
-/// Dropout (during training).
+/// Dropout: zero each element with probability `p` and scale the rest by
+/// `1 / (1 - p)`. Identity when `training` is false or `p` is 0.
 ///
-/// Randomly zeros elements with probability p and scales remaining elements by 1/(1-p).
-///
-/// Note: This implementation uses CPU and breaks autograd. For training,
-/// use GPU dropout kernel (TODO).
+/// # Panics
+/// Panics unless `0 <= p < 1`.
 pub fn dropout(x: &Tensor, p: f32, training: bool) -> Tensor {
+    assert!(
+        (0.0..1.0).contains(&p),
+        "dropout probability must be in [0, 1), got {p}"
+    );
     if !training || p == 0.0 {
         return x.clone();
     }
-
-    assert!(
-        (0.0..1.0).contains(&p),
-        "Dropout probability must be in [0, 1)"
-    );
-
     use rand::Rng;
     let mut rng = rand::thread_rng();
-    let data = x.to_vec();
     let scale = 1.0 / (1.0 - p);
-
-    let result: Vec<f32> = data
-        .iter()
-        .map(|&v| if rng.gen::<f32>() < p { 0.0 } else { v * scale })
+    let mask: Vec<f32> = (0..x.numel())
+        .map(|_| if rng.gen::<f32>() < p { 0.0 } else { scale })
         .collect();
-
-    // Note: This breaks autograd - CPU fallback
-    // For production, implement GPU dropout kernel
-    Tensor::from_data(&result, &x.shape, &x.device)
+    x.mul(&Tensor::from_vec(mask, &x.shape, x.device()))
 }
 
-/// One-hot encoding.
-pub fn one_hot(indices: &[usize], num_classes: usize, device: &crate::Device) -> Tensor {
-    let batch_size = indices.len();
-    let mut data = vec![0.0f32; batch_size * num_classes];
+/// Scaled dot-product attention: `softmax(q k^T / sqrt(d) + mask) v`.
+///
+/// `q` is `[.., Lq, d]`, `k` is `[.., Lk, d]`, `v` is `[.., Lk, dv]` with
+/// equal leading dims. With `causal`, query `i` attends only to keys
+/// `j <= i + (Lk - Lq)` (so a query block at the end of a longer key
+/// sequence still sees its own past).
+pub fn scaled_dot_product_attention(q: &Tensor, k: &Tensor, v: &Tensor, causal: bool) -> Tensor {
+    let d = *q.shape.last().expect("attention inputs need a feature dim");
+    let lq = q.shape[q.ndim() - 2];
+    let lk = k.shape[k.ndim() - 2];
+    let mut scores = q.matmul(&k.transpose()).mul_scalar(1.0 / (d as f32).sqrt());
+    if causal {
+        let offset = lk.saturating_sub(lq);
+        let mask: Vec<f32> = (0..lq * lk)
+            .map(|i| if i % lk > i / lk + offset { 1.0 } else { 0.0 })
+            .collect();
+        let mask = Tensor::from_vec(mask, &[lq, lk], q.device());
+        scores = scores.masked_fill(&mask, -1e9);
+    }
+    scores.softmax(-1).matmul(v)
+}
 
+// ============================================================================
+// LOSSES
+// ============================================================================
+
+/// Mean squared error: `mean((pred - target)^2)`.
+pub fn mse_loss(pred: &Tensor, target: &Tensor) -> Tensor {
+    assert_eq!(pred.shape, target.shape, "shapes must match for MSE loss");
+    pred.sub(target).square().mean()
+}
+
+/// Mean absolute error: `mean(|pred - target|)`.
+pub fn l1_loss(pred: &Tensor, target: &Tensor) -> Tensor {
+    assert_eq!(pred.shape, target.shape, "shapes must match for L1 loss");
+    pred.sub(target).abs().mean()
+}
+
+/// Smooth L1 (Huber) loss, averaged: `0.5 d^2 / beta` where `|d| < beta`,
+/// else `|d| - 0.5 beta`. `beta = 0` gives the L1 loss.
+pub fn smooth_l1_loss(pred: &Tensor, target: &Tensor, beta: f32) -> Tensor {
+    assert_eq!(
+        pred.shape, target.shape,
+        "shapes must match for Smooth L1 loss"
+    );
+    assert!(beta >= 0.0, "beta must be non-negative");
+    let abs = pred.sub(target).abs();
+    if beta == 0.0 {
+        return abs.mean();
+    }
+    // With m = min(|d|, beta): 0.5 m^2 / beta + (|d| - m) equals the
+    // piecewise definition on both sides of beta.
+    let m = abs.clamp(0.0, beta);
+    m.square().mul_scalar(0.5 / beta).add(&abs.sub(&m)).mean()
+}
+
+/// Cross-entropy between `logits` (`[.., C]`) and `targets`, averaged.
+///
+/// `targets` is either:
+/// - class indices with the shape of `logits` minus its last dim (stored as
+///   `f32`); negative indices (e.g. `-100`) are ignored, as for padding or
+///   prompt tokens, and the mean is over the remaining positions;
+/// - or a distribution (one-hot or soft labels) with the shape of `logits`.
+pub fn cross_entropy(logits: &Tensor, targets: &Tensor) -> Tensor {
+    let log_probs = logits.log_softmax(-1);
+    if targets.shape == logits.shape {
+        let rows = (logits.numel() / logits.shape[logits.ndim() - 1]).max(1);
+        return log_probs.mul(targets).sum().div_scalar(-(rows as f32));
+    }
+    assert_eq!(
+        targets.shape,
+        logits.shape[..logits.ndim() - 1],
+        "class-index targets must have the logits shape without the class dim"
+    );
+    let indices: Vec<i64> = targets.to_vec().iter().map(|&t| t as i64).collect();
+    nll_loss_indices(&log_probs, &indices)
+}
+
+/// Negative log-likelihood of class `targets` under `log_probs` (`[.., C]`),
+/// averaged over non-ignored (non-negative) targets.
+pub fn nll_loss(log_probs: &Tensor, targets: &[i64]) -> Tensor {
+    nll_loss_indices(log_probs, targets)
+}
+
+fn nll_loss_indices(log_probs: &Tensor, targets: &[i64]) -> Tensor {
+    let classes = log_probs.shape[log_probs.ndim() - 1];
+    let rows = log_probs.numel() / classes.max(1);
+    assert_eq!(
+        targets.len(),
+        rows,
+        "one target per row of log-probabilities"
+    );
+    let kept = targets.iter().filter(|&&t| t >= 0).count();
+    let mut weights = vec![0.0f32; rows * classes];
+    if kept > 0 {
+        for (row, &t) in targets.iter().enumerate() {
+            if t >= 0 {
+                let t = t as usize;
+                assert!(
+                    t < classes,
+                    "target class {t} out of range for {classes} classes"
+                );
+                weights[row * classes + t] = -1.0 / kept as f32;
+            }
+        }
+    }
+    let weights = Tensor::from_vec(weights, &log_probs.shape, log_probs.device());
+    log_probs.mul(&weights).sum()
+}
+
+/// Binary cross-entropy on probabilities, averaged:
+/// `-mean(t log p + (1 - t) log(1 - p))`. `pred` is clamped to
+/// `[1e-7, 1 - 1e-7]`; prefer [`binary_cross_entropy_with_logits`].
+pub fn binary_cross_entropy(pred: &Tensor, target: &Tensor) -> Tensor {
+    assert_eq!(pred.shape, target.shape, "shapes must match for BCE loss");
+    let p = pred.clamp(1e-7, 1.0 - 1e-7);
+    let pos = target.mul(&p.log());
+    let neg = target.rsub_scalar(1.0).mul(&p.rsub_scalar(1.0).log());
+    pos.add(&neg).mean().neg()
+}
+
+/// Binary cross-entropy on logits (numerically stable), averaged:
+/// `mean(max(x, 0) - x t + log(1 + exp(-|x|)))`.
+pub fn binary_cross_entropy_with_logits(logits: &Tensor, target: &Tensor) -> Tensor {
+    assert_eq!(
+        logits.shape, target.shape,
+        "shapes must match for BCE with logits"
+    );
+    let zero = Tensor::zeros(&[], logits.device());
+    let softplus_neg_abs = logits.abs().neg().exp().add_scalar(1.0).log();
+    logits
+        .maximum(&zero)
+        .sub(&logits.mul(target))
+        .add(&softplus_neg_abs)
+        .mean()
+}
+
+// ============================================================================
+// METRICS AND HELPERS
+// ============================================================================
+
+/// Cosine similarity along `dim`: `sum(a b) / (|a| |b| + eps)`.
+pub fn cosine_similarity(a: &Tensor, b: &Tensor, dim: isize) -> Tensor {
+    let dot = a.mul(b).sum_dim(dim, false);
+    let norm_a = a.square().sum_dim(dim, false).sqrt();
+    let norm_b = b.square().sum_dim(dim, false).sqrt();
+    dot.div(&norm_a.mul(&norm_b).add_scalar(1e-8))
+}
+
+/// One-hot rows for `indices` (`[indices.len(), num_classes]`); indices out
+/// of range give an all-zero row.
+pub fn one_hot(indices: &[usize], num_classes: usize, device: &Device) -> Tensor {
+    let mut data = vec![0.0f32; indices.len() * num_classes];
     for (i, &idx) in indices.iter().enumerate() {
         if idx < num_classes {
             data[i * num_classes + idx] = 1.0;
         }
     }
+    Tensor::from_vec(data, &[indices.len(), num_classes], device)
+}
 
-    Tensor::from_data(&data, &[batch_size, num_classes], device)
+/// Fraction of rows of `logits` (`[N, C]`) whose argmax equals the target
+/// class.
+pub fn accuracy(logits: &Tensor, targets: &[usize]) -> f32 {
+    let pred = logits.argmax_dim(-1).to_vec();
+    assert_eq!(pred.len(), targets.len(), "one target per row");
+    if targets.is_empty() {
+        return 0.0;
+    }
+    let correct = pred
+        .iter()
+        .zip(targets)
+        .filter(|(p, &t)| **p as usize == t)
+        .count();
+    correct as f32 / targets.len() as f32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tensor::tests::{check_gpu_parity, check_gradients, Case, Init};
+
+    const U: Init = Init::Uniform(-2.0, 2.0);
+    const PROB: Init = Init::Uniform(0.05, 0.95);
+
+    fn case(name: &'static str, inputs: &[(&[usize], Init)], f: fn(&[Tensor]) -> Tensor) -> Case {
+        Case {
+            name,
+            inputs: inputs.iter().map(|(s, i)| (s.to_vec(), *i)).collect(),
+            f,
+        }
+    }
+
+    fn cases() -> Vec<Case> {
+        vec![
+            case("linear", &[(&[2, 3], U), (&[3, 4], U), (&[4], U)], |x| {
+                linear(&x[0], &x[1], Some(&x[2]))
+            }),
+            case("embedding", &[(&[5, 3], U)], |x| {
+                embedding(&x[0], &[1, 4, 1])
+            }),
+            case("layer_norm", &[(&[3, 5], U), (&[5], U), (&[5], U)], |x| {
+                layer_norm(&x[0], Some(&x[1]), Some(&x[2]), 1e-5)
+            }),
+            case("rms_norm", &[(&[2, 3, 4], U), (&[4], U)], |x| {
+                rms_norm(&x[0], Some(&x[1]), 1e-6)
+            }),
+            case(
+                "attention",
+                &[(&[2, 3, 4], U), (&[2, 3, 4], U), (&[2, 3, 2], U)],
+                |x| scaled_dot_product_attention(&x[0], &x[1], &x[2], false),
+            ),
+            case(
+                "attention_causal",
+                &[(&[2, 4], U), (&[3, 4], U), (&[3, 2], U)],
+                |x| scaled_dot_product_attention(&x[0], &x[1], &x[2], true),
+            ),
+            case("mse", &[(&[2, 3], U), (&[2, 3], U)], |x| {
+                mse_loss(&x[0], &x[1])
+            }),
+            case("l1", &[(&[6], Init::AwayFromZero(-2.0, 2.0))], |x| {
+                l1_loss(&x[0], &x[0].zeros_like())
+            }),
+            case("smooth_l1", &[(&[8], U)], |x| {
+                smooth_l1_loss(&x[0], &x[0].zeros_like().add_scalar(0.1), 0.7)
+            }),
+            case("cross_entropy_indices", &[(&[3, 4], U)], |x| {
+                let t = Tensor::from_data(&[2.0, -100.0, 0.0], &[3], x[0].device());
+                cross_entropy(&x[0], &t)
+            }),
+            case("cross_entropy_soft", &[(&[2, 3], U)], |x| {
+                let t = Tensor::from_data(&[0.2, 0.3, 0.5, 1.0, 0.0, 0.0], &[2, 3], x[0].device());
+                cross_entropy(&x[0], &t)
+            }),
+            case("bce", &[(&[5], PROB), (&[5], PROB)], |x| {
+                binary_cross_entropy(&x[0], &x[1])
+            }),
+            case("bce_logits", &[(&[5], U), (&[5], PROB)], |x| {
+                binary_cross_entropy_with_logits(&x[0], &x[1])
+            }),
+            case("cosine", &[(&[2, 4], U), (&[2, 4], U)], |x| {
+                cosine_similarity(&x[0], &x[1], -1)
+            }),
+            case("dropout_eval", &[(&[4], U)], |x| {
+                dropout(&x[0], 0.5, false).square()
+            }),
+        ]
+    }
+
+    #[test]
+    fn gradients_match_finite_differences() {
+        for case in cases() {
+            check_gradients(&case);
+        }
+    }
+
+    #[test]
+    fn gpu_matches_cpu() {
+        check_gpu_parity(&cases());
+    }
+
+    fn cpu(data: &[f32], shape: &[usize]) -> Tensor {
+        Tensor::from_data(data, shape, &Device::cpu())
+    }
+
+    #[test]
+    fn cross_entropy_matches_hand_computation() {
+        let logits = cpu(&[1.0, 2.0, 3.0, 1.0, 1.0, 1.0], &[2, 3]);
+        let targets = cpu(&[2.0, 0.0], &[2]);
+        let lse0 = (1f32.exp() + 2f32.exp() + 3f32.exp()).ln();
+        let expected = ((lse0 - 3.0) + 3f32.ln()) / 2.0;
+        assert!((cross_entropy(&logits, &targets).item() - expected).abs() < 1e-5);
+        // Same loss from one-hot targets.
+        let one_hot = one_hot(&[2, 0], 3, &Device::cpu());
+        assert!((cross_entropy(&logits, &one_hot).item() - expected).abs() < 1e-5);
+    }
+
+    #[test]
+    fn ignored_targets_do_not_count() {
+        let logits = cpu(&[1.0, 2.0, 3.0, 9.0, 0.0, 0.0], &[2, 3]);
+        let only_first = cross_entropy(&logits.narrow(0, 0, 1), &cpu(&[2.0], &[1])).item();
+        let masked = cross_entropy(&logits, &cpu(&[2.0, -100.0], &[2])).item();
+        assert!((only_first - masked).abs() < 1e-6);
+    }
+
+    #[test]
+    fn smooth_l1_is_piecewise() {
+        let pred = cpu(&[0.1, 2.0], &[2]);
+        let loss = smooth_l1_loss(&pred, &cpu(&[0.0, 0.0], &[2]), 1.0).item();
+        let expected = (0.5 * 0.01 + (2.0 - 0.5)) / 2.0;
+        assert!((loss - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn bce_matches_bce_with_logits() {
+        let logits = cpu(&[-1.0, 0.5, 2.0], &[3]);
+        let target = cpu(&[0.0, 1.0, 1.0], &[3]);
+        let a = binary_cross_entropy(&logits.sigmoid(), &target).item();
+        let b = binary_cross_entropy_with_logits(&logits, &target).item();
+        assert!((a - b).abs() < 1e-5);
+    }
+
+    #[test]
+    fn layer_norm_normalizes_rows() {
+        let x = cpu(&[1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0], &[2, 4]);
+        let y = layer_norm(&x, None, None, 1e-5);
+        for row in y.to_vec().chunks(4) {
+            let mean: f32 = row.iter().sum::<f32>() / 4.0;
+            let var: f32 = row.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / 4.0;
+            assert!(mean.abs() < 1e-5 && (var - 1.0).abs() < 1e-3);
+        }
+    }
+
+    #[test]
+    fn dropout_keeps_expectation_and_respects_eval() {
+        let x = Tensor::ones(&[10_000], &Device::cpu());
+        let y = dropout(&x, 0.3, true).to_vec();
+        let zeros = y.iter().filter(|&&v| v == 0.0).count() as f32 / 10_000.0;
+        assert!((zeros - 0.3).abs() < 0.03);
+        let mean: f32 = y.iter().sum::<f32>() / 10_000.0;
+        assert!((mean - 1.0).abs() < 0.05);
+        assert_eq!(dropout(&x, 0.3, false).to_vec(), x.to_vec());
+    }
+
+    #[test]
+    fn causal_attention_ignores_future_keys() {
+        let d = Device::cpu();
+        let q = Tensor::ones(&[3, 2], &d);
+        let k = Tensor::ones(&[3, 2], &d);
+        let v = cpu(&[1.0, 0.0, 0.0, 1.0, 5.0, 5.0], &[3, 2]);
+        let out = scaled_dot_product_attention(&q, &k, &v, true).to_vec();
+        // Row 0 sees only key 0; row 1 averages keys 0 and 1.
+        assert!((out[0] - 1.0).abs() < 1e-5 && out[1].abs() < 1e-5);
+        assert!((out[2] - 0.5).abs() < 1e-5 && (out[3] - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn accuracy_counts_argmax_hits() {
+        let logits = cpu(&[0.1, 0.9, 0.8, 0.2], &[2, 2]);
+        assert_eq!(accuracy(&logits, &[1, 1]), 0.5);
+    }
 }

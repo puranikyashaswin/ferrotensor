@@ -280,8 +280,9 @@ fn gradients_match_finite_differences() {
     }
 }
 
-#[test]
-fn gpu_matches_cpu() {
+/// With `RUSTY_RUN_GPU_TESTS=1`, check that each case's forward values and
+/// gradients on the GPU match the CPU.
+pub(crate) fn check_gpu_parity(cases: &[Case]) {
     if std::env::var("RUSTY_RUN_GPU_TESTS").as_deref() != Ok("1") {
         eprintln!("skipping GPU parity; set RUSTY_RUN_GPU_TESTS=1 to enable");
         return;
@@ -297,14 +298,19 @@ fn gpu_matches_cpu() {
             );
         }
     };
-    for case in cases() {
-        let (cpu_out, cpu_grads) = analytic_grads(&case, &make_inputs(&case, &cpu));
-        let (gpu_out, gpu_grads) = analytic_grads(&case, &make_inputs(&case, &gpu));
+    for case in cases {
+        let (cpu_out, cpu_grads) = analytic_grads(case, &make_inputs(case, &cpu));
+        let (gpu_out, gpu_grads) = analytic_grads(case, &make_inputs(case, &gpu));
         close(&gpu_out, &cpu_out, &format!("{} forward", case.name));
         for (i, (g, c)) in gpu_grads.iter().zip(&cpu_grads).enumerate() {
             close(g, c, &format!("{} grad {i}", case.name));
         }
     }
+}
+
+#[test]
+fn gpu_matches_cpu() {
+    check_gpu_parity(&cases());
 }
 
 // ============================================================================
