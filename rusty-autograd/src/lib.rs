@@ -269,7 +269,11 @@ impl AutogradNode for ReshapeNode {
     }
 }
 
-fn apply_rope_in_place(
+/// Rotate `data` (`[batch, seq, hidden]` or `[seq, hidden]`, heads of
+/// `head_dim` packed in `hidden`) by the RoPE angles of positions
+/// `pos..pos + seq`; `inverse` rotates back (the transpose, used for the
+/// gradient).
+pub fn apply_rope_in_place(
     data: &mut [f32],
     shape: &[usize],
     head_dim: usize,
@@ -334,6 +338,38 @@ impl AutogradNode for RoPENode {
     }
 }
 
+/// Gradients of `y = x * w / sqrt(mean(x^2) + eps)` (per row of `hidden`
+/// elements) with respect to `x` and `w`, given the output gradient `g`.
+pub fn rms_norm_backward_cpu(
+    x: &[f32],
+    g: &[f32],
+    w: &[f32],
+    eps: f32,
+    hidden: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut grad_x = vec![0.0f32; x.len()];
+    let mut grad_w = vec![0.0f32; w.len()];
+    for ((x_row, g_row), gx_row) in x
+        .chunks(hidden)
+        .zip(g.chunks(hidden))
+        .zip(grad_x.chunks_mut(hidden))
+    {
+        let mean_sq = x_row.iter().map(|v| v * v).sum::<f32>() / hidden as f32;
+        let inv_rms = 1.0 / (mean_sq + eps).sqrt();
+        let mut dot = 0.0f32;
+        for idx in 0..hidden {
+            dot += g_row[idx] * w[idx] * x_row[idx];
+            grad_w[idx] += g_row[idx] * x_row[idx] * inv_rms;
+        }
+        for idx in 0..hidden {
+            gx_row[idx] =
+                g_row[idx] * w[idx] * inv_rms - x_row[idx] * dot * inv_rms.powi(3) / hidden as f32;
+        }
+    }
+    (grad_x, grad_w)
+}
+
+/// Backward node of [`Tensor::rms_norm`].
 pub struct RMSNormNode {
     pub input: Tensor,
     pub weight: Tensor,
@@ -346,35 +382,12 @@ impl AutogradNode for RMSNormNode {
     fn backward(&self, grad: &UnifiedTensor, _engine: &ComputeEngine) -> Vec<UnifiedTensor> {
         let input_shape = self.input.data.shape.clone();
         let hidden = *input_shape.last().expect("RMSNorm input must be non-empty");
-        let rows = input_shape.iter().product::<usize>() / hidden;
 
         let x = pollster::block_on(self.input.data.to_vec(&self.input.ctx));
         let g = pollster::block_on(grad.to_vec(&self.input.ctx));
         let w = pollster::block_on(self.weight.data.to_vec(&self.weight.ctx));
 
-        let mut grad_x = vec![0.0f32; x.len()];
-        let mut grad_w = vec![0.0f32; w.len()];
-
-        for row in 0..rows {
-            let start = row * hidden;
-            let end = start + hidden;
-            let x_row = &x[start..end];
-            let g_row = &g[start..end];
-
-            let mean_sq = x_row.iter().map(|v| v * v).sum::<f32>() / hidden as f32;
-            let inv_rms: f32 = 1.0f32 / (mean_sq + self.eps).sqrt();
-
-            let mut dot = 0.0f32;
-            for idx in 0..hidden {
-                dot += g_row[idx] * w[idx] * x_row[idx];
-                grad_w[idx] += g_row[idx] * x_row[idx] * inv_rms;
-            }
-
-            for idx in 0..hidden {
-                grad_x[start + idx] = g_row[idx] * w[idx] * inv_rms
-                    - x_row[idx] * dot * inv_rms.powi(3) / hidden as f32;
-            }
-        }
+        let (grad_x, grad_w) = rms_norm_backward_cpu(&x, &g, &w, self.eps, hidden);
 
         vec![
             UnifiedTensor::new(&self.input.ctx, &grad_x, &input_shape),
@@ -424,8 +437,10 @@ impl AutogradNode for MSELossNode {
         if (upstream - 1.0).abs() > f32::EPSILON {
             engine.gradient_scale(&self.pred.ctx, &grad_in, upstream);
         }
-        // Target gradient is not usually needed, but technically it's -(pred-target)
+        // d/d(target) of 0.5 * (pred - target)^2 is the negated pred gradient.
         let grad_target = UnifiedTensor::empty(&self.target.ctx, &self.target.data.shape);
+        engine.copy_tensor(&self.target.ctx, &grad_in, &grad_target, 0);
+        engine.gradient_scale(&self.target.ctx, &grad_target, -1.0);
         vec![grad_in, grad_target]
     }
 }
@@ -490,23 +505,30 @@ impl AutogradNode for SiLUGateNode {
 // Saves memory by recomputing activations during backward pass instead of storing them.
 // Key for training large models on limited memory devices.
 
-/// Trait for functions that can be checkpointed
+/// A forward computation that [`checkpoint`] can replay during backward.
 pub trait CheckpointFn: Send + Sync {
+    /// Run the forward computation on `inputs`.
     fn forward(&self, inputs: &[Tensor], engine: &ComputeEngine) -> Vec<Tensor>;
-    fn backward(
-        &self,
-        inputs: &[Tensor],
-        outputs: &[Tensor],
-        grad_outputs: &[UnifiedTensor],
-        engine: &ComputeEngine,
-    ) -> Vec<UnifiedTensor>;
 }
 
-/// Node that recomputes forward pass during backward to save memory
+impl<F> CheckpointFn for F
+where
+    F: Fn(&[Tensor], &ComputeEngine) -> Vec<Tensor> + Send + Sync,
+{
+    fn forward(&self, inputs: &[Tensor], engine: &ComputeEngine) -> Vec<Tensor> {
+        self(inputs, engine)
+    }
+}
+
+/// Backward node of one output of a checkpointed computation: drops the
+/// forward activations and recomputes them when gradients are needed.
 pub struct CheckpointedNode {
+    /// Inputs of the checkpointed computation.
     pub inputs: Vec<Tensor>,
+    /// The computation to replay.
     pub checkpoint_fn: Arc<dyn CheckpointFn>,
-    pub outputs: Vec<Tensor>, // Only shapes stored, data discarded after forward
+    /// Which of the computation's outputs this node produced.
+    pub output_index: usize,
 }
 
 impl AutogradNode for CheckpointedNode {
@@ -515,86 +537,64 @@ impl AutogradNode for CheckpointedNode {
     }
 
     fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
-        // Recompute forward pass to get activations
-        let recomputed_outputs = self.checkpoint_fn.forward(&self.inputs, engine);
-
-        // Now compute backward with recomputed activations
-        self.checkpoint_fn
-            .backward(&self.inputs, &recomputed_outputs, &[grad.clone()], engine)
+        // Replay the forward pass from fresh leaves that share the input
+        // data, backpropagate through the recomputed graph, and read the
+        // gradients that reach the leaves.
+        let leaves: Vec<Tensor> = self
+            .inputs
+            .iter()
+            .map(|t| Tensor::new(t.ctx.clone(), t.data.as_ref().clone()))
+            .collect();
+        let outputs = self.checkpoint_fn.forward(&leaves, engine);
+        let output = &outputs[self.output_index];
+        output.accumulate_grad(engine, grad);
+        output.backward(engine);
+        leaves
+            .iter()
+            .map(|leaf| {
+                leaf.grad
+                    .borrow()
+                    .clone()
+                    .unwrap_or_else(|| UnifiedTensor::zeros(&leaf.ctx, &leaf.data.shape))
+            })
+            .collect()
     }
 }
 
-/// Checkpoint a sequence of operations to save memory
-/// During forward: computes normally but discards intermediate activations
-/// During backward: recomputes activations from checkpoint
+/// Gradient checkpointing: run `forward_fn` now but keep only its outputs;
+/// the intermediate activations are recomputed during backward, trading
+/// compute for memory.
 pub fn checkpoint<F>(inputs: Vec<Tensor>, forward_fn: F, engine: &ComputeEngine) -> Vec<Tensor>
 where
     F: Fn(&[Tensor], &ComputeEngine) -> Vec<Tensor> + Send + Sync + 'static,
 {
-    // Create wrapper for the forward function
-    struct FnWrapper<Func>(Func);
-
-    impl<Func> CheckpointFn for FnWrapper<Func>
-    where
-        Func: Fn(&[Tensor], &ComputeEngine) -> Vec<Tensor> + Send + Sync,
-    {
-        fn forward(&self, inputs: &[Tensor], engine: &ComputeEngine) -> Vec<Tensor> {
-            (self.0)(inputs, engine)
-        }
-
-        fn backward(
-            &self,
-            inputs: &[Tensor],
-            outputs: &[Tensor],
-            grad_outputs: &[UnifiedTensor],
-            engine: &ComputeEngine,
-        ) -> Vec<UnifiedTensor> {
-            // Run backward on the recomputed outputs
-            // Each output should have been created with autograd, so we can backprop through it
-            let _input_grads: Vec<UnifiedTensor> = vec![];
-            for (_i, (output, grad)) in outputs.iter().zip(grad_outputs.iter()).enumerate() {
-                *output.grad.borrow_mut() = Some(grad.clone());
-            }
-
-            // Trigger backward on each output
-            for output in outputs {
-                if output.creator.is_some() {
-                    // Get gradients for all inputs
-                    let grad = output.grad.borrow().clone().unwrap();
-                    if let Some(creator) = &output.creator {
-                        return creator.backward(&grad, engine);
-                    }
-                }
-            }
-
-            // Return empty grads if no backward path
-            inputs
-                .iter()
-                .map(|t| UnifiedTensor::zeros(&t.ctx, &t.data.shape))
-                .collect()
-        }
-    }
-
-    // Run forward pass
     let outputs = forward_fn(&inputs, engine);
-
-    // Create checkpointed outputs that will recompute on backward
-    let checkpoint_fn = Arc::new(FnWrapper(forward_fn));
-
+    let checkpoint_fn: Arc<dyn CheckpointFn> = Arc::new(forward_fn);
     outputs
         .into_iter()
-        .map(|output| {
+        .enumerate()
+        .map(|(output_index, output)| {
             let node = Arc::new(CheckpointedNode {
                 inputs: inputs.clone(),
                 checkpoint_fn: checkpoint_fn.clone(),
-                outputs: vec![output.clone()],
+                output_index,
             });
+            // The output's own graph is dropped here; only its data is kept.
             Tensor::with_creator(output.ctx.clone(), output.data.as_ref().clone(), node)
         })
         .collect()
 }
 
-/// Convenience function for checkpointing a single-output function
+/// [`checkpoint`] for a single-input, single-output function.
+///
+/// Checkpointing each transformer block keeps one activation per block
+/// instead of every intermediate:
+/// ```rust,ignore
+/// let mut x = input;
+/// for layer in &layers {
+///     x = checkpoint_single(x, move |h, eng| layer.forward(h, eng), engine);
+/// }
+/// ```
 pub fn checkpoint_single<F>(input: Tensor, forward_fn: F, engine: &ComputeEngine) -> Tensor
 where
     F: Fn(&Tensor, &ComputeEngine) -> Tensor + Send + Sync + 'static,
@@ -602,31 +602,10 @@ where
     let wrapper = move |inputs: &[Tensor], eng: &ComputeEngine| -> Vec<Tensor> {
         vec![forward_fn(&inputs[0], eng)]
     };
-    checkpoint(vec![input], wrapper, engine).pop().unwrap()
+    checkpoint(vec![input], wrapper, engine)
+        .pop()
+        .expect("checkpointed function returned one output")
 }
-
-/// Apply checkpointing to a sequence of functions (e.g., transformer blocks)
-/// This is the main entry point for memory-efficient training of large models.
-///
-/// Usage:
-/// ```rust
-/// // Instead of:
-/// let mut x = input;
-/// for block in &blocks {
-///     x = block.forward(&x, engine);
-/// }
-///
-/// // Use checkpointed version:
-/// let x = checkpoint_single(hidden, |h, eng| layer.forward(h, eng), engine);
-/// ```
-///
-/// For sequential layers, apply checkpoint_single to each layer in a loop:
-/// ```rust,ignore
-/// let mut x = input;
-/// for layer in &layers {
-///     x = checkpoint_single(x, |h, eng| layer.forward(h, eng), engine);
-/// }
-/// ```
 
 impl Tensor {
     pub fn reshape(input: &Tensor, new_shape: &[usize]) -> Tensor {
@@ -700,9 +679,17 @@ impl Tensor {
         });
         Tensor::with_creator(input.ctx.clone(), out_data, node)
     }
+    /// Squared-error loss `0.5 * sum((pred - target)^2)`, shape `[1]`.
+    ///
+    /// Its gradient is `pred - target` (the backward kernel's output).
     pub fn mse_loss(pred: &Tensor, target: &Tensor, engine: &ComputeEngine) -> Tensor {
-        let out_data = UnifiedTensor::empty(&pred.ctx, &[1]);
-        engine.mse_loss(&pred.ctx, &pred.data, &target.data, &out_data);
+        // The kernel writes 0.5 * (p - t)^2 per element; sum on the host.
+        let per_element = UnifiedTensor::empty(&pred.ctx, &pred.data.shape);
+        engine.mse_loss(&pred.ctx, &pred.data, &target.data, &per_element);
+        let total: f32 = pollster::block_on(per_element.to_vec(&pred.ctx))
+            .iter()
+            .sum();
+        let out_data = UnifiedTensor::new(&pred.ctx, &[total], &[1]);
         let node = Arc::new(MSELossNode {
             pred: pred.clone(),
             target: target.clone(),
@@ -1203,5 +1190,130 @@ impl LRScheduler for WarmupCosineScheduler {
 
     fn current_step(&self) -> usize {
         self.current
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reference RMSNorm forward on the CPU.
+    fn rms_norm_cpu(x: &[f32], w: &[f32], eps: f32, hidden: usize) -> Vec<f32> {
+        x.chunks(hidden)
+            .flat_map(|row| {
+                let mean_sq = row.iter().map(|v| v * v).sum::<f32>() / hidden as f32;
+                let inv = 1.0 / (mean_sq + eps).sqrt();
+                row.iter().zip(w).map(move |(v, wi)| v * inv * wi)
+            })
+            .collect()
+    }
+
+    fn pseudo_random(n: usize, seed: u32) -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                (((i as u32 + 1).wrapping_mul(2_654_435_761) ^ seed) % 1000) as f32 / 500.0 - 1.0
+            })
+            .collect()
+    }
+
+    /// Central-difference gradient of `f` at `x`.
+    fn numeric_grad(x: &[f32], f: impl Fn(&[f32]) -> f64) -> Vec<f64> {
+        let h = 1e-3f32;
+        (0..x.len())
+            .map(|i| {
+                let mut plus = x.to_vec();
+                plus[i] += h;
+                let mut minus = x.to_vec();
+                minus[i] -= h;
+                (f(&plus) - f(&minus)) / (2.0 * h as f64)
+            })
+            .collect()
+    }
+
+    fn assert_close(analytic: &[f32], numeric: &[f64], what: &str) {
+        for (i, (a, n)) in analytic.iter().zip(numeric).enumerate() {
+            let tol = 2e-3 + 1e-2 * n.abs();
+            assert!(
+                (*a as f64 - n).abs() <= tol,
+                "{what}[{i}]: analytic {a} vs numeric {n}"
+            );
+        }
+    }
+
+    #[test]
+    fn rms_norm_backward_matches_finite_differences() {
+        let (hidden, eps) = (5, 1e-5);
+        let x = pseudo_random(3 * hidden, 1);
+        let w = pseudo_random(hidden, 2);
+        let g = pseudo_random(3 * hidden, 3);
+        let loss = |x: &[f32], w: &[f32]| -> f64 {
+            rms_norm_cpu(x, w, eps, hidden)
+                .iter()
+                .zip(&g)
+                .map(|(y, gi)| (*y * *gi) as f64)
+                .sum()
+        };
+        let (grad_x, grad_w) = rms_norm_backward_cpu(&x, &g, &w, eps, hidden);
+        assert_close(&grad_x, &numeric_grad(&x, |x| loss(x, &w)), "grad_x");
+        assert_close(&grad_w, &numeric_grad(&w, |w| loss(&x, w)), "grad_w");
+    }
+
+    #[test]
+    fn rope_backward_is_the_transposed_rotation() {
+        // For loss = sum(g * rope(x)), dloss/dx = rope^T(g) = inverse rope of g.
+        let shape = [2, 3, 8]; // batch 2, seq 3, two heads of 4
+        let (head_dim, pos) = (4, 5);
+        let x = pseudo_random(48, 4);
+        let g = pseudo_random(48, 5);
+        let loss = |x: &[f32]| -> f64 {
+            let mut y = x.to_vec();
+            apply_rope_in_place(&mut y, &shape, head_dim, pos, false);
+            y.iter().zip(&g).map(|(a, b)| (*a * *b) as f64).sum()
+        };
+        let mut analytic = g.clone();
+        apply_rope_in_place(&mut analytic, &shape, head_dim, pos, true);
+        assert_close(&analytic, &numeric_grad(&x, loss), "rope grad");
+    }
+
+    #[test]
+    fn rope_positions_depend_on_token_not_head() {
+        // Two identical heads of one token must be rotated identically.
+        let shape = [1, 2, 8];
+        let mut data: Vec<f32> = [1.0, 2.0, 3.0, 4.0].repeat(4);
+        apply_rope_in_place(&mut data, &shape, 4, 3, false);
+        assert_eq!(data[0..4], data[4..8]);
+        assert_eq!(data[8..12], data[12..16]);
+        assert_ne!(data[0..4], data[8..12]);
+        // Position 0 is the identity.
+        let mut first = vec![1.0, 2.0, 3.0, 4.0];
+        apply_rope_in_place(&mut first, &[1, 4], 4, 0, false);
+        assert_eq!(first, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn schedulers_follow_their_curves() {
+        let mut cosine = CosineAnnealingLR::new(1.0, 0.0, 10);
+        assert_eq!(cosine.get_lr(), 1.0);
+        for _ in 0..5 {
+            cosine.step();
+        }
+        assert!((cosine.get_lr() - 0.5).abs() < 1e-6);
+        for _ in 0..5 {
+            cosine.step();
+        }
+        assert_eq!(cosine.get_lr(), 0.0);
+        assert_eq!(cosine.current_step(), 10);
+
+        let mut warm = WarmupCosineScheduler::new(1.0, 0.1, 4, 14);
+        let lrs: Vec<f32> = (0..15)
+            .map(|_| {
+                let lr = warm.get_lr();
+                warm.step();
+                lr
+            })
+            .collect();
+        assert_eq!(&lrs[..5], &[0.0, 0.25, 0.5, 0.75, 1.0]);
+        assert!((lrs[9] - 0.55).abs() < 1e-6);
+        assert_eq!(lrs[14], 0.1);
     }
 }
