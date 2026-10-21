@@ -1,24 +1,30 @@
 //! AdamW Optimizer
 //!
-//! Adam optimizer with decoupled weight decay.
+//! Adam with decoupled weight decay. Updates run as tensor ops on the
+//! parameters' device.
 
-use super::Optimizer;
-use crate::tensor::Tensor;
+use super::{clip_grad_norm, Optimizer};
+use crate::tensor::{no_grad, Tensor};
 
 /// AdamW optimizer - Adam with decoupled weight decay.
 ///
+/// Per step `t`: `m = b1 m + (1 - b1) g`, `v = b2 v + (1 - b2) g^2`,
+/// `p = p (1 - lr wd) - lr m_hat / (sqrt(v_hat) + eps)` with bias-corrected
+/// `m_hat`, `v_hat`. Set `weight_decay(0.0)` for plain Adam.
+///
 /// # Example
-/// ```rust,no_run
+/// ```rust
 /// use rusty::prelude::*;
 ///
-/// let device = Device::new();
+/// let device = Device::cpu();
 /// let model = nn::Linear::new(10, 5, &device);
-/// let mut optimizer = optim::AdamW::new(model.parameters(), 1e-4);
+/// let mut optimizer = optim::AdamW::new(model.parameters(), 1e-3).clip_grad_norm(1.0);
 ///
-/// // Training step
-/// // ...
-/// optimizer.step();
+/// let x = Tensor::randn(&[8, 10], &device);
+/// let loss = model.forward(&x).square().mean();
 /// optimizer.zero_grad();
+/// loss.backward();
+/// optimizer.step();
 /// ```
 pub struct AdamW {
     params: Vec<Tensor>,
@@ -28,31 +34,15 @@ pub struct AdamW {
     eps: f32,
     weight_decay: f32,
     t: usize,
-    max_grad_norm: Option<f32>, // Gradient clipping
-    // First moment estimates
-    m: Vec<Vec<f32>>,
-    // Second moment estimates
-    v: Vec<Vec<f32>>,
+    max_grad_norm: Option<f32>,
+    /// First and second moment estimates, created on first use.
+    moments: Vec<Option<(Tensor, Tensor)>>,
 }
 
 impl AdamW {
-    /// Create a new AdamW optimizer with default hyperparameters.
+    /// Create AdamW with betas (0.9, 0.999), eps 1e-8, weight decay 0.01.
     pub fn new(params: Vec<Tensor>, lr: f32) -> Self {
-        let m: Vec<Vec<f32>> = params.iter().map(|p| vec![0.0; p.numel()]).collect();
-        let v: Vec<Vec<f32>> = params.iter().map(|p| vec![0.0; p.numel()]).collect();
-
-        Self {
-            params,
-            lr,
-            beta1: 0.9,
-            beta2: 0.999,
-            eps: 1e-8,
-            weight_decay: 0.01,
-            t: 0,
-            max_grad_norm: None,
-            m,
-            v,
-        }
+        Self::with_params(params, lr, 0.9, 0.999, 1e-8, 0.01)
     }
 
     /// Create AdamW with custom hyperparameters.
@@ -64,9 +54,7 @@ impl AdamW {
         eps: f32,
         weight_decay: f32,
     ) -> Self {
-        let m: Vec<Vec<f32>> = params.iter().map(|p| vec![0.0; p.numel()]).collect();
-        let v: Vec<Vec<f32>> = params.iter().map(|p| vec![0.0; p.numel()]).collect();
-
+        let num_params = params.len();
         Self {
             params,
             lr,
@@ -76,8 +64,7 @@ impl AdamW {
             weight_decay,
             t: 0,
             max_grad_norm: None,
-            m,
-            v,
+            moments: vec![None; num_params],
         }
     }
 
@@ -99,88 +86,57 @@ impl AdamW {
         self
     }
 
-    /// Enable gradient clipping by norm.
-    ///
-    /// Gradients are clipped to have a maximum L2 norm of `max_norm`.
-    /// This helps prevent exploding gradients during training.
+    /// Set epsilon.
+    pub fn eps(mut self, eps: f32) -> Self {
+        self.eps = eps;
+        self
+    }
+
+    /// Clip the global gradient norm to `max_norm` before every step.
     pub fn clip_grad_norm(mut self, max_norm: f32) -> Self {
         self.max_grad_norm = Some(max_norm);
         self
+    }
+
+    /// Number of steps taken.
+    pub fn steps(&self) -> usize {
+        self.t
+    }
+
+    /// The parameters being optimized.
+    pub fn params(&self) -> &[Tensor] {
+        &self.params
     }
 }
 
 impl Optimizer for AdamW {
     fn step(&mut self) {
-        self.t += 1;
-        let t = self.t as f32;
-
-        // Gradient clipping: compute global norm first
         if let Some(max_norm) = self.max_grad_norm {
-            let mut global_norm_sq = 0.0f32;
-
-            for param in &self.params {
-                if let Some(grad_tensor) = param.grad() {
-                    let grad = grad_tensor.to_vec();
-                    global_norm_sq += grad.iter().map(|g| g * g).sum::<f32>();
-                }
-            }
-
-            let global_norm = global_norm_sq.sqrt();
-            if global_norm > max_norm {
-                let scale = max_norm / global_norm;
-                // Apply scaling in the next loop
-            }
+            clip_grad_norm(&self.params, max_norm);
         }
-
-        for (i, param) in self.params.iter().enumerate() {
-            if let Some(grad_tensor) = param.grad() {
-                let mut grad = grad_tensor.to_vec();
-
-                // Apply gradient clipping if enabled
-                if let Some(max_norm) = self.max_grad_norm {
-                    let grad_norm = grad.iter().map(|g| g * g).sum::<f32>().sqrt();
-                    if grad_norm > max_norm {
-                        let scale = max_norm / grad_norm;
-                        for g in &mut grad {
-                            *g *= scale;
-                        }
-                    }
-                }
-
-                let mut weights = param.to_vec();
-
-                // Update biased first moment estimate
-                for (m_i, g) in self.m[i].iter_mut().zip(grad.iter()) {
-                    *m_i = self.beta1 * *m_i + (1.0 - self.beta1) * *g;
-                }
-
-                // Update biased second moment estimate
-                for (v_i, g) in self.v[i].iter_mut().zip(grad.iter()) {
-                    *v_i = self.beta2 * *v_i + (1.0 - self.beta2) * *g * *g;
-                }
-
-                // Bias correction
-                let bias_correction1 = 1.0 - self.beta1.powf(t);
-                let bias_correction2 = 1.0 - self.beta2.powf(t);
-
-                // Update weights
-                for ((w, m_i), v_i) in weights
-                    .iter_mut()
-                    .zip(self.m[i].iter())
-                    .zip(self.v[i].iter())
-                {
-                    let m_hat = *m_i / bias_correction1;
-                    let v_hat = *v_i / bias_correction2;
-
-                    // AdamW update: decoupled weight decay
-                    *w =
-                        *w - self.lr * (m_hat / (v_hat.sqrt() + self.eps) + self.weight_decay * *w);
-                }
-
-                // Write back
-                param.copy_from_slice(&weights);
+        self.t += 1;
+        let t = self.t as i32;
+        let bias1 = 1.0 - self.beta1.powi(t);
+        let bias2 = 1.0 - self.beta2.powi(t);
+        no_grad(|| {
+            for (param, moments) in self.params.iter().zip(&mut self.moments) {
+                let Some(g) = param.grad() else { continue };
+                let (m, v) = moments
+                    .take()
+                    .unwrap_or_else(|| (param.zeros_like(), param.zeros_like()));
+                let m = m
+                    .mul_scalar(self.beta1)
+                    .add(&g.mul_scalar(1.0 - self.beta1));
+                let v = v
+                    .mul_scalar(self.beta2)
+                    .add(&g.square().mul_scalar(1.0 - self.beta2));
+                let denom = v.div_scalar(bias2).sqrt().add_scalar(self.eps);
+                let update = m.div_scalar(bias1).div(&denom).mul_scalar(self.lr);
+                let decayed = param.mul_scalar(1.0 - self.lr * self.weight_decay);
+                param.assign(&decayed.sub(&update));
+                *moments = Some((m, v));
             }
-        }
+        });
     }
 
     fn zero_grad(&self) {
