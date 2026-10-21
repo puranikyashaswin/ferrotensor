@@ -178,6 +178,7 @@ impl FlashAttention {
     ///
     /// # Returns
     /// FlashAttentionGrads containing dQ, dK, dV
+    #[allow(clippy::too_many_arguments)]
     pub fn backward(
         &self,
         q: &UnifiedTensor,

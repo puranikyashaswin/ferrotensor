@@ -3,7 +3,7 @@ use rusty_backend::{ComputeEngine, UnifiedTensor, WgpuContext};
 use rusty_graph::{Linear, RMSNorm};
 use serde::Deserialize;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[derive(Deserialize)]
@@ -33,7 +33,7 @@ fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/reference/phase0_linear_rmsnorm.json")
 }
 
-fn ensure_fixture(path: &PathBuf) {
+fn ensure_fixture(path: &Path) {
     if path.exists() {
         return;
     }

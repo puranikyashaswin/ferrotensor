@@ -83,7 +83,7 @@ impl<'a> Lfm2ModelBuilder<'a> {
             let ut = self
                 .weights
                 .upload_quantized(name, &self.ctx, &self.engine)
-                .expect(&format!("Failed to load quantized weight: {}", name));
+                .unwrap_or_else(|e| panic!("Failed to load quantized weight: {}: {}", name, e));
             Tensor::new(self.ctx.clone(), ut)
         } else {
             // Regular FP32/FP16 weight - direct load
@@ -95,7 +95,7 @@ impl<'a> Lfm2ModelBuilder<'a> {
         let (data, shape) = self
             .weights
             .read_f32_tensor(name)
-            .expect(&format!("Failed to load weight: {}", name));
+            .unwrap_or_else(|e| panic!("Failed to load weight: {}: {}", name, e));
 
         let ut = UnifiedTensor::new(&self.ctx, &data, &shape);
         Tensor::new(self.ctx.clone(), ut)
@@ -106,7 +106,7 @@ impl<'a> Lfm2ModelBuilder<'a> {
         let (data, shape) = self
             .weights
             .read_f32_tensor(&weight_name)
-            .expect(&format!("Failed to load weight: {}", weight_name));
+            .unwrap_or_else(|e| panic!("Failed to load weight: {}: {}", weight_name, e));
 
         let (data, shape) = if shape.len() == 2 {
             let rows = shape[0];

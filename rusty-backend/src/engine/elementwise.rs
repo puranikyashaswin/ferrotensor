@@ -4,6 +4,7 @@ use super::{groups64, ComputeEngine, Kernel};
 use crate::{UnifiedTensor, WgpuContext};
 
 impl ComputeEngine {
+    /// `out = a + b`, element-wise; `a`, `b` and `out` have the same length.
     pub fn add(
         &self,
         ctx: &WgpuContext,
@@ -14,6 +15,7 @@ impl ComputeEngine {
         self.binary(ctx, &self.add, a, b, out);
     }
 
+    /// `out = a * b`, element-wise.
     pub fn mul(
         &self,
         ctx: &WgpuContext,
@@ -24,6 +26,7 @@ impl ComputeEngine {
         self.binary(ctx, &self.mul, a, b, out);
     }
 
+    /// `out = a - b`, element-wise.
     pub fn sub(
         &self,
         ctx: &WgpuContext,
@@ -50,6 +53,7 @@ impl ComputeEngine {
         );
     }
 
+    /// Gradients of `a + b`: writes `grad_out` to both `grad_a` and `grad_b`.
     pub fn add_backward(
         &self,
         ctx: &WgpuContext,
@@ -69,6 +73,7 @@ impl ComputeEngine {
         );
     }
 
+    /// Gradients of `a - b`: `grad_a = grad_out`, `grad_b = -grad_out`.
     pub fn sub_backward(
         &self,
         ctx: &WgpuContext,
@@ -88,6 +93,7 @@ impl ComputeEngine {
         );
     }
 
+    /// Gradients of `a * b`: `grad_a = grad_out * b`, `grad_b = grad_out * a`.
     pub fn mul_backward(
         &self,
         ctx: &WgpuContext,
@@ -111,6 +117,7 @@ impl ComputeEngine {
         );
     }
 
+    /// `out = x * sigmoid(x)`, element-wise.
     pub fn silu(&self, ctx: &WgpuContext, input: &UnifiedTensor, out: &UnifiedTensor) {
         self.run(
             ctx,
@@ -120,6 +127,8 @@ impl ComputeEngine {
         );
     }
 
+    /// Gradient of SiLU: `grad_in = grad_out * s * (1 + x * (1 - s))` with
+    /// `s = sigmoid(input)`.
     pub fn silu_backward(
         &self,
         ctx: &WgpuContext,
@@ -139,6 +148,7 @@ impl ComputeEngine {
         );
     }
 
+    /// `out = max(x, 0)`, element-wise.
     pub fn relu(&self, ctx: &WgpuContext, input: &UnifiedTensor, out: &UnifiedTensor) {
         self.run(
             ctx,
@@ -148,6 +158,7 @@ impl ComputeEngine {
         );
     }
 
+    /// Gradient of ReLU: `grad_out` where `input > 0`, else 0.
     pub fn relu_backward(
         &self,
         ctx: &WgpuContext,

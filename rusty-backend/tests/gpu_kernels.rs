@@ -309,6 +309,12 @@ fn matmul_at_matches_cpu() {
 
 const ELEMWISE_LEN: usize = 1000; // not a multiple of the workgroup size
 
+type BinaryOp = fn(&ComputeEngine, &WgpuContext, &UnifiedTensor, &UnifiedTensor, &UnifiedTensor);
+type UnaryOp = fn(&ComputeEngine, &WgpuContext, &UnifiedTensor, &UnifiedTensor);
+/// (name, GPU op, CPU reference)
+type BinaryCase = (&'static str, BinaryOp, fn(f32, f32) -> f32);
+type UnaryCase = (&'static str, UnaryOp, fn(f32) -> f32);
+
 #[test]
 #[ignore = "needs a GPU; run with --ignored --test-threads=1"]
 fn binary_ops_match_cpu() {
@@ -317,8 +323,7 @@ fn binary_ops_match_cpu() {
     let a = rand_vec(n, 1);
     let b = rand_vec(n, 2);
     let (ta, tb) = (upload(&a, &[n]), upload(&b, &[n]));
-    type Op = fn(&ComputeEngine, &WgpuContext, &UnifiedTensor, &UnifiedTensor, &UnifiedTensor);
-    let cases: [(&str, Op, fn(f32, f32) -> f32); 5] = [
+    let cases: [BinaryCase; 5] = [
         ("add", ComputeEngine::add, |x, y| x + y),
         ("sub", ComputeEngine::sub, |x, y| x - y),
         ("mul", ComputeEngine::mul, |x, y| x * y),
@@ -344,8 +349,7 @@ fn unary_ops_match_cpu() {
     let n = ELEMWISE_LEN;
     let x: Vec<f32> = rand_vec(n, 3).iter().map(|v| v * 8.0).collect();
     let tx = upload(&x, &[n]);
-    type Op = fn(&ComputeEngine, &WgpuContext, &UnifiedTensor, &UnifiedTensor);
-    let cases: [(&str, Op, fn(f32) -> f32); 3] = [
+    let cases: [UnaryCase; 3] = [
         ("silu", ComputeEngine::silu, |v| v * sigmoid(v)),
         ("relu", ComputeEngine::relu, |v| v.max(0.0)),
         ("grad_norm_sq", ComputeEngine::gradient_norm_squared, |v| {

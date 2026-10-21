@@ -68,6 +68,7 @@ impl Lfm2Conv {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 pub enum Lfm2LayerOp {
     Conv(Lfm2Conv),
     Attention(Attention),

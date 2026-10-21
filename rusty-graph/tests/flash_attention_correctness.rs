@@ -147,7 +147,7 @@ mod tests {
     #[test]
     fn test_multi_head_creation() {
         let flash_attn = FlashAttention::new(768, 12, true);
-        assert_eq!(flash_attn.memory_savings(1024).len() > 0, true);
+        assert!(!flash_attn.memory_savings(1024).is_empty());
     }
 
     #[test]

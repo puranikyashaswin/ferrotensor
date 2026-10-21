@@ -4,6 +4,9 @@ use super::{groups64, uniform, ComputeEngine};
 use crate::{UnifiedTensor, WgpuContext};
 
 impl ComputeEngine {
+    /// Writes the indices of the `k` largest values of `input`, largest first,
+    /// as `u32`s into `out_idx`. Runs on a single GPU thread; meant for sampling
+    /// from one logits vector.
     pub fn top_k(&self, ctx: &WgpuContext, input: &UnifiedTensor, out_idx: &UnifiedTensor, k: u32) {
         let params = uniform(ctx, bytemuck::cast_slice(&[k]));
         self.run(
@@ -14,6 +17,9 @@ impl ComputeEngine {
         );
     }
 
+    /// Depthwise 1-D convolution with kernel size 3 and padding 1:
+    /// `out[d, s] = bias[d] + sum_k weight[d, k] * input[d, s + k - 1]`, with
+    /// `input`/`out` `[dim, seq_len]`, `weight` `[dim, 3]` and `bias` `[dim]`.
     pub fn conv1d(
         &self,
         ctx: &WgpuContext,

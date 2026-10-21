@@ -69,6 +69,7 @@ impl ComputeEngine {
         );
     }
 
+    /// Softmax over the last dimension of `input`.
     pub fn softmax(&self, ctx: &WgpuContext, input: &UnifiedTensor, out: &UnifiedTensor) {
         let size = *input.shape.last().unwrap_or(&1);
         let rows = input.shape.iter().product::<usize>() / size;
@@ -81,6 +82,8 @@ impl ComputeEngine {
         );
     }
 
+    /// Gradient of softmax over the last dimension, given the forward
+    /// output `final_out`: `grad_in = s * (grad_out - sum(grad_out * s))`.
     pub fn softmax_backward(
         &self,
         ctx: &WgpuContext,

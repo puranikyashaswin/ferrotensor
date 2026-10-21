@@ -3,19 +3,29 @@
 use super::{groups64, uniform, ComputeEngine};
 use crate::{UnifiedTensor, WgpuContext};
 
+/// Hyper-parameters for [`ComputeEngine::adamw_update`]; laid out to match
+/// the WGSL uniform.
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct AdamParams {
+    /// Learning rate.
     pub lr: f32,
+    /// First-moment decay.
     pub beta1: f32,
+    /// Second-moment decay.
     pub beta2: f32,
+    /// Denominator epsilon.
     pub eps: f32,
+    /// Decoupled weight decay.
     pub weight_decay: f32,
+    /// 1-based step number, used for bias correction.
     pub t: f32,
+    /// Padding to a 16-byte multiple; set to zero.
     pub _pad: [f32; 2],
 }
 
 impl ComputeEngine {
+    /// In-place SGD step: `weight -= lr * grad`.
     pub fn sgd_update(
         &self,
         ctx: &WgpuContext,
@@ -32,6 +42,8 @@ impl ComputeEngine {
         );
     }
 
+    /// In-place AdamW step, updating `weight` and the moment buffers `m`
+    /// and `v`.
     pub fn adamw_update(
         &self,
         ctx: &WgpuContext,
@@ -56,6 +68,7 @@ impl ComputeEngine {
         );
     }
 
+    /// Per-element squared error `out = 0.5 * (pred - target)^2` (not reduced).
     pub fn mse_loss(
         &self,
         ctx: &WgpuContext,
@@ -66,6 +79,7 @@ impl ComputeEngine {
         self.binary(ctx, &self.mse_loss, pred, target, out);
     }
 
+    /// Gradient of [`mse_loss`](Self::mse_loss): `grad_in = pred - target`.
     pub fn mse_loss_backward(
         &self,
         ctx: &WgpuContext,
@@ -85,7 +99,7 @@ impl ComputeEngine {
         );
     }
 
-    /// Cross-entropy loss forward: computes -log(softmax(logits)[target])
+    /// Cross-entropy loss of one logits vector: `loss_out[0] = -log(softmax(logits)[target])`.
     pub fn cross_entropy_loss(
         &self,
         ctx: &WgpuContext,

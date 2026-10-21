@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use wgpu::{Buffer, BufferDescriptor, BufferUsages, Device};
 
+/// Free lists of GPU buffers keyed by exact byte size.
 pub struct BufferPool {
     buffers: Mutex<HashMap<u64, Vec<Arc<Buffer>>>>,
     usage: BufferUsages,
@@ -20,6 +21,7 @@ impl std::fmt::Debug for BufferPool {
 }
 
 impl BufferPool {
+    /// A pool whose buffers are created with `usage`.
     pub fn new(usage: BufferUsages) -> Self {
         Self {
             buffers: Mutex::new(HashMap::new()),
@@ -27,6 +29,7 @@ impl BufferPool {
         }
     }
 
+    /// A free buffer of exactly `size` bytes, or a new one.
     pub fn get(&self, device: &Device, size: u64) -> Arc<Buffer> {
         let mut buffers = self.buffers.lock().unwrap();
         if let Some(list) = buffers.get_mut(&size) {
@@ -44,11 +47,13 @@ impl BufferPool {
         }))
     }
 
+    /// Returns `buffer` (of `size` bytes) to the pool for reuse.
     pub fn return_buffer(&self, size: u64, buffer: Arc<Buffer>) {
         let mut buffers = self.buffers.lock().unwrap();
-        buffers.entry(size).or_insert_with(Vec::new).push(buffer);
+        buffers.entry(size).or_default().push(buffer);
     }
 
+    /// Drops every pooled buffer.
     pub fn clear(&self) {
         let mut buffers = self.buffers.lock().unwrap();
         buffers.clear();

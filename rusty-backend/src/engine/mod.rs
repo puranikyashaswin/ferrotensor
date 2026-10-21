@@ -72,6 +72,12 @@ fn uniform(ctx: &WgpuContext, bytes: &[u8]) -> Buffer {
         })
 }
 
+/// Compiled WGSL kernels and the methods that dispatch them.
+///
+/// Every method records and submits its own command buffer and returns
+/// without waiting; reading a result (e.g. with
+/// [`UnifiedTensor::to_vec`](crate::UnifiedTensor::to_vec)) waits for the GPU.
+/// Tensors are dense, row-major `f32` unless stated otherwise.
 pub struct ComputeEngine {
     matmul: Kernel,
     rope: Kernel,
@@ -111,6 +117,7 @@ pub struct ComputeEngine {
 }
 
 impl ComputeEngine {
+    /// Compiles every kernel for `ctx`'s device.
     pub fn new(ctx: &WgpuContext) -> Self {
         let combined_src = shader_source();
         let module = ctx
@@ -193,6 +200,7 @@ impl ComputeEngine {
         ctx.queue.submit(Some(encoder.finish()));
     }
 
+    /// Copies all of `src` into `dst`, starting at byte offset `dst_offset`.
     pub fn copy_tensor(
         &self,
         ctx: &WgpuContext,

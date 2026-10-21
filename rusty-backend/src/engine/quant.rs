@@ -4,6 +4,8 @@ use super::{groups64, ComputeEngine};
 use crate::{UnifiedTensor, WgpuContext};
 
 impl ComputeEngine {
+    /// Unpacks bytes to floats: element `i` of `out` is byte `i` of `input`
+    /// (read as packed `u32`s) converted to `f32`, without scaling.
     pub fn dequantize(&self, ctx: &WgpuContext, input: &UnifiedTensor, out: &UnifiedTensor) {
         let words = input.shape.iter().product::<usize>().div_ceil(4);
         self.run(
@@ -14,6 +16,8 @@ impl ComputeEngine {
         );
     }
 
+    /// 8-bit affine dequantisation with groups of 64 (MLX layout):
+    /// `out[i] = byte(weight, i) * scales[i / 64] + biases[i / 64]`.
     pub fn affine_dequantize(
         &self,
         ctx: &WgpuContext,
