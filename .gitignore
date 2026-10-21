@@ -32,7 +32,7 @@ logs/
 *.ggml
 
 # Data files
-data/
+/data/
 checkpoints/
 outputs/
 
