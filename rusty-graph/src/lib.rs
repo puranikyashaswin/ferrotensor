@@ -329,8 +329,9 @@ pub struct MLP {
 impl MLP {
     pub fn forward(&self, engine: &ComputeEngine, input: &Tensor) -> Tensor {
         let up = self.up_proj.forward(engine, input);
-        let gate_linear = self.gate_proj.forward(engine, input);
-        let fused = Tensor::silu_gate_fused(&up, &gate_linear, engine);
+        let gate = self.gate_proj.forward(engine, input);
+        // silu_gate_fused(a, b) = silu(a) * b; SwiGLU applies SiLU to the gate.
+        let fused = Tensor::silu_gate_fused(&gate, &up, engine);
         self.down_proj.forward(engine, &fused)
     }
 
