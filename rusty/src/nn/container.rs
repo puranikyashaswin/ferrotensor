@@ -2,67 +2,110 @@
 //!
 //! Sequential and ModuleList containers.
 
-use super::{LayerNorm, Linear, Module, RMSNorm, ReLU, SiLU, Sigmoid, Tanh, GELU};
+use super::module::prefixed;
+use super::{
+    Dropout, Embedding, LayerNorm, LeakyReLU, Linear, Module, MultiHeadAttention, RMSNorm, ReLU,
+    SiLU, Sigmoid, Softmax, Tanh, GELU,
+};
 use crate::tensor::Tensor;
 use crate::Device;
 
-/// A layer that can be added to Sequential.
-pub enum Layer {
-    Linear(Linear),
-    ReLU(ReLU),
-    SiLU(SiLU),
-    GELU(GELU),
-    Sigmoid(Sigmoid),
-    Tanh(Tanh),
-    LayerNorm(LayerNorm),
-    RMSNorm(RMSNorm),
-    Custom(Box<dyn Module>),
+macro_rules! layers {
+    ($($variant:ident),* $(,)?) => {
+        /// A layer that can be added to [`Sequential`].
+        pub enum Layer {
+            $(
+                #[doc = concat!("A [`", stringify!($variant), "`] layer.")]
+                $variant($variant),
+            )*
+            /// Any other module.
+            Custom(Box<dyn Module>),
+        }
+
+        impl Layer {
+            fn module(&self) -> &dyn Module {
+                match self {
+                    $(Layer::$variant(l) => l,)*
+                    Layer::Custom(l) => l.as_ref(),
+                }
+            }
+
+            fn module_mut(&mut self) -> &mut dyn Module {
+                match self {
+                    $(Layer::$variant(l) => l,)*
+                    Layer::Custom(l) => l.as_mut(),
+                }
+            }
+        }
+
+        $(
+            impl From<$variant> for Layer {
+                fn from(l: $variant) -> Self {
+                    Layer::$variant(l)
+                }
+            }
+        )*
+    };
+}
+
+layers!(
+    Linear,
+    ReLU,
+    LeakyReLU,
+    SiLU,
+    GELU,
+    Sigmoid,
+    Tanh,
+    Softmax,
+    Dropout,
+    LayerNorm,
+    RMSNorm,
+    Embedding,
+    MultiHeadAttention,
+);
+
+impl From<Box<dyn Module>> for Layer {
+    fn from(m: Box<dyn Module>) -> Self {
+        Layer::Custom(m)
+    }
 }
 
 impl Module for Layer {
     fn forward(&self, x: &Tensor) -> Tensor {
-        match self {
-            Layer::Linear(l) => l.forward(x),
-            Layer::ReLU(l) => l.forward(x),
-            Layer::SiLU(l) => l.forward(x),
-            Layer::GELU(l) => l.forward(x),
-            Layer::Sigmoid(l) => l.forward(x),
-            Layer::Tanh(l) => l.forward(x),
-            Layer::LayerNorm(l) => l.forward(x),
-            Layer::RMSNorm(l) => l.forward(x),
-            Layer::Custom(l) => l.forward(x),
-        }
+        self.module().forward(x)
     }
 
     fn parameters(&self) -> Vec<Tensor> {
-        match self {
-            Layer::Linear(l) => l.parameters(),
-            Layer::ReLU(l) => l.parameters(),
-            Layer::SiLU(l) => l.parameters(),
-            Layer::GELU(l) => l.parameters(),
-            Layer::Sigmoid(l) => l.parameters(),
-            Layer::Tanh(l) => l.parameters(),
-            Layer::LayerNorm(l) => l.parameters(),
-            Layer::RMSNorm(l) => l.parameters(),
-            Layer::Custom(l) => l.parameters(),
-        }
+        self.module().parameters()
+    }
+
+    fn named_parameters(&self) -> Vec<(String, Tensor)> {
+        self.module().named_parameters()
+    }
+
+    fn set_training(&mut self, training: bool) {
+        self.module_mut().set_training(training);
     }
 }
 
 /// Sequential container - runs layers in order.
 ///
+/// Parameters are named `"<index>.<name>"`, e.g. `"0.weight"`.
+///
 /// # Example
-/// ```rust,no_run
+/// ```rust
 /// use rusty::prelude::*;
 ///
-/// let device = Device::new();
+/// let device = Device::cpu();
 /// let model = nn::Sequential::new(&device)
 ///     .add(nn::Linear::new(784, 256, &device))
 ///     .add(nn::ReLU)
+///     .add(nn::Dropout::new(0.1))
 ///     .add(nn::Linear::new(256, 10, &device));
 ///
 /// let x = Tensor::randn(&[32, 784], &device);
 /// let y = model.forward(&x);
+/// assert_eq!(y.shape, vec![32, 10]);
 /// ```
 pub struct Sequential {
     layers: Vec<Layer>,
@@ -79,13 +122,14 @@ impl Sequential {
         }
     }
 
-    /// Add a Linear layer.
+    /// Append a layer.
+    #[allow(clippy::should_implement_trait)]
     pub fn add(mut self, layer: impl Into<Layer>) -> Self {
         self.layers.push(layer.into());
         self
     }
 
-    /// Add a custom module.
+    /// Append a custom module.
     pub fn add_module(mut self, module: Box<dyn Module>) -> Self {
         self.layers.push(Layer::Custom(module));
         self
@@ -99,6 +143,11 @@ impl Sequential {
     /// Check if empty.
     pub fn is_empty(&self) -> bool {
         self.layers.is_empty()
+    }
+
+    /// The layer at `index`.
+    pub fn get(&self, index: usize) -> Option<&Layer> {
+        self.layers.get(index)
     }
 }
 
@@ -114,6 +163,20 @@ impl Module for Sequential {
     fn parameters(&self) -> Vec<Tensor> {
         self.layers.iter().flat_map(|l| l.parameters()).collect()
     }
+
+    fn named_parameters(&self) -> Vec<(String, Tensor)> {
+        self.layers
+            .iter()
+            .enumerate()
+            .flat_map(|(i, l)| prefixed(&i.to_string(), l.named_parameters()))
+            .collect()
+    }
+
+    fn set_training(&mut self, training: bool) {
+        for layer in &mut self.layers {
+            layer.set_training(training);
+        }
+    }
 }
 
 impl std::fmt::Debug for Sequential {
@@ -124,56 +187,9 @@ impl std::fmt::Debug for Sequential {
     }
 }
 
-// Implement From for common types
-impl From<Linear> for Layer {
-    fn from(l: Linear) -> Self {
-        Layer::Linear(l)
-    }
-}
-
-impl From<ReLU> for Layer {
-    fn from(l: ReLU) -> Self {
-        Layer::ReLU(l)
-    }
-}
-
-impl From<SiLU> for Layer {
-    fn from(l: SiLU) -> Self {
-        Layer::SiLU(l)
-    }
-}
-
-impl From<GELU> for Layer {
-    fn from(l: GELU) -> Self {
-        Layer::GELU(l)
-    }
-}
-
-impl From<Sigmoid> for Layer {
-    fn from(l: Sigmoid) -> Self {
-        Layer::Sigmoid(l)
-    }
-}
-
-impl From<Tanh> for Layer {
-    fn from(l: Tanh) -> Self {
-        Layer::Tanh(l)
-    }
-}
-
-impl From<LayerNorm> for Layer {
-    fn from(l: LayerNorm) -> Self {
-        Layer::LayerNorm(l)
-    }
-}
-
-impl From<RMSNorm> for Layer {
-    fn from(l: RMSNorm) -> Self {
-        Layer::RMSNorm(l)
-    }
-}
-
-/// ModuleList - stores modules in a list.
+/// ModuleList - an indexable list of modules (no forward of its own).
+///
+/// Parameters are named `"<index>.<name>"`.
 pub struct ModuleList {
     modules: Vec<Box<dyn Module>>,
 }
@@ -205,6 +221,27 @@ impl ModuleList {
     pub fn iter(&self) -> impl Iterator<Item = &Box<dyn Module>> {
         self.modules.iter()
     }
+
+    /// Parameters of every module, in order.
+    pub fn parameters(&self) -> Vec<Tensor> {
+        self.modules.iter().flat_map(|m| m.parameters()).collect()
+    }
+
+    /// Named parameters of every module, prefixed by its index.
+    pub fn named_parameters(&self) -> Vec<(String, Tensor)> {
+        self.modules
+            .iter()
+            .enumerate()
+            .flat_map(|(i, m)| prefixed(&i.to_string(), m.named_parameters()))
+            .collect()
+    }
+
+    /// Switch every module between training and evaluation.
+    pub fn set_training(&mut self, training: bool) {
+        for module in &mut self.modules {
+            module.set_training(training);
+        }
+    }
 }
 
 impl Default for ModuleList {
@@ -217,5 +254,68 @@ impl std::ops::Index<usize> for ModuleList {
     type Output = Box<dyn Module>;
     fn index(&self, index: usize) -> &Self::Output {
         &self.modules[index]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::prelude::*;
+
+    #[test]
+    fn sequential_names_and_mode_propagate() {
+        let d = Device::cpu();
+        let mut model = nn::Sequential::new(&d)
+            .add(nn::Linear::new(3, 4, &d))
+            .add(nn::Dropout::new(0.5))
+            .add(nn::LayerNorm::new(&[4], &d));
+        let names: Vec<String> = model
+            .named_parameters()
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(names, ["0.weight", "0.bias", "2.weight", "2.bias"]);
+
+        model.eval();
+        let x = Tensor::randn(&[2, 3], &d);
+        assert_eq!(model.forward(&x).to_vec(), model.forward(&x).to_vec());
+    }
+
+    #[test]
+    fn attention_shapes_and_gradients() {
+        let d = Device::cpu();
+        let attn = nn::MultiHeadAttention::new(8, 2, &d).causal(true);
+        let x = Tensor::randn(&[5, 8], &d).requires_grad_();
+        let y = attn.forward(&x);
+        assert_eq!(y.shape, vec![5, 8]);
+        y.sum().backward();
+        assert!(x.grad().is_some());
+        assert!(attn.parameters().iter().all(|p| p.grad().is_some()));
+        assert_eq!(attn.named_parameters()[0].0, "q_proj.weight");
+    }
+
+    #[test]
+    fn causal_attention_output_ignores_later_tokens() {
+        let d = Device::cpu();
+        let attn = nn::MultiHeadAttention::new(8, 2, &d).causal(true);
+        let x = Tensor::randn(&[1, 4, 8], &d);
+        let full = attn.forward(&x).to_vec();
+        let prefix = attn.forward(&x.narrow(1, 0, 2)).to_vec();
+        for (a, b) in prefix.iter().zip(&full[..16]) {
+            assert!((a - b).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn embedding_forward_keeps_id_shape() {
+        let d = Device::cpu();
+        let emb = nn::Embedding::new(10, 3, &d);
+        let ids = Tensor::from_data(&[1.0, 2.0, 3.0, 1.0], &[2, 2], &d);
+        let out = emb.forward(&ids);
+        assert_eq!(out.shape, vec![2, 2, 3]);
+        out.sum().backward();
+        let g = emb.weight.grad().unwrap().to_vec();
+        assert_eq!(&g[3..6], &[2.0, 2.0, 2.0]); // id 1 used twice
+        assert_eq!(&g[0..3], &[0.0, 0.0, 0.0]);
     }
 }

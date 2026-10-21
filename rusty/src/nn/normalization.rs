@@ -1,35 +1,33 @@
 //! Normalization Layers
 //!
-//! Layer normalization and RMS normalization.
+//! Layer normalization and RMS normalization, both differentiable in their
+//! input and parameters.
 
 use super::Module;
+use crate::functional;
 use crate::tensor::Tensor;
 use crate::Device;
 
-/// Layer Normalization.
-///
-/// Normalizes over the last dimension with learnable scale (gamma) and shift (beta).
+/// Layer Normalization over the trailing `normalized_shape` dimensions,
+/// with learnable scale (gamma) and shift (beta).
 pub struct LayerNorm {
-    /// Gamma (scale) parameter
+    /// Gamma (scale) parameter, flattened to `[prod(normalized_shape)]`
     pub gamma: Tensor,
-    /// Beta (bias) parameter  
+    /// Beta (shift) parameter, flattened to `[prod(normalized_shape)]`
     pub beta: Tensor,
     /// Epsilon for numerical stability
     pub eps: f32,
-    /// Normalized shape
+    /// Normalized shape (the trailing dims of the input)
     pub normalized_shape: Vec<usize>,
 }
 
 impl LayerNorm {
-    /// Create a new LayerNorm layer.
+    /// Create a LayerNorm layer (gamma = 1, beta = 0, eps = 1e-5).
     pub fn new(normalized_shape: &[usize], device: &Device) -> Self {
         let size: usize = normalized_shape.iter().product();
-        let gamma = Tensor::ones(&[size], device).requires_grad_();
-        let beta = Tensor::zeros(&[size], device).requires_grad_();
-
         Self {
-            gamma,
-            beta,
+            gamma: Tensor::ones(&[size], device).requires_grad_(),
+            beta: Tensor::zeros(&[size], device).requires_grad_(),
             eps: 1e-5,
             normalized_shape: normalized_shape.to_vec(),
         }
@@ -45,47 +43,33 @@ impl LayerNorm {
 
 impl Module for LayerNorm {
     fn forward(&self, x: &Tensor) -> Tensor {
-        // For now, use CPU fallback for LayerNorm
-        // TODO: Optimize with GPU kernel
-        let data = x.to_vec();
-        let size = self.normalized_shape.iter().product::<usize>();
-
-        // Assume the last dimension is the normalization dimension
-        let total_elements = data.len();
-        let num_rows = total_elements / size;
-
-        // Compute mean and variance per row
-        let gamma_data = self.gamma.to_vec();
-        let beta_data = self.beta.to_vec();
-
-        let mut result = Vec::with_capacity(total_elements);
-
-        for row in 0..num_rows {
-            let row_start = row * size;
-            let row_end = row_start + size;
-            let row_data = &data[row_start..row_end];
-
-            // Compute mean for this row
-            let mean: f32 = row_data.iter().sum::<f32>() / size as f32;
-
-            // Compute variance for this row
-            let variance: f32 =
-                row_data.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / size as f32;
-            let inv_std = 1.0 / (variance + self.eps).sqrt();
-
-            // Normalize and apply affine for this row
-            for (i, &v) in row_data.iter().enumerate() {
-                let idx = i % size;
-                let normalized = (v - mean) * inv_std;
-                result.push(normalized * gamma_data[idx] + beta_data[idx]);
-            }
-        }
-
-        Tensor::from_data(&result, &x.shape, &x.device)
+        let k = self.normalized_shape.len();
+        assert!(
+            x.ndim() >= k && x.shape[x.ndim() - k..] == self.normalized_shape[..],
+            "LayerNorm over {:?} got input of shape {:?}",
+            self.normalized_shape,
+            x.shape
+        );
+        let size = self.gamma.numel();
+        let flat = [&x.shape[..x.ndim() - k], &[size]].concat();
+        functional::layer_norm(
+            &x.reshape(&flat),
+            Some(&self.gamma),
+            Some(&self.beta),
+            self.eps,
+        )
+        .reshape(&x.shape)
     }
 
     fn parameters(&self) -> Vec<Tensor> {
         vec![self.gamma.clone(), self.beta.clone()]
+    }
+
+    fn named_parameters(&self) -> Vec<(String, Tensor)> {
+        vec![
+            ("weight".to_string(), self.gamma.clone()),
+            ("bias".to_string(), self.beta.clone()),
+        ]
     }
 }
 
@@ -98,9 +82,9 @@ impl std::fmt::Debug for LayerNorm {
     }
 }
 
-/// RMS Normalization (used in Llama, etc.)
+/// RMS Normalization over the last dimension (used in Llama, etc.).
 ///
-/// Normalizes by root mean square without centering.
+/// Normalizes by root mean square without centering, then scales.
 pub struct RMSNorm {
     /// Weight (scale) parameter
     pub weight: Tensor,
@@ -111,12 +95,10 @@ pub struct RMSNorm {
 }
 
 impl RMSNorm {
-    /// Create a new RMSNorm layer.
+    /// Create an RMSNorm layer (weight = 1, eps = 1e-5).
     pub fn new(hidden_size: usize, device: &Device) -> Self {
-        let weight = Tensor::ones(&[hidden_size], device).requires_grad_();
-
         Self {
-            weight,
+            weight: Tensor::ones(&[hidden_size], device).requires_grad_(),
             eps: 1e-5,
             hidden_size,
         }
@@ -142,39 +124,22 @@ impl RMSNorm {
 
 impl Module for RMSNorm {
     fn forward(&self, x: &Tensor) -> Tensor {
-        // CPU fallback for now
-        let data = x.to_vec();
-        let size = self.hidden_size;
-
-        let total_elements = data.len();
-        let num_rows = total_elements / size;
-
-        // Normalize and scale
-        let weight_data = self.weight.to_vec();
-        let mut result = Vec::with_capacity(total_elements);
-
-        for row in 0..num_rows {
-            let row_start = row * size;
-            let row_end = row_start + size;
-            let row_data = &data[row_start..row_end];
-
-            // Compute RMS for this row
-            let sq_sum: f32 = row_data.iter().map(|v| v * v).sum::<f32>();
-            let rms = (sq_sum / size as f32 + self.eps).sqrt();
-            let inv_rms = 1.0 / rms;
-
-            // Normalize and scale for this row
-            for (i, &v) in row_data.iter().enumerate() {
-                let idx = i % size;
-                result.push(v * inv_rms * weight_data[idx]);
-            }
-        }
-
-        Tensor::from_data(&result, &x.shape, &x.device)
+        assert_eq!(
+            x.shape.last(),
+            Some(&self.hidden_size),
+            "RMSNorm of size {} got input of shape {:?}",
+            self.hidden_size,
+            x.shape
+        );
+        functional::rms_norm(x, Some(&self.weight), self.eps)
     }
 
     fn parameters(&self) -> Vec<Tensor> {
         vec![self.weight.clone()]
+    }
+
+    fn named_parameters(&self) -> Vec<(String, Tensor)> {
+        vec![("weight".to_string(), self.weight.clone())]
     }
 }
 

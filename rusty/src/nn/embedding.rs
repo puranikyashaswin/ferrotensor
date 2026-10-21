@@ -6,9 +6,17 @@ use super::Module;
 use crate::tensor::Tensor;
 use crate::Device;
 
-/// Embedding layer for token lookup.
+/// Embedding layer: maps integer token ids to learned dense vectors.
 ///
-/// Maps integer token IDs to dense vectors.
+/// # Example
+/// ```rust
+/// use rusty::prelude::*;
+///
+/// let device = Device::cpu();
+/// let emb = nn::Embedding::new(100, 16, &device);
+/// let out = emb.forward_ids(&[3, 7, 3]);
+/// assert_eq!(out.shape, vec![3, 16]);
+/// ```
 pub struct Embedding {
     /// Embedding weights [vocab_size, embedding_dim]
     pub weight: Tensor,
@@ -19,13 +27,11 @@ pub struct Embedding {
 }
 
 impl Embedding {
-    /// Create a new Embedding layer with random initialization.
+    /// Create an Embedding with N(0, 0.02^2) weights.
     pub fn new(vocab_size: usize, embedding_dim: usize, device: &Device) -> Self {
-        // Initialize with small random values
         let weight = Tensor::randn(&[vocab_size, embedding_dim], device)
             .mul_scalar(0.02)
             .requires_grad_();
-
         Self {
             weight,
             vocab_size,
@@ -33,7 +39,7 @@ impl Embedding {
         }
     }
 
-    /// Create Embedding from existing weights.
+    /// Create an Embedding from existing weights (`[vocab, dim]`).
     pub fn from_weights(weight: Tensor) -> Self {
         let vocab_size = weight.shape[0];
         let embedding_dim = weight.shape[1];
@@ -44,33 +50,34 @@ impl Embedding {
         }
     }
 
-    /// Lookup embeddings for given token IDs.
+    /// Look up `ids`; returns `[ids.len(), embedding_dim]` (differentiable
+    /// in the weights).
+    pub fn forward_ids(&self, ids: &[usize]) -> Tensor {
+        crate::functional::embedding(&self.weight, ids)
+    }
+
+    /// Look up `u32` token ids.
     pub fn forward_indices(&self, token_ids: &[u32]) -> Tensor {
-        let weight_data = self.weight.to_vec();
-        let seq_len = token_ids.len();
-
-        // Gather embeddings
-        let mut result = Vec::with_capacity(seq_len * self.embedding_dim);
-        for &id in token_ids {
-            let start = (id as usize) * self.embedding_dim;
-            let end = start + self.embedding_dim;
-            result.extend_from_slice(&weight_data[start..end]);
-        }
-
-        Tensor::from_data(&result, &[seq_len, self.embedding_dim], &self.weight.device)
+        let ids: Vec<usize> = token_ids.iter().map(|&id| id as usize).collect();
+        self.forward_ids(&ids)
     }
 }
 
 impl Module for Embedding {
+    /// `x` holds token ids stored as `f32`; the output has shape
+    /// `x.shape + [embedding_dim]`.
     fn forward(&self, x: &Tensor) -> Tensor {
-        // Extract token IDs from tensor and forward
-        // Assumes x contains integer token IDs as floats
-        let ids: Vec<u32> = x.to_vec().iter().map(|&v| v as u32).collect();
-        self.forward_indices(&ids)
+        let ids: Vec<usize> = x.to_vec().iter().map(|&v| v as usize).collect();
+        let out_shape = [&x.shape[..], &[self.embedding_dim]].concat();
+        self.forward_ids(&ids).reshape(&out_shape)
     }
 
     fn parameters(&self) -> Vec<Tensor> {
         vec![self.weight.clone()]
+    }
+
+    fn named_parameters(&self) -> Vec<(String, Tensor)> {
+        vec![("weight".to_string(), self.weight.clone())]
     }
 }
 
