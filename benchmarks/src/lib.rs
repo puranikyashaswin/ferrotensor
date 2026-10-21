@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 /// Benchmark settings parsed from the command line.
 #[derive(Debug, Clone, Default)]
 pub struct Config {
-    /// Use smaller problem sizes (about 10 s in total).
+    /// Use smaller problem sizes (about 8 s in total).
     pub quick: bool,
     /// Only run cases whose name contains this string.
     pub filter: Option<String>,

@@ -18,10 +18,12 @@ default-run = "bench"
 [lib]
 name = "rusty_benchmarks"
 path = "src/lib.rs"
+bench = false
 
 [[bin]]
 name = "bench"
 path = "src/main.rs"
+bench = false
 
 [[bench]]
 name = "gpu"
