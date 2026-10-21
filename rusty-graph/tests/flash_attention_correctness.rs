@@ -69,9 +69,15 @@ mod tests {
         // Verify output is not all zeros
         assert!(result.iter().any(|&x| x.abs() > 1e-6));
 
-        // TODO: Add more specific causality checks
-        // - Verify that position i doesn't attend to positions > i
-        // - Check attention weight distribution
+        // Query 0 sees only key 0, so its output is v[0] (all zeros here);
+        // query i averages v[0..=i] with weights favouring larger keys, so
+        // every output row stays within [0, i].
+        assert!(result[..hidden_dim].iter().all(|&x| x.abs() < 1e-6));
+        for i in 0..seq_len {
+            for &x in &result[i * hidden_dim..(i + 1) * hidden_dim] {
+                assert!((-1e-4..=i as f32 + 1e-4).contains(&x), "row {i}: {x}");
+            }
+        }
     }
 
     #[test]
@@ -106,7 +112,7 @@ mod tests {
     #[test]
     fn test_backward_pass_shapes() {
         let Some((ctx, engine)) = setup() else { return };
-        let flash_attn = FlashAttention::new(768, 12, true);
+        let flash_attn = FlashAttention::new(64, 1, true);
 
         let seq_len = 64;
         let head_dim = 64;

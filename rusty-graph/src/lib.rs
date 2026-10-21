@@ -273,7 +273,9 @@ impl Attention {
             ]);
 
             // Compute attention using cached K,V
-            let attn_out_4d = gqa.forward(&q_4d, &c_k_4d, &c_v_4d, mask, &x.ctx, engine);
+            // Queries sit at positions pos..pos + seq_len; causal masking
+            // hides the cache slots that have not been written yet.
+            let attn_out_4d = gqa.forward_at(&q_4d, &c_k_4d, &c_v_4d, mask, pos, &x.ctx, engine);
 
             // Reshape back to 3D [B, S, H*D]
             let attn_out = attn_out_4d.reshaped(&[batch, seq_len, self.n_heads * self.head_dim]);

@@ -3,7 +3,7 @@
 //! Implements FlashAttention-2 algorithm for O(N) memory instead of O(N²).
 //! Uses tiled matrix multiplication with online softmax normalization.
 
-use rusty_backend::{ComputeEngine, UnifiedTensor, WgpuContext};
+use rusty_backend::{AttentionOptions, ComputeEngine, UnifiedTensor, WgpuContext};
 use std::sync::Arc;
 
 /// Flash Attention layer with tiled computation and online softmax.
@@ -61,15 +61,34 @@ impl FlashAttention {
         }
     }
 
+    /// `[seq, dim]`, `[batch, seq, dim]` or `[batch, seq, heads, head_dim]`
+    /// viewed as `[batch, seq, num_heads, head_dim]`.
+    fn heads_view(&self, t: &UnifiedTensor) -> UnifiedTensor {
+        let (batch, seq) = match t.shape.len() {
+            2 => (1, t.shape[0]),
+            3 | 4 => (t.shape[0], t.shape[1]),
+            n => panic!("FlashAttention expects a 2-D, 3-D or 4-D tensor, got {n}-D"),
+        };
+        assert_eq!(
+            t.shape.iter().product::<usize>(),
+            batch * seq * self.dim,
+            "tensor {:?} does not have dim {} per token",
+            t.shape,
+            self.dim
+        );
+        t.reshaped(&[batch, seq, self.num_heads, self.head_dim])
+    }
+
     /// Forward pass using Flash Attention algorithm.
     ///
     /// # Arguments
-    /// * `q` - Query tensor [batch, seq_q, dim] or [batch, seq_q, num_heads, head_dim]
-    /// * `k` - Key tensor [batch, seq_k, dim] or [batch, seq_k, num_heads, head_dim]
-    /// * `v` - Value tensor [batch, seq_k, dim] or [batch, seq_k, num_heads, head_dim]
+    /// * `q` - Query tensor `[batch, seq_q, dim]`, `[seq_q, dim]` or
+    ///   `[batch, seq_q, num_heads, head_dim]`
+    /// * `k` - Key tensor with the same layout and `seq_k` tokens
+    /// * `v` - Value tensor with the same layout as `k`
     ///
     /// # Returns
-    /// Output tensor [batch, seq_q, dim]
+    /// Output tensor with the same shape as `q`.
     pub fn forward(
         &self,
         q: &UnifiedTensor,
@@ -78,37 +97,19 @@ impl FlashAttention {
         ctx: &WgpuContext,
         engine: &ComputeEngine,
     ) -> UnifiedTensor {
-        // For now, use the simple kernel
-        // TODO: Add multi-head kernel dispatch when use_multi_head_kernel is true
-
-        // Determine input shape
-        let _batch_size = q.shape[0];
-        let _seq_q = q.shape[1];
-        let _seq_k = k.shape[1];
-
-        // Check if input is already split into heads
-        let is_multi_head_input = q.shape.len() == 4;
-
-        if is_multi_head_input {
-            // Input shape: [batch, seq, num_heads, head_dim]
-            // Need to reshape to [batch * num_heads, seq, head_dim] for kernel
-            assert_eq!(q.shape[2], self.num_heads);
-            assert_eq!(q.shape[3], self.head_dim);
-
-            // For now, fall back to simple kernel
-            // TODO: Implement proper multi-head kernel dispatch
-            let output = UnifiedTensor::empty(ctx, &q.shape);
-            engine.flash_attention(ctx, q, k, v, &output, self.causal);
-            output
-        } else {
-            // Input shape: [batch, seq, dim]
-            // Simple single-head or merged multi-head
-            assert_eq!(q.shape[2], self.dim);
-
-            let output = UnifiedTensor::empty(ctx, &q.shape);
-            engine.flash_attention(ctx, q, k, v, &output, self.causal);
-            output
-        }
+        let output = UnifiedTensor::empty(ctx, &q.shape);
+        engine.flash_attention_v2(
+            ctx,
+            &self.heads_view(q),
+            &self.heads_view(k),
+            &self.heads_view(v),
+            &self.heads_view(&output),
+            self.causal,
+            0.0,
+            0,
+            None,
+        );
+        output
     }
 
     /// Multi-head attention forward pass with automatic head splitting.
@@ -187,22 +188,20 @@ impl FlashAttention {
         ctx: &WgpuContext,
         engine: &ComputeEngine,
     ) -> FlashAttentionGrads {
-        // Initialize gradient tensors to zero
-        let grad_q = UnifiedTensor::zeros(ctx, &q.shape);
-        let grad_k = UnifiedTensor::zeros(ctx, &k.shape);
-        let grad_v = UnifiedTensor::zeros(ctx, &v.shape);
+        let grad_q = UnifiedTensor::empty(ctx, &q.shape);
+        let grad_k = UnifiedTensor::empty(ctx, &k.shape);
+        let grad_v = UnifiedTensor::empty(ctx, &v.shape);
 
-        // Dispatch to GPU backward kernel
-        engine.flash_attention_backward(
+        engine.flash_attention_v2_backward(
             ctx,
-            q,
-            k,
-            v,
-            output,
-            grad_output,
-            &grad_q,
-            &grad_k,
-            &grad_v,
+            &self.heads_view(q),
+            &self.heads_view(k),
+            &self.heads_view(v),
+            &self.heads_view(output),
+            &self.heads_view(grad_output),
+            &self.heads_view(&grad_q),
+            &self.heads_view(&grad_k),
+            &self.heads_view(&grad_v),
             self.causal,
         );
 
@@ -357,6 +356,23 @@ impl GroupedQueryAttention {
         ctx: &WgpuContext,
         engine: &ComputeEngine,
     ) -> UnifiedTensor {
+        self.forward_at(q, k, v, mask, 0, ctx, engine)
+    }
+
+    /// Like [`forward`](Self::forward), with the first query at absolute
+    /// position `pos`: query `i` attends to keys `0..=pos + i` when causal.
+    /// Used to decode against a KV cache, where `k`/`v` hold the cache.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_at(
+        &self,
+        q: &UnifiedTensor,
+        k: &UnifiedTensor,
+        v: &UnifiedTensor,
+        mask: Option<&UnifiedTensor>,
+        pos: usize,
+        ctx: &WgpuContext,
+        engine: &ComputeEngine,
+    ) -> UnifiedTensor {
         // Validation: Expect 4D tensors [batch, seq, heads, dim]
         if q.shape.len() != 4 || k.shape.len() != 4 || v.shape.len() != 4 {
             panic!("GroupedQueryAttention expects 4D tensors (batch, seq, heads, dim)");
@@ -373,18 +389,14 @@ impl GroupedQueryAttention {
             .unwrap_or_default()
             .as_nanos() as u64;
 
-        // Use native GQA kernel (V2)
-        engine.flash_attention_v2(
-            ctx,
-            q,
-            k,
-            v,
-            &output,
-            self.causal,
-            self.dropout_prob,
+        let opts = AttentionOptions {
+            causal: self.causal,
+            causal_offset: pos as u32,
+            dropout_prob: self.dropout_prob,
             seed,
-            mask,
-        );
+            ..AttentionOptions::default()
+        };
+        engine.flash_attention_v2_with(ctx, q, k, v, &output, &opts, mask);
 
         output
     }
@@ -560,12 +572,24 @@ impl SlidingWindowAttention {
         ctx: &WgpuContext,
         engine: &ComputeEngine,
     ) -> UnifiedTensor {
-        // TODO: Implement sliding window attention kernel
-        // For now, fall back to standard attention
-        // The kernel would apply a band mask limiting attention to window_size
-
+        let view = |t: &UnifiedTensor| {
+            t.reshaped(&[t.shape[0], t.shape[1], self.num_heads, self.head_dim])
+        };
         let output = UnifiedTensor::empty(ctx, &q.shape);
-        engine.flash_attention(ctx, q, k, v, &output, self.causal);
+        let opts = AttentionOptions {
+            causal: self.causal,
+            window: self.window_size as u32,
+            ..AttentionOptions::default()
+        };
+        engine.flash_attention_v2_with(
+            ctx,
+            &view(q),
+            &view(k),
+            &view(v),
+            &view(&output),
+            &opts,
+            None,
+        );
         output
     }
 
