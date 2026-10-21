@@ -44,6 +44,7 @@ fn main() {
                 head_dim: 4,
                 num_kv_heads: 1,
                 dropout_prob: 0.0,
+                rope_theta: 10000.0,
             },
             norm2: RMSNorm::new(w_norm.clone(), 1e-5),
             mlp,

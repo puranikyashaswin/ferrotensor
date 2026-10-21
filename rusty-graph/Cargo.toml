@@ -19,6 +19,7 @@ rusty-autograd = { path = "../rusty-autograd", version = "0.1.0" }
 rusty-loader = { path = "../rusty-loader", version = "0.1.0" }
 env_logger = "0.11"
 pollster = "0.3"
+log = "0.4"
 bytemuck = "1.14"
 
 [dev-dependencies]

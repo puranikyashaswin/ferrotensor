@@ -1,4 +1,10 @@
-use bytemuck;
+//! Saving and restoring LoRA adapters and training state.
+//!
+//! Adapters are written as safetensors (F32) with their LoRA settings in
+//! the file's metadata, so `rusty-cli generate --lora` can rebuild the same
+//! adapter shapes. [`TrainingCheckpoint`] (JSON) holds the step counter,
+//! optimizer moments and loss-scaler state for resuming.
+
 use rusty_autograd::{OptimizerCheckpoint, Tensor};
 use rusty_backend::WgpuContext;
 use rusty_loader::{LoaderError, WeightsContext};
@@ -8,6 +14,8 @@ use std::sync::Arc;
 
 use crate::scaler::GradScalerCheckpoint;
 
+/// Overwrite each tensor in `tensors` with the weight of the same name in
+/// `weights_ctx`; names that are missing are logged and skipped.
 pub fn load_weights(
     ctx: &Arc<WgpuContext>,
     weights_ctx: &WeightsContext,
@@ -23,75 +31,167 @@ pub fn load_weights(
     Ok(())
 }
 
-/// Save LoRA adapter weights to a .safetensors file
+/// LoRA settings stored in an adapter file's metadata.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LoraMetadata {
+    /// Adapter rank.
+    pub rank: usize,
+    /// Scale numerator (the update is scaled by `alpha / rank`).
+    pub alpha: f32,
+    /// Projection names that carry adapters.
+    pub target_modules: Vec<String>,
+}
+
+impl LoraMetadata {
+    fn to_map(&self) -> HashMap<String, String> {
+        HashMap::from([
+            ("format".to_string(), "rusty-lora".to_string()),
+            ("rank".to_string(), self.rank.to_string()),
+            ("alpha".to_string(), self.alpha.to_string()),
+            ("target_modules".to_string(), self.target_modules.join(",")),
+        ])
+    }
+
+    fn from_map(map: &HashMap<String, String>) -> Option<Self> {
+        Some(Self {
+            rank: map.get("rank")?.parse().ok()?,
+            alpha: map.get("alpha")?.parse().ok()?,
+            target_modules: map
+                .get("target_modules")?
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
+        })
+    }
+}
+
+/// Tensors and metadata read from an adapter file.
+#[derive(Clone, Debug)]
+pub struct LoraCheckpoint {
+    /// Tensor name to `(shape, values)`.
+    pub tensors: HashMap<String, (Vec<usize>, Vec<f32>)>,
+    /// LoRA settings, when the file was written with them.
+    pub metadata: Option<LoraMetadata>,
+}
+
+impl LoraCheckpoint {
+    /// Number of tensors.
+    pub fn len(&self) -> usize {
+        self.tensors.len()
+    }
+
+    /// Whether the file held no tensors.
+    pub fn is_empty(&self) -> bool {
+        self.tensors.is_empty()
+    }
+}
+
+/// Save LoRA adapter weights (F32 safetensors) to `path`, with `metadata`
+/// in the header. The file is written to a temporary name and renamed, so a
+/// crash never leaves a truncated adapter behind.
 pub async fn save_lora_checkpoint<P: AsRef<Path>>(
     ctx: &Arc<WgpuContext>,
     path: P,
     tensors: &HashMap<String, Tensor>,
+    metadata: Option<&LoraMetadata>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut data_to_save = HashMap::new();
-
+    let mut data_to_save = Vec::with_capacity(tensors.len());
     for (name, tensor) in tensors {
-        let f32_data = tensor.data.to_vec(ctx).await;
-        let byte_data: Vec<u8> = bytemuck::cast_slice(&f32_data).to_vec();
-        data_to_save.insert(name.clone(), (tensor.data.shape.clone(), byte_data));
+        let values = tensor.data.to_vec(ctx).await;
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        data_to_save.push((name.clone(), tensor.data.shape.clone(), bytes));
     }
 
-    // Use safetensors::serialize to create the buffer
     let mut tensor_map = HashMap::new();
-    for (name, (shape, data)) in &data_to_save {
+    for (name, shape, bytes) in &data_to_save {
         tensor_map.insert(
             name.clone(),
-            safetensors::tensor::TensorView::new(safetensors::Dtype::F32, shape.clone(), data)?,
+            safetensors::tensor::TensorView::new(safetensors::Dtype::F32, shape.clone(), bytes)?,
         );
     }
 
-    let data = safetensors::tensor::serialize(tensor_map, &None)?;
-    std::fs::write(path, data)?;
-
+    let data = safetensors::tensor::serialize(tensor_map, &metadata.map(LoraMetadata::to_map))?;
+    let path = path.as_ref();
+    let tmp = path.with_extension("safetensors.tmp");
+    std::fs::write(&tmp, data)?;
+    std::fs::rename(&tmp, path)?;
     Ok(())
 }
 
-/// Load LoRA adapter weights from a .safetensors file
-/// Returns a HashMap of weight name to (shape, data) that can be used to update tensors
+/// Load LoRA adapter weights from a safetensors file (F32, F16 or BF16
+/// tensors are accepted and returned as F32).
 pub fn load_lora_checkpoint<P: AsRef<Path>>(
     path: P,
-) -> Result<HashMap<String, (Vec<usize>, Vec<f32>)>, Box<dyn std::error::Error>> {
-    let data = std::fs::read(path)?;
+) -> Result<LoraCheckpoint, Box<dyn std::error::Error>> {
+    let path = path.as_ref();
+    let data = std::fs::read(path)
+        .map_err(|e| format!("cannot read adapter file {}: {e}", path.display()))?;
+    let (_, header) = safetensors::tensor::SafeTensors::read_metadata(&data)
+        .map_err(|e| format!("{} is not a safetensors file: {e}", path.display()))?;
+    let metadata = header.metadata().as_ref().and_then(LoraMetadata::from_map);
     let tensors = safetensors::tensor::SafeTensors::deserialize(&data)?;
 
     let mut result = HashMap::new();
-    for (name, tensor_view) in tensors.tensors() {
-        let shape: Vec<usize> = tensor_view.shape().to_vec();
-        let bytes = tensor_view.data();
-        let f32_data: Vec<f32> = bytemuck::cast_slice(bytes).to_vec();
-        result.insert(name.to_string(), (shape, f32_data));
+    for (name, view) in tensors.tensors() {
+        let bytes = view.data();
+        let values: Vec<f32> = match view.dtype() {
+            safetensors::Dtype::F32 => bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect(),
+            safetensors::Dtype::F16 => bytes
+                .chunks_exact(2)
+                .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect(),
+            safetensors::Dtype::BF16 => bytes
+                .chunks_exact(2)
+                .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect(),
+            other => return Err(format!("tensor {name} has unsupported dtype {other:?}").into()),
+        };
+        result.insert(name.to_string(), (view.shape().to_vec(), values));
     }
 
-    Ok(result)
+    Ok(LoraCheckpoint {
+        tensors: result,
+        metadata,
+    })
 }
 
-/// Apply loaded checkpoint data to existing tensors
+/// Copy checkpoint values into the matching `tensors`.
+///
+/// Every tensor in `tensors` must be present in the checkpoint with the
+/// same shape; otherwise nothing is written and the error names the first
+/// problem (a different rank or target set usually causes it). Returns the
+/// number of tensors restored.
 pub fn apply_checkpoint(
     ctx: &Arc<WgpuContext>,
-    checkpoint_data: &HashMap<String, (Vec<usize>, Vec<f32>)>,
+    checkpoint: &LoraCheckpoint,
     tensors: &HashMap<String, Tensor>,
-) {
-    for (name, tensor) in tensors {
-        if let Some((shape, data)) = checkpoint_data.get(name) {
-            if tensor.data.shape == *shape {
-                let bytes: &[u8] = bytemuck::cast_slice(data);
-                tensor.data.write_data(ctx, bytes);
-            } else {
-                log::warn!(
-                    "Shape mismatch for {}: expected {:?}, got {:?}",
-                    name,
-                    tensor.data.shape,
-                    shape
-                );
+) -> Result<usize, String> {
+    let mut names: Vec<&String> = tensors.keys().collect();
+    names.sort();
+    for name in &names {
+        let tensor = &tensors[*name];
+        match checkpoint.tensors.get(*name) {
+            None => return Err(format!("adapter file has no tensor {name}")),
+            Some((shape, _)) if *shape != tensor.data.shape => {
+                return Err(format!(
+                    "tensor {name}: adapter file has shape {shape:?}, model expects {:?}",
+                    tensor.data.shape
+                ))
             }
+            Some(_) => {}
         }
     }
+    for name in names {
+        if let Some((_, values)) = checkpoint.tensors.get(name) {
+            let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            tensors[name].data.write_data(ctx, &bytes);
+        }
+    }
+    Ok(tensors.len())
 }
 
 /// Training checkpoint containing step count and scheduler state
@@ -113,6 +213,9 @@ pub struct TrainingState {
     pub model_path: String,
     #[serde(default)]
     pub dataset_path: String,
+    /// Data-order seed of the run, so a resume replays the same order.
+    #[serde(default)]
+    pub seed: u64,
 }
 
 fn default_task() -> String {
@@ -135,6 +238,7 @@ impl TrainingState {
             task: "sft".to_string(),
             model_path: String::new(),
             dataset_path: String::new(),
+            seed: 0,
         }
     }
 

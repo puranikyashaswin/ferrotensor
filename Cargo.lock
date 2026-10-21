@@ -282,6 +282,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a75ca66430e33a14957acc24c5077b503e7d374151b2b4b3a10c83b4ceb4be0e"
 dependencies = [
  "clap_builder",
+ "clap_derive",
 ]
 
 [[package]]
@@ -290,8 +291,22 @@ version = "4.5.56"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "793207c7fa6300a0608d1080b858e5fdbe713cdc1c8db9fb17777d8a13e63df0"
 dependencies = [
+ "anstream",
  "anstyle",
  "clap_lex",
+ "strsim",
+]
+
+[[package]]
+name = "clap_derive"
+version = "4.5.55"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a92793da1a46a5f2a02a6f4c46c6496b28c43638adea8306fcb0caa1634f24e5"
+dependencies = [
+ "heck",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.114",
 ]
 
 [[package]]
@@ -1785,11 +1800,10 @@ dependencies = [
 name = "rusty-cli"
 version = "0.1.0"
 dependencies = [
- "bytemuck",
+ "clap",
  "env_logger",
  "log",
  "pollster",
- "rand 0.8.5",
  "rusty-autograd",
  "rusty-backend",
  "rusty-graph",
@@ -1806,6 +1820,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "env_logger",
+ "log",
  "pollster",
  "rusty-autograd",
  "rusty-backend",
@@ -1864,6 +1879,7 @@ name = "rusty-trainer"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "half",
  "log",
  "pollster",
  "rusty-autograd",

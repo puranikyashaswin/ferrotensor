@@ -1,5 +1,6 @@
 use crate::{Attention, KVCacheLayer, Linear, RMSNorm, Tensor, MLP};
 use rusty_backend::{ComputeEngine, UnifiedTensor};
+use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -183,21 +184,77 @@ impl Lfm2Block {
     }
 }
 
-/// An LFM2 language model.
+/// A decoder-only language model: LFM2 (mixed conv/attention blocks) or
+/// Llama-style (every block is attention), as built by
+/// [`Lfm2ModelBuilder`](crate::model_builder::Lfm2ModelBuilder).
 pub struct Lfm2Model {
     /// Embedding table `[vocab, hidden]`.
     pub embed_tokens: Tensor, // Embedding weight
-    /// Norm applied right after the embedding.
-    pub embedding_norm: RMSNorm,
+    /// Optional norm applied right after the embedding (neither Llama nor
+    /// Hugging Face LFM2 use one; LFM2's `embedding_norm` is its final norm).
+    pub embedding_norm: Option<RMSNorm>,
     /// Blocks.
     pub layers: Vec<Lfm2Block>,
     /// Final norm.
     pub norm_f: RMSNorm,
     /// Projection to vocabulary logits.
     pub lm_head: Linear,
+    /// Host copy of `embed_tokens`, read once on first use (the embedding
+    /// lookup runs on the CPU).
+    embed_host: OnceCell<Vec<f32>>,
 }
 
 impl Lfm2Model {
+    /// Assemble a model from its parts.
+    pub fn new(
+        embed_tokens: Tensor,
+        embedding_norm: Option<RMSNorm>,
+        layers: Vec<Lfm2Block>,
+        norm_f: RMSNorm,
+        lm_head: Linear,
+    ) -> Self {
+        Self {
+            embed_tokens,
+            embedding_norm,
+            layers,
+            norm_f,
+            lm_head,
+            embed_host: OnceCell::new(),
+        }
+    }
+
+    /// Whether every block is attention, so incremental decoding with a
+    /// [`KVCache`](crate::KVCache) is exact (conv blocks keep no state).
+    pub fn supports_kv_cache(&self) -> bool {
+        self.layers
+            .iter()
+            .all(|l| matches!(l.op, Lfm2LayerOp::Attention(_)))
+    }
+
+    /// An empty KV cache for sequences of up to `max_seq` tokens, or `None`
+    /// when [`supports_kv_cache`](Self::supports_kv_cache) is false.
+    pub fn new_kv_cache(&self, max_seq: usize) -> Option<crate::KVCache> {
+        if !self.supports_kv_cache() {
+            return None;
+        }
+        let ctx = &self.embed_tokens.ctx;
+        let layers = self
+            .layers
+            .iter()
+            .filter_map(|l| match &l.op {
+                Lfm2LayerOp::Attention(a) => {
+                    let shape = [1, max_seq, a.num_kv_heads * a.head_dim];
+                    Some(crate::KVCacheLayer {
+                        key: UnifiedTensor::zeros(ctx, &shape),
+                        value: UnifiedTensor::zeros(ctx, &shape),
+                    })
+                }
+                Lfm2LayerOp::Conv(_) => None,
+            })
+            .collect();
+        Some(crate::KVCache { layers })
+    }
+
     /// Logits `[1, seq, vocab]` for `input_ids`, the first of which is at `pos`.
     pub fn forward(
         &self,
@@ -212,7 +269,9 @@ impl Lfm2Model {
         // 1. Embedding
         // Note: Generic Embedding.forward usually handles this, manual here for LFM specific
         let mut x = self.lookup_embeddings(&ctx, engine, input_ids);
-        x = self.embedding_norm.forward(engine, &x);
+        if let Some(norm) = &self.embedding_norm {
+            x = norm.forward(engine, &x);
+        }
 
         // 2. Layers
         for (i, layer) in self.layers.iter().enumerate() {
@@ -235,13 +294,20 @@ impl Lfm2Model {
         let seq_len = ids.len();
         let mut data = Vec::with_capacity(seq_len * hidden_dim);
 
-        // Host-side lookup (Mocking for now as we don't have a high-perf GPU embedding kernel yet)
-        let w = pollster::block_on(self.embed_tokens.data.to_vec(ctx));
+        // Host-side lookup against a cached copy of the table (there is no
+        // GPU gather kernel yet). Out-of-range ids map to zeros.
+        let w = self
+            .embed_host
+            .get_or_init(|| pollster::block_on(self.embed_tokens.data.to_vec(ctx)));
         for &id in ids {
             let start = (id as usize) * hidden_dim;
-            data.extend_from_slice(&w[start..start + hidden_dim]);
+            match w.get(start..start + hidden_dim) {
+                Some(row) => data.extend_from_slice(row),
+                None => data.extend(std::iter::repeat(0.0).take(hidden_dim)),
+            }
         }
-        Tensor::new(
+        // The lookup is not differentiable, so its output is a constant.
+        Tensor::frozen(
             ctx.clone(),
             UnifiedTensor::new(ctx, &data, &[1, seq_len, hidden_dim]),
         )
@@ -260,7 +326,9 @@ impl Lfm2Model {
     /// All trainable tensors.
     pub fn params(&self) -> Vec<Tensor> {
         let mut p = vec![self.embed_tokens.clone()];
-        p.extend(self.embedding_norm.params());
+        if let Some(norm) = &self.embedding_norm {
+            p.extend(norm.params());
+        }
         for layer in &self.layers {
             p.extend(layer.params());
         }
@@ -276,7 +344,9 @@ impl Lfm2Model {
             "model.embed_tokens.weight".to_string(),
             self.embed_tokens.clone(),
         );
-        map.extend(self.embedding_norm.named_params("model.embedding_norm"));
+        if let Some(norm) = &self.embedding_norm {
+            map.extend(norm.named_params("model.embedding_norm"));
+        }
         for (idx, layer) in self.layers.iter().enumerate() {
             map.extend(layer.named_params(&format!("model.layers.{}", idx)));
         }

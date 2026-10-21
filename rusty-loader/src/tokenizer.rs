@@ -86,15 +86,30 @@ impl Tokenizer {
         })
     }
 
-    /// Encode text to token IDs (simple whitespace + subword split)
+    /// Encode text to token IDs, adding the tokenizer's special tokens
+    /// (e.g. a leading BOS) when it defines any.
     pub fn encode(&self, text: &str) -> Vec<u32> {
+        self.encode_with(text, true)
+    }
+
+    /// Encode text without adding special tokens; use this for text that
+    /// continues a sequence (an SFT response after its prompt).
+    pub fn encode_continuation(&self, text: &str) -> Vec<u32> {
+        self.encode_with(text, false)
+    }
+
+    fn encode_with(&self, text: &str, add_special_tokens: bool) -> Vec<u32> {
         if let Some(tokenizer) = &self.hf_tokenizer {
-            if let Ok(encoding) = tokenizer.encode(text, true) {
+            if let Ok(encoding) = tokenizer.encode(text, add_special_tokens) {
                 return encoding.get_ids().to_vec();
             }
         }
 
-        let mut tokens = vec![self.bos_token_id];
+        let mut tokens = if add_special_tokens {
+            vec![self.bos_token_id]
+        } else {
+            Vec::new()
+        };
 
         // Simple character/byte fallback encoding
         // Real BPE would be more complex, but this works for basic testing
@@ -152,93 +167,176 @@ impl Tokenizer {
         result
     }
 
-    /// Encode with chat template format
-    pub fn encode_chat(&self, system: Option<&str>, user: &str) -> Vec<u32> {
+    /// The ChatML prompt for one user turn (with an optional system turn),
+    /// ending with the assistant header so the model continues as the
+    /// assistant: `<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n`.
+    pub fn chat_prompt(system: Option<&str>, user: &str) -> String {
         let mut prompt = String::new();
-
         if let Some(sys) = system {
             prompt.push_str("<|im_start|>system\n");
             prompt.push_str(sys);
-            prompt.push_str("\n<|im_end|>\n");
+            prompt.push_str("<|im_end|>\n");
         }
-
         prompt.push_str("<|im_start|>user\n");
         prompt.push_str(user);
-        prompt.push_str("\n<|im_end|>\n<|im_start|>assistant\n");
+        prompt.push_str("<|im_end|>\n<|im_start|>assistant\n");
+        prompt
+    }
 
-        self.encode(&prompt)
+    /// Encode [`chat_prompt`](Self::chat_prompt).
+    pub fn encode_chat(&self, system: Option<&str>, user: &str) -> Vec<u32> {
+        self.encode(&Self::chat_prompt(system, user))
     }
 }
 
-/// Sampling utilities
+/// Next-token sampler: temperature, top-k and nucleus (top-p) filtering.
+///
+/// `temperature <= 0` means greedy decoding. `top_k == 0` and
+/// `top_p >= 1` disable the respective filters.
 pub struct Sampler {
+    /// Softmax temperature.
     pub temperature: f32,
+    /// Keep only the `top_k` most likely tokens (0 = all).
+    pub top_k: usize,
+    /// Keep the smallest set of tokens whose probability reaches `top_p`.
     pub top_p: f32,
+    rng: rand::rngs::StdRng,
 }
 
 impl Default for Sampler {
     fn default() -> Self {
-        Self {
-            temperature: 0.7,
-            top_p: 0.9,
-        }
+        Self::new(0.7, 0, 0.9, None)
     }
 }
 
 impl Sampler {
-    pub fn sample(&self, logits: &[f32]) -> u32 {
-        if self.temperature <= 0.0 {
-            // Greedy
-            return logits
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-                .map(|(i, _)| i as u32)
-                .unwrap_or(0);
+    /// A sampler; `seed` makes the draws reproducible.
+    pub fn new(temperature: f32, top_k: usize, top_p: f32, seed: Option<u64>) -> Self {
+        use rand::SeedableRng;
+        let rng = match seed {
+            Some(seed) => rand::rngs::StdRng::seed_from_u64(seed),
+            None => rand::rngs::StdRng::from_entropy(),
+        };
+        Self {
+            temperature,
+            top_k,
+            top_p,
+            rng,
+        }
+    }
+
+    /// Pick a token id from one row of logits.
+    pub fn sample(&mut self, logits: &[f32]) -> u32 {
+        use rand::Rng;
+        if logits.is_empty() {
+            return 0;
+        }
+        if self.temperature <= 0.0 || self.top_k == 1 {
+            return argmax(logits);
         }
 
-        // Temperature scaling
-        let scaled: Vec<f32> = logits.iter().map(|x| x / self.temperature).collect();
+        // Candidates sorted by logit, highest first; NaNs sort last.
+        let mut order: Vec<usize> = (0..logits.len()).collect();
+        order.sort_unstable_by(|&a, &b| logits[b].total_cmp(&logits[a]));
+        if self.top_k > 0 {
+            order.truncate(self.top_k);
+        }
 
-        // Softmax
-        let max_val = scaled.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let exp_sum: f32 = scaled.iter().map(|x| (x - max_val).exp()).sum();
-        let probs: Vec<f32> = scaled
+        let max = logits[order[0]];
+        let mut probs: Vec<f32> = order
             .iter()
-            .map(|x| (x - max_val).exp() / exp_sum)
+            .map(|&i| ((logits[i] - max) / self.temperature).exp())
             .collect();
+        let total: f32 = probs.iter().sum();
+        probs.iter_mut().for_each(|p| *p /= total);
 
-        // Top-p sampling
-        let mut sorted_indices: Vec<usize> = (0..probs.len()).collect();
-        sorted_indices.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
-
-        let mut cumsum = 0.0;
-        let mut nucleus_indices = Vec::new();
-        for &idx in &sorted_indices {
-            cumsum += probs[idx];
-            nucleus_indices.push(idx);
-            if cumsum >= self.top_p {
-                break;
+        if self.top_p < 1.0 {
+            let mut cumsum = 0.0;
+            let mut keep = probs.len();
+            for (i, p) in probs.iter().enumerate() {
+                cumsum += p;
+                if cumsum >= self.top_p {
+                    keep = i + 1;
+                    break;
+                }
             }
+            order.truncate(keep);
+            probs.truncate(keep);
         }
 
-        // Renormalize
-        let nucleus_sum: f32 = nucleus_indices.iter().map(|&i| probs[i]).sum();
-        let normalized: Vec<f32> = nucleus_indices
-            .iter()
-            .map(|&i| probs[i] / nucleus_sum)
-            .collect();
-
-        // Sample
-        let r: f32 = rand::random();
-        let mut cumsum = 0.0;
-        for (i, &p) in normalized.iter().enumerate() {
-            cumsum += p;
-            if r < cumsum {
-                return nucleus_indices[i] as u32;
+        let total: f32 = probs.iter().sum();
+        let mut r = self.rng.gen::<f32>() * total;
+        for (&idx, &p) in order.iter().zip(&probs) {
+            if r < p {
+                return idx as u32;
             }
+            r -= p;
         }
+        order[order.len() - 1] as u32
+    }
+}
 
-        nucleus_indices[0] as u32
+/// Index of the largest logit (NaN-safe).
+pub fn argmax(logits: &[f32]) -> u32 {
+    logits
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .map(|(i, _)| i as u32)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn greedy_picks_argmax() {
+        let mut s = Sampler::new(0.0, 0, 1.0, Some(1));
+        assert_eq!(s.sample(&[0.1, 3.0, -1.0, 2.9]), 1);
+    }
+
+    #[test]
+    fn top_k_one_is_greedy() {
+        let mut s = Sampler::new(1.5, 1, 1.0, Some(7));
+        for _ in 0..20 {
+            assert_eq!(s.sample(&[0.0, 0.5, 0.4]), 1);
+        }
+    }
+
+    #[test]
+    fn top_k_never_returns_tokens_outside_the_k_best() {
+        let mut s = Sampler::new(5.0, 2, 1.0, Some(3));
+        for _ in 0..200 {
+            let t = s.sample(&[1.0, 4.0, 3.9, 0.0, -2.0]);
+            assert!(t == 1 || t == 2, "sampled {t}");
+        }
+    }
+
+    #[test]
+    fn top_p_keeps_only_the_nucleus() {
+        // Token 0 holds almost all of the mass, so top_p=0.5 keeps only it.
+        let mut s = Sampler::new(1.0, 0, 0.5, Some(9));
+        for _ in 0..50 {
+            assert_eq!(s.sample(&[10.0, 0.0, 0.0, 0.0]), 0);
+        }
+    }
+
+    #[test]
+    fn seeded_sampling_is_reproducible() {
+        let logits = [0.3, 0.2, 0.1, 0.25, 0.15];
+        let mut a = Sampler::new(1.0, 0, 1.0, Some(42));
+        let mut b = Sampler::new(1.0, 0, 1.0, Some(42));
+        let xs: Vec<u32> = (0..32).map(|_| a.sample(&logits)).collect();
+        let ys: Vec<u32> = (0..32).map(|_| b.sample(&logits)).collect();
+        assert_eq!(xs, ys);
+    }
+
+    #[test]
+    fn chat_prompt_matches_chatml() {
+        assert_eq!(
+            Tokenizer::chat_prompt(Some("Be brief."), "Hi"),
+            "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
+        );
     }
 }

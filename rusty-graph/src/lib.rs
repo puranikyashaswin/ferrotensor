@@ -34,8 +34,12 @@ pub struct LoRAAdapter {
 }
 
 impl LoRAAdapter {
-    /// An adapter for an `in_dim -> out_dim` projection, with `a` filled with
-    /// 0.01 and `b` with zeros.
+    /// An adapter for an `in_dim -> out_dim` projection. `a` is drawn
+    /// uniformly from `±1/sqrt(in_dim)` (Kaiming-uniform, as in PEFT) with a
+    /// deterministic generator seeded from the shape, and `b` is zero.
+    ///
+    /// A constant `a` would make every rank component identical, so the
+    /// adapter could never learn more than a rank-1 update.
     pub fn new(
         ctx: Arc<WgpuContext>,
         in_dim: usize,
@@ -43,15 +47,41 @@ impl LoRAAdapter {
         rank: usize,
         alpha: f32,
     ) -> Self {
-        let mk_tensor = |shape: &[usize], val: f32| {
-            Tensor::new(
-                ctx.clone(),
-                UnifiedTensor::new(&ctx, &vec![val; shape.iter().product()], shape),
-            )
-        };
+        Self::new_seeded(ctx, in_dim, out_dim, rank, alpha, 0)
+    }
+
+    /// [`new`](Self::new) with an extra `seed`, so adapters of equal shape
+    /// (e.g. every layer's `q_proj`) start from different matrices.
+    pub fn new_seeded(
+        ctx: Arc<WgpuContext>,
+        in_dim: usize,
+        out_dim: usize,
+        rank: usize,
+        alpha: f32,
+        seed: u64,
+    ) -> Self {
+        let bound = 1.0 / (in_dim.max(1) as f32).sqrt();
+        let mut state = seed
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add((in_dim as u64) << 32 | (out_dim as u64) << 8 | rank as u64)
+            | 1;
+        let a_data: Vec<f32> = (0..in_dim * rank)
+            .map(|_| {
+                // xorshift64*
+                state ^= state >> 12;
+                state ^= state << 25;
+                state ^= state >> 27;
+                let bits = state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 40;
+                let unit = bits as f32 / (1u64 << 24) as f32;
+                (unit * 2.0 - 1.0) * bound
+            })
+            .collect();
         Self {
-            a: mk_tensor(&[in_dim, rank], 0.01),
-            b: mk_tensor(&[rank, out_dim], 0.0),
+            a: Tensor::new(
+                ctx.clone(),
+                UnifiedTensor::new(&ctx, &a_data, &[in_dim, rank]),
+            ),
+            b: Tensor::new(ctx.clone(), UnifiedTensor::zeros(&ctx, &[rank, out_dim])),
             alpha,
             rank,
         }
@@ -245,6 +275,8 @@ pub struct Attention {
     pub num_kv_heads: usize,
     /// Attention dropout probability.
     pub dropout_prob: f32,
+    /// RoPE base frequency (`rope_theta` in Hugging Face configs).
+    pub rope_theta: f32,
 }
 
 impl Attention {
@@ -263,24 +295,37 @@ impl Attention {
         let k = self.k_proj.forward(engine, x);
         let v = self.v_proj.forward(engine, x);
 
-        let q = Tensor::rope(&q, self.head_dim, pos, engine);
-        let k = Tensor::rope(&k, self.head_dim, pos, engine);
+        let q = Tensor::rope_theta(&q, self.head_dim, pos, self.rope_theta, engine);
+        let k = Tensor::rope_theta(&k, self.head_dim, pos, self.rope_theta, engine);
 
         // Reshape for GQA [batch, seq, n_heads, head_dim]
         let batch = q.data.shape[0];
         let seq_len = q.data.shape[1];
 
+        let Some(c) = cache else {
+            // Differentiable path (training and full-sequence evaluation).
+            let q_4d = Tensor::reshape(&q, &[batch, seq_len, self.n_heads, self.head_dim]);
+            let k_4d = Tensor::reshape(&k, &[batch, seq_len, self.num_kv_heads, self.head_dim]);
+            let v_4d = Tensor::reshape(&v, &[batch, seq_len, self.num_kv_heads, self.head_dim]);
+            let mask = mask.map(|m| Tensor::frozen(x.ctx.clone(), m.clone()));
+            let out = Tensor::flash_attention(
+                &q_4d,
+                &k_4d,
+                &v_4d,
+                mask.as_ref(),
+                true,
+                self.dropout_prob,
+                0,
+                engine,
+            );
+            let out = Tensor::reshape(&out, &[batch, seq_len, self.n_heads * self.head_dim]);
+            return self.o_proj.forward(engine, &out);
+        };
+
+        // Incremental decoding against a KV cache (inference only, no autograd).
         let q_4d = q
             .data
             .reshaped(&[batch, seq_len, self.n_heads, self.head_dim]);
-        let k_4d = k
-            .data
-            .reshaped(&[batch, seq_len, self.num_kv_heads, self.head_dim]);
-        let v_4d = v
-            .data
-            .reshaped(&[batch, seq_len, self.num_kv_heads, self.head_dim]);
-
-        // Initialize GQA helper
         let gqa = GroupedQueryAttention::new(
             self.n_heads * self.head_dim,
             self.n_heads,
@@ -289,57 +334,27 @@ impl Attention {
             self.dropout_prob,
         );
 
-        // Use cached K,V if available (for incremental decoding)
-        if let Some(c) = cache {
-            // Copy current K,V to cache at position
-            // Important: Use num_kv_heads for offset calculation!
-            engine.copy_tensor(
-                &x.ctx,
-                &k.data,
-                &c.key,
-                pos * self.num_kv_heads * self.head_dim * 4,
-            );
-            engine.copy_tensor(
-                &x.ctx,
-                &v.data,
-                &c.value,
-                pos * self.num_kv_heads * self.head_dim * 4,
-            );
+        // Write the new keys/values at `pos` (cache is `[1, max_seq, kv * head_dim]`).
+        let offset = pos * self.num_kv_heads * self.head_dim * 4;
+        engine.copy_tensor(&x.ctx, &k.data, &c.key, offset);
+        engine.copy_tensor(&x.ctx, &v.data, &c.value, offset);
 
-            // Reshape cache for GQA (assuming cache is [B, MaxSeq, H_KV, D])
-            // Note: cache.key is likely [B, MaxSeq, H_KV * D]
-            let cache_shape = &c.key.shape;
-            let c_k_4d = c.key.reshaped(&[
-                cache_shape[0],
-                cache_shape[1],
-                self.num_kv_heads,
-                self.head_dim,
-            ]);
-            let c_v_4d = c.value.reshaped(&[
-                cache_shape[0],
-                cache_shape[1],
-                self.num_kv_heads,
-                self.head_dim,
-            ]);
+        let cache_shape = &c.key.shape;
+        let kv_shape = [
+            cache_shape[0],
+            cache_shape[1],
+            self.num_kv_heads,
+            self.head_dim,
+        ];
+        let c_k_4d = c.key.reshaped(&kv_shape);
+        let c_v_4d = c.value.reshaped(&kv_shape);
 
-            // Compute attention using cached K,V
-            // Queries sit at positions pos..pos + seq_len; causal masking
-            // hides the cache slots that have not been written yet.
-            let attn_out_4d = gqa.forward_at(&q_4d, &c_k_4d, &c_v_4d, mask, pos, &x.ctx, engine);
-
-            // Reshape back to 3D [B, S, H*D]
-            let attn_out = attn_out_4d.reshaped(&[batch, seq_len, self.n_heads * self.head_dim]);
-            let attn_tensor = Tensor::new(x.ctx.clone(), attn_out);
-            self.o_proj.forward(engine, &attn_tensor)
-        } else {
-            // No cache, use current K,V only
-            let attn_out_4d = gqa.forward(&q_4d, &k_4d, &v_4d, mask, &x.ctx, engine);
-
-            // Reshape back to 3D
-            let attn_out = attn_out_4d.reshaped(&[batch, seq_len, self.n_heads * self.head_dim]);
-            let attn_tensor = Tensor::new(x.ctx.clone(), attn_out);
-            self.o_proj.forward(engine, &attn_tensor)
-        }
+        // Queries sit at positions pos..pos + seq_len; causal masking
+        // hides the cache slots that have not been written yet.
+        let attn_out_4d = gqa.forward_at(&q_4d, &c_k_4d, &c_v_4d, mask, pos, &x.ctx, engine);
+        let attn_out = attn_out_4d.reshaped(&[batch, seq_len, self.n_heads * self.head_dim]);
+        let attn_tensor = Tensor::new(x.ctx.clone(), attn_out);
+        self.o_proj.forward(engine, &attn_tensor)
     }
 
     /// Trainable tensors (weights, then any LoRA adapters).

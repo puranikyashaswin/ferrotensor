@@ -148,18 +148,28 @@ impl TextDataset {
 
         let content = fs::read_to_string(path)?;
         let mut samples = Vec::new();
-        for line in content.lines().filter(|line| !line.trim().is_empty()) {
-            if let Ok(sample) = serde_json::from_str::<JsonlSample>(line) {
-                if let Some(example) = build_sft_example(
-                    tokenizer,
-                    &sample.prompt,
-                    &sample.response,
-                    sample.system.as_deref(),
-                    use_chat_template,
-                    max_len,
-                ) {
-                    samples.push(example);
-                }
+        for (line_no, line) in content.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let sample = serde_json::from_str::<JsonlSample>(line).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "line {}: expected {{\"prompt\": ..., \"response\": ...}}: {e}",
+                        line_no + 1
+                    ),
+                )
+            })?;
+            if let Some(example) = build_sft_example(
+                tokenizer,
+                &sample.prompt,
+                &sample.response,
+                sample.system.as_deref(),
+                use_chat_template,
+                max_len,
+            ) {
+                samples.push(example);
             }
         }
         Ok(Self { samples })
@@ -248,7 +258,15 @@ impl TextDataset {
     }
 }
 
-fn build_sft_example(
+/// Tokenize one SFT pair into a response-masked example of at most
+/// `max_len` input tokens.
+///
+/// With `use_chat_template` the prompt is wrapped in the ChatML template
+/// and the response is followed by the end-of-turn token, so the model also
+/// learns where to stop. The response is tokenized without special tokens.
+/// Long examples are truncated at the end (the prompt is kept whole);
+/// examples whose prompt leaves no room for a response token are dropped.
+pub fn build_sft_example(
     tokenizer: &Tokenizer,
     prompt: &str,
     response: &str,
@@ -257,27 +275,31 @@ fn build_sft_example(
     max_len: usize,
 ) -> Option<TrainingExample> {
     let (prompt_tokens, response_tokens) = if use_chat_template {
-        let prompt_part = tokenizer.encode_chat(system, prompt);
-        let response_part = tokenizer.encode(response);
-        (prompt_part, response_part)
+        let mut response_part = tokenizer.encode_continuation(response);
+        response_part.push(tokenizer.eos_token_id);
+        (tokenizer.encode_chat(system, prompt), response_part)
     } else {
-        (tokenizer.encode(prompt), tokenizer.encode(response))
+        (
+            tokenizer.encode(prompt),
+            tokenizer.encode_continuation(response),
+        )
     };
 
     if prompt_tokens.is_empty() || response_tokens.is_empty() {
         return None;
     }
+    // The first supervised target sits at index prompt_len - 1.
+    if max_len < 2 || prompt_tokens.len() > max_len {
+        return None;
+    }
 
     let mut example = TrainingExample::from_sft_prompt_response(prompt_tokens, response_tokens);
-    if example.input_ids.len() > max_len && max_len >= 2 {
-        // Keep the tail so response tokens remain when possible.
-        let keep = max_len;
-        let drop = example.input_ids.len().saturating_sub(keep);
-        example.input_ids = example.input_ids[drop..].to_vec();
-        example.target_ids = example.target_ids[drop..].to_vec();
-        example.loss_mask = example.loss_mask[drop..].to_vec();
+    if example.input_ids.len() > max_len {
+        example.input_ids.truncate(max_len);
+        example.target_ids.truncate(max_len);
+        example.loss_mask.truncate(max_len);
     }
-    if example.input_ids.len() < 2 {
+    if example.input_ids.len() < 2 || !example.loss_mask.contains(&1) {
         return None;
     }
     Some(example)
@@ -323,8 +345,11 @@ pub struct DataLoader<D: Dataset> {
     batch_size: usize,
     pad_token_id: u32,
     shuffle: bool,
+    base_indices: Vec<usize>,
     indices: Vec<usize>,
     current_idx: usize,
+    seed: Option<u64>,
+    epoch: u64,
 }
 
 impl<D: Dataset> DataLoader<D> {
@@ -341,11 +366,14 @@ impl<D: Dataset> DataLoader<D> {
     ) -> Self {
         Self {
             dataset: Arc::new(dataset),
-            batch_size,
+            batch_size: batch_size.max(1),
             pad_token_id,
             shuffle,
+            base_indices: indices.clone(),
             indices,
             current_idx: 0,
+            seed: None,
+            epoch: 0,
         }
     }
 
@@ -355,31 +383,43 @@ impl<D: Dataset> DataLoader<D> {
         shuffle: bool,
         pad_token_id: u32,
     ) -> Self {
-        let len = dataset.len();
-        let indices: Vec<usize> = (0..len).collect();
-        Self {
-            dataset: Arc::new(dataset),
-            batch_size,
-            pad_token_id,
-            shuffle,
-            indices,
-            current_idx: 0,
-        }
+        let indices: Vec<usize> = (0..dataset.len()).collect();
+        Self::new_with_indices(dataset, batch_size, shuffle, pad_token_id, indices)
     }
 
-    /// Reset the dataloader for a new epoch
+    /// Make shuffling reproducible: epoch `e` uses an order derived from
+    /// `seed` and `e` only (see [`set_epoch`](Self::set_epoch)).
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.seed = Some(seed);
+        self
+    }
+
+    /// Select the epoch whose order the next [`reset`](Self::reset) produces.
+    pub fn set_epoch(&mut self, epoch: u64) {
+        self.epoch = epoch;
+    }
+
+    /// Rewind to the first batch, reshuffling when shuffling is on. With a
+    /// seed the order depends only on the seed and the epoch; without one it
+    /// is seeded from the clock.
     pub fn reset(&mut self) {
         self.current_idx = 0;
+        self.indices.clone_from(&self.base_indices);
         if self.shuffle {
-            // Simple Fisher-Yates shuffle
-            use std::time::{SystemTime, UNIX_EPOCH};
-            let seed = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos() as u64;
+            let seed = match self.seed {
+                Some(seed) => seed ^ self.epoch.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                None => {
+                    use std::time::{SystemTime, UNIX_EPOCH};
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as u64)
+                        .unwrap_or(0)
+                }
+            };
             let mut rng = SimpleRng::new(seed);
+            // Fisher-Yates
             for i in (1..self.indices.len()).rev() {
-                let j = rng.next() as usize % (i + 1);
+                let j = (rng.next() >> 33) as usize % (i + 1);
                 self.indices.swap(i, j);
             }
         }
@@ -387,7 +427,7 @@ impl<D: Dataset> DataLoader<D> {
 
     /// Number of batches per epoch
     pub fn num_batches(&self) -> usize {
-        (self.indices.len() + self.batch_size - 1) / self.batch_size
+        self.indices.len().div_ceil(self.batch_size)
     }
 
     /// Total number of samples

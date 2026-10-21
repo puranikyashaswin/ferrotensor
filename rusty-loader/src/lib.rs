@@ -8,7 +8,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 pub mod tokenizer;
-pub use tokenizer::{Sampler, Tokenizer};
+pub use tokenizer::{argmax, Sampler, Tokenizer};
 
 use rusty_backend::UnifiedTensor;
 
@@ -46,7 +46,7 @@ pub struct Lfm2Config {
     pub num_attention_heads: usize,
     pub num_hidden_layers: usize,
     pub vocab_size: usize,
-    #[serde(default = "default_norm_eps")]
+    #[serde(default = "default_norm_eps", alias = "rms_norm_eps")]
     pub norm_eps: f32,
     #[serde(default)]
     pub block_dim: Option<usize>,
@@ -66,6 +66,15 @@ pub struct Lfm2Config {
     pub eos_token_id: Option<u32>,
     #[serde(default)]
     pub attention_dropout: Option<f32>,
+    /// Hugging Face `model_type`, e.g. `"llama"` or `"lfm2"`.
+    #[serde(default)]
+    pub model_type: Option<String>,
+    /// Whether `lm_head` shares the token-embedding matrix.
+    #[serde(default)]
+    pub tie_word_embeddings: Option<bool>,
+    /// Per-head dimension when it is not `hidden_size / num_attention_heads`.
+    #[serde(default)]
+    pub head_dim: Option<usize>,
 }
 
 fn default_norm_eps() -> f32 {
