@@ -1777,9 +1777,7 @@ name = "rusty-benchmarks"
 version = "0.1.0"
 dependencies = [
  "pollster",
- "rusty-autograd",
  "rusty-backend",
- "rusty-graph",
  "wgpu",
 ]
 

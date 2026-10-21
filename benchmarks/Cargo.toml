@@ -13,14 +13,22 @@ documentation = "https://docs.rs/rusty-benchmarks"
 readme = "../README.md"
 keywords = ["benchmark", "machine-learning", "gpu", "wgpu", "performance"]
 categories = ["science"]
+default-run = "bench"
+
+[lib]
+name = "rusty_benchmarks"
+path = "src/lib.rs"
 
 [[bin]]
 name = "bench"
 path = "src/main.rs"
 
+[[bench]]
+name = "gpu"
+path = "benches/gpu.rs"
+harness = false
+
 [dependencies]
 rusty-backend = { path = "../rusty-backend", version = "0.1.0" }
-rusty-autograd = { path = "../rusty-autograd", version = "0.1.0" }
-rusty-graph = { path = "../rusty-graph", version = "0.1.0" }
 pollster = "0.3"
 wgpu = "0.19"
