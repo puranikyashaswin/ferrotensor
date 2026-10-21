@@ -18,9 +18,10 @@ pub use training::AdamParams;
 /// The full WGSL source compiled into the engine's shader module.
 fn shader_source() -> String {
     let kernels_src = include_str!("../shaders/kernels.wgsl");
+    let matmul_src = include_str!("../shaders/matmul.wgsl");
     let flash_v2_src = include_str!("../shaders/flash_attention_v2.wgsl");
     let flash_v2_bw_src = include_str!("../shaders/flash_attention_v2_backward.wgsl");
-    format!("{}\n{}\n{}", kernels_src, flash_v2_src, flash_v2_bw_src)
+    format!("{kernels_src}\n{matmul_src}\n{flash_v2_src}\n{flash_v2_bw_src}")
 }
 
 /// A compiled compute pipeline together with its bind group layout.
@@ -73,8 +74,6 @@ fn uniform(ctx: &WgpuContext, bytes: &[u8]) -> Buffer {
 
 pub struct ComputeEngine {
     matmul: Kernel,
-    matmul_bt: Kernel,
-    matmul_at: Kernel,
     rope: Kernel,
     rms_norm: Kernel,
     silu: Kernel,
@@ -124,9 +123,7 @@ impl ComputeEngine {
         let k = |entry: &str| Kernel::new(&ctx.device, &module, entry);
 
         Self {
-            matmul: k("matmul_tiled"),
-            matmul_bt: k("matmul_bt"),
-            matmul_at: k("matmul_at"),
+            matmul: k("matmul_blocked"),
             rope: k("rope"),
             rms_norm: k("rms_norm"),
             silu: k("silu"),

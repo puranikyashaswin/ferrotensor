@@ -1,6 +1,3 @@
-// --- Constants ---
-const TILE_SIZE: u32 = 16u; // Workgroup tile size for MatMul
-
 // --- Dispatch ---
 // 1-D kernels may be launched on a 2-D grid when they need more than 65535
 // workgroups; they rebuild a linear index from gid.x + gid.y * grid width.
@@ -8,54 +5,7 @@ const TILE_SIZE: u32 = 16u; // Workgroup tile size for MatMul
 // --- Bindings ---
 // We use generic bindings (0,1,2,3) to reuse layouts across pipelines where possible
 
-// --- 1. Tiled Matrix Multiplication (Optimized) ---
-@group(0) @binding(0) var<storage, read> mm_a: array<f32>;
-@group(0) @binding(1) var<storage, read> mm_b: array<f32>;
-@group(0) @binding(2) var<storage, read_write> mm_out: array<f32>;
-@group(0) @binding(3) var<uniform> mm_params: vec4<u32>; // M, K, N, Padding
-
-var<workgroup> tile_a: array<array<f32, 16>, 16>;
-var<workgroup> tile_b: array<array<f32, 16>, 16>;
-
-@compute @workgroup_size(16, 16, 1)
-fn matmul_tiled(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(local_invocation_id) local_id: vec3<u32>) {
-    let row = global_id.y;
-    let col = global_id.x;
-    let m = mm_params.x;
-    let k = mm_params.y;
-    let n = mm_params.z;
-
-    var acc = 0.0;
-    let num_tiles = (k + 15u) / 16u;
-
-    for (var t = 0u; t < num_tiles; t = t + 1u) {
-        let r = row;
-        let c = t * 16u + local_id.x;
-        if (r < m && c < k) {
-            tile_a[local_id.y][local_id.x] = mm_a[r * k + c];
-        } else {
-            tile_a[local_id.y][local_id.x] = 0.0;
-        }
-
-        let r_b = t * 16u + local_id.y;
-        let c_b = col;
-        if (r_b < k && c_b < n) {
-            tile_b[local_id.y][local_id.x] = mm_b[r_b * n + c_b];
-        } else {
-            tile_b[local_id.y][local_id.x] = 0.0;
-        }
-
-        workgroupBarrier();
-        for (var i = 0u; i < 16u; i = i + 1u) {
-            acc = acc + tile_a[local_id.y][i] * tile_b[i][local_id.x];
-        }
-        workgroupBarrier();
-    }
-
-    if (row < m && col < n) {
-        mm_out[row * n + col] = acc;
-    }
-}
+// --- 1. Matrix multiplication lives in matmul.wgsl ---
 
 // --- 2. Rotary Positional Embeddings (RoPE) ---
 @group(0) @binding(0) var<storage, read_write> rope_data: array<f32>;
@@ -247,31 +197,6 @@ fn silu_backward_real(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(nu
     let x = silu_bk_input[i];
     let s = 1.0 / (1.0 + exp(-x));
     silu_bk_grad_in[i] = silu_bk_grad_out[i] * s * (1.0 + x * (1.0 - s));
-}
-
-@group(0) @binding(0) var<storage, read> mm_bk_grad: array<f32>;
-@group(0) @binding(1) var<storage, read> mm_bk_other: array<f32>; 
-@group(0) @binding(2) var<storage, read_write> mm_bk_out: array<f32>;
-@group(0) @binding(3) var<uniform> mm_bk_params: vec4<u32>; 
-
-@compute @workgroup_size(16, 16, 1)
-fn matmul_bt(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let row = global_id.y; let col = global_id.x;
-    let m = mm_bk_params.x; let k = mm_bk_params.y; let n = mm_bk_params.z;
-    if (row >= m || col >= n) { return; }
-    var acc = 0.0;
-    for (var i = 0u; i < k; i = i + 1u) { acc = acc + mm_bk_grad[row * k + i] * mm_bk_other[col * k + i]; }
-    mm_bk_out[row * n + col] = acc;
-}
-
-@compute @workgroup_size(16, 16, 1)
-fn matmul_at(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let row = global_id.y; let col = global_id.x;
-    let m = mm_bk_params.x; let k = mm_bk_params.y; let n = mm_bk_params.z;
-    if (row >= m || col >= n) { return; }
-    var acc = 0.0;
-    for (var i = 0u; i < k; i = i + 1u) { acc = acc + mm_bk_grad[i * m + row] * mm_bk_other[i * n + col]; }
-    mm_bk_out[row * n + col] = acc;
 }
 
 // --- 10. Optimizer Kernels ---
