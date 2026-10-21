@@ -39,9 +39,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2.7.5
-      # Warnings are reported but do not fail the job yet. Flip to
-      # `-- -D warnings` once `cargo clippy --workspace --all-targets` is clean.
-      - run: cargo clippy --workspace --all-targets
+      - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
     name: Test (${{ matrix.os }})
