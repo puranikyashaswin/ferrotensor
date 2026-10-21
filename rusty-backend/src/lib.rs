@@ -4460,7 +4460,11 @@ impl ComputeEngine {
     }
 
     pub fn rope(&self, ctx: &WgpuContext, tensor: &UnifiedTensor, head_dim: usize, pos: usize) {
-        let seq_len = if tensor.shape.len() >= 3 { tensor.shape[1] } else { 1 };
+        let seq_len = if tensor.shape.len() >= 3 {
+            tensor.shape[1]
+        } else {
+            1
+        };
         let params = [head_dim as u32, seq_len as u32, pos as u32, 0];
         let uniform_buf = ctx
             .device

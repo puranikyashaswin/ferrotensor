@@ -235,8 +235,11 @@ impl App {
             self.training_stats.current_step = state.step;
             self.training_stats.total_steps = state.total_steps.max(1);
             self.training_stats.current_epoch = state.epoch.max(1);
-            self.training_stats.total_epochs =
-                self.training_config.epochs.parse().unwrap_or(state.epoch.max(1));
+            self.training_stats.total_epochs = self
+                .training_config
+                .epochs
+                .parse()
+                .unwrap_or(state.epoch.max(1));
             // best_loss is Option<f32>; training_stats.loss is f64.
             self.training_stats.loss = state
                 .best_loss

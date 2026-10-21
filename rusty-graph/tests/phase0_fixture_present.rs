@@ -4,8 +4,7 @@
 use std::path::PathBuf;
 
 fn fixture_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../tests/reference/phase0_linear_rmsnorm.json")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/reference/phase0_linear_rmsnorm.json")
 }
 
 #[test]
@@ -23,11 +22,7 @@ fn phase0_fixture_exists_or_is_generated() {
             "generate_phase0_pure.py failed; cannot run Phase 0 parity tests"
         );
     }
-    assert!(
-        path.exists(),
-        "expected fixture at {}",
-        path.display()
-    );
+    assert!(path.exists(), "expected fixture at {}", path.display());
     let content = std::fs::read_to_string(&path).expect("read fixture");
     assert!(content.contains("linear_weight_hf_layout"));
     assert!(content.contains("rms_output"));

@@ -150,9 +150,14 @@ impl TextDataset {
         let mut samples = Vec::new();
         for line in content.lines().filter(|line| !line.trim().is_empty()) {
             if let Ok(sample) = serde_json::from_str::<JsonlSample>(line) {
-                if let Some(example) =
-                    build_sft_example(tokenizer, &sample.prompt, &sample.response, sample.system.as_deref(), use_chat_template, max_len)
-                {
+                if let Some(example) = build_sft_example(
+                    tokenizer,
+                    &sample.prompt,
+                    &sample.response,
+                    sample.system.as_deref(),
+                    use_chat_template,
+                    max_len,
+                ) {
                     samples.push(example);
                 }
             }
@@ -161,12 +166,18 @@ impl TextDataset {
     }
 
     /// Create from a JSONL instruction dataset with `{prompt,response}` objects.
-    pub fn from_jsonl<P: AsRef<Path>>(path: P, tokenizer: &Tokenizer) -> Result<Self, std::io::Error> {
+    pub fn from_jsonl<P: AsRef<Path>>(
+        path: P,
+        tokenizer: &Tokenizer,
+    ) -> Result<Self, std::io::Error> {
         Self::from_jsonl_sft(path, tokenizer, true, usize::MAX)
     }
 
     /// Create from a plain text file, one training sample per non-empty line.
-    pub fn from_text_file<P: AsRef<Path>>(path: P, tokenizer: &Tokenizer) -> Result<Self, std::io::Error> {
+    pub fn from_text_file<P: AsRef<Path>>(
+        path: P,
+        tokenizer: &Tokenizer,
+    ) -> Result<Self, std::io::Error> {
         let content = fs::read_to_string(path)?;
         let sequences = content
             .lines()
@@ -250,10 +261,7 @@ fn build_sft_example(
         let response_part = tokenizer.encode(response);
         (prompt_part, response_part)
     } else {
-        (
-            tokenizer.encode(prompt),
-            tokenizer.encode(response),
-        )
+        (tokenizer.encode(prompt), tokenizer.encode(response))
     };
 
     if prompt_tokens.is_empty() || response_tokens.is_empty() {
@@ -425,11 +433,7 @@ impl<D: Dataset> Iterator for DataLoader<D> {
         let mut padded_target_ids = Vec::with_capacity(batch_indices.len());
         let mut attention_mask = Vec::with_capacity(batch_indices.len());
         let mut loss_masks = Vec::with_capacity(batch_indices.len());
-        for ((inp, tgt), loss_mask) in input_ids
-            .iter()
-            .zip(&target_ids)
-            .zip(&loss_masks_raw)
-        {
+        for ((inp, tgt), loss_mask) in input_ids.iter().zip(&target_ids).zip(&loss_masks_raw) {
             let valid_len = inp.len().min(tgt.len());
             let mut padded_inp = inp.clone();
             padded_inp.resize(max_seq_len, self.pad_token_id);

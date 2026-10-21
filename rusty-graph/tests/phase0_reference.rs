@@ -30,8 +30,7 @@ fn gpu_tests_enabled() -> bool {
 }
 
 fn fixture_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../tests/reference/phase0_linear_rmsnorm.json")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/reference/phase0_linear_rmsnorm.json")
 }
 
 fn ensure_fixture(path: &PathBuf) {
@@ -100,7 +99,8 @@ fn linear_and_rmsnorm_match_reference_fixture() {
     ensure_fixture(&path);
 
     let fixture: Phase0Fixture =
-        serde_json::from_str(&fs::read_to_string(path).expect("read fixture")).expect("parse fixture");
+        serde_json::from_str(&fs::read_to_string(path).expect("read fixture"))
+            .expect("parse fixture");
 
     let ctx = Arc::new(pollster::block_on(async { WgpuContext::new().await }));
     let engine = ComputeEngine::new(&ctx);

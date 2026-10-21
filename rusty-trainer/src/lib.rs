@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 pub mod checkpoint;
 pub mod data;
-pub mod distributed;
 pub mod demo;
+pub mod distributed;
 pub mod scaler;
 
 pub use data::{Batch, DataLoader, Dataset, TextDataset, TrainingExample};
@@ -112,7 +112,10 @@ impl Trainer {
         }
 
         let mut loss = loss.unwrap_or_else(|| {
-            Tensor::new(self.ctx.clone(), UnifiedTensor::new(&self.ctx, &[0.0], &[1]))
+            Tensor::new(
+                self.ctx.clone(),
+                UnifiedTensor::new(&self.ctx, &[0.0], &[1]),
+            )
         });
 
         if included > 1 {
@@ -325,20 +328,12 @@ mod tests {
         assert_eq!(full_count, 4);
 
         // Simulate grad-accum of 2 microbatches of 2 tokens each.
-        let micro_a = masked_cross_entropy_from_logits(
-            &logits[..4],
-            2,
-            &targets[..2],
-            &full_mask[..2],
-        )
-        .unwrap();
-        let micro_b = masked_cross_entropy_from_logits(
-            &logits[4..],
-            2,
-            &targets[2..],
-            &full_mask[2..],
-        )
-        .unwrap();
+        let micro_a =
+            masked_cross_entropy_from_logits(&logits[..4], 2, &targets[..2], &full_mask[..2])
+                .unwrap();
+        let micro_b =
+            masked_cross_entropy_from_logits(&logits[4..], 2, &targets[2..], &full_mask[2..])
+                .unwrap();
         let accum_mean = (micro_a.0 + micro_b.0) / 2.0;
         assert!((accum_mean - full_loss).abs() < 1e-5);
     }
@@ -364,8 +359,7 @@ mod tests {
         let logits = vec![1.0, 0.0, 0.0, 2.0];
         let targets = [0u32, 1u32];
         let mask = [1u8, 1u8];
-        let (masked, _) =
-            masked_cross_entropy_from_logits(&logits, 2, &targets, &mask).unwrap();
+        let (masked, _) = masked_cross_entropy_from_logits(&logits, 2, &targets, &mask).unwrap();
         // Same as ignoring nothing.
         let (unmasked, _) =
             masked_cross_entropy_from_logits(&logits, 2, &targets, &[1, 1]).unwrap();

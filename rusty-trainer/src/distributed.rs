@@ -62,9 +62,7 @@ fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     fs::create_dir_all(parent)?;
     let tmp = parent.join(format!(
         ".{}.tmp.{}",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("grad"),
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("grad"),
         std::process::id()
     ));
     fs::write(&tmp, bytes)?;

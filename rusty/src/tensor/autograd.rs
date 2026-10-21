@@ -650,14 +650,22 @@ impl AutogradNode for SigmoidNode {
         });
 
         let pipeline = engine.get_pipeline("sigmoid").unwrap();
-        let bind_group =
-            engine.create_unary_bind_group(&device.device, pipeline, &self.input.buffer, &sigmoid_out);
+        let bind_group = engine.create_unary_bind_group(
+            &device.device,
+            pipeline,
+            &self.input.buffer,
+            &sigmoid_out,
+        );
         engine.dispatch(
             &device.device,
             &device.queue,
             "sigmoid",
             &bind_group,
-            (crate::backend::ComputeEngine::workgroups_1d(size as u32), 1, 1),
+            (
+                crate::backend::ComputeEngine::workgroups_1d(size as u32),
+                1,
+                1,
+            ),
         );
 
         // grad_input = grad_output * sigmoid_out * (1 - sigmoid_out)
@@ -701,7 +709,11 @@ impl AutogradNode for SigmoidNode {
             &device.queue,
             "sub_scalar",
             &bind_group,
-            (crate::backend::ComputeEngine::workgroups_1d(size as u32), 1, 1),
+            (
+                crate::backend::ComputeEngine::workgroups_1d(size as u32),
+                1,
+                1,
+            ),
         );
 
         let sigmoid_deriv = device.device.create_buffer(&wgpu::BufferDescriptor {
@@ -724,7 +736,11 @@ impl AutogradNode for SigmoidNode {
             &device.queue,
             "mul",
             &bind_group,
-            (crate::backend::ComputeEngine::workgroups_1d(size as u32), 1, 1),
+            (
+                crate::backend::ComputeEngine::workgroups_1d(size as u32),
+                1,
+                1,
+            ),
         );
 
         let grad_in = device.device.create_buffer(&wgpu::BufferDescriptor {
@@ -747,7 +763,11 @@ impl AutogradNode for SigmoidNode {
             &device.queue,
             "mul",
             &bind_group,
-            (crate::backend::ComputeEngine::workgroups_1d(size as u32), 1, 1),
+            (
+                crate::backend::ComputeEngine::workgroups_1d(size as u32),
+                1,
+                1,
+            ),
         );
 
         self.input
@@ -791,7 +811,11 @@ impl AutogradNode for TanhNode {
             &device.queue,
             "tanh_act",
             &bind_group,
-            (crate::backend::ComputeEngine::workgroups_1d(size as u32), 1, 1),
+            (
+                crate::backend::ComputeEngine::workgroups_1d(size as u32),
+                1,
+                1,
+            ),
         );
 
         // tanh^2
@@ -815,7 +839,11 @@ impl AutogradNode for TanhNode {
             &device.queue,
             "mul",
             &bind_group,
-            (crate::backend::ComputeEngine::workgroups_1d(size as u32), 1, 1),
+            (
+                crate::backend::ComputeEngine::workgroups_1d(size as u32),
+                1,
+                1,
+            ),
         );
 
         // 1 - tanh^2
@@ -859,7 +887,11 @@ impl AutogradNode for TanhNode {
             &device.queue,
             "sub_scalar",
             &bind_group,
-            (crate::backend::ComputeEngine::workgroups_1d(size as u32), 1, 1),
+            (
+                crate::backend::ComputeEngine::workgroups_1d(size as u32),
+                1,
+                1,
+            ),
         );
 
         // grad_input = grad_output * (1 - tanh^2)
@@ -883,7 +915,11 @@ impl AutogradNode for TanhNode {
             &device.queue,
             "mul",
             &bind_group,
-            (crate::backend::ComputeEngine::workgroups_1d(size as u32), 1, 1),
+            (
+                crate::backend::ComputeEngine::workgroups_1d(size as u32),
+                1,
+                1,
+            ),
         );
 
         self.input
@@ -976,12 +1012,16 @@ impl AutogradNode for SoftmaxNode {
             &device.queue,
             "mul",
             &bind_group,
-            (crate::backend::ComputeEngine::workgroups_1d(size as u32), 1, 1),
+            (
+                crate::backend::ComputeEngine::workgroups_1d(size as u32),
+                1,
+                1,
+            ),
         );
 
         // sum(grad_output * softmax) - simplified CPU fallback
         // For production, implement proper GPU reduction kernel
-        
+
         // Simple passthrough: grad_input = grad_output * softmax * (1 - softmax)
         // This is an approximation - full softmax backward needs sum reduction
         let grad_in = device.device.create_buffer(&wgpu::BufferDescriptor {
@@ -1005,7 +1045,11 @@ impl AutogradNode for SoftmaxNode {
             &device.queue,
             "mul",
             &bind_group,
-            (crate::backend::ComputeEngine::workgroups_1d(size as u32), 1, 1),
+            (
+                crate::backend::ComputeEngine::workgroups_1d(size as u32),
+                1,
+                1,
+            ),
         );
 
         self.input

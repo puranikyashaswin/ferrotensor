@@ -49,7 +49,7 @@ impl Module for LayerNorm {
         // TODO: Optimize with GPU kernel
         let data = x.to_vec();
         let size = self.normalized_shape.iter().product::<usize>();
-        
+
         // Assume the last dimension is the normalization dimension
         let total_elements = data.len();
         let num_rows = total_elements / size;
@@ -59,17 +59,18 @@ impl Module for LayerNorm {
         let beta_data = self.beta.to_vec();
 
         let mut result = Vec::with_capacity(total_elements);
-        
+
         for row in 0..num_rows {
             let row_start = row * size;
             let row_end = row_start + size;
             let row_data = &data[row_start..row_end];
-            
+
             // Compute mean for this row
             let mean: f32 = row_data.iter().sum::<f32>() / size as f32;
-            
+
             // Compute variance for this row
-            let variance: f32 = row_data.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / size as f32;
+            let variance: f32 =
+                row_data.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / size as f32;
             let inv_std = 1.0 / (variance + self.eps).sqrt();
 
             // Normalize and apply affine for this row
@@ -144,19 +145,19 @@ impl Module for RMSNorm {
         // CPU fallback for now
         let data = x.to_vec();
         let size = self.hidden_size;
-        
+
         let total_elements = data.len();
         let num_rows = total_elements / size;
 
         // Normalize and scale
         let weight_data = self.weight.to_vec();
         let mut result = Vec::with_capacity(total_elements);
-        
+
         for row in 0..num_rows {
             let row_start = row * size;
             let row_end = row_start + size;
             let row_data = &data[row_start..row_end];
-            
+
             // Compute RMS for this row
             let sq_sum: f32 = row_data.iter().map(|v| v * v).sum::<f32>();
             let rms = (sq_sum / size as f32 + self.eps).sqrt();

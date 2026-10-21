@@ -116,7 +116,10 @@ impl<'a> Lfm2ModelBuilder<'a> {
             (data, shape)
         };
 
-        Tensor::new(self.ctx.clone(), UnifiedTensor::new(&self.ctx, &data, &shape))
+        Tensor::new(
+            self.ctx.clone(),
+            UnifiedTensor::new(&self.ctx, &data, &shape),
+        )
     }
 
     fn maybe_add_lora(&self, linear: Linear, module_name: &str) -> Linear {

@@ -65,10 +65,7 @@ pub fn cross_entropy(logits: &Tensor, targets: &Tensor) -> Tensor {
 ///
 /// This function maintains the autograd graph.
 pub fn binary_cross_entropy(pred: &Tensor, target: &Tensor) -> Tensor {
-    assert_eq!(
-        pred.shape, target.shape,
-        "Shapes must match for BCE loss"
-    );
+    assert_eq!(pred.shape, target.shape, "Shapes must match for BCE loss");
 
     // Clamp pred to avoid log(0) - maintains autograd
     let pred_clamped = pred.clamp(1e-7, 1.0 - 1e-7);
@@ -205,13 +202,7 @@ pub fn dropout(x: &Tensor, p: f32, training: bool) -> Tensor {
 
     let result: Vec<f32> = data
         .iter()
-        .map(|&v| {
-            if rng.gen::<f32>() < p {
-                0.0
-            } else {
-                v * scale
-            }
-        })
+        .map(|&v| if rng.gen::<f32>() < p { 0.0 } else { v * scale })
         .collect();
 
     // Note: This breaks autograd - CPU fallback

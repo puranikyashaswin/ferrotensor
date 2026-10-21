@@ -235,9 +235,9 @@ impl WeightsContext {
                         return;
                     }
                     out.extend(
-                        bytes
-                            .chunks_exact(4)
-                            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])),
+                        bytes.chunks_exact(4).map(|chunk| {
+                            f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
+                        }),
                     );
                 }
                 safetensors::Dtype::F16 => {

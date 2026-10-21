@@ -971,17 +971,16 @@ impl Tensor {
         data.iter()
             .enumerate()
             .max_by(|(_, a), (_, b)| {
-                a.partial_cmp(b)
-                    .unwrap_or_else(|| {
-                        // Handle NaN: treat NaN as greater
-                        if a.is_nan() {
-                            std::cmp::Ordering::Greater
-                        } else if b.is_nan() {
-                            std::cmp::Ordering::Less
-                        } else {
-                            std::cmp::Ordering::Equal
-                        }
-                    })
+                a.partial_cmp(b).unwrap_or_else(|| {
+                    // Handle NaN: treat NaN as greater
+                    if a.is_nan() {
+                        std::cmp::Ordering::Greater
+                    } else if b.is_nan() {
+                        std::cmp::Ordering::Less
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                })
             })
             .map(|(i, _)| i)
             .unwrap_or(0)
@@ -996,16 +995,15 @@ impl Tensor {
         data.iter()
             .enumerate()
             .min_by(|(_, a), (_, b)| {
-                a.partial_cmp(b)
-                    .unwrap_or_else(|| {
-                        if a.is_nan() {
-                            std::cmp::Ordering::Greater
-                        } else if b.is_nan() {
-                            std::cmp::Ordering::Less
-                        } else {
-                            std::cmp::Ordering::Equal
-                        }
-                    })
+                a.partial_cmp(b).unwrap_or_else(|| {
+                    if a.is_nan() {
+                        std::cmp::Ordering::Greater
+                    } else if b.is_nan() {
+                        std::cmp::Ordering::Less
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                })
             })
             .map(|(i, _)| i)
             .unwrap_or(0)

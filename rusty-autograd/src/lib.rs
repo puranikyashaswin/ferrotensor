@@ -269,7 +269,13 @@ impl AutogradNode for ReshapeNode {
     }
 }
 
-fn apply_rope_in_place(data: &mut [f32], shape: &[usize], head_dim: usize, pos: usize, inverse: bool) {
+fn apply_rope_in_place(
+    data: &mut [f32],
+    shape: &[usize],
+    head_dim: usize,
+    pos: usize,
+    inverse: bool,
+) {
     let (batch, seq_len, hidden) = match shape {
         [batch, seq_len, hidden] => (*batch, *seq_len, *hidden),
         [seq_len, hidden] => (1, *seq_len, *hidden),

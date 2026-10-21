@@ -24,15 +24,14 @@ fn sft_mask_ignores_prompt_tokens_in_host_loss() {
     for v in 0..vocab {
         logits[v] = if v == 0 { 10.0 } else { 0.0 };
     }
-    let (loss, count) = masked_cross_entropy_from_logits(
-        &logits,
-        vocab,
-        &example.target_ids,
-        &example.loss_mask,
-    )
-    .expect("masked loss");
+    let (loss, count) =
+        masked_cross_entropy_from_logits(&logits, vocab, &example.target_ids, &example.loss_mask)
+            .expect("masked loss");
     assert_eq!(count, 2);
-    assert!(loss < 0.05, "response-only loss should be near zero, got {loss}");
+    assert!(
+        loss < 0.05,
+        "response-only loss should be near zero, got {loss}"
+    );
 }
 
 #[test]
@@ -48,7 +47,10 @@ fn pretrain_packing_masks_all_targets() {
 #[test]
 fn dataloader_pads_sft_masks_without_training_on_pad() {
     let mut ds = TextDataset::new();
-    ds.add_example(TrainingExample::from_sft_prompt_response(vec![1, 2], vec![3, 4, 5]));
+    ds.add_example(TrainingExample::from_sft_prompt_response(
+        vec![1, 2],
+        vec![3, 4, 5],
+    ));
     ds.add_example(TrainingExample::from_sft_prompt_response(vec![9], vec![8]));
     let mut loader = DataLoader::new_with_pad_token(ds, 2, false, 0);
     let batch = loader.next().unwrap();
@@ -73,7 +75,9 @@ fn grad_accum_token_mean_matches_full_batch() {
     let mask = [1u8, 1, 1, 1];
     let (full, _) = masked_cross_entropy_from_logits(&logits, 2, &targets, &mask).unwrap();
 
-    let (a, _) = masked_cross_entropy_from_logits(&logits[..4], 2, &targets[..2], &mask[..2]).unwrap();
-    let (b, _) = masked_cross_entropy_from_logits(&logits[4..], 2, &targets[2..], &mask[2..]).unwrap();
+    let (a, _) =
+        masked_cross_entropy_from_logits(&logits[..4], 2, &targets[..2], &mask[..2]).unwrap();
+    let (b, _) =
+        masked_cross_entropy_from_logits(&logits[4..], 2, &targets[2..], &mask[2..]).unwrap();
     assert!(((a + b) * 0.5 - full).abs() < 1e-5);
 }

@@ -12,8 +12,7 @@ use rusty_backend::{ComputeEngine, WgpuContext};
 use rusty_graph::model_builder::{Lfm2ModelBuilder, LoRaConfig};
 use rusty_loader::{ModelLoader, Sampler, Tokenizer, WeightsContext};
 use rusty_trainer::checkpoint::{
-    apply_checkpoint, load_lora_checkpoint, save_lora_checkpoint, TrainingCheckpoint,
-    TrainingState,
+    apply_checkpoint, load_lora_checkpoint, save_lora_checkpoint, TrainingCheckpoint, TrainingState,
 };
 use rusty_trainer::{
     masked_cross_entropy_from_logits, DataLoader, Dataset, FileGradSyncConfig, GradScaler,
@@ -184,7 +183,9 @@ fn print_usage() {
     println!("======================================================================");
     println!();
     println!("USAGE:");
-    println!("  rusty-cli train --model <PATH> --data <DATA> [--task sft|pretrain] [--lite] [--out DIR]");
+    println!(
+        "  rusty-cli train --model <PATH> --data <DATA> [--task sft|pretrain] [--lite] [--out DIR]"
+    );
     println!("  rusty-cli eval  --model <PATH> --data <DATA> [--task sft|pretrain]");
     println!("  rusty-cli infer --model <PATH> [--prompt TEXT] [--resume LORA]");
     println!("  rusty-cli --demo | --monitor | --benchmark | --help");
@@ -518,7 +519,9 @@ async fn run_pipeline(config: &RunConfig) {
         && config.dataset_path.is_none()
         && !config.allow_fallback
     {
-        println!("[ERROR] Dataset required for train/eval. Pass --data <PATH> or --allow-fallback.");
+        println!(
+            "[ERROR] Dataset required for train/eval. Pass --data <PATH> or --allow-fallback."
+        );
         return;
     }
 
@@ -542,9 +545,8 @@ async fn run_pipeline(config: &RunConfig) {
         }
         DevicePreference::Cpu => (rusty_backend::wgpu::PowerPreference::LowPower, true),
     };
-    let ctx = Arc::new(
-        WgpuContext::new_with_options(power_preference, force_fallback_adapter).await,
-    );
+    let ctx =
+        Arc::new(WgpuContext::new_with_options(power_preference, force_fallback_adapter).await);
     let engine = Arc::new(ComputeEngine::new(&ctx));
     println!("       Ready: {}", ctx.adapter_info());
 
@@ -564,7 +566,11 @@ async fn run_pipeline(config: &RunConfig) {
     let dataset = if matches!(config.mode, CommandMode::Train | CommandMode::Eval) {
         match load_task_dataset(config, &tokenizer) {
             Ok(ds) => {
-                println!("[DATA] Loaded {} samples ({})", ds.len(), config.task.as_str());
+                println!(
+                    "[DATA] Loaded {} samples ({})",
+                    ds.len(),
+                    config.task.as_str()
+                );
                 ds
             }
             Err(e) => {
@@ -687,7 +693,11 @@ async fn run_pipeline(config: &RunConfig) {
     let is_root = !is_distributed || config.rank == 0;
     // In distributed mode, shard data by rank and avoid early stopping on
     // max_samples so step counts stay aligned across ranks.
-    let max_samples_effective = if is_distributed { None } else { config.max_samples };
+    let max_samples_effective = if is_distributed {
+        None
+    } else {
+        config.max_samples
+    };
 
     println!("[CONFIG] task={} lr={learning_rate} epochs={epochs} batch={batch_size} accum={grad_accum} seq={}",
         config.task.as_str(), config.sequence_length);
@@ -862,7 +872,12 @@ async fn run_pipeline(config: &RunConfig) {
                 indices,
             )
         } else {
-            DataLoader::new_with_pad_token(dataset.clone(), batch_size, true, tokenizer.pad_token_id)
+            DataLoader::new_with_pad_token(
+                dataset.clone(),
+                batch_size,
+                true,
+                tokenizer.pad_token_id,
+            )
         };
         loader.reset();
         Some(loader)
@@ -890,8 +905,7 @@ async fn run_pipeline(config: &RunConfig) {
                         train_params.as_ref().map(Vec::as_slice).unwrap_or(&[]),
                     );
                     for (idx, loss) in losses.iter().enumerate() {
-                        let loss_val =
-                            loss.data.to_vec(&ctx).await.first().copied().unwrap_or(0.0);
+                        let loss_val = loss.data.to_vec(&ctx).await.first().copied().unwrap_or(0.0);
                         total_loss += loss_val;
                         let counted = batch
                             .loss_masks
@@ -979,9 +993,7 @@ async fn run_pipeline(config: &RunConfig) {
             let monitor_path = Path::new(&out_dir).join("training_state.json");
             let _ = state.save(&monitor_path);
             let _ = state.save("outputs/training_state.json");
-            if let (Some(trainer), Some(named)) =
-                (trainer.as_ref(), named_train_params.as_ref())
-            {
+            if let (Some(trainer), Some(named)) = (trainer.as_ref(), named_train_params.as_ref()) {
                 let checkpoint = TrainingCheckpoint {
                     training_state: state,
                     optimizer_state: trainer.optimizer.save_state(&ctx, named),
@@ -1063,10 +1075,7 @@ fn load_task_dataset(
     config: &RunConfig,
     tokenizer: &Tokenizer,
 ) -> Result<TextDataset, Box<dyn std::error::Error>> {
-    let path = config
-        .dataset_path
-        .as_ref()
-        .ok_or("dataset path missing")?;
+    let path = config.dataset_path.as_ref().ok_or("dataset path missing")?;
     let dataset_path = Path::new(path);
     if !dataset_path.exists() {
         return Err(format!("dataset file not found: {path}").into());
@@ -1158,9 +1167,10 @@ fn load_json_sft_dataset(
                 tokenizer.encode(&sample.prompt)
             };
             let response_tokens = tokenizer.encode(&sample.response);
-            if let Some(example) =
-                truncate_example(TrainingExample::from_sft_prompt_response(prompt_tokens, response_tokens), max_len)
-            {
+            if let Some(example) = truncate_example(
+                TrainingExample::from_sft_prompt_response(prompt_tokens, response_tokens),
+                max_len,
+            ) {
                 dataset.add_example(example);
             }
         }
@@ -1186,7 +1196,11 @@ fn truncate_example(mut example: TrainingExample, max_len: usize) -> Option<Trai
     }
 }
 
-fn create_default_dataset(tokenizer: &Tokenizer, sequence_length: usize, task: TaskKind) -> TextDataset {
+fn create_default_dataset(
+    tokenizer: &Tokenizer,
+    sequence_length: usize,
+    task: TaskKind,
+) -> TextDataset {
     let samples = vec![
         Sample {
             prompt: "Hello".into(),
@@ -1274,9 +1288,8 @@ fn print_capacity_guidance(
     max_vram_gb: Option<f32>,
 ) {
     let weight_gb = estimate_model_weight_gb(model_path);
-    let activation_gb =
-        batch_size as f32 * seq_len as f32 * hidden as f32 * layers as f32 * 4.0
-            / (1024.0 * 1024.0 * 1024.0);
+    let activation_gb = batch_size as f32 * seq_len as f32 * hidden as f32 * layers as f32 * 4.0
+        / (1024.0 * 1024.0 * 1024.0);
     let estimated = weight_gb + activation_gb * 2.0;
     println!("[CHECK] estimated working set ~{estimated:.2} GB (weights {weight_gb:.2} GB)");
     let budget = max_vram_gb.unwrap_or(8.0);

@@ -238,7 +238,10 @@ impl Lfm2Model {
 
     pub fn named_params(&self) -> HashMap<String, Tensor> {
         let mut map = HashMap::new();
-        map.insert("model.embed_tokens.weight".to_string(), self.embed_tokens.clone());
+        map.insert(
+            "model.embed_tokens.weight".to_string(),
+            self.embed_tokens.clone(),
+        );
         map.extend(self.embedding_norm.named_params("model.embedding_norm"));
         for (idx, layer) in self.layers.iter().enumerate() {
             map.extend(layer.named_params(&format!("model.layers.{}", idx)));

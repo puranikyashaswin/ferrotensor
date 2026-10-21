@@ -65,7 +65,11 @@ impl Linear {
             let scale = lora.alpha / lora.rank as f32;
             let scale_tensor = Tensor::new(
                 x.ctx.clone(),
-                UnifiedTensor::new(&x.ctx, &vec![scale; lora_out.data.shape.iter().product()], &lora_out.data.shape),
+                UnifiedTensor::new(
+                    &x.ctx,
+                    &vec![scale; lora_out.data.shape.iter().product()],
+                    &lora_out.data.shape,
+                ),
             );
             let scaled_lora = Tensor::mul(&lora_out, &scale_tensor, engine);
             out = Tensor::add(&out, &scaled_lora, engine);
