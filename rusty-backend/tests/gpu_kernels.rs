@@ -497,6 +497,19 @@ fn rms_norm_matches_cpu() {
             1e-4,
         );
     }
+    let (rows, len) = (4, 96);
+    let x: Vec<f32> = rand_vec(rows * len, 60).iter().map(|v| v * 0.01).collect();
+    let w = rand_vec(len, 61);
+    let out = zeros(&[rows, len]);
+    g.engine.rms_norm_eps(
+        &g.ctx,
+        &upload(&x, &[rows, len]),
+        &upload(&w, &[len]),
+        &out,
+        1e-2,
+    );
+    let want = cpu_rms_norm(&x, &w, len, 1e-2);
+    assert_close("rms_norm_eps", &read(&out), &want, 1e-5, 1e-4);
 }
 
 #[test]
@@ -564,6 +577,13 @@ fn rope_matches_cpu() {
             1e-4,
         );
     }
+    // 2-D [seq, heads * head_dim] input: rows are tokens.
+    let (seq, heads, hd, pos) = (6, 3, 16, 2);
+    let x = rand_vec(seq * heads * hd, 62);
+    let t = upload(&x, &[seq, heads * hd]);
+    g.engine.rope(&g.ctx, &t, hd, pos);
+    let want = cpu_rope(&x, 1, seq, heads, hd, pos);
+    assert_close("rope 2-D", &read(&t), &want, 1e-4, 1e-4);
 }
 
 // ---------------------------------------------------------------------------

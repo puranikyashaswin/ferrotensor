@@ -40,7 +40,7 @@ fn rope(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 @group(0) @binding(0) var<storage, read> rms_input: array<f32>;
 @group(0) @binding(1) var<storage, read> rms_weight: array<f32>;
 @group(0) @binding(2) var<storage, read_write> rms_out: array<f32>;
-@group(0) @binding(3) var<uniform> rms_params: vec2<u32>;
+@group(0) @binding(3) var<uniform> rms_params: vec4<u32>; // size, rows, eps bits, 0
 
 @compute @workgroup_size(64)
 fn rms_norm(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
@@ -56,7 +56,7 @@ fn rms_norm(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgrou
         ss = ss + val * val;
     }
     ss = ss / f32(size);
-    let inv_rms = 1.0 / sqrt(ss + 1e-5);
+    let inv_rms = 1.0 / sqrt(ss + bitcast<f32>(rms_params.z));
     for (var i = 0u; i < size; i = i + 1u) {
         rms_out[row_offset + i] = rms_input[row_offset + i] * inv_rms * rms_weight[i];
     }

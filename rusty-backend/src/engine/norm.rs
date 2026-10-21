@@ -4,6 +4,8 @@ use super::{grid, groups64, uniform, ComputeEngine};
 use crate::{UnifiedTensor, WgpuContext};
 
 impl ComputeEngine {
+    /// RMSNorm over the last dimension with eps = 1e-5:
+    /// `out = x / sqrt(mean(x^2) + eps) * weight`.
     pub fn rms_norm(
         &self,
         ctx: &WgpuContext,
@@ -11,9 +13,24 @@ impl ComputeEngine {
         weight: &UnifiedTensor,
         out: &UnifiedTensor,
     ) {
+        self.rms_norm_eps(ctx, input, weight, out, 1e-5);
+    }
+
+    /// RMSNorm over the last dimension with a caller-chosen `eps`.
+    pub fn rms_norm_eps(
+        &self,
+        ctx: &WgpuContext,
+        input: &UnifiedTensor,
+        weight: &UnifiedTensor,
+        out: &UnifiedTensor,
+        eps: f32,
+    ) {
         let size = *input.shape.last().unwrap_or(&1);
         let rows = input.shape.iter().product::<usize>() / size;
-        let params = uniform(ctx, bytemuck::cast_slice(&[size as u32, rows as u32]));
+        let params = uniform(
+            ctx,
+            bytemuck::cast_slice(&[size as u32, rows as u32, eps.to_bits(), 0]),
+        );
         self.run(
             ctx,
             &self.rms_norm,

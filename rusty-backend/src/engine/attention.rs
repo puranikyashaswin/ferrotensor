@@ -5,20 +5,17 @@ use crate::{UnifiedTensor, WgpuContext};
 use wgpu::Buffer;
 
 impl ComputeEngine {
+    /// Rotate-half RoPE (theta 10000) applied in place.
+    ///
+    /// `tensor` is `[batch, seq, ...]`, `[seq, hidden]` or a single token
+    /// `[hidden]`; every head vector of token `s` gets position `pos + s`.
     pub fn rope(&self, ctx: &WgpuContext, tensor: &UnifiedTensor, head_dim: usize, pos: usize) {
-        // [batch, seq, ...] tensors: every head vector of token s gets
-        // position pos + s. 1-D/2-D tensors are a single token.
-        let seq_len = if tensor.shape.len() >= 3 {
-            tensor.shape[1]
-        } else {
-            1
+        let (seq_len, tokens) = match tensor.shape.len() {
+            0 | 1 => (1, 1),
+            2 => (tensor.shape[0], tensor.shape[0]),
+            _ => (tensor.shape[1], tensor.shape[0] * tensor.shape[1]),
         };
         let total = tensor.shape.iter().product::<usize>();
-        let tokens = if tensor.shape.len() >= 3 {
-            tensor.shape[0] * tensor.shape[1]
-        } else {
-            1
-        };
         let heads = total / (tokens * head_dim).max(1);
         let params = uniform(
             ctx,
