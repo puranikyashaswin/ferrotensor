@@ -75,7 +75,7 @@ fn optimizers_skip_params_without_grad() {
 fn clip_grad_value_clamps() {
     let w = leaf(&[1.0, 2.0]);
     w.mul_scalar(10.0).sum().backward();
-    optim::clip_grad_value(&[w.clone()], 3.0);
+    optim::clip_grad_value(std::slice::from_ref(&w), 3.0);
     assert_eq!(w.grad().unwrap().to_vec(), vec![3.0, 3.0]);
 }
 

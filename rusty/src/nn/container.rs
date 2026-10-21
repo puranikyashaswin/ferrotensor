@@ -13,6 +13,8 @@ use crate::Device;
 macro_rules! layers {
     ($($variant:ident),* $(,)?) => {
         /// A layer that can be added to [`Sequential`].
+        // Layers are built once per model, so variant size does not matter.
+        #[allow(clippy::large_enum_variant)]
         pub enum Layer {
             $(
                 #[doc = concat!("A [`", stringify!($variant), "`] layer.")]

@@ -3,18 +3,19 @@
 /// NumPy-style broadcast of two shapes, or `None` when they are incompatible.
 pub(crate) fn broadcast_shapes(a: &[usize], b: &[usize]) -> Option<Vec<usize>> {
     let ndim = a.len().max(b.len());
-    let mut out = vec![0; ndim];
-    for i in 0..ndim {
-        let da = dim_from_right(a, ndim - 1 - i);
-        let db = dim_from_right(b, ndim - 1 - i);
-        out[i] = match (da, db) {
-            (x, y) if x == y => x,
-            (1, y) => y,
-            (x, 1) => x,
-            _ => return None,
-        };
-    }
-    Some(out)
+    (0..ndim)
+        .map(|i| {
+            match (
+                dim_from_right(a, ndim - 1 - i),
+                dim_from_right(b, ndim - 1 - i),
+            ) {
+                (x, y) if x == y => Some(x),
+                (1, y) => Some(y),
+                (x, 1) => Some(x),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 /// Size of the `i`-th dimension counted from the right (1 when absent).

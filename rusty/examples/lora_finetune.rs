@@ -4,8 +4,8 @@
 //!
 //! Run with: cargo run --example lora_finetune --release
 
-use rusty_backend::{ComputeEngine, UnifiedTensor, WgpuContext};
-use rusty_trainer::{DemoConfig, GradScaler};
+use rusty_backend::{UnifiedTensor, WgpuContext};
+use rusty_trainer::GradScaler;
 
 fn main() {
     println!("Rusty ML - LoRA Fine-tuning Example");
@@ -13,7 +13,6 @@ fn main() {
 
     // Initialize GPU
     let ctx = std::sync::Arc::new(pollster::block_on(async { WgpuContext::new().await }));
-    let engine = ComputeEngine::new(&ctx);
 
     // Print GPU info
     let info = ctx.adapter.get_info();
