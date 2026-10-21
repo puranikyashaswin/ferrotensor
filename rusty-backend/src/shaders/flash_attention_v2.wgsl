@@ -11,10 +11,10 @@
 //
 // One thread owns one query row; a workgroup covers FA_TILE_Q queries of one
 // (batch, head) and streams K/V through workgroup memory FA_TILE_K keys at a
-// time, keeping a running max / sum (online softmax) so the full score matrix
-// is never materialised.
+// time as vec4s, keeping a running max / sum (online softmax) so the full
+// score matrix is never materialised.
 
-const FA_TILE_Q: u32 = 64u;
+const FA_TILE_Q: u32 = 128u;
 const FA_TILE_K: u32 = 16u;
 const FA_MAX_D: u32 = 128u;
 // Scores at or below this are treated as masked out (-inf).
@@ -87,16 +87,36 @@ fn fa_visible(p: FlashV2Params, q_idx: u32, kp: u32) -> bool {
     return true;
 }
 
-var<workgroup> fa_k_tile: array<f32, 2048>; // FA_TILE_K * FA_MAX_D
-var<workgroup> fa_v_tile: array<f32, 2048>;
+// K/V tiles as vec4s: [FA_TILE_K][FA_MAX_D / 4].
+var<workgroup> fa_k_tile: array<vec4<f32>, 512>;
+var<workgroup> fa_v_tile: array<vec4<f32>, 512>;
 
-@compute @workgroup_size(64, 1, 1)
+// Element `c` of a head_dim-long row starting at `base`, or 0 past the end.
+fn fa_ld(buf_sel: u32, base: u32, c: u32, d_len: u32) -> f32 {
+    if (c >= d_len) { return 0.0; }
+    if (buf_sel == 0u) { return flash_v2_q[base + c]; }
+    if (buf_sel == 1u) { return flash_v2_k[base + c]; }
+    return flash_v2_v[base + c];
+}
+
+fn fa_ld4(buf_sel: u32, base: u32, c4: u32, d_len: u32) -> vec4<f32> {
+    let c = c4 * 4u;
+    return vec4<f32>(
+        fa_ld(buf_sel, base, c, d_len),
+        fa_ld(buf_sel, base, c + 1u, d_len),
+        fa_ld(buf_sel, base, c + 2u, d_len),
+        fa_ld(buf_sel, base, c + 3u, d_len),
+    );
+}
+
+@compute @workgroup_size(128, 1, 1)
 fn flash_attention_v2_metal(
     @builtin(local_invocation_id) local_id: vec3<u32>,
     @builtin(workgroup_id) wg_id: vec3<u32>,
 ) {
     let p = flash_v2_params;
     let d_len = p.head_dim;
+    let d4 = (d_len + 3u) / 4u;
     let batch_idx = wg_id.z / p.num_heads;
     let head_idx = wg_id.z % p.num_heads;
     let kv_head_idx = head_idx / (p.num_heads / p.num_kv_heads);
@@ -105,12 +125,12 @@ fn flash_attention_v2_metal(
     let q_idx = q_start + local_id.x;
     let valid = q_idx < p.seq_q;
 
-    var q_reg: array<f32, 128>;
-    var acc: array<f32, 128>;
+    var q_reg: array<vec4<f32>, 32>;
+    var acc: array<vec4<f32>, 32>;
     let q_base = ((batch_idx * p.seq_q + q_idx) * p.num_heads + head_idx) * d_len;
-    for (var d = 0u; d < d_len; d++) {
-        acc[d] = 0.0;
-        if (valid) { q_reg[d] = flash_v2_q[q_base + d] * p.scale; } else { q_reg[d] = 0.0; }
+    for (var c = 0u; c < d4; c++) {
+        acc[c] = vec4<f32>(0.0);
+        if (valid) { q_reg[c] = fa_ld4(0u, q_base, c, d_len) * p.scale; } else { q_reg[c] = vec4<f32>(0.0); }
     }
 
     var m_run = FA_MASKED; // running max
@@ -132,20 +152,19 @@ fn flash_attention_v2_metal(
 
     for (var k_start = k_begin; k_start < k_end; k_start += FA_TILE_K) {
         // Cooperative load of FA_TILE_K rows of K and V.
-        let n = FA_TILE_K * d_len;
-        for (var i = local_id.x; i < n; i += 64u) {
-            let r = i / d_len;
-            let c = i % d_len;
+        for (var i = local_id.x; i < FA_TILE_K * d4; i += 128u) {
+            let r = i / d4;
+            let c = i % d4;
             let kp = k_start + r;
-            var kv = 0.0;
-            var vv = 0.0;
+            var kv = vec4<f32>(0.0);
+            var vv = vec4<f32>(0.0);
             if (kp < p.seq_k) {
-                let off = ((batch_idx * p.seq_k + kp) * p.num_kv_heads + kv_head_idx) * d_len + c;
-                kv = flash_v2_k[off];
-                vv = flash_v2_v[off];
+                let base = ((batch_idx * p.seq_k + kp) * p.num_kv_heads + kv_head_idx) * d_len;
+                kv = fa_ld4(1u, base, c, d_len);
+                vv = fa_ld4(2u, base, c, d_len);
             }
-            fa_k_tile[r * FA_MAX_D + c] = kv;
-            fa_v_tile[r * FA_MAX_D + c] = vv;
+            fa_k_tile[r * (FA_MAX_D / 4u) + c] = kv;
+            fa_v_tile[r * (FA_MAX_D / 4u) + c] = vv;
         }
         workgroupBarrier();
 
@@ -156,11 +175,11 @@ fn flash_attention_v2_metal(
                 let kp = k_start + j;
                 var sc = FA_MASKED;
                 if (fa_visible(p, q_idx, kp)) {
-                    var dot = 0.0;
-                    for (var d = 0u; d < d_len; d++) {
-                        dot += q_reg[d] * fa_k_tile[j * FA_MAX_D + d];
+                    var dot4 = vec4<f32>(0.0);
+                    for (var c = 0u; c < d4; c++) {
+                        dot4 = fma(q_reg[c], fa_k_tile[j * (FA_MAX_D / 4u) + c], dot4);
                     }
-                    sc = dot;
+                    sc = dot4.x + dot4.y + dot4.z + dot4.w;
                     if (p.has_mask == 1u) {
                         sc += flash_v2_mask[mask_base + kp * p.mask_stride_k];
                     }
@@ -173,14 +192,14 @@ fn flash_attention_v2_metal(
                 let m_new = max(m_run, tile_max);
                 let corr = exp(m_run - m_new);
                 l_run *= corr;
-                for (var d = 0u; d < d_len; d++) { acc[d] *= corr; }
+                for (var c = 0u; c < d4; c++) { acc[c] *= corr; }
                 for (var j = 0u; j < FA_TILE_K; j++) {
                     if (s[j] > FA_MASKED) {
                         let pj = exp(s[j] - m_new);
                         l_run += pj;
                         let w = pj * dropout_scale(p.dropout_prob, p.seed_val, bh, q_idx, k_start + j);
-                        for (var d = 0u; d < d_len; d++) {
-                            acc[d] += w * fa_v_tile[j * FA_MAX_D + d];
+                        for (var c = 0u; c < d4; c++) {
+                            acc[c] = fma(vec4<f32>(w), fa_v_tile[j * (FA_MAX_D / 4u) + c], acc[c]);
                         }
                     }
                 }
@@ -193,8 +212,13 @@ fn flash_attention_v2_metal(
     if (valid) {
         var inv = 0.0;
         if (l_run > 0.0) { inv = 1.0 / l_run; }
-        for (var d = 0u; d < d_len; d++) {
-            flash_v2_out[q_base + d] = acc[d] * inv;
+        for (var c = 0u; c < d4; c++) {
+            let o = acc[c] * inv;
+            let d = c * 4u;
+            flash_v2_out[q_base + d] = o.x;
+            if (d + 1u < d_len) { flash_v2_out[q_base + d + 1u] = o.y; }
+            if (d + 2u < d_len) { flash_v2_out[q_base + d + 2u] = o.z; }
+            if (d + 3u < d_len) { flash_v2_out[q_base + d + 3u] = o.w; }
         }
     }
 }

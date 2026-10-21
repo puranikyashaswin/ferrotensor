@@ -118,7 +118,7 @@ impl ComputeEngine {
                 (4, &params),
                 (5, mask_buf),
             ],
-            (1, dims.seq_q.div_ceil(64), dims.batch * dims.heads),
+            (1, dims.seq_q.div_ceil(128), dims.batch * dims.heads),
         );
     }
 
