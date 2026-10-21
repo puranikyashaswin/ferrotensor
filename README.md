@@ -1,348 +1,209 @@
-<p align="center">
-  <img src="https://img.shields.io/badge/rust-1.75+-orange?style=for-the-badge&logo=rust" alt="Rust">
-  <img src="https://img.shields.io/badge/Metal-Apple%20Silicon-purple?style=for-the-badge&logo=apple" alt="Metal">
-  <img src="https://img.shields.io/badge/GFLOPS-121+-green?style=for-the-badge" alt="Performance">
-  <img src="https://img.shields.io/badge/license-MIT-blue?style=for-the-badge" alt="License">
-</p>
-
 <h1 align="center">Rusty</h1>
 
-<h3 align="center">GPU-Accelerated ML Framework in Pure Rust</h3>
+<p align="center"><strong>A pure-Rust GPU ML framework: no CUDA, no Python, no C++ toolchain.</strong></p>
 
 <p align="center">
-  <strong>From custom GPU kernels to Llama architecture — understanding ML at every layer</strong>
+  <img src="https://img.shields.io/badge/rust-1.75+-orange" alt="Rust 1.75+">
+  <img src="https://img.shields.io/badge/GPU-Metal%20%7C%20Vulkan%20%7C%20DX12-purple" alt="GPU backends">
+  <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license">
+  <img src="https://img.shields.io/badge/status-pre--1.0-yellow" alt="pre-1.0">
 </p>
 
-<p align="center">
-  <a href="#-quick-start">Quick Start</a> •
-  <a href="#-key-features">Features</a> •
-  <a href="#-architecture">Architecture</a> •
-  <a href="#-performance">Benchmarks</a> •
-  <a href="#-examples">Examples</a>
-</p>
+Rusty runs tensors, autograd and neural networks on whatever GPU you have
+(Apple Silicon through Metal, or Vulkan/DX12 on Windows and Linux) using
+[wgpu](https://wgpu.rs) and hand-written WGSL compute kernels. There is no
+CUDA, cuDNN or libtorch to install and no Python at runtime: `cargo build` is
+the whole toolchain. The same tensor API also runs on a CPU device, which is
+what the test suite and CI use, so every op is checked against finite
+differences on the CPU and against the CPU on the GPU. It is built for the
+people CUDA-first frameworks leave out (laptops, consumer and integrated
+GPUs) and for anyone who wants to read, and change, every layer from the API
+down to the shader. It is young: pre-1.0, f32 only, and small-scale by design.
 
----
+- [Quickstart](#quickstart) · [Features](#feature-matrix) · [Architecture](#architecture) · [Compared with candle, burn and tch](#compared-with-candle-burn-and-tch) · [Roadmap](#roadmap)
+- Docs: [architecture](docs/architecture.md) · [writing a kernel](docs/writing-a-kernel.md) · [use cases](docs/use-cases.md) · [LoRA SFT walkthrough](docs/examples/lora-sft.md) *(link placeholder: written by another branch)* · [benchmarks](benchmarks/RESULTS.md)
 
-## Overview
+## Quickstart
 
-Rusty is a GPU-accelerated machine learning framework built entirely from scratch in Rust. The most dependable path today is the **World Trainer** lite path: LoRA SFT (response-only loss + chat template) and short-sequence pretrain/eval for smaller models on ~8GB consumer hardware. Full-scale / distributed training remains a later milestone.
-
-**What makes this project unique:**
-
-- **Custom GPU Kernels** — Hand-written WGSL compute shaders, not relying on cuBLAS or external libraries
-- **LFM2 / Llama-style blocks** — Attention, SwiGLU MLP, RMSNorm, KV cache (experimental)
-- **LoRA adapters** — Attach, train, save, and resume low-rank adapters
-- **Cross-Platform GPU** — Runs on Metal (Apple Silicon) and Vulkan (Windows/Linux)
-
----
-
-## Quick Start
-
-Run a GPU demo in 30 seconds:
+You need Rust 1.75+ (`rustup` is enough). On macOS no other setup is needed.
 
 ```bash
 git clone https://github.com/puranikyashaswin/rusty.git
 cd rusty
-cargo run --example basic_tensor --release -p rusty
+cargo run --release -p rusty --example quickstart
 ```
 
-**Expected output:**
+Output on an Apple M2 (the device line changes with your hardware):
+
 ```
-Rusty ML - Basic Tensor Example
-
-[GPU] Apple M2 (Metal)
-
-[INIT] Creating tensors...
-       Tensor A: [32, 32]
-       Tensor B: [32, 32]
-
-[COMPUTE] Performing matrix multiplication...
-          Result shape: [32, 32]
-          First few values: [..., ..., ..., ..., ...]  (GPU-dependent)
-
-[DONE] All operations completed successfully!
+device: Apple M2 (Metal)
+x @ w = [7.5, 2.0, 18.0, 2.0] (shape [2, 2])
+dL/dw = [5.0, 5.0, 7.0, 7.0, 9.0, 9.0]
 ```
 
----
+That is [`rusty/examples/quickstart.rs`](rusty/examples/quickstart.rs): a
+matmul and its gradient on the best available device. No GPU? Use
+`Device::cpu()`; the same code runs.
 
-## Key Features
+In your own code:
 
-### GPU Compute Engine
+```rust
+use rusty::prelude::*;
 
-Custom WGSL compute shaders optimized for ML workloads:
+let device = Device::cpu(); // or Device::best() for a GPU when present
+let model = nn::Sequential::new(&device)
+    .add(nn::Linear::new(2, 16, &device))
+    .add(nn::Tanh)
+    .add(nn::Linear::new(16, 2, &device));
+let mut opt = optim::AdamW::new(model.parameters(), 0.05).weight_decay(0.0);
 
-| Category | Kernels |
-|----------|---------|
-| **Linear Algebra** | Tiled MatMul, RoPE, RMSNorm |
-| **Activations** | SiLU, Softmax, ReLU |
-| **Training** | AdamW, SGD, Gradient Clipping |
-| **Quantization** | Int8 Dequantization, FP16 Casting |
-| **Attention** | Flash Attention, Scaled Dot-Product |
+// XOR
+let x = Tensor::from_data(&[0., 0., 0., 1., 1., 0., 1., 1.], &[4, 2], &device);
+let y = Tensor::from_data(&[0., 1., 1., 0.], &[4], &device);
+for _ in 0..200 {
+    opt.zero_grad();
+    let loss = F::cross_entropy(&model.forward(&x), &y);
+    loss.backward();
+    opt.step();
+}
+```
 
-### Neural Network Layers
+More runnable programs, with their real output, are in
+[docs/use-cases.md](docs/use-cases.md): an MLP with a `DataLoader`, a
+character-level transformer trained from scratch, a CPU-vs-GPU matmul and
+attention comparison, and similarity search.
 
-Production-ready building blocks:
+## Feature matrix
 
-- **Embedding** — Token embedding with vocabulary lookup
-- **Linear** — Dense layers with optional LoRA adapters
-- **Attention** — Multi-head attention with rotary embeddings
-- **MLP** — SwiGLU feedforward network
-- **LlamaBlock** — Transformer block (experimental)
-- **Lfm2Model** — LFM2-style model builder used by the CLI
+"Stable" means implemented, covered by tests, and used by the examples; the
+API can still change before 1.0. "Experimental" means it runs but is less
+tested, incomplete, or only checked on one machine.
 
-### Training Infrastructure
-
-- Automatic differentiation with gradient tape
-- GPU-accelerated AdamW optimizer
-- Mixed precision loss scaling (FP16)
-- Gradient accumulation and clipping
-- LoRA for parameter-efficient fine-tuning
-- SFT with chat-template tokenization and **response-only** loss masking
-- Pretrain / next-token LM on `.txt` and packed `.bin` token streams
-- Unified training checkpoints with transactional resume validation
-
----
+| Area | Status | Notes |
+|------|--------|-------|
+| `Tensor` on GPU (wgpu) and CPU | **Stable** | `f32`; broadcasting element-wise ops, reductions, batched matmul, softmax, permute, slice/cat, gathers |
+| Autograd | **Stable** | Reverse mode; every op's gradient is checked against finite differences, and GPU gradients against the CPU |
+| `nn` layers | **Stable** | `Linear`, `Embedding`, `LayerNorm`, `RMSNorm`, `Dropout`, causal `MultiHeadAttention`, activations, `Sequential` |
+| Optimizers and LR schedules | **Stable** | `SGD` (momentum, Nesterov), `AdamW`, gradient clipping, constant/step/cosine/warmup schedules |
+| Safetensors save/load, state dicts | **Stable** | `rusty::serialize` |
+| `DataLoader` | **Stable** | Batching and seeded shuffling; single-threaded |
+| LoRA fine-tuning of Llama-style models (`rusty-cli`) | **Experimental** | Small models (TinyLlama class) on ~8 GB machines; see the [LoRA walkthrough](docs/examples/lora-sft.md) |
+| Llama / LFM2-style blocks (`rusty-graph`) | **Experimental** | Attention with RoPE, SwiGLU MLP, RMSNorm, KV cache |
+| Flash attention kernels (`rusty-backend`) | **Experimental** | Forward v2 and a backward kernel; see `tests/flash_grad_check.rs` |
+| FP16 loss scaling, checkpoint/resume (`rusty-trainer`) | **Experimental** | |
+| Terminal monitor, Hub download helpers | **Experimental** | `rusty-monitor`, `rusty-hub` |
+| `f16` / `bf16` tensors in the `rusty` API | Planned | |
+| Convolutions, sort/top-k, cumsum in the `rusty` API | Planned | |
+| Faster small-op GPU path (batched dispatch) | Planned | Per-op submission makes tiny GPU workloads slower than the CPU |
+| Multi-GPU / distributed training | Planned | `rusty-cli` has a file-based gradient sync flag (`--world-size`) that is a prototype |
+| A CUDA backend | Not planned | wgpu is the point of the project |
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│      rusty-cli          │      rusty-monitor                    │
-│   Command Line Interface│   TUI Dashboard + Training Viz        │
-├─────────────────────────────────────────────────────────────────┤
-│      rusty-trainer      │      rusty-loader                     │
-│      Training Loops     │      Safetensors + Tokenizer          │
-├─────────────────────────────────────────────────────────────────┤
-│                       rusty-graph                               │
-│            Neural Networks: Attention, MLP, Llama               │
-├─────────────────────────────────────────────────────────────────┤
-│                      rusty-autograd                             │
-│             Automatic Differentiation + Optimizers              │
-├─────────────────────────────────────────────────────────────────┤
-│                      rusty-backend                              │
-│              GPU Compute Engine + WGSL Kernels                  │
-├─────────────────────────────────────────────────────────────────┤
-│                     Metal / Vulkan                              │
-│                   Apple M1/M2/M3, GPUs                          │
-└─────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    cli[rusty-cli] --> trainer[rusty-trainer]
+    cli --> monitor[rusty-monitor]
+    hub[rusty-hub] --> graph
+    trainer --> graph[rusty-graph]
+    trainer --> autograd[rusty-autograd]
+    trainer --> loader[rusty-loader]
+    graph --> autograd
+    graph --> loader
+    autograd --> backend[rusty-backend]
+    loader --> backend
+    graph --> backend
+    backend --> wgpu[wgpu: Metal / Vulkan / DX12]
+
+    rusty["rusty (Tensor, autograd, nn, optim)"] --> kernels["own WGSL kernels + CPU reference"]
+    kernels --> wgpu
 ```
 
-### Crate Overview
+The workspace has two layers. The **`rusty`** crate is the PyTorch-style tensor
+API (it carries its own small set of generic kernels and a CPU device). The
+**LLM stack** (`rusty-backend` through `rusty-cli`) has purpose-built kernels
+for Llama-style models and the LoRA fine-tuning CLI. Details, including how a
+tensor op reaches a WGSL kernel, are in [docs/architecture.md](docs/architecture.md).
 
-| Crate | Description |
-|-------|-------------|
-| **rusty-backend** | GPU compute engine with custom WGSL shaders |
-| **rusty-graph** | Neural network layers (Attention, MLP, LlamaBlock) |
-| **rusty-autograd** | Automatic differentiation and optimizers |
-| **rusty-loader** | Safetensors and tokenizer loading |
-| **rusty-trainer** | Training loops with mixed precision |
-| **rusty-monitor** | TUI dashboard with real-time training visualization |
-| **rusty-cli** | Command-line interface |
+| Crate | What it is |
+|-------|------------|
+| [`rusty`](rusty) | Tensor, autograd, `nn`, `optim`, `serialize`, `data` |
+| [`rusty-backend`](rusty-backend) | wgpu context, WGSL kernels (matmul, RoPE, RMSNorm, flash attention, AdamW, ...), buffer pool |
+| [`rusty-autograd`](rusty-autograd) | Gradient tape for the backend tensors |
+| [`rusty-graph`](rusty-graph) | Transformer building blocks and the Llama/LFM2-style model builder |
+| [`rusty-loader`](rusty-loader) | Safetensors (single and sharded) and tokenizer loading |
+| [`rusty-trainer`](rusty-trainer) | Training loops, LoRA, loss scaling, checkpoints |
+| [`rusty-cli`](rusty-cli) | `train`, `eval` and `infer` commands |
+| [`rusty-monitor`](rusty-monitor) | Terminal dashboard |
+| [`rusty-hub`](rusty-hub) | Hugging Face Hub download helpers |
+| [`benchmarks`](benchmarks) | GPU kernel benchmarks |
 
----
+## Fine-tuning a model
 
-## Performance
-
-Benchmarked on Apple M2 (Metal backend). MatMul numbers are from `benchmarks/RESULTS.md`; run locally to reproduce.
-
-| Operation | Size | Throughput |
-|-----------|------|------------|
-| MatMul | 4096×4096 | **121 GFLOPS** |
-| MatMul | 2048×2048 | 114 GFLOPS |
-| MatMul | 1024×1024 | 109 GFLOPS |
-
-<details>
-<summary>Run benchmarks</summary>
+`rusty-cli` fine-tunes small Llama-style models with LoRA (response-only loss
+and a chat template for SFT) and can run short pretraining on `.txt` or packed
+`.bin` token files:
 
 ```bash
-cargo run -p rusty-benchmarks --release
-```
-
-</details>
-
----
-
-## Examples
-
-### Basic GPU Operations
-
-```bash
-cargo run --example basic_tensor --release -p rusty
-```
-
-Matrix multiplication, element-wise operations, and activations on GPU.
-
-### Flash Attention
-
-```bash
-cargo run --example flash_attention --release -p rusty
-```
-
-Memory-efficient attention with O(N) memory instead of O(N²).
-
-### LoRA Fine-tuning
-
-```bash
-cargo run --example lora_finetune --release -p rusty
-```
-
-Parameter-efficient training with low-rank adapters.
-
-### Training Demo
-
-Simulated training demo (loss curve only — no GPU backward pass):
-
-```bash
-cargo run -p rusty-cli --release -- --demo
-```
-
----
-
-## Fine-tuning Models
-
-Rusty World Trainer is **lite-first**: LoRA SFT and short-sequence pretrain/continued LM on ~8GB MacBook-class hardware.
-
-### Step 1: Download a Model
-
-```bash
-./scripts/download_model.sh tinyllama
-```
-
-Or manually:
-```bash
-pip install huggingface-hub
-huggingface-cli download TinyLlama/TinyLlama-1.1B-Chat-v1.0 --local-dir ./models/tinyllama
-```
-
-### Step 2: Prepare Training Data
-
-SFT (`--task sft`) expects `.json` / `.jsonl` with `{prompt,response}` (optional `system`). Chat template encoding is applied by default; loss is computed **only on response tokens**.
-
-```json
-[
-  {"prompt": "Who are you?", "response": "I am an AI assistant."},
-  {"prompt": "What can you do?", "response": "I can answer questions and assist with tasks."}
-]
-```
-
-Pretrain (`--task pretrain`) accepts:
-
-- `.txt` — one sample per non-empty line
-- `.bin` — packed little-endian `u32` token stream (fixed windows)
-
-### Step 3: Train / eval / infer (recommended CLI)
-
-```bash
-# 8GB MacBook SFT (LoRA, safe defaults, response-only loss + chat template)
 cargo run -p rusty-cli --release -- train \
   --lite --task sft \
   --model ./models/tinyllama \
   --data ./data/train.jsonl \
   --out ./outputs/run1
-
-# Continued pretrain / next-token LM on packed tokens
-cargo run -p rusty-cli --release -- train \
-  --lite --task pretrain \
-  --model ./models/tinyllama \
-  --data ./data/train.bin \
-  --out ./outputs/lm1
-
-# Eval (same masking rules as train)
-cargo run -p rusty-cli --release -- eval \
-  --task sft \
-  --model ./models/tinyllama \
-  --data ./data/val.jsonl
-
-# Resume (validates task / seq-len / train-modules / model path)
-cargo run -p rusty-cli --release -- train \
-  --lite --task sft \
-  --model ./models/tinyllama \
-  --data ./data/train.jsonl \
-  --resume ./outputs/run1/lora_adapters.safetensors \
-  --out ./outputs/run1
-
-# Interactive-style generation
-cargo run -p rusty-cli --release -- infer \
-  --model ./models/tinyllama \
-  --prompt "Hello"
 ```
 
-`--lite` / `--auto` set consumer-safe defaults (LoRA, fp16, grad-accum=8, seq-len=128, epochs=3, max-vram ~8GB) unless you override them explicitly. Silent demo-data fallback is **disabled** unless `--allow-fallback` is set. Use `--no-chat-template` only if you intentionally want raw prompt/response tokenization for SFT.
+`--help` lists every flag. A step-by-step walkthrough with real output is in
+[docs/examples/lora-sft.md](docs/examples/lora-sft.md) *(placeholder: written by another branch)*.
+This path is experimental.
 
-Legacy positional / `--train` flags still work for older scripts.
+## Compared with candle, burn and tch
 
----
+These are good projects; Rusty is not trying to replace them. The honest
+picture, as of this writing:
 
-## Supported Models
+| | Rusty | [candle](https://github.com/huggingface/candle) | [burn](https://github.com/tracel-ai/burn) | [tch-rs](https://github.com/LaurentMazare/tch-rs) |
+|---|---|---|---|---|
+| What it is | Small pure-Rust framework on wgpu | Minimalist Rust ML framework from Hugging Face | Full Rust deep-learning framework with swappable backends | Rust bindings to libtorch (PyTorch's C++ library) |
+| GPU story | wgpu only: Metal, Vulkan, DX12 | CUDA and Metal, plus CPU | wgpu, CUDA, Metal, CPU and others through backends | Whatever libtorch supports, notably CUDA |
+| Needs a C++/CUDA toolchain | No | For CUDA builds | Depends on backend | Yes, libtorch |
+| Maturity | Young, pre-1.0, one maintainer | Widely used, many reference model implementations | Widely used, training-focused, large API | Mature, full PyTorch op coverage |
+| Model zoo / ecosystem | Tiny | Large | Growing | The whole PyTorch ecosystem via TorchScript/weights |
 
-| Model | Status |
-|-------|--------|
-| LLaMA / LLaMA-2 / LLaMA-3 | Experimental (single-shard, LFM2 builder) |
-| TinyLlama | Best tested and recommended lightweight path |
-| Mistral | Config detection only |
-| Phi / Phi-2 / Phi-3 | Download script available |
-| Qwen / Qwen-2 | Config detection only |
-| Gemma / Gemma-2 | Download script available |
+Choose candle for inference of popular models, burn for a mature all-Rust
+training framework, tch-rs when you need exact PyTorch semantics and CUDA.
+Choose Rusty to learn how the stack works end to end, when you want a
+dependency-light wgpu-only codebase you can read and modify, or to
+experiment on a consumer GPU without installing CUDA. Rusty does not match
+their op coverage, model support or hardening, and we have not benchmarked it
+against them; kernel-level numbers for Rusty alone are in
+[benchmarks/RESULTS.md](benchmarks/RESULTS.md).
 
-Sharded safetensors through `model.safetensors.index.json` are supported. Larger-model training paths remain experimental even when loading succeeds.
+## Roadmap
 
----
-
-## Requirements
-
-- **Rust** 1.75 or later
-- **GPU**: Apple Silicon (M1/M2/M3) or Vulkan-capable GPU recommended
-- **OS**: macOS, Linux, or Windows
-
-For the best current experience, use a small model such as TinyLlama or Phi-mini class checkpoints, LoRA training, and conservative sequence length / batch size settings.
-
----
-
-## Project Status
-
-| Component | Status |
-|-----------|--------|
-| GPU Backend (wgpu) | Working — matmul, element-wise, activations |
-| Custom WGSL Kernels | Working — core ops; attention/norm fixes in progress |
-| LFM2 / Llama-style graph | Experimental — inference plus lightweight fine-tuning |
-| LoRA adapters | Working — attach, train, save, resume |
-| Autograd + Optimizers | Partial — low-level `rusty-autograd`; trainer integration for LoRA/SFT |
-| Safetensors Loading | Working — single + sharded files |
-| Mixed Precision (FP16) | Working — `GradScaler` with checkpointing |
-| Flash Attention | Partial — forward V2; backward WIP |
-| CUDA Backend | Planned |
-| Distributed Training | Planned |
-
----
+- [x] Rebuilt tensor core with a CPU device, checked autograd, differentiable `nn` layers, LR schedules, safetensors state dicts
+- [x] CI: fmt, clippy, tests on Linux and macOS, docs, MSRV, cargo-deny
+- [ ] Reliable end-to-end LoRA SFT run, documented ([walkthrough](docs/examples/lora-sft.md))
+- [ ] Published kernel benchmarks ([benchmarks/RESULTS.md](benchmarks/RESULTS.md))
+- [ ] Faster GPU path for many small ops (command batching, bind-group caching)
+- [ ] Parallel-reduction softmax and layer norm kernels
+- [ ] `f16`/`bf16` tensors, convolutions, sort/top-k
+- [ ] Unify the `rusty` tensor API with the LLM stack
+- [ ] First crates.io release
 
 ## Contributing
 
-Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
-```bash
-git clone https://github.com/YOUR_USERNAME/rusty.git
-git checkout -b feature/your-feature
-cargo test --workspace
-git commit -m "feat: description"
-git push origin feature/your-feature
-```
-
----
+Contributions are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) covers setup,
+tests and the PR process; [docs/good-first-issues.md](docs/good-first-issues.md)
+lists concrete starting points; [docs/writing-a-kernel.md](docs/writing-a-kernel.md)
+walks through adding a GPU op.
 
 ## License
 
-MIT License — see [LICENSE](LICENSE).
-
----
+MIT, see [LICENSE](LICENSE).
 
 ## Acknowledgments
 
-- [wgpu](https://github.com/gfx-rs/wgpu) — Cross-platform GPU API
-- [safetensors](https://github.com/huggingface/safetensors) — Safe tensor serialization
-- [Flash Attention](https://arxiv.org/abs/2205.14135) — Memory-efficient attention
-
----
-
-<p align="center">
-  <strong>Built with Rust</strong>
-</p>
+[wgpu](https://github.com/gfx-rs/wgpu) for the cross-platform GPU layer,
+[safetensors](https://github.com/huggingface/safetensors) for the weight
+format, and [FlashAttention](https://arxiv.org/abs/2205.14135) for the
+attention algorithm.
