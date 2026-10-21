@@ -167,14 +167,14 @@ fn gpu_gradients_match_finite_differences() {
         let w = values(n_out, 99, false);
         let grads = analytic(&ctx, &engine, &case, &w);
         for (i, (data, shape)) in case.inputs.iter().enumerate() {
-            for j in 0..data.len() {
+            for (j, &got) in grads[i].iter().enumerate().take(data.len()) {
                 let eval = |delta: f32| {
                     let mut inputs = case.inputs.clone();
                     inputs[i].0[j] += delta;
                     loss(&ctx, &engine, &case, &inputs).0
                 };
                 let numeric = (eval(h) - eval(-h)) / (2.0 * h as f64);
-                let got = grads[i][j] as f64;
+                let got = got as f64;
                 if (got - numeric).abs() > 5e-3 + 2e-2 * numeric.abs() {
                     failures.push(format!(
                         "{} input {i} {shape:?}[{j}]: analytic {got:.5} vs numeric {numeric:.5}",

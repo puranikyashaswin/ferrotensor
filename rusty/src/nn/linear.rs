@@ -22,9 +22,9 @@ use crate::Device;
 /// assert_eq!(y.shape, vec![32, 256]);
 /// ```
 pub struct Linear {
-    /// Weight matrix [in_features, out_features]
+    /// Weight matrix `[in_features, out_features]`
     pub weight: Tensor,
-    /// Bias vector [out_features] (optional)
+    /// Bias vector `[out_features]` (optional)
     pub bias: Option<Tensor>,
 }
 

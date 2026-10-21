@@ -1,18 +1,44 @@
+//! Reverse-mode automatic differentiation over [`rusty_backend`] GPU tensors.
+//!
+//! A [`Tensor`] wraps a [`UnifiedTensor`] with a gradient slot and the
+//! [`AutogradNode`] that produced it. Ops such as [`Tensor::matmul`] run a
+//! GPU kernel and record a node; [`Tensor::backward`] walks the graph in
+//! reverse topological order and accumulates gradients into every input.
+//! The crate also provides [`AdamW`], learning-rate schedulers and
+//! gradient [`checkpoint`]ing. This is the engine behind `rusty-graph` and
+//! `rusty-trainer`.
+
+#![warn(missing_docs)]
+// `Tensor` shares `Arc<RefCell<..>>` gradient slots across clones; the graph
+// is single-threaded, and the field types are public API used by
+// rusty-graph and rusty-trainer.
+#![allow(clippy::arc_with_non_send_sync)]
+
 use rusty_backend::{AdamParams, ComputeEngine, UnifiedTensor, WgpuContext};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// A recorded op: maps the output gradient to one gradient per input.
 pub trait AutogradNode {
+    /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
     fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor>;
+    /// The tensors this op consumed.
     fn inputs(&self) -> Vec<Tensor>;
 }
 
+/// A GPU tensor that records the ops applied to it for backpropagation.
+///
+/// Clones share data, gradient and creator.
 #[derive(Clone)]
 pub struct Tensor {
+    /// The values (shared between clones).
     pub data: Arc<UnifiedTensor>,
+    /// Accumulated gradient, if backward has reached this tensor.
     pub grad: Arc<RefCell<Option<UnifiedTensor>>>,
+    /// GPU context the data lives in.
     pub ctx: Arc<WgpuContext>,
+    /// The op that produced this tensor (`None` for leaves).
     pub creator: Option<Arc<dyn AutogradNode>>,
 }
 
@@ -25,6 +51,7 @@ impl std::fmt::Debug for Tensor {
 }
 
 impl Tensor {
+    /// A leaf tensor holding `data`.
     pub fn new(ctx: Arc<WgpuContext>, data: UnifiedTensor) -> Self {
         Self {
             data: Arc::new(data),
@@ -34,6 +61,7 @@ impl Tensor {
         }
     }
 
+    /// A tensor produced by the op `creator`.
     pub fn with_creator(
         ctx: Arc<WgpuContext>,
         data: UnifiedTensor,
@@ -47,6 +75,8 @@ impl Tensor {
         }
     }
 
+    /// Backpropagate from this tensor (seeded with ones unless a gradient is
+    /// already set) and accumulate gradients into every tensor in its graph.
     pub fn backward(&self, engine: &ComputeEngine) {
         let mut sorted_tensors = Vec::new();
         let mut visited = std::collections::HashSet::new();
@@ -87,7 +117,7 @@ impl Tensor {
                 if let Some(creator) = &tensor.creator {
                     let input_grads = creator.backward(&grad, engine);
                     let inputs = creator.inputs();
-                    for (input, input_grad) in inputs.iter().zip(input_grads.into_iter()) {
+                    for (input, input_grad) in inputs.iter().zip(input_grads) {
                         input.accumulate_grad(engine, &input_grad);
                     }
                 }
@@ -95,6 +125,7 @@ impl Tensor {
         }
     }
 
+    /// Add `new_grad` to this tensor's gradient.
     pub fn accumulate_grad(&self, engine: &ComputeEngine, new_grad: &UnifiedTensor) {
         let mut grad_ref = self.grad.borrow_mut();
         if let Some(existing) = grad_ref.as_ref() {
@@ -108,11 +139,13 @@ impl Tensor {
         }
     }
 
+    /// Clear this tensor's gradient.
     pub fn zero_grad(&self) {
         *self.grad.borrow_mut() = None;
     }
 
     // Recursive zero_grad for the whole graph
+    /// Clear the gradients of every tensor in this tensor's graph.
     pub fn zero_grad_graph(&self) {
         let mut sorted_tensors = Vec::new();
         let mut visited = std::collections::HashSet::new();
@@ -141,14 +174,18 @@ impl Tensor {
     }
 }
 
+/// Backward node of [`Tensor::matmul`].
 pub struct MatMulNode {
+    /// Left operand `[M, K]`.
     pub a: Tensor,
+    /// Right operand `[K, N]`.
     pub b: Tensor,
 }
 impl AutogradNode for MatMulNode {
     fn inputs(&self) -> Vec<Tensor> {
         vec![self.a.clone(), self.b.clone()]
     }
+    /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
     fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
         let grad_a = UnifiedTensor::empty(&self.a.ctx, &self.a.data.shape);
         engine.matmul_bt(&self.a.ctx, grad, &self.b.data, &grad_a);
@@ -158,14 +195,18 @@ impl AutogradNode for MatMulNode {
     }
 }
 
+/// Backward node of [`Tensor::add`].
 pub struct AddNode {
+    /// Left operand.
     pub a: Tensor,
+    /// Right operand.
     pub b: Tensor,
 }
 impl AutogradNode for AddNode {
     fn inputs(&self) -> Vec<Tensor> {
         vec![self.a.clone(), self.b.clone()]
     }
+    /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
     fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
         let grad_a = UnifiedTensor::empty(&self.a.ctx, &self.a.data.shape);
         let grad_b = UnifiedTensor::empty(&self.b.ctx, &self.b.data.shape);
@@ -174,14 +215,18 @@ impl AutogradNode for AddNode {
     }
 }
 
+/// Backward node of [`Tensor::mul`].
 pub struct MulNode {
+    /// Left operand.
     pub a: Tensor,
+    /// Right operand.
     pub b: Tensor,
 }
 impl AutogradNode for MulNode {
     fn inputs(&self) -> Vec<Tensor> {
         vec![self.a.clone(), self.b.clone()]
     }
+    /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
     fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
         let grad_a = UnifiedTensor::empty(&self.a.ctx, &self.a.data.shape);
         let grad_b = UnifiedTensor::empty(&self.b.ctx, &self.b.data.shape);
@@ -197,14 +242,18 @@ impl AutogradNode for MulNode {
     }
 }
 
+/// Backward node of [`Tensor::sub`].
 pub struct SubNode {
+    /// Left operand.
     pub a: Tensor,
+    /// Right operand.
     pub b: Tensor,
 }
 impl AutogradNode for SubNode {
     fn inputs(&self) -> Vec<Tensor> {
         vec![self.a.clone(), self.b.clone()]
     }
+    /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
     fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
         let grad_a = UnifiedTensor::empty(&self.a.ctx, &self.a.data.shape);
         let grad_b = UnifiedTensor::empty(&self.b.ctx, &self.b.data.shape);
@@ -213,13 +262,16 @@ impl AutogradNode for SubNode {
     }
 }
 
+/// Backward node of [`Tensor::silu`].
 pub struct SiLUNode {
+    /// Input of the activation.
     pub input: Tensor,
 }
 impl AutogradNode for SiLUNode {
     fn inputs(&self) -> Vec<Tensor> {
         vec![self.input.clone()]
     }
+    /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
     fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
         let grad_in = UnifiedTensor::empty(&self.input.ctx, &self.input.data.shape);
         engine.silu_backward(&self.input.ctx, grad, &self.input.data, &grad_in);
@@ -227,13 +279,16 @@ impl AutogradNode for SiLUNode {
     }
 }
 
+/// Backward node of [`Tensor::relu`].
 pub struct ReluNode {
+    /// Input of the activation.
     pub input: Tensor,
 }
 impl AutogradNode for ReluNode {
     fn inputs(&self) -> Vec<Tensor> {
         vec![self.input.clone()]
     }
+    /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
     fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
         let grad_in = UnifiedTensor::empty(&self.input.ctx, &self.input.data.shape);
         engine.relu_backward(&self.input.ctx, grad, &self.input.data, &grad_in);
@@ -241,14 +296,18 @@ impl AutogradNode for ReluNode {
     }
 }
 
+/// Backward node of [`Tensor::softmax`] (row-wise over the last dim).
 pub struct SoftmaxNode {
+    /// Input logits.
     pub input: Tensor,
+    /// Softmax output (reused by the backward pass).
     pub output: Tensor,
 }
 impl AutogradNode for SoftmaxNode {
     fn inputs(&self) -> Vec<Tensor> {
         vec![self.input.clone()]
     }
+    /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
     fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
         let grad_in = UnifiedTensor::empty(&self.input.ctx, &self.input.data.shape);
         engine.softmax_backward(&self.input.ctx, grad, &self.output.data, &grad_in);
@@ -256,14 +315,18 @@ impl AutogradNode for SoftmaxNode {
     }
 }
 
+/// Backward node of [`Tensor::reshape`].
 pub struct ReshapeNode {
+    /// Tensor before the reshape.
     pub input: Tensor,
+    /// Shape to restore for the gradient.
     pub original_shape: Vec<usize>,
 }
 impl AutogradNode for ReshapeNode {
     fn inputs(&self) -> Vec<Tensor> {
         vec![self.input.clone()]
     }
+    /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
     fn backward(&self, grad: &UnifiedTensor, _engine: &ComputeEngine) -> Vec<UnifiedTensor> {
         vec![grad.reshaped(&self.original_shape)]
     }
@@ -312,15 +375,20 @@ pub fn apply_rope_in_place(
     }
 }
 
+/// Backward node of [`Tensor::rope`].
 pub struct RoPENode {
+    /// Input before rotation.
     pub input: Tensor,
+    /// Size of each attention head.
     pub head_dim: usize,
+    /// Position of the first token.
     pub pos: usize,
 }
 impl AutogradNode for RoPENode {
     fn inputs(&self) -> Vec<Tensor> {
         vec![self.input.clone()]
     }
+    /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
     fn backward(&self, grad: &UnifiedTensor, _engine: &ComputeEngine) -> Vec<UnifiedTensor> {
         let mut grad_cpu = pollster::block_on(grad.to_vec(&self.input.ctx));
         apply_rope_in_place(
@@ -371,14 +439,18 @@ pub fn rms_norm_backward_cpu(
 
 /// Backward node of [`Tensor::rms_norm`].
 pub struct RMSNormNode {
+    /// Normalized input.
     pub input: Tensor,
+    /// Per-feature scale.
     pub weight: Tensor,
+    /// Epsilon inside the square root.
     pub eps: f32,
 }
 impl AutogradNode for RMSNormNode {
     fn inputs(&self) -> Vec<Tensor> {
         vec![self.input.clone(), self.weight.clone()]
     }
+    /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
     fn backward(&self, grad: &UnifiedTensor, _engine: &ComputeEngine) -> Vec<UnifiedTensor> {
         let input_shape = self.input.data.shape.clone();
         let hidden = *input_shape.last().expect("RMSNorm input must be non-empty");
@@ -396,15 +468,20 @@ impl AutogradNode for RMSNormNode {
     }
 }
 
+/// Backward node of [`Tensor::select_token`].
 pub struct SelectTokenNode {
+    /// Logits `[seq, vocab]`.
     pub input: Tensor,
+    /// Selected row.
     pub token_index: usize,
+    /// Row length.
     pub vocab_size: usize,
 }
 impl AutogradNode for SelectTokenNode {
     fn inputs(&self) -> Vec<Tensor> {
         vec![self.input.clone()]
     }
+    /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
     fn backward(&self, grad: &UnifiedTensor, _engine: &ComputeEngine) -> Vec<UnifiedTensor> {
         let mut full_grad = vec![0.0f32; self.input.data.shape.iter().product()];
         let token_grad = pollster::block_on(grad.to_vec(&self.input.ctx));
@@ -419,14 +496,18 @@ impl AutogradNode for SelectTokenNode {
     }
 }
 
+/// Backward node of [`Tensor::mse_loss`].
 pub struct MSELossNode {
+    /// Predictions.
     pub pred: Tensor,
+    /// Targets.
     pub target: Tensor,
 }
 impl AutogradNode for MSELossNode {
     fn inputs(&self) -> Vec<Tensor> {
         vec![self.pred.clone(), self.target.clone()]
     }
+    /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
     fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
         let grad_in = UnifiedTensor::empty(&self.pred.ctx, &self.pred.data.shape);
         engine.mse_loss_backward(&self.pred.ctx, &self.pred.data, &self.target.data, &grad_in);
@@ -446,16 +527,19 @@ impl AutogradNode for MSELossNode {
 }
 
 /// Cross-entropy loss node for LLM training
-/// Forward: -log(softmax(logits)[target])
-/// Backward: softmax(logits) - one_hot(target)
+/// Forward: `-log(softmax(logits)[target])`
+/// Backward: `softmax(logits) - one_hot(target)`
 pub struct CrossEntropyLossNode {
+    /// Logits `[vocab]`.
     pub logits: Tensor,
+    /// Target class.
     pub target_idx: u32,
 }
 impl AutogradNode for CrossEntropyLossNode {
     fn inputs(&self) -> Vec<Tensor> {
         vec![self.logits.clone()]
     }
+    /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
     fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
         let grad_logits = UnifiedTensor::empty(&self.logits.ctx, &self.logits.data.shape);
         engine.cross_entropy_backward(
@@ -479,13 +563,16 @@ impl AutogradNode for CrossEntropyLossNode {
 /// Forward: out = SiLU(up) * gate
 /// Reduces memory bandwidth by 2x compared to separate ops
 pub struct SiLUGateNode {
+    /// Input passed through SiLU.
     pub up: Tensor,
+    /// Multiplicative gate.
     pub gate: Tensor,
 }
 impl AutogradNode for SiLUGateNode {
     fn inputs(&self) -> Vec<Tensor> {
         vec![self.up.clone(), self.gate.clone()]
     }
+    /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
     fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
         let grad_up = UnifiedTensor::empty(&self.up.ctx, &self.up.data.shape);
         let grad_gate = UnifiedTensor::empty(&self.gate.ctx, &self.gate.data.shape);
@@ -536,6 +623,7 @@ impl AutogradNode for CheckpointedNode {
         self.inputs.clone()
     }
 
+    /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
     fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
         // Replay the forward pass from fresh leaves that share the input
         // data, backpropagate through the recomputed graph, and read the
@@ -608,6 +696,7 @@ where
 }
 
 impl Tensor {
+    /// Reshape (same element count); the gradient is reshaped back.
     pub fn reshape(input: &Tensor, new_shape: &[usize]) -> Tensor {
         let out_data = input.data.reshaped(new_shape);
         let node = Arc::new(ReshapeNode {
@@ -617,6 +706,7 @@ impl Tensor {
         Tensor::with_creator(input.ctx.clone(), out_data, node)
     }
 
+    /// Flatten `[batch, seq, hidden]` to `[batch * seq, hidden]` (2-D inputs pass through).
     pub fn reshape_2d(input: &Tensor) -> Tensor {
         match input.data.shape.as_slice() {
             [_, _] => input.clone(),
@@ -625,6 +715,7 @@ impl Tensor {
         }
     }
 
+    /// Reshape `[batch * seq, hidden]` back to `[batch, seq, hidden]`.
     pub fn unflatten_last(input: &Tensor, batch: usize, seq: usize) -> Tensor {
         let hidden = *input
             .data
@@ -634,6 +725,7 @@ impl Tensor {
         Tensor::reshape(input, &[batch, seq, hidden])
     }
 
+    /// Matrix product of `[M, K]` and `[K, N]`.
     pub fn matmul(a: &Tensor, b: &Tensor, engine: &ComputeEngine) -> Tensor {
         let out_shape = vec![a.data.shape[0], b.data.shape[1]];
         let out_data = UnifiedTensor::empty(&a.ctx, &out_shape);
@@ -644,6 +736,7 @@ impl Tensor {
         });
         Tensor::with_creator(a.ctx.clone(), out_data, node)
     }
+    /// Element-wise sum of equally shaped tensors.
     pub fn add(a: &Tensor, b: &Tensor, engine: &ComputeEngine) -> Tensor {
         let out_data = UnifiedTensor::empty(&a.ctx, &a.data.shape);
         engine.add(&a.ctx, &a.data, &b.data, &out_data);
@@ -653,6 +746,7 @@ impl Tensor {
         });
         Tensor::with_creator(a.ctx.clone(), out_data, node)
     }
+    /// Element-wise product of equally shaped tensors.
     pub fn mul(a: &Tensor, b: &Tensor, engine: &ComputeEngine) -> Tensor {
         let out_data = UnifiedTensor::empty(&a.ctx, &a.data.shape);
         engine.mul(&a.ctx, &a.data, &b.data, &out_data);
@@ -662,6 +756,7 @@ impl Tensor {
         });
         Tensor::with_creator(a.ctx.clone(), out_data, node)
     }
+    /// Element-wise difference of equally shaped tensors.
     pub fn sub(a: &Tensor, b: &Tensor, engine: &ComputeEngine) -> Tensor {
         let out_data = UnifiedTensor::empty(&a.ctx, &a.data.shape);
         engine.sub(&a.ctx, &a.data, &b.data, &out_data);
@@ -671,6 +766,7 @@ impl Tensor {
         });
         Tensor::with_creator(a.ctx.clone(), out_data, node)
     }
+    /// SiLU activation `x * sigmoid(x)`.
     pub fn silu(input: &Tensor, engine: &ComputeEngine) -> Tensor {
         let out_data = UnifiedTensor::empty(&input.ctx, &input.data.shape);
         engine.silu(&input.ctx, &input.data, &out_data);
@@ -697,6 +793,7 @@ impl Tensor {
         Tensor::with_creator(pred.ctx.clone(), out_data, node)
     }
 
+    /// ReLU activation `max(0, x)`.
     pub fn relu(input: &Tensor, engine: &ComputeEngine) -> Tensor {
         let out_data = UnifiedTensor::empty(&input.ctx, &input.data.shape);
         engine.relu(&input.ctx, &input.data, &out_data);
@@ -706,6 +803,7 @@ impl Tensor {
         Tensor::with_creator(input.ctx.clone(), out_data, node)
     }
 
+    /// Softmax over the last dimension.
     pub fn softmax(input: &Tensor, engine: &ComputeEngine) -> Tensor {
         let out_data = UnifiedTensor::empty(&input.ctx, &input.data.shape);
         engine.softmax(&input.ctx, &input.data, &out_data);
@@ -717,6 +815,8 @@ impl Tensor {
         Tensor::with_creator(input.ctx.clone(), out_tensor.data.as_ref().clone(), node)
     }
 
+    /// Rotary position embedding for tokens at positions `pos..pos + seq`
+    /// (`[batch, seq, hidden]` or `[seq, hidden]`).
     pub fn rope(input: &Tensor, head_dim: usize, pos: usize, engine: &ComputeEngine) -> Tensor {
         let out_data = UnifiedTensor::empty(&input.ctx, &input.data.shape);
         engine.copy_tensor(&input.ctx, &input.data, &out_data, 0);
@@ -729,6 +829,7 @@ impl Tensor {
         Tensor::with_creator(input.ctx.clone(), out_data, node)
     }
 
+    /// RMS normalization over the last dimension, scaled by `weight`.
     pub fn rms_norm(input: &Tensor, weight: &Tensor, eps: f32, engine: &ComputeEngine) -> Tensor {
         let out_data = UnifiedTensor::empty(&input.ctx, &input.data.shape);
         engine.rms_norm(&input.ctx, &input.data, &weight.data, &out_data);
@@ -740,6 +841,7 @@ impl Tensor {
         Tensor::with_creator(input.ctx.clone(), out_data, node)
     }
 
+    /// Row `token_index` of `[seq, vocab]` logits.
     pub fn select_token(input: &Tensor, token_index: usize) -> Tensor {
         let vocab_size = *input
             .data
@@ -759,7 +861,7 @@ impl Tensor {
     }
 
     /// Cross-entropy loss for language model training
-    /// Computes -log(softmax(logits)[target])
+    /// Computes `-log(softmax(logits)[target])`
     pub fn cross_entropy_loss(logits: &Tensor, target: u32, engine: &ComputeEngine) -> Tensor {
         let out_data = UnifiedTensor::empty(&logits.ctx, &[1]);
         engine.cross_entropy_loss(&logits.ctx, &logits.data, target, &out_data);
@@ -782,7 +884,8 @@ impl Tensor {
         Tensor::with_creator(up.ctx.clone(), out_data, node)
     }
 
-    /// Flash Attention V2 (Fused)
+    /// Flash Attention V2 (fused) over `[batch, seq, heads, head_dim]`.
+    #[allow(clippy::too_many_arguments)]
     pub fn flash_attention(
         q: &Tensor,
         k: &Tensor,
@@ -823,13 +926,21 @@ impl Tensor {
     }
 }
 
+/// Backward node of [`Tensor::flash_attention`].
 pub struct FlashAttentionNode {
+    /// Queries.
     pub q: Tensor,
+    /// Keys.
     pub k: Tensor,
+    /// Values.
     pub v: Tensor,
+    /// Optional additive mask.
     pub mask: Option<Tensor>,
+    /// Whether future positions are masked.
     pub causal: bool,
+    /// Attention dropout probability.
     pub dropout_prob: f32,
+    /// Dropout RNG seed.
     pub seed: u64,
 }
 
@@ -842,6 +953,7 @@ impl AutogradNode for FlashAttentionNode {
         inputs
     }
 
+    /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
     fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
         let grad_q = UnifiedTensor::empty(&self.q.ctx, &self.q.data.shape);
         let grad_k = UnifiedTensor::empty(&self.k.ctx, &self.k.data.shape);
@@ -885,9 +997,13 @@ impl AutogradNode for FlashAttentionNode {
     }
 }
 
+/// An optimizer that updates parameters from their accumulated gradients.
 pub trait Optimizer: Send + Sync {
+    /// Update `params` from their gradients.
     fn step(&mut self, params: &[Tensor]);
+    /// Clear the gradients of `params`.
     fn zero_grad(&mut self, params: &[Tensor]);
+    /// Serialize optimizer state keyed by parameter name (`None` if unsupported).
     fn save_state(
         &self,
         _ctx: &Arc<WgpuContext>,
@@ -895,6 +1011,8 @@ pub trait Optimizer: Send + Sync {
     ) -> Option<OptimizerCheckpoint> {
         None
     }
+    /// Restore state saved by [`save_state`](Optimizer::save_state);
+    /// returns whether it was applied.
     fn load_state(
         &mut self,
         _ctx: &Arc<WgpuContext>,
@@ -905,42 +1023,65 @@ pub trait Optimizer: Send + Sync {
     }
 }
 
+/// One optimizer state tensor, serialized.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct OptimizerTensorState {
+    /// Tensor shape.
     pub shape: Vec<usize>,
+    /// Row-major values.
     pub data: Vec<f32>,
 }
 
+/// Serialized [`AdamW`] state for resuming training.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AdamWCheckpoint {
+    /// Learning rate.
     pub lr: f32,
+    /// First-moment decay.
     pub beta1: f32,
+    /// Second-moment decay.
     pub beta2: f32,
+    /// Denominator epsilon.
     pub eps: f32,
+    /// Decoupled weight decay.
     pub weight_decay: f32,
+    /// Steps taken.
     pub t: f32,
+    /// First moments by parameter name.
     pub m_states: HashMap<String, OptimizerTensorState>,
+    /// Second moments by parameter name.
     pub v_states: HashMap<String, OptimizerTensorState>,
 }
 
+/// Serialized optimizer state.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum OptimizerCheckpoint {
+    /// State of an [`AdamW`] optimizer.
     AdamW(AdamWCheckpoint),
 }
 
+/// AdamW optimizer running its update as one GPU kernel per parameter.
 pub struct AdamW {
+    /// Engine that runs the update kernel.
     pub engine: Arc<ComputeEngine>,
+    /// Learning rate.
     pub lr: f32,
+    /// First-moment decay.
     pub beta1: f32,
+    /// Second-moment decay.
     pub beta2: f32,
+    /// Denominator epsilon.
     pub eps: f32,
+    /// Decoupled weight decay.
     pub weight_decay: f32,
+    /// Steps taken.
     pub t: f32,
     m_states: HashMap<usize, UnifiedTensor>,
     v_states: HashMap<usize, UnifiedTensor>,
 }
 
 impl AdamW {
+    /// AdamW with betas (0.9, 0.999), eps 1e-8 and weight decay 0.01.
     pub fn new(engine: Arc<ComputeEngine>, lr: f32) -> Self {
         Self {
             engine,
@@ -955,6 +1096,7 @@ impl AdamW {
         }
     }
 
+    /// Take one optimization step.
     pub fn step(&mut self, params: &[Tensor]) {
         self.apply_step(params);
     }
@@ -991,6 +1133,7 @@ impl AdamW {
         }
     }
 
+    /// Clear the gradients of `params`.
     pub fn zero_grad(&mut self, params: &[Tensor]) {
         self.clear_grads(params);
     }
@@ -1009,6 +1152,7 @@ impl Optimizer for AdamW {
     fn zero_grad(&mut self, params: &[Tensor]) {
         self.clear_grads(params);
     }
+    /// Serialize optimizer state keyed by parameter name (`None` if unsupported).
     fn save_state(
         &self,
         ctx: &Arc<WgpuContext>,
@@ -1055,6 +1199,8 @@ impl Optimizer for AdamW {
             v_states,
         }))
     }
+    /// Restore state saved by [`save_state`](Optimizer::save_state);
+    /// returns whether it was applied.
     fn load_state(
         &mut self,
         ctx: &Arc<WgpuContext>,
@@ -1108,13 +1254,18 @@ pub trait LRScheduler {
 /// Cosine Annealing Learning Rate Scheduler
 /// LR decays from initial_lr to min_lr following a cosine curve
 pub struct CosineAnnealingLR {
+    /// Starting rate.
     pub initial_lr: f32,
+    /// Final rate.
     pub min_lr: f32,
+    /// Length of the decay.
     pub total_steps: usize,
+    /// Steps taken.
     pub current: usize,
 }
 
 impl CosineAnnealingLR {
+    /// Decay from `initial_lr` to `min_lr` over `total_steps`.
     pub fn new(initial_lr: f32, min_lr: f32, total_steps: usize) -> Self {
         Self {
             initial_lr,
@@ -1147,14 +1298,20 @@ impl LRScheduler for CosineAnnealingLR {
 /// Linear Warmup + Cosine Annealing Scheduler
 /// Warmups linearly from 0 to peak_lr, then decays using cosine schedule
 pub struct WarmupCosineScheduler {
+    /// Rate at the end of warmup.
     pub peak_lr: f32,
+    /// Final rate.
     pub min_lr: f32,
+    /// Warmup length (linear from 0).
     pub warmup_steps: usize,
+    /// Total length including warmup.
     pub total_steps: usize,
+    /// Steps taken.
     pub current: usize,
 }
 
 impl WarmupCosineScheduler {
+    /// Warm up to `peak_lr` over `warmup_steps`, then decay to `min_lr` at `total_steps`.
     pub fn new(peak_lr: f32, min_lr: f32, warmup_steps: usize, total_steps: usize) -> Self {
         Self {
             peak_lr,
