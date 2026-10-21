@@ -106,7 +106,6 @@ pub struct ComputeEngine {
     grad_accum: Kernel,
     grad_scale: Kernel,
     flash_attn_v2: Kernel,
-    flash_attn_v2_bw_preprocess: Kernel,
     flash_attn_v2_bw_dq: Kernel,
     flash_attn_v2_bw_dkdv: Kernel,
 }
@@ -156,7 +155,6 @@ impl ComputeEngine {
             grad_accum: k("gradient_accumulate"),
             grad_scale: k("gradient_scale"),
             flash_attn_v2: k("flash_attention_v2_metal"),
-            flash_attn_v2_bw_preprocess: k("flash_bwd_preprocess"),
             flash_attn_v2_bw_dq: k("flash_bwd_dq"),
             flash_attn_v2_bw_dkdv: k("flash_bwd_dk_dv"),
         }

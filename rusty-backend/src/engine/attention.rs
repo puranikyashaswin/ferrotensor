@@ -208,32 +208,19 @@ impl ComputeEngine {
         let (b, h, hkv) = (dims.batch, dims.heads, dims.kv_heads);
         self.run(
             ctx,
-            &self.flash_attn_v2_bw_preprocess,
-            &[
-                (0, q.buffer()),
-                (1, k.buffer()),
-                (3, out.buffer()),
-                (4, grad_out.buffer()),
-                (8, &params),
-                (9, mask_buf),
-                (10, &stats),
-            ],
-            (dims.seq_q.div_ceil(64), h, b),
-        );
-        self.run(
-            ctx,
             &self.flash_attn_v2_bw_dq,
             &[
                 (0, q.buffer()),
                 (1, k.buffer()),
                 (2, v.buffer()),
+                (3, out.buffer()),
                 (4, grad_out.buffer()),
                 (5, grad_q.buffer()),
                 (8, &params),
                 (9, mask_buf),
                 (10, &stats),
             ],
-            (dims.seq_q.div_ceil(64), h, b),
+            (1, dims.seq_q.div_ceil(128), b * h),
         );
         self.run(
             ctx,
@@ -249,7 +236,7 @@ impl ComputeEngine {
                 (9, mask_buf),
                 (10, &stats),
             ],
-            (dims.seq_k.div_ceil(64), hkv, b),
+            (1, dims.seq_k.div_ceil(128), b * hkv),
         );
     }
 }
