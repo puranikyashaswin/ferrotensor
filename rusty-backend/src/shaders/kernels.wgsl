@@ -43,22 +43,22 @@ fn row_max(lid: u32, v: f32) -> f32 {
 
 // --- 2. Rotary Positional Embeddings (RoPE) ---
 @group(0) @binding(0) var<storage, read_write> rope_data: array<f32>;
-@group(0) @binding(1) var<uniform> rope_params: vec4<u32>;
+@group(0) @binding(1) var<uniform> rope_params: array<vec4<u32>, 2>; // [head_dim, seq, pos, heads], [theta bits, 0, 0, 0]
 
 @compute @workgroup_size(64)
 fn rope(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
     let global_id = vec3<u32>(gid.x + gid.y * nwg.x * 64u, 0u, 0u);
     let idx = global_id.x;
-    let head_dim = rope_params.x;
+    let head_dim = rope_params[0].x;
     let half_dim = head_dim / 2u;
     let token_idx = idx / half_dim;
     let dim_idx = idx % half_dim;
-    let seq_len = rope_params.y;
-    let base_pos = rope_params.z;
-    let heads = max(rope_params.w, 1u); // head vectors per token
+    let seq_len = rope_params[0].y;
+    let base_pos = rope_params[0].z;
+    let heads = max(rope_params[0].w, 1u); // head vectors per token
     let pos = f32(base_pos + (token_idx / heads) % seq_len);
     let freq_exp = -2.0 * f32(dim_idx) / f32(head_dim);
-    let angle = pos * pow(10000.0, freq_exp);
+    let angle = pos * pow(bitcast<f32>(rope_params[1].x), freq_exp);
     let cos_a = cos(angle);
     let sin_a = sin(angle);
     let idx1 = token_idx * head_dim + dim_idx;

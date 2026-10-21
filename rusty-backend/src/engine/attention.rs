@@ -10,6 +10,19 @@ impl ComputeEngine {
     /// `tensor` is `[batch, seq, ...]`, `[seq, hidden]` or a single token
     /// `[hidden]`; every head vector of token `s` gets position `pos + s`.
     pub fn rope(&self, ctx: &WgpuContext, tensor: &UnifiedTensor, head_dim: usize, pos: usize) {
+        self.rope_theta(ctx, tensor, head_dim, pos, 10000.0);
+    }
+
+    /// [`rope`](Self::rope) with base frequency `theta` (the `rope_theta` of
+    /// a Hugging Face config, e.g. 100000 for SmolLM2).
+    pub fn rope_theta(
+        &self,
+        ctx: &WgpuContext,
+        tensor: &UnifiedTensor,
+        head_dim: usize,
+        pos: usize,
+        theta: f32,
+    ) {
         let (seq_len, tokens) = match tensor.shape.len() {
             0 | 1 => (1, 1),
             2 => (tensor.shape[0], tensor.shape[0]),
@@ -19,7 +32,16 @@ impl ComputeEngine {
         let heads = total / (tokens * head_dim).max(1);
         let params = uniform(
             ctx,
-            bytemuck::cast_slice(&[head_dim as u32, seq_len as u32, pos as u32, heads as u32]),
+            bytemuck::cast_slice(&[
+                head_dim as u32,
+                seq_len as u32,
+                pos as u32,
+                heads as u32,
+                theta.to_bits(),
+                0,
+                0,
+                0,
+            ]),
         );
         let pairs = tensor.shape.iter().product::<usize>() / 2;
         self.run(
