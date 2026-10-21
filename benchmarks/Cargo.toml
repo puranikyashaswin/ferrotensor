@@ -2,14 +2,25 @@
 name = "rusty-benchmarks"
 version = "0.1.0"
 edition = "2021"
+description = "Benchmarks for the Rusty GPU ML framework"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+homepage = "https://github.com/puranikyashaswin/rusty"
+documentation = "https://docs.rs/rusty-benchmarks"
+readme = "../README.md"
+keywords = ["benchmark", "machine-learning", "gpu", "wgpu", "performance"]
+categories = ["science"]
 
 [[bin]]
 name = "bench"
 path = "src/main.rs"
 
 [dependencies]
-rusty-backend = { path = "../rusty-backend" }
-rusty-autograd = { path = "../rusty-autograd" }
-rusty-graph = { path = "../rusty-graph" }
+rusty-backend = { path = "../rusty-backend", version = "0.1.0" }
+rusty-autograd = { path = "../rusty-autograd", version = "0.1.0" }
+rusty-graph = { path = "../rusty-graph", version = "0.1.0" }
 pollster = "0.3"
 wgpu = "0.19"

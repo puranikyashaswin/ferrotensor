@@ -2,14 +2,24 @@
 name = "rusty-cli"
 version = "0.1.0"
 edition = "2021"
+description = "Command-line interface for training and running models with Rusty"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+homepage = "https://github.com/puranikyashaswin/rusty"
+documentation = "https://docs.rs/rusty-cli"
+readme = "../README.md"
+keywords = ["machine-learning", "cli", "lora", "llm", "gpu"]
+categories = ["science"]
 
 [dependencies]
-rusty-backend = { path = "../rusty-backend" }
-rusty-graph = { path = "../rusty-graph" }
-rusty-loader = { path = "../rusty-loader" }
-rusty-autograd = { path = "../rusty-autograd" }
-rusty-trainer = { path = "../rusty-trainer" }
-rusty-monitor = { path = "../rusty-monitor" }
+rusty-backend = { path = "../rusty-backend", version = "0.1.0" }
+rusty-graph = { path = "../rusty-graph", version = "0.1.0" }
+rusty-loader = { path = "../rusty-loader", version = "0.1.0" }
+rusty-autograd = { path = "../rusty-autograd", version = "0.1.0" }
+rusty-trainer = { path = "../rusty-trainer", version = "0.1.0" }
+rusty-monitor = { path = "../rusty-monitor", version = "0.1.0" }
 pollster = "0.3"
 env_logger = "0.11"
 log = "0.4"

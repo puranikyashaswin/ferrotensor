@@ -18,8 +18,9 @@ edition = "2021"
 version = "0.1.0"
 license = "MIT"
 repository = "https://github.com/puranikyashaswin/rusty"
-authors = ["Yashaswin Puranik <puranikyashaswin@gmail.com>"]
+authors = ["Yashaswin Puranik <puranikyashaswinsharma@gmail.com>"]
 rust-version = "1.75"
+homepage = "https://github.com/puranikyashaswin/rusty"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

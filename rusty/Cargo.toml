@@ -2,21 +2,24 @@
 name = "rusty"
 version = "0.1.0"
 edition = "2021"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
 description = "GPU-accelerated machine learning library for training and inference in Rust"
-license = "MIT"
-repository = "https://github.com/puranikyashaswin/rusty"
 documentation = "https://docs.rs/rusty"
+homepage = "https://github.com/puranikyashaswin/rusty"
 readme = "../README.md"
 keywords = ["machine-learning", "deep-learning", "gpu", "neural-networks", "transformer"]
 categories = ["science::ml", "algorithms"]
 
 [dependencies]
 # Internal crates
-rusty-backend = { path = "../rusty-backend" }
-rusty-autograd = { path = "../rusty-autograd" }
-rusty-graph = { path = "../rusty-graph" }
-rusty-trainer = { path = "../rusty-trainer" }
-rusty-loader = { path = "../rusty-loader" }
+rusty-backend = { path = "../rusty-backend", version = "0.1.0" }
+rusty-autograd = { path = "../rusty-autograd", version = "0.1.0" }
+rusty-graph = { path = "../rusty-graph", version = "0.1.0" }
+rusty-trainer = { path = "../rusty-trainer", version = "0.1.0" }
+rusty-loader = { path = "../rusty-loader", version = "0.1.0" }
 
 # GPU Backend
 wgpu = "0.19"

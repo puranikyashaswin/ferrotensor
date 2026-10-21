@@ -2,12 +2,22 @@
 name = "rusty-trainer"
 version = "0.1.0"
 edition = "2021"
+description = "Optimizers, LoRA fine-tuning and training loops for Rusty"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+homepage = "https://github.com/puranikyashaswin/rusty"
+documentation = "https://docs.rs/rusty-trainer"
+readme = "../README.md"
+keywords = ["lora", "fine-tuning", "training", "machine-learning", "gpu"]
+categories = ["science", "algorithms"]
 
 [dependencies]
-rusty-backend = { path = "../rusty-backend" }
-rusty-autograd = { path = "../rusty-autograd" }
-rusty-graph = { path = "../rusty-graph" }
-rusty-loader = { path = "../rusty-loader" }
+rusty-backend = { path = "../rusty-backend", version = "0.1.0" }
+rusty-autograd = { path = "../rusty-autograd", version = "0.1.0" }
+rusty-graph = { path = "../rusty-graph", version = "0.1.0" }
+rusty-loader = { path = "../rusty-loader", version = "0.1.0" }
 safetensors = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

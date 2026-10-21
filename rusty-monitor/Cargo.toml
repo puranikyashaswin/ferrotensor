@@ -2,6 +2,16 @@
 name = "rusty-monitor"
 version = "0.1.0"
 edition = "2021"
+description = "Terminal dashboard for monitoring Rusty training runs"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+homepage = "https://github.com/puranikyashaswin/rusty"
+documentation = "https://docs.rs/rusty-monitor"
+readme = "../README.md"
+keywords = ["tui", "monitoring", "training", "machine-learning", "dashboard"]
+categories = ["science"]
 
 [dependencies]
 ratatui = "0.29.0"
@@ -11,4 +21,4 @@ tokio = { version = "1.43.0", features = ["full"] }
 anyhow = "1.0.95"
 chrono = "0.4.39"
 rand = "0.9.2"
-rusty-trainer = { path = "../rusty-trainer" }
+rusty-trainer = { path = "../rusty-trainer", version = "0.1.0" }
