@@ -12,8 +12,11 @@ use std::sync::Arc;
 
 /// Configuration for LoRA adapters
 pub struct LoRaConfig {
+    /// Adapter rank.
     pub rank: usize,
+    /// Scale numerator (`alpha / rank`).
     pub alpha: f32,
+    /// Projection names that get adapters, e.g. `["q_proj", "v_proj"]`.
     pub target_modules: Vec<String>, // e.g., ["q_proj", "v_proj"]
 }
 
@@ -54,6 +57,7 @@ impl<'a> Lfm2ModelBuilder<'a> {
         transposed
     }
 
+    /// A builder reading weights from `weights` with the given config.
     pub fn new(
         ctx: Arc<WgpuContext>,
         engine: Arc<ComputeEngine>,
@@ -69,6 +73,7 @@ impl<'a> Lfm2ModelBuilder<'a> {
         }
     }
 
+    /// Adds LoRA adapters to the projections named in `lora_config`.
     pub fn with_lora(mut self, lora_config: LoRaConfig) -> Self {
         self.lora_config = Some(lora_config);
         self

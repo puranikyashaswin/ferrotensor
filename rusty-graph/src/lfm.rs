@@ -3,14 +3,20 @@ use rusty_backend::{ComputeEngine, UnifiedTensor};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// LFM2 short-convolution operator: projection, depthwise conv, projection.
 pub struct Lfm2Conv {
+    /// Input projection.
     pub in_proj: Linear,
+    /// Depthwise kernel `[dim, 3]`.
     pub conv_weight: Tensor, // [dim, 3]
-    pub conv_bias: Tensor,   // [dim]
+    /// Bias `[dim]`.
+    pub conv_bias: Tensor, // [dim]
+    /// Output projection.
     pub out_proj: Linear,
 }
 
 impl Lfm2Conv {
+    /// Applies the operator to `x`.
     pub fn forward(&self, engine: &ComputeEngine, x: &Tensor) -> Tensor {
         let projected = self.in_proj.forward(engine, x);
 
@@ -27,6 +33,7 @@ impl Lfm2Conv {
         self.out_proj.forward(engine, &conv_out)
     }
 
+    /// Trainable tensors (weights, then any LoRA adapters).
     pub fn params(&self) -> Vec<Tensor> {
         let mut p = self.in_proj.params();
         p.push(self.conv_weight.clone());
@@ -35,12 +42,14 @@ impl Lfm2Conv {
         p
     }
 
+    /// Only the LoRA adapter tensors (what LoRA fine-tuning updates).
     pub fn lora_params(&self) -> Vec<Tensor> {
         let mut p = self.in_proj.lora_params();
         p.extend(self.out_proj.lora_params());
         p
     }
 
+    /// Parameters keyed by Hugging Face-style names under `prefix`.
     pub fn named_params(&self, prefix: &str) -> HashMap<String, Tensor> {
         let mut map = HashMap::new();
         map.extend(self.in_proj.named_params(&format!("{}.in_proj", prefix)));
@@ -50,6 +59,7 @@ impl Lfm2Conv {
         map
     }
 
+    /// LoRA tensors keyed by name under `prefix`.
     pub fn named_lora_params(&self, prefix: &str) -> HashMap<String, Tensor> {
         let mut map = HashMap::new();
         map.extend(
@@ -68,20 +78,29 @@ impl Lfm2Conv {
     }
 }
 
+/// The token-mixing operator of an LFM2 block.
 #[allow(clippy::large_enum_variant)]
 pub enum Lfm2LayerOp {
+    /// Short convolution.
     Conv(Lfm2Conv),
+    /// Grouped-query attention.
     Attention(Attention),
 }
 
+/// LFM2 block: `x + op(norm(x))` then `h + mlp(norm(h))`.
 pub struct Lfm2Block {
+    /// Norm before the operator.
     pub operator_norm: RMSNorm,
+    /// Convolution or attention.
     pub op: Lfm2LayerOp,
+    /// Norm before the MLP.
     pub ffn_norm: RMSNorm,
+    /// Feed-forward.
     pub mlp: MLP,
 }
 
 impl Lfm2Block {
+    /// Runs the block; `pos`, `cache` and `mask` are used by attention layers.
     pub fn forward(
         &self,
         engine: &ComputeEngine,
@@ -104,6 +123,7 @@ impl Lfm2Block {
         Tensor::add(&h, &m, engine)
     }
 
+    /// Trainable tensors (weights, then any LoRA adapters).
     pub fn params(&self) -> Vec<Tensor> {
         let mut p = self.operator_norm.params();
         match &self.op {
@@ -115,6 +135,7 @@ impl Lfm2Block {
         p
     }
 
+    /// Only the LoRA adapter tensors (what LoRA fine-tuning updates).
     pub fn lora_params(&self) -> Vec<Tensor> {
         let mut p = match &self.op {
             Lfm2LayerOp::Conv(c) => c.lora_params(),
@@ -124,6 +145,7 @@ impl Lfm2Block {
         p
     }
 
+    /// Parameters keyed by Hugging Face-style names under `prefix`.
     pub fn named_params(&self, prefix: &str) -> HashMap<String, Tensor> {
         let mut map = HashMap::new();
         map.extend(
@@ -141,6 +163,7 @@ impl Lfm2Block {
         map
     }
 
+    /// LoRA tensors keyed by name under `prefix`.
     pub fn named_lora_params(&self, prefix: &str) -> HashMap<String, Tensor> {
         let mut map = match &self.op {
             Lfm2LayerOp::Conv(c) => c.named_lora_params(&format!("{}.conv", prefix)),
@@ -160,15 +183,22 @@ impl Lfm2Block {
     }
 }
 
+/// An LFM2 language model.
 pub struct Lfm2Model {
+    /// Embedding table `[vocab, hidden]`.
     pub embed_tokens: Tensor, // Embedding weight
+    /// Norm applied right after the embedding.
     pub embedding_norm: RMSNorm,
+    /// Blocks.
     pub layers: Vec<Lfm2Block>,
+    /// Final norm.
     pub norm_f: RMSNorm,
+    /// Projection to vocabulary logits.
     pub lm_head: Linear,
 }
 
 impl Lfm2Model {
+    /// Logits `[1, seq, vocab]` for `input_ids`, the first of which is at `pos`.
     pub fn forward(
         &self,
         engine: &ComputeEngine,
@@ -217,6 +247,7 @@ impl Lfm2Model {
         )
     }
 
+    /// Only the LoRA adapter tensors (what LoRA fine-tuning updates).
     pub fn lora_params(&self) -> Vec<Tensor> {
         let mut p = Vec::new();
         for layer in &self.layers {
@@ -226,6 +257,7 @@ impl Lfm2Model {
         p
     }
 
+    /// All trainable tensors.
     pub fn params(&self) -> Vec<Tensor> {
         let mut p = vec![self.embed_tokens.clone()];
         p.extend(self.embedding_norm.params());
@@ -237,6 +269,7 @@ impl Lfm2Model {
         p
     }
 
+    /// All parameters keyed by Hugging Face-style names.
     pub fn named_params(&self) -> HashMap<String, Tensor> {
         let mut map = HashMap::new();
         map.insert(
@@ -252,6 +285,7 @@ impl Lfm2Model {
         map
     }
 
+    /// LoRA tensors keyed by name.
     pub fn named_lora_params(&self) -> HashMap<String, Tensor> {
         let mut map = HashMap::new();
         for (idx, layer) in self.layers.iter().enumerate() {

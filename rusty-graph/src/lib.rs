@@ -1,9 +1,14 @@
+//! Model building blocks on top of `rusty-autograd`: linear layers with
+//! LoRA, RMSNorm, RoPE grouped-query attention, SwiGLU MLPs, Llama and LFM2
+//! decoders, and the fused attention layers in [`flash_attention`].
+
 use rusty_autograd::Tensor;
 use rusty_backend::{ComputeEngine, UnifiedTensor, WgpuContext};
 use std::collections::HashMap;
 use std::sync::Arc;
 
 pub mod flash_attention;
+/// LFM2 (Liquid foundation model) blocks.
 pub mod lfm;
 pub mod model_builder;
 
@@ -14,15 +19,23 @@ pub use flash_attention::{
 pub use lfm::Lfm2Model;
 
 // --- LoRA Adapter ---
+/// Low-rank adapter added to a [`Linear`]: `x @ a @ b * alpha / rank`.
 #[derive(Debug, Clone)]
 pub struct LoRAAdapter {
+    /// Down projection `[in, rank]`.
     pub a: Tensor, // [In, Rank]
+    /// Up projection `[rank, out]` (zero-initialised, so training starts
+    /// from the base model).
     pub b: Tensor, // [Rank, Out]
+    /// Scale numerator; the update is scaled by `alpha / rank`.
     pub alpha: f32,
+    /// Adapter rank.
     pub rank: usize,
 }
 
 impl LoRAAdapter {
+    /// An adapter for an `in_dim -> out_dim` projection, with `a` filled with
+    /// 0.01 and `b` with zeros.
     pub fn new(
         ctx: Arc<WgpuContext>,
         in_dim: usize,
@@ -44,14 +57,18 @@ impl LoRAAdapter {
         }
     }
 
+    /// The adapter tensors `[a, b]`.
     pub fn params(&self) -> Vec<Tensor> {
         vec![self.a.clone(), self.b.clone()]
     }
 }
 
+/// Bias-free linear layer `y = x @ weight` with an optional LoRA adapter.
 #[derive(Debug, Clone)]
 pub struct Linear {
+    /// Weight `[in, out]` (already transposed from the PyTorch `[out, in]`).
     pub weight: Tensor,
+    /// Optional low-rank adapter added to the output.
     pub lora: Option<LoRAAdapter>,
 }
 
@@ -78,10 +95,12 @@ impl Linear {
         out
     }
 
+    /// A layer without LoRA.
     pub fn new(weight: Tensor) -> Self {
         Self { weight, lora: None }
     }
 
+    /// A layer with a LoRA adapter.
     pub fn with_lora(weight: Tensor, lora: LoRAAdapter) -> Self {
         Self {
             weight,
@@ -89,6 +108,8 @@ impl Linear {
         }
     }
 
+    /// Projects `[tokens, in]` or `[batch, seq, in]` to the same leading
+    /// shape with `out` features.
     pub fn forward(&self, engine: &ComputeEngine, x: &Tensor) -> Tensor {
         match x.data.shape.as_slice() {
             [_, _] => self.project_2d(engine, x),
@@ -101,6 +122,7 @@ impl Linear {
         }
     }
 
+    /// Trainable tensors (weights, then any LoRA adapters).
     pub fn params(&self) -> Vec<Tensor> {
         let mut p = vec![self.weight.clone()];
         if let Some(lora) = &self.lora {
@@ -109,6 +131,7 @@ impl Linear {
         p
     }
 
+    /// Parameters keyed by Hugging Face-style names under `prefix`.
     pub fn named_params(&self, prefix: &str) -> HashMap<String, Tensor> {
         let mut map = HashMap::new();
         map.insert(format!("{}.weight", prefix), self.weight.clone());
@@ -119,6 +142,7 @@ impl Linear {
         map
     }
 
+    /// Only the LoRA adapter tensors (what LoRA fine-tuning updates).
     pub fn lora_params(&self) -> Vec<Tensor> {
         if let Some(lora) = &self.lora {
             lora.params()
@@ -128,15 +152,20 @@ impl Linear {
     }
 }
 
+/// Token embedding table.
 pub struct Embedding {
+    /// Embedding table `[vocab, hidden]`.
     pub weight: Tensor,
 }
 
 impl Embedding {
+    /// Wraps an embedding table.
     pub fn new(weight: Tensor) -> Self {
         Self { weight }
     }
 
+    /// Looks up `input_ids` and returns `[1, seq, hidden]`. The lookup runs
+    /// on the CPU (the table is read back from the GPU).
     pub fn forward(&self, ctx: &WgpuContext, _engine: &ComputeEngine, input_ids: &[u32]) -> Tensor {
         let hidden_dim = self.weight.data.shape[1];
         let seq_len = input_ids.len();
@@ -153,10 +182,12 @@ impl Embedding {
         )
     }
 
+    /// Trainable tensors (weights, then any LoRA adapters).
     pub fn params(&self) -> Vec<Tensor> {
         vec![self.weight.clone()]
     }
 
+    /// Parameters keyed by Hugging Face-style names under `prefix`.
     pub fn named_params(&self, prefix: &str) -> HashMap<String, Tensor> {
         let mut map = HashMap::new();
         map.insert(format!("{}.weight", prefix), self.weight.clone());
@@ -164,24 +195,31 @@ impl Embedding {
     }
 }
 
+/// Root-mean-square layer norm over the last dimension.
 pub struct RMSNorm {
+    /// Per-feature scale `[hidden]`.
     pub weight: Tensor,
+    /// Epsilon added to the mean square.
     pub eps: f32,
 }
 
 impl RMSNorm {
+    /// Wraps a scale vector and epsilon.
     pub fn new(weight: Tensor, eps: f32) -> Self {
         Self { weight, eps }
     }
 
+    /// Normalises `input` over its last dimension.
     pub fn forward(&self, engine: &ComputeEngine, input: &Tensor) -> Tensor {
         Tensor::rms_norm(input, &self.weight, self.eps, engine)
     }
 
+    /// Trainable tensors (weights, then any LoRA adapters).
     pub fn params(&self) -> Vec<Tensor> {
         vec![self.weight.clone()]
     }
 
+    /// Parameters keyed by Hugging Face-style names under `prefix`.
     pub fn named_params(&self, prefix: &str) -> HashMap<String, Tensor> {
         let mut map = HashMap::new();
         map.insert(format!("{}.weight", prefix), self.weight.clone());
@@ -189,18 +227,30 @@ impl RMSNorm {
     }
 }
 
+/// Causal grouped-query self-attention with RoPE (Llama style).
 pub struct Attention {
+    /// Query projection `[hidden, n_heads * head_dim]`.
     pub q_proj: Linear,
+    /// Key projection `[hidden, num_kv_heads * head_dim]`.
     pub k_proj: Linear,
+    /// Value projection `[hidden, num_kv_heads * head_dim]`.
     pub v_proj: Linear,
+    /// Output projection `[n_heads * head_dim, hidden]`.
     pub o_proj: Linear,
+    /// Number of query heads.
     pub n_heads: usize,
+    /// Dimension of each head (at most 128).
     pub head_dim: usize,
+    /// Number of key/value heads; divides `n_heads`.
     pub num_kv_heads: usize,
+    /// Attention dropout probability.
     pub dropout_prob: f32,
 }
 
 impl Attention {
+    /// Attends over `x` (`[batch, seq, hidden]`) whose first token is at
+    /// position `pos`. With `cache`, the new keys/values are written at `pos`
+    /// and the queries attend to the whole cache up to their own position.
     pub fn forward(
         &self,
         engine: &ComputeEngine,
@@ -292,6 +342,7 @@ impl Attention {
         }
     }
 
+    /// Trainable tensors (weights, then any LoRA adapters).
     pub fn params(&self) -> Vec<Tensor> {
         let mut p = Vec::new();
         p.extend(self.q_proj.params());
@@ -301,6 +352,7 @@ impl Attention {
         p
     }
 
+    /// Parameters keyed by Hugging Face-style names under `prefix`.
     pub fn named_params(&self, prefix: &str) -> HashMap<String, Tensor> {
         let mut map = HashMap::new();
         map.extend(self.q_proj.named_params(&format!("{}.q_proj", prefix)));
@@ -310,6 +362,7 @@ impl Attention {
         map
     }
 
+    /// Only the LoRA adapter tensors (what LoRA fine-tuning updates).
     pub fn lora_params(&self) -> Vec<Tensor> {
         let mut p = Vec::new();
         p.extend(self.q_proj.lora_params());
@@ -320,13 +373,18 @@ impl Attention {
     }
 }
 
+/// SwiGLU feed-forward: `down(silu(gate(x)) * up(x))`.
 pub struct MLP {
+    /// Gate projection (passed through SiLU).
     pub gate_proj: Linear,
+    /// Up projection.
     pub up_proj: Linear,
+    /// Down projection back to the hidden size.
     pub down_proj: Linear,
 }
 
 impl MLP {
+    /// Applies the feed-forward to `[tokens, hidden]` or `[batch, seq, hidden]`.
     pub fn forward(&self, engine: &ComputeEngine, input: &Tensor) -> Tensor {
         let up = self.up_proj.forward(engine, input);
         let gate = self.gate_proj.forward(engine, input);
@@ -335,6 +393,7 @@ impl MLP {
         self.down_proj.forward(engine, &fused)
     }
 
+    /// Trainable tensors (weights, then any LoRA adapters).
     pub fn params(&self) -> Vec<Tensor> {
         let mut p = Vec::new();
         p.extend(self.gate_proj.params());
@@ -343,6 +402,7 @@ impl MLP {
         p
     }
 
+    /// Parameters keyed by Hugging Face-style names under `prefix`.
     pub fn named_params(&self, prefix: &str) -> HashMap<String, Tensor> {
         let mut map = HashMap::new();
         map.extend(
@@ -357,6 +417,7 @@ impl MLP {
         map
     }
 
+    /// Only the LoRA adapter tensors (what LoRA fine-tuning updates).
     pub fn lora_params(&self) -> Vec<Tensor> {
         let mut p = Vec::new();
         p.extend(self.gate_proj.lora_params());
@@ -366,14 +427,21 @@ impl MLP {
     }
 }
 
+/// Pre-norm Llama decoder block: attention and MLP with residuals.
 pub struct LlamaBlock {
+    /// Norm before attention (`input_layernorm`).
     pub norm1: RMSNorm,
+    /// Self-attention.
     pub attn: Attention,
+    /// Norm before the MLP (`post_attention_layernorm`).
     pub norm2: RMSNorm,
+    /// Feed-forward.
     pub mlp: MLP,
 }
 
 impl LlamaBlock {
+    /// Runs the block on `input` (`[batch, seq, hidden]`); see
+    /// [`Attention::forward`] for `pos`, `cache` and `mask`.
     pub fn forward(
         &self,
         engine: &ComputeEngine,
@@ -390,6 +458,7 @@ impl LlamaBlock {
         Tensor::add(&h, &mlp_out, engine)
     }
 
+    /// Trainable tensors (weights, then any LoRA adapters).
     pub fn params(&self) -> Vec<Tensor> {
         let mut p = Vec::new();
         p.extend(self.norm1.params());
@@ -399,6 +468,7 @@ impl LlamaBlock {
         p
     }
 
+    /// Parameters keyed by Hugging Face-style names under `prefix`.
     pub fn named_params(&self, prefix: &str) -> HashMap<String, Tensor> {
         let mut map = HashMap::new();
         map.extend(
@@ -414,6 +484,7 @@ impl LlamaBlock {
         map
     }
 
+    /// Only the LoRA adapter tensors (what LoRA fine-tuning updates).
     pub fn lora_params(&self) -> Vec<Tensor> {
         let mut p = Vec::new();
         p.extend(self.attn.lora_params());
@@ -422,14 +493,21 @@ impl LlamaBlock {
     }
 }
 
+/// A Llama-style decoder: embedding, blocks, final norm and LM head.
 pub struct LlamaModel {
+    /// Token embeddings.
     pub embed_tokens: Embedding,
+    /// Decoder blocks.
     pub layers: Vec<LlamaBlock>,
+    /// Final norm.
     pub norm: RMSNorm,
+    /// Projection to vocabulary logits.
     pub lm_head: Linear,
 }
 
 impl LlamaModel {
+    /// Logits `[1, seq, vocab]` for `input_ids`, the first of which is at
+    /// `start_pos`.
     pub fn forward(
         &self,
         ctx: &WgpuContext,
@@ -448,6 +526,7 @@ impl LlamaModel {
         self.lm_head.forward(engine, &x_norm)
     }
 
+    /// Trainable tensors (weights, then any LoRA adapters).
     pub fn params(&self) -> Vec<Tensor> {
         let mut p = Vec::new();
         p.extend(self.embed_tokens.params());
@@ -459,6 +538,7 @@ impl LlamaModel {
         p
     }
 
+    /// Parameters keyed by Hugging Face-style names under `prefix`.
     pub fn named_params(&self, prefix: &str) -> HashMap<String, Tensor> {
         let mut map = HashMap::new();
         map.extend(
@@ -473,6 +553,7 @@ impl LlamaModel {
         map
     }
 
+    /// Only the LoRA adapter tensors (what LoRA fine-tuning updates).
     pub fn lora_params(&self) -> Vec<Tensor> {
         let mut p = Vec::new();
         for layer in &self.layers {
@@ -483,11 +564,16 @@ impl LlamaModel {
     }
 }
 
+/// Cached keys and values of one layer for incremental decoding.
 pub struct KVCacheLayer {
+    /// Keys `[batch, max_seq, num_kv_heads * head_dim]`.
     pub key: UnifiedTensor,
+    /// Values, same shape as `key`.
     pub value: UnifiedTensor,
 }
+/// Per-layer KV caches of a model.
 pub struct KVCache {
+    /// One cache per decoder layer.
     pub layers: Vec<KVCacheLayer>,
 }
 
