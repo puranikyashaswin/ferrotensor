@@ -21,3 +21,6 @@ env_logger = "0.11"
 bytemuck = { version = "1.14", features = ["derive"] }
 futures-intrusive = "0.5"
 
+
+[dev-dependencies]
+naga = { version = "0.19", features = ["wgsl-in"] }

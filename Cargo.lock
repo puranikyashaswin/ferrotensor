@@ -1767,6 +1767,7 @@ dependencies = [
  "env_logger",
  "futures-intrusive",
  "log",
+ "naga",
  "pollster",
  "wgpu",
 ]

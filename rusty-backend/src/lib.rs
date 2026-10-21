@@ -247,6 +247,14 @@ impl UnifiedTensor {
     }
 }
 
+/// The full WGSL source compiled into the engine's shader module.
+fn shader_source() -> String {
+    let kernels_src = include_str!("kernels.wgsl");
+    let flash_v2_src = include_str!("flash_attention_v2.wgsl");
+    let flash_v2_bw_src = include_str!("flash_attention_v2_backward_optimized.wgsl");
+    format!("{}\n{}\n{}", kernels_src, flash_v2_src, flash_v2_bw_src)
+}
+
 pub struct ComputeEngine {
     matmul_pipeline: wgpu::ComputePipeline,
     matmul_bg_layout: wgpu::BindGroupLayout,
@@ -348,11 +356,7 @@ pub struct AdamParams {
 
 impl ComputeEngine {
     pub fn new(ctx: &WgpuContext) -> Self {
-        // Concatenate kernel files
-        let kernels_src = include_str!("kernels.wgsl");
-        let flash_v2_src = include_str!("flash_attention_v2.wgsl");
-        let flash_v2_bw_src = include_str!("flash_attention_v2_backward_optimized.wgsl");
-        let combined_src = format!("{}\n{}\n{}", kernels_src, flash_v2_src, flash_v2_bw_src);
+        let combined_src = shader_source();
 
         let module = ctx
             .device
@@ -6005,5 +6009,26 @@ impl ComputeEngine {
             pass.dispatch_workgroups(seq_k, num_kv_heads, batch_size);
         }
         ctx.queue.submit(Some(encoder.finish()));
+    }
+}
+
+#[cfg(test)]
+mod shader_tests {
+    /// Parses and validates the combined WGSL with naga, so shader errors
+    /// fail `cargo test` without needing a GPU.
+    #[test]
+    fn combined_wgsl_validates() {
+        let src = super::shader_source();
+        let module = match naga::front::wgsl::parse_str(&src) {
+            Ok(m) => m,
+            Err(e) => panic!("WGSL parse error:\n{}", e.emit_to_string(&src)),
+        };
+        let mut validator = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        );
+        if let Err(e) = validator.validate(&module) {
+            panic!("WGSL validation error:\n{}", e.emit_to_string(&src));
+        }
     }
 }

@@ -93,11 +93,11 @@ fn flash_bwd_preprocess(@builtin(global_invocation_id) global_id: vec3<u32>) {
     var max_score = -1e20;
     var sum_exp = 0.0;
     
-    for (var k = 0u; k < params.seq_k; k++) {
+    for (var kj = 0u; kj < params.seq_k; kj++) {
         // Causal
-        if (params.causal == 1u && k > q_idx) { continue; }
+        if (params.causal == 1u && kj > q_idx) { continue; }
         
-        let k_offset = kv_base + k * s_kv_k;
+        let k_offset = kv_base + kj * s_kv_k;
         
         var score = 0.0;
         for (var d = 0u; d < params.head_dim; d++) {
@@ -106,7 +106,7 @@ fn flash_bwd_preprocess(@builtin(global_invocation_id) global_id: vec3<u32>) {
         score *= params.scale;
         
         if (mask_p.has_mask == 1u) {
-             let m_idx = batch_idx * mask_p.s_b + head_idx * mask_p.s_h + q_idx * mask_p.s_q + k * mask_p.s_k;
+             let m_idx = batch_idx * mask_p.s_b + head_idx * mask_p.s_h + q_idx * mask_p.s_q + kj * mask_p.s_k;
              score += mask[m_idx];
         }
         
@@ -160,11 +160,11 @@ fn flash_bwd_dq(@builtin(global_invocation_id) global_id: vec3<u32>) {
     for(var i=0u; i<params.head_dim; i++) { dq_acc[i] = 0.0; }
     
     // Loop over K
-    for (var k = 0u; k < params.seq_k; k++) {
-        if (params.causal == 1u && k > q_idx) { continue; }
+    for (var kj = 0u; kj < params.seq_k; kj++) {
+        if (params.causal == 1u && kj > q_idx) { continue; }
         
-        let k_offset = kv_base + k * s_kv_k;
-        let v_offset = kv_base + k * s_kv_k; // Same
+        let k_offset = kv_base + kj * s_kv_k;
+        let v_offset = kv_base + kj * s_kv_k; // Same
         
         // Score
         var score = 0.0;
@@ -173,7 +173,7 @@ fn flash_bwd_dq(@builtin(global_invocation_id) global_id: vec3<u32>) {
         }
         score *= params.scale;
          if (mask_p.has_mask == 1u) {
-             let m_idx = batch_idx * mask_p.s_b + head_idx * mask_p.s_h + q_idx * mask_p.s_q + k * mask_p.s_k;
+             let m_idx = batch_idx * mask_p.s_b + head_idx * mask_p.s_h + q_idx * mask_p.s_q + kj * mask_p.s_k;
              score += mask[m_idx];
         }
         
@@ -181,7 +181,7 @@ fn flash_bwd_dq(@builtin(global_invocation_id) global_id: vec3<u32>) {
         var p_ij = exp(score - l_val);
         
         // Dropout
-        let rand_val = hash3(batch_idx * params.num_heads + head_idx, q_idx, k + params.seed);
+        let rand_val = hash3(batch_idx * params.num_heads + head_idx, q_idx, kj + params.seed);
         let keep = step(params.dropout_prob, rand_val);
         let dropout_scale = 1.0 / (1.0 - params.dropout_prob + 0.00001);
         p_ij = p_ij * keep * dropout_scale;
