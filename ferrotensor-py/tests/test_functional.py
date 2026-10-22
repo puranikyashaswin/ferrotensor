@@ -69,5 +69,7 @@ def test_attention_and_misc():
     assert out.shape == (2, 4, 3)
     assert F.one_hot([0, 2], 3).tolist() == [[1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
     assert F.accuracy(ft.tensor([[1.0, 0.0], [1.0, 0.0]]), [0, 1]) == 0.5
+    assert F.accuracy(ft.tensor([[1.0, 0.0], [1.0, 0.0]]), ft.tensor([0, 1])) == 0.5
+    assert F.accuracy(ft.tensor([[1.0, 0.0], [1.0, 0.0]]), [0, -100]) == 1.0
     a = ft.tensor([[1.0, 0.0]])
     assert F.cosine_similarity(a, a).tolist() == pytest.approx([1.0])

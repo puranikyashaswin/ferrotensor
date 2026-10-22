@@ -5,6 +5,8 @@
 //! through all of them; `functional::tests` checks each against finite
 //! differences.
 
+use std::borrow::Cow;
+
 use crate::tensor::Tensor;
 use crate::Device;
 
@@ -165,32 +167,160 @@ pub fn smooth_l1_loss(pred: &Tensor, target: &Tensor, beta: f32) -> Tensor {
     m.square().mul_scalar(0.5 / beta).add(&abs.sub(&m)).mean()
 }
 
-/// Cross-entropy between `logits` (`[.., C]`) and `targets`, averaged.
+/// Class targets for [`cross_entropy`], [`nll_loss`], [`accuracy`] and
+/// [`one_hot`].
 ///
-/// `targets` is either:
-/// - class indices with the shape of `logits` minus its last dim (stored as
-///   `f32`); negative indices (e.g. `-100`) are ignored, as for padding or
-///   prompt tokens, and the mean is over the remaining positions;
-/// - or a distribution (one-hot or soft labels) with the shape of `logits`.
-pub fn cross_entropy(logits: &Tensor, targets: &Tensor) -> Tensor {
-    let log_probs = logits.log_softmax(-1);
-    if targets.shape == logits.shape {
-        let rows = (logits.numel() / logits.shape[logits.ndim() - 1]).max(1);
-        return log_probs.mul(targets).sum().div_scalar(-(rows as f32));
-    }
-    assert_eq!(
-        targets.shape,
-        logits.shape[..logits.ndim() - 1],
-        "class-index targets must have the logits shape without the class dim"
-    );
-    let indices: Vec<i64> = targets.to_vec().iter().map(|&t| t as i64).collect();
-    nll_loss_indices(&log_probs, &indices)
+/// One convention for all four: a target is a class id, and a negative id
+/// (such as `-100`, for padding or prompt tokens) marks a position to skip.
+/// Each function takes `impl Into<Targets>`, so any of these work:
+///
+/// - a `&Tensor` of class ids stored as `f32`, such as the targets a
+///   [`DataLoader`](crate::data::DataLoader) yields;
+/// - a slice, array or `Vec` (owned or borrowed) of `i64`, `i32` or `usize`
+///   ids.
+///
+/// [`cross_entropy`] also takes a `&Tensor` with the shape of the logits as
+/// a class distribution (one-hot or soft labels).
+///
+/// # Example
+/// ```rust
+/// use ferrotensor::prelude::*;
+///
+/// let d = Device::cpu();
+/// let logits = Tensor::from_data(&[2.0, 0.0, 0.0, 3.0], &[2, 2], &d);
+/// let as_tensor = Tensor::from_data(&[0.0, 1.0], &[2], &d);
+/// let a = F::cross_entropy(&logits, &as_tensor).item();
+/// let b = F::cross_entropy(&logits, &[0, 1]).item();
+/// let c = F::nll_loss(&logits.log_softmax(-1), vec![0usize, 1]).item();
+/// assert!((a - b).abs() < 1e-6 && (a - c).abs() < 1e-6);
+/// assert_eq!(F::accuracy(&logits, &as_tensor), 1.0);
+/// // -100 is skipped: only the first row counts.
+/// assert_eq!(F::accuracy(&logits, &[0, -100]), 1.0);
+/// ```
+#[derive(Debug, Clone)]
+pub enum Targets<'a> {
+    /// Class ids stored as `f32` or, for [`cross_entropy`], class
+    /// probabilities with the shape of the logits.
+    Tensor(&'a Tensor),
+    /// Class ids; negative ids are skipped.
+    Ids(Cow<'a, [i64]>),
 }
 
-/// Negative log-likelihood of class `targets` under `log_probs` (`[.., C]`),
-/// averaged over non-ignored (non-negative) targets.
-pub fn nll_loss(log_probs: &Tensor, targets: &[i64]) -> Tensor {
-    nll_loss_indices(log_probs, targets)
+impl Targets<'_> {
+    /// The targets as class ids (reads a tensor back from its device).
+    pub fn ids(&self) -> Cow<'_, [i64]> {
+        match self {
+            Targets::Tensor(t) => Cow::Owned(t.to_vec().iter().map(|&v| v as i64).collect()),
+            Targets::Ids(ids) => Cow::Borrowed(ids),
+        }
+    }
+
+    /// Number of targets (elements of a tensor).
+    pub fn len(&self) -> usize {
+        match self {
+            Targets::Tensor(t) => t.numel(),
+            Targets::Ids(ids) => ids.len(),
+        }
+    }
+
+    /// True when there are no targets.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl<'a> From<&'a Tensor> for Targets<'a> {
+    fn from(t: &'a Tensor) -> Self {
+        Targets::Tensor(t)
+    }
+}
+
+impl<'a> From<&'a [i64]> for Targets<'a> {
+    fn from(ids: &'a [i64]) -> Self {
+        Targets::Ids(Cow::Borrowed(ids))
+    }
+}
+
+impl From<Vec<i64>> for Targets<'_> {
+    fn from(ids: Vec<i64>) -> Self {
+        Targets::Ids(Cow::Owned(ids))
+    }
+}
+
+impl<'a> From<&'a Vec<i64>> for Targets<'a> {
+    fn from(ids: &'a Vec<i64>) -> Self {
+        Targets::Ids(Cow::Borrowed(ids))
+    }
+}
+
+impl<'a, const N: usize> From<&'a [i64; N]> for Targets<'a> {
+    fn from(ids: &'a [i64; N]) -> Self {
+        Targets::Ids(Cow::Borrowed(ids))
+    }
+}
+
+/// `From` for slices, arrays and vectors of ids that convert to `i64`.
+macro_rules! targets_from_ids {
+    ($($t:ty),*) => {$(
+        impl From<&[$t]> for Targets<'_> {
+            fn from(ids: &[$t]) -> Self {
+                Targets::Ids(Cow::Owned(ids.iter().map(|&i| i as i64).collect()))
+            }
+        }
+
+        impl From<Vec<$t>> for Targets<'_> {
+            fn from(ids: Vec<$t>) -> Self {
+                Targets::from(&ids[..])
+            }
+        }
+
+        impl From<&Vec<$t>> for Targets<'_> {
+            fn from(ids: &Vec<$t>) -> Self {
+                Targets::from(&ids[..])
+            }
+        }
+
+        impl<const N: usize> From<&[$t; N]> for Targets<'_> {
+            fn from(ids: &[$t; N]) -> Self {
+                Targets::from(&ids[..])
+            }
+        }
+    )*};
+}
+
+targets_from_ids!(i32, usize);
+
+/// Cross-entropy between `logits` (`[.., C]`) and `targets`, averaged.
+///
+/// `targets` (see [`Targets`]) is either:
+/// - class ids, one per row of `logits` (a tensor must have the shape of
+///   `logits` minus its last dim); negative ids (e.g. `-100`) are skipped,
+///   as for padding or prompt tokens, and the mean is over the remaining
+///   positions;
+/// - or a `&Tensor` distribution (one-hot or soft labels) with the shape of
+///   `logits`.
+pub fn cross_entropy<'a>(logits: &Tensor, targets: impl Into<Targets<'a>>) -> Tensor {
+    let targets = targets.into();
+    let log_probs = logits.log_softmax(-1);
+    if let Targets::Tensor(t) = targets {
+        if t.shape == logits.shape {
+            let rows = (logits.numel() / logits.shape[logits.ndim() - 1]).max(1);
+            return log_probs.mul(t).sum().div_scalar(-(rows as f32));
+        }
+        assert_eq!(
+            t.shape,
+            logits.shape[..logits.ndim() - 1],
+            "class-id targets must have the logits shape without the class dim"
+        );
+    }
+    nll_loss_indices(&log_probs, &targets.ids())
+}
+
+/// Negative log-likelihood of class `targets` (see [`Targets`]) under
+/// `log_probs` (`[.., C]`), averaged over non-skipped (non-negative)
+/// targets.
+pub fn nll_loss<'a>(log_probs: &Tensor, targets: impl Into<Targets<'a>>) -> Tensor {
+    nll_loss_indices(log_probs, &targets.into().ids())
 }
 
 fn nll_loss_indices(log_probs: &Tensor, targets: &[i64]) -> Tensor {
@@ -258,32 +388,39 @@ pub fn cosine_similarity(a: &Tensor, b: &Tensor, dim: isize) -> Tensor {
     dot.div(&norm_a.mul(&norm_b).add_scalar(1e-8))
 }
 
-/// One-hot rows for `indices` (`[indices.len(), num_classes]`); indices out
-/// of range give an all-zero row.
-pub fn one_hot(indices: &[usize], num_classes: usize, device: &Device) -> Tensor {
-    let mut data = vec![0.0f32; indices.len() * num_classes];
-    for (i, &idx) in indices.iter().enumerate() {
-        if idx < num_classes {
-            data[i * num_classes + idx] = 1.0;
+/// One-hot rows for class `targets` (see [`Targets`]):
+/// `[targets.len(), num_classes]`. Negative (skipped) or out-of-range ids
+/// give an all-zero row.
+pub fn one_hot<'a>(targets: impl Into<Targets<'a>>, num_classes: usize, device: &Device) -> Tensor {
+    let ids = targets.into();
+    let ids = ids.ids();
+    let mut data = vec![0.0f32; ids.len() * num_classes];
+    for (i, &id) in ids.iter().enumerate() {
+        if (0..num_classes as i64).contains(&id) {
+            data[i * num_classes + id as usize] = 1.0;
         }
     }
-    Tensor::from_vec(data, &[indices.len(), num_classes], device)
+    Tensor::from_vec(data, &[ids.len(), num_classes], device)
 }
 
-/// Fraction of rows of `logits` (`[N, C]`) whose argmax equals the target
-/// class.
-pub fn accuracy(logits: &Tensor, targets: &[usize]) -> f32 {
+/// Fraction of rows of `logits` (`[.., C]`) whose argmax equals the target
+/// class (see [`Targets`]). Rows with a negative (skipped) target do not
+/// count; with no counted rows the result is 0.
+pub fn accuracy<'a>(logits: &Tensor, targets: impl Into<Targets<'a>>) -> f32 {
+    let targets = targets.into();
+    let targets = targets.ids();
     let pred = logits.argmax_dim(-1).to_vec();
     assert_eq!(pred.len(), targets.len(), "one target per row");
-    if targets.is_empty() {
+    let kept = targets.iter().filter(|&&t| t >= 0).count();
+    if kept == 0 {
         return 0.0;
     }
     let correct = pred
         .iter()
-        .zip(targets)
-        .filter(|(p, &t)| **p as usize == t)
+        .zip(targets.iter())
+        .filter(|(p, &t)| t >= 0 && **p as i64 == t)
         .count();
-    correct as f32 / targets.len() as f32
+    correct as f32 / kept as f32
 }
 
 #[cfg(test)]
@@ -449,5 +586,49 @@ mod tests {
     fn accuracy_counts_argmax_hits() {
         let logits = cpu(&[0.1, 0.9, 0.8, 0.2], &[2, 2]);
         assert_eq!(accuracy(&logits, &[1, 1]), 0.5);
+        assert_eq!(accuracy(&logits, &[1, -100]), 1.0);
+        assert_eq!(accuracy(&logits, &[-1, -100]), 0.0);
+    }
+
+    #[test]
+    fn every_target_form_gives_the_same_loss() {
+        let logits = cpu(&[1.0, 2.0, 3.0, 1.0, 0.5, 1.0, -1.0, 0.0, 2.0], &[3, 3]);
+        let log_probs = logits.log_softmax(-1);
+        let tensor = cpu(&[2.0, -100.0, 0.0], &[3]);
+        let expected = cross_entropy(&logits, &tensor).item();
+        let ids_i64: Vec<i64> = vec![2, -100, 0];
+        let forms: Vec<Targets<'_>> = vec![
+            (&tensor).into(),
+            (&ids_i64).into(),
+            ids_i64[..].into(),
+            ids_i64.clone().into(),
+            (&[2i32, -100, 0]).into(),
+            vec![2i32, -100, 0].into(),
+            (&[2, -100, 0]).into(),
+        ];
+        for t in forms {
+            assert_eq!(t.len(), 3);
+            assert_eq!(&t.ids()[..], &[2, -100, 0]);
+            assert!((cross_entropy(&logits, t.clone()).item() - expected).abs() < 1e-6);
+            assert!((nll_loss(&log_probs, t).item() - expected).abs() < 1e-6);
+        }
+        // usize ids cannot be negative.
+        let rows = [2usize, 0];
+        let first_last = logits.index_select(0, &[0, 2]);
+        assert!(
+            (cross_entropy(&first_last, &rows).item() - expected).abs() < 1e-6,
+            "usize targets"
+        );
+        assert!((cross_entropy(&first_last, vec![2usize, 0]).item() - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn one_hot_takes_every_target_form() {
+        let d = Device::cpu();
+        let want = vec![0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        assert_eq!(one_hot(&[2usize, 5, 0], 3, &d).to_vec(), want);
+        assert_eq!(one_hot(&[2, -100, 0], 3, &d).to_vec(), want);
+        let t = cpu(&[2.0, -1.0, 0.0], &[3]);
+        assert_eq!(one_hot(&t, 3, &d).to_vec(), want);
     }
 }

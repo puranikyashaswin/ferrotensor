@@ -280,12 +280,13 @@ pub(crate) fn one_hot(
     guard(|| F::one_hot(&ids, num_classes, &device)).map(Into::into)
 }
 
-/// Fraction of rows of `logits` whose argmax equals the target class.
+/// Fraction of rows of `logits` whose argmax equals the target class; rows
+/// with a negative (ignored) target do not count.
 #[pyfunction]
 pub(crate) fn accuracy(logits: PyRef<'_, PyTensor>, target: &Bound<'_, PyAny>) -> PyResult<f32> {
     let l = &logits.inner;
     let classes = scores_and_classes("accuracy", l)?;
-    let ids = crate::tensor::parse_indices(target, classes)?;
+    let ids = class_indices(&target_tensor(target, l)?, classes)?;
     if l.ndim() != 2 || ids.len() != l.shape[0] {
         return Err(value_error(format!(
             "accuracy: logits must be [N, C] with N targets, got {:?} and {} targets",
