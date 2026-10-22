@@ -606,7 +606,7 @@ dependencies = [
 
 [[package]]
 name = "ferrotensor"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "naga",
@@ -619,7 +619,7 @@ dependencies = [
 
 [[package]]
 name = "ferrotensor-autograd"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ferrotensor-backend",
  "pollster",
@@ -628,7 +628,7 @@ dependencies = [
 
 [[package]]
 name = "ferrotensor-backend"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "env_logger",
@@ -641,7 +641,7 @@ dependencies = [
 
 [[package]]
 name = "ferrotensor-benchmarks"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ferrotensor",
  "ferrotensor-backend",
@@ -652,7 +652,7 @@ dependencies = [
 
 [[package]]
 name = "ferrotensor-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "env_logger",
@@ -670,7 +670,7 @@ dependencies = [
 
 [[package]]
 name = "ferrotensor-graph"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "env_logger",
@@ -685,7 +685,7 @@ dependencies = [
 
 [[package]]
 name = "ferrotensor-hub"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ferrotensor-autograd",
  "ferrotensor-backend",
@@ -698,7 +698,7 @@ dependencies = [
 
 [[package]]
 name = "ferrotensor-loader"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "env_logger",
@@ -716,7 +716,7 @@ dependencies = [
 
 [[package]]
 name = "ferrotensor-monitor"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -730,7 +730,7 @@ dependencies = [
 
 [[package]]
 name = "ferrotensor-py"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ferrotensor",
  "pyo3",
@@ -739,7 +739,7 @@ dependencies = [
 
 [[package]]
 name = "ferrotensor-trainer"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "ferrotensor-autograd",

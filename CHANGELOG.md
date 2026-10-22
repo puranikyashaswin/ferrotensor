@@ -7,13 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-- `ferrotensor`: GPU ops are batched into one submission and one compute pass per sync point, reuse freed buffers, and read back without wgpu's 1 ms sleep on Metal. `char_transformer` trains 600 steps in 31.9 s on an M2 GPU (was 105.0 s). Results are bit for bit unchanged.
-- `ferrotensor`: `Embedding::forward` gathers on the GPU without reading the ids back. Ids outside `[0, vocab)` now give zero rows and no gradient on both devices (before: a panic, or row 0 for negative ids).
+## [0.2.0] - 2026-10-22
 
 ### Added
-- `Device::synchronize()` waits for all queued GPU work.
-- `ferrotensor-benchmarks`: `tensor-api` binary timing the `ferrotensor` Tensor API on the CPU and GPU.
+- **Python bindings** (`ferrotensor-py`, published to PyPI as `ferrotensor`): `Device`, `Tensor` with autograd and operators (`@` for matmul), `nn` layers (Linear, Embedding, LayerNorm, RMSNorm, Dropout, activations, Sequential), losses, SGD and AdamW with LR schedules, and safetensors state dicts. abi3 wheels for CPython 3.10+ on macOS arm64 and Linux x86_64, type stubs, a pytest suite and an MLP example.
+- `ferrotensor`: `Tensor::tril` and `Tensor::triu`; the causal mask is built with `triu`.
+- `ferrotensor`: a KV cache for `nn::MultiHeadAttention` (`forward_cached` with `nn::KvCache`). Decoding one token at a time matches the full causal forward within 1e-5 on CPU and GPU; `char_transformer` samples with it.
+- `ferrotensor`: `DataLoader::epoch_prefetched` gathers batches on a background thread, in the same order as `epoch`.
+- GPU parity tests for every `nn` layer and for safetensors round trips; a Tensor API benchmark (`benchmarks`, `tensor-api` binary) for CPU and GPU devices.
+- CI builds and tests the Python wheels on every push and publishes them to PyPI from `v*` tags through trusted publishing.
+
+### Changed
+- `ferrotensor`: GPU ops are batched into one submission and one compute pass per sync point, reuse freed buffers, and read back without wgpu's 1 ms sleep on Metal. On an M2, 100 small element-wise ops go from 10.6 ms to 0.82 ms and an MLP training step (784-256-10, batch 64) from 10.8 ms to 3.98 ms; `char_transformer` trains 600 steps in 31.9 s (was 105.0 s). Results are bit for bit unchanged.
+- `ferrotensor`: `Embedding::forward` gathers on the GPU without reading the ids back. Ids outside `[0, vocab)` now give zero rows and no gradient on both devices (before: a panic, or row 0 for negative ids).
+- `ferrotensor`: `cross_entropy`, `nll_loss`, `accuracy` and `one_hot` take `impl Into<Targets>`: an f32 tensor of class ids or a slice, array or `Vec` of `i64`, `i32` or `usize`. Negative ids are skipped everywhere, so `accuracy` now ignores `-100` rows like the losses. Existing call forms still compile.
+- `ferrotensor`: `DataLoader` stacks batches into one preallocated buffer instead of cloning each sample (`Dataset::with_sample`). An epoch of 20k × 784 floats at batch 128 goes from 63,923 allocations (251 MB) and 11.3 ms to 2,043 allocations (63 MB) and 6.4 ms on an M2.
+- The `ferrotensor-backend` examples are ported to the current API and check their results against a CPU reference.
+- Docs: install lines, a Python quickstart, batched dispatch in the architecture guide, refreshed timings, and new good first issues.
+
+### Removed
+- `ferrotensor`: the `metal` and `vulkan` Cargo features (no code read them) and the unused dependencies on the internal LLM crates, serde, serde_json, memmap2, log, env_logger and criterion.
 
 ## [0.1.0] - 2026-10-21
 
@@ -35,5 +48,6 @@ First public version.
 - Renamed the project from Rusty to Ferrotensor; crates are now `ferrotensor-*` and the CLI binary is `ferrotensor`.
 - Licensed under MIT OR Apache-2.0 (previously MIT only).
 
-[Unreleased]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/puranikyashaswin/ferrotensor/releases/tag/v0.1.0

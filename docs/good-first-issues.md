@@ -17,6 +17,8 @@ cleanly on Rust 1.99.1 (it is also a CI job).
 
 ## 2. Remove unused dependencies and empty features from the `ferrotensor` crate
 
+*Done in 0.2.0.* `ferrotensor` now depends only on wgpu, pollster, bytemuck, safetensors, thiserror and rand, and the empty `metal`/`vulkan` features are gone.
+
 *easy · `cleanup` · `good first issue`*
 
 `ferrotensor/Cargo.toml` depends on `ferrotensor-backend`, `ferrotensor-autograd`, `ferrotensor-graph`,
@@ -61,6 +63,8 @@ the gradient on the host.
 
 ## 6. Make loss-function target types consistent
 
+*Done in 0.2.0.* Losses and metrics take `impl Into<Targets>`; negative ids are skipped everywhere.
+
 *easy · `api`*
 
 In `ferrotensor/src/functional.rs`, `cross_entropy` takes targets as an `f32`
@@ -71,6 +75,8 @@ example a `Targets` enum or an `impl Into` trait, with the old forms kept
 working), update the doc examples, and note it in `CHANGELOG.md`.
 
 ## 7. Add `tril` / `triu` (and use them for the causal mask)
+
+*Done in 0.2.0.* `Tensor::tril` / `Tensor::triu` exist and build the causal mask.
 
 *easy · `tensor-ops`, `good first issue`*
 
@@ -84,6 +90,8 @@ Done when the new ops pass the CPU gradient check and the GPU parity test.
 
 ## 8. KV cache for `nn::MultiHeadAttention`
 
+*Done in 0.2.0.* `MultiHeadAttention::forward_cached` with `nn::KvCache`, tested against the full causal forward.
+
 *harder · `nn`, `inference`*
 
 `examples/char_transformer.rs` generates text by re-running the whole context
@@ -96,6 +104,8 @@ Done when generating N tokens with the cache matches the uncached logits
 within 1e-5 (a test), and the example uses it.
 
 ## 9. GPU parity tests for the `nn` layers and `serialize`
+
+*Done in 0.2.0.* GPU parity tests cover every `nn` layer and safetensors round trips.
 
 *easy · `tests`, `good first issue`*
 
@@ -130,6 +140,8 @@ training; the real LoRA path is the
 [walkthrough](examples/lora-sft.md).
 
 ## 12. `DataLoader` clones every sample and has no prefetching
+
+*Done in 0.2.0.* Batches are stacked without per-sample clones, and `DataLoader::epoch_prefetched` prefetches on a background thread.
 
 *medium · `data`*
 
