@@ -11,16 +11,9 @@ workflow.
 
 ## 1. `cargo clippy` fails on a workspace lint-priority error
 
-*easy · `build` · `good first issue`*
-
-On Rust 1.99.1, `cargo clippy --workspace --all-targets` stops with
-`error: lint group 'rust_2018_idioms' has the same priority (0) as a lint`
-pointing at `Cargo.toml:28`. Lint groups in `[workspace.lints.rust]` need a
-lower priority than the individual lints. Give `rust_2018_idioms` a
-`priority = -1` (and check the `[workspace.lints.clippy]` table for the same
-problem), then fix whatever warnings clippy shows once it can run.
-
-Done when `cargo clippy --workspace --all-targets` exits cleanly on stable.
+*Done.* `rust_2018_idioms` has `priority = -1` in `[workspace.lints.rust]`, and
+`cargo clippy --workspace --all-targets --all-features -- -D warnings` exits
+cleanly on Rust 1.99.1 (it is also a CI job).
 
 ## 2. Remove unused dependencies and empty features from the `ferrotensor` crate
 
@@ -39,13 +32,8 @@ with the smaller dependency list.
 
 ## 3. Fix rustdoc broken-link warnings
 
-*easy · `docs` · `good first issue`*
-
-`cargo doc --workspace --no-deps` warns `unresolved link to 'target'` at
-`ferrotensor-backend/src/lib.rs:5087`: the text `[target]` in a doc comment is read
-as an intra-doc link. Escape the brackets (`\[target\]`), then fix any other
-warnings the command prints. CI builds the docs, so this keeps the output
-clean.
+*Done.* `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` exits
+cleanly on Rust 1.99.1 (it is also a CI job).
 
 ## 4. Softmax kernel does the row reduction in a single thread
 
@@ -131,15 +119,15 @@ for the method and what is still slow.
 
 ## 11. Port the legacy `ferrotensor_backend` examples and verify they run
 
-*medium · `examples`, `docs`*
-
-`ferrotensor/examples/basic_tensor.rs`, `flash_attention.rs` and `lora_finetune.rs`
-are written against the low-level `ferrotensor_backend` API, not the `ferrotensor` tensor
-API the rest of the docs use, and at the time of writing `basic_tensor`
-panics in `ComputeEngine::new` with a WGSL parse error. Once the backend fix
-lands, run each, fix what is broken, and put the real output in the example's
-doc comment and in `ferrotensor/examples/README.md`. Delete or clearly mark any
-example that cannot be made to work.
+*Done.* The WGSL parse error is gone and every example runs on an Apple M2:
+the four in `ferrotensor-backend/examples` (`init_wgpu`, `tensor_creation`,
+`fused_op`, `ops_test`), plus `basic_tensor` (moved there from the
+`ferrotensor` crate) and `flash_attention` (moved to
+`ferrotensor-graph/examples`). Each has its command and real output in its
+doc comment and checks its result against a CPU computation or hand-computed
+values. `lora_finetune` was deleted: its loss table was a formula, not
+training; the real LoRA path is the
+[walkthrough](examples/lora-sft.md).
 
 ## 12. `DataLoader` clones every sample and has no prefetching
 
@@ -154,3 +142,103 @@ batch while the current step runs.
 Done when a benchmark with a large in-memory dataset shows fewer allocations or
 less time per epoch, and the public behaviour (order, shuffling, `drop_last`)
 is unchanged and tested.
+
+## 13. `FlashAttention::memory_savings` prints "0MB vs 1MB"
+
+*easy · `bug`, `docs`, `good first issue`*
+
+`ferrotensor-graph/src/flash_attention.rs` formats the two sizes with integer
+division by 1,000,000, so for sequence length 512 and head dim 64 it prints
+`8.0x less memory (0MB vs 1MB for seq=512)`: the flash side rounds to zero.
+Print KiB (or switch units by size), and say in the doc comment that the
+sizes are per head and for the score matrix only.
+
+Done when the string for `seq = 512` shows non-zero sizes and the existing
+`test_memory_savings` is extended to check the numbers.
+
+## 14. `FlashAttention::forward_multi_head` and `multi_head_forward` are stubs
+
+*easy · `cleanup`, `good first issue`*
+
+In `ferrotensor-graph/src/flash_attention.rs`, `forward_multi_head` has a
+`TODO` and calls `forward`, and `multi_head_forward` calls `forward` with the
+same tensor as Q, K and V and no projections, although its doc comment says it
+"handles Q, K, V projection and output projection". `forward` already splits
+heads (it views the `[batch, seq, heads, head_dim]` layout). Either delete
+the two methods and update their callers, or make the docs say what they
+do. Check with `rg "multi_head_forward|forward_multi_head"` first.
+
+Done when no public method's doc comment promises something it does not do.
+
+## 15. Run the reductions in `cross_entropy`, `argmax` and `cat` on the GPU
+
+*medium · `performance`, `kernels`*
+
+Since GPU ops are [batched](architecture.md#batched-gpu-dispatch), every op
+that copies values to the host in the middle of its work splits the batch.
+The ones that do (see "What is still slow" in
+[benchmarks/RESULTS.md](../benchmarks/RESULTS.md#ferrotensor-tensor-api-cpu-and-gpu-devices)):
+`cross_entropy` with class-index targets, `argmax`/`argmin` and `cat`. Pick
+one, write the kernel (see [writing-a-kernel.md](writing-a-kernel.md)) and
+keep the CPU reference as the oracle.
+
+Done when the op's GPU path no longer calls `to_vec` or `item`, the GPU parity
+test passes, and `cargo run -p ferrotensor-benchmarks --release --bin
+tensor-api` shows the case you touched no slower (report both numbers and the
+machine).
+
+## 16. Index backward passes (`index_select`, `Embedding`) scatter on the host
+
+*medium · `performance`, `kernels`*
+
+The backward pass of `index_select` and of `nn::Embedding` reads the ids and
+the incoming gradient back to the host and scatters there, which forces a
+sync on the GPU. Add a scatter-add kernel (atomics on `u32`-encoded floats or
+a sorted-ids reduction; note WGSL has no float atomics) and use it from both.
+
+Done when the gradient checks in `ferrotensor/src/tensor/tests.rs` and
+`ferrotensor/src/nn/embedding.rs` pass on the CPU and, with
+`FERROTENSOR_RUN_GPU_TESTS=1`, on the GPU, and neither backward calls `to_vec`.
+
+## 17. Full reductions (`sum()`) use a single GPU thread
+
+*medium · `performance`, `kernels`*
+
+A reduction over a whole tensor (`x.sum()`) runs one GPU thread per output,
+so for a scalar output the `reduce` kernel in
+`ferrotensor/src/backend/kernels.rs` uses one thread to add every element.
+Write a two-stage or workgroup-tree reduction for the full-reduction case and
+leave the per-axis path alone.
+
+Done when `sum()` over a `[4096, 4096]` tensor on the GPU matches the CPU
+within f32 tolerance and is measurably faster than before (report numbers and
+the machine).
+
+## 18. `clip_grad_norm` reads one scalar back per parameter
+
+*easy · `performance`, `good first issue`*
+
+`optim::clip_grad_norm` computes `g.square().sum().item()` for every
+parameter (`ferrotensor/src/optim/optimizer.rs`), so on the GPU each
+parameter forces a sync. Accumulate the squared norms on the device (add the
+per-parameter sums as tensors, then read the total once), keeping the result
+and the clipping behaviour identical.
+
+Done when the existing clipping tests pass unchanged and
+`FERROTENSOR_RUN_GPU_TESTS=1 cargo test -p ferrotensor --lib` still passes.
+
+## 19. Fuse chains of element-wise ops into one kernel
+
+*harder · `performance`, `kernels`*
+
+100 tiny element-wise ops on the GPU still take about 18x as long as on the
+CPU, mostly GPU time per dispatch (about 9-13 µs each). Because ops are now
+recorded before they run, consecutive `unary`/`binary` dispatches on same-sized
+buffers could be merged into one kernel that applies the op codes in
+sequence. This needs design discussion first: where the merge happens
+(`GpuContext::dispatch` or `ComputeEngine::encode`), and how intermediates
+that other tensors still reference stay correct.
+
+Done when the 100-op case in `tensor-api` improves, every output stays
+bit-identical (the benchmark prints checksums), and the CPU-vs-GPU parity tests
+pass.
