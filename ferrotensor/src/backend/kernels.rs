@@ -369,12 +369,14 @@ fn permute(@builtin(global_invocation_id) gid: vec3<u32>,
 }
 
 // --- Row gather (embedding lookup / index_select on dim 0) -------------------
+// With ids_f32 set, the indices are f32 values (an embedding's id tensor);
+// an id outside [0, rows) gives a row of zeros.
 
 struct GatherParams {
     n_idx: u32,
     row: u32,
-    _pad0: u32,
-    _pad1: u32,
+    rows: u32,
+    ids_f32: u32,
 };
 
 @group(0) @binding(0) var<storage, read> gat_table: array<f32>;
@@ -389,6 +391,15 @@ fn gather_rows(@builtin(global_invocation_id) gid: vec3<u32>,
     if (i >= gat_p.n_idx * gat_p.row) { return; }
     let r = i / gat_p.row;
     let c = i % gat_p.row;
-    gat_out[i] = gat_table[gat_idx[r] * gat_p.row + c];
+    var id = gat_idx[r];
+    if (gat_p.ids_f32 != 0u) {
+        let f = bitcast<f32>(id);
+        id = select(gat_p.rows, u32(f), f >= 0.0 && f < f32(gat_p.rows));
+    }
+    if (id >= gat_p.rows) {
+        gat_out[i] = 0.0;
+        return;
+    }
+    gat_out[i] = gat_table[id * gat_p.row + c];
 }
 "#;

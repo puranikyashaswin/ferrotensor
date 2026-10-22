@@ -318,7 +318,7 @@ impl Tensor {
             Some((ctx, table)) if n > 0 => {
                 let out = alloc(ctx, n);
                 let indices = u32_buffer(ctx, &idx32);
-                let params = Arg::Params([idx.len() as u32, row as u32, 0, 0]);
+                let params = Arg::Params([idx.len() as u32, row as u32, rows as u32, 0]);
                 ctx.dispatch(
                     "gather_rows",
                     &[
@@ -337,4 +337,51 @@ impl Tensor {
             }
         }
     }
+
+    /// Rows of this `[rows, ..]` table picked by the ids stored as `f32` in
+    /// `ids`; the result has shape `ids.shape + self.shape[1..]`. An id
+    /// outside `[0, rows)` gives a row of zeros.
+    ///
+    /// On a GPU the ids are read on the device, with no copy to the host.
+    pub(crate) fn gather_rows_by_ids_raw(&self, ids: &Tensor) -> Tensor {
+        let rows = self.shape[0];
+        let row: usize = self.shape[1..].iter().product();
+        let out_shape = [&ids.shape[..], &self.shape[1..]].concat();
+        let n = ids.numel() * row;
+        let ids = ids.to_device(&self.device);
+        match (self.gpu(), ids.gpu()) {
+            (Some((ctx, table)), Some((_, idx))) if n > 0 => {
+                let out = alloc(ctx, n);
+                let params = Arg::Params([ids.numel() as u32, row as u32, rows as u32, 1]);
+                ctx.dispatch(
+                    "gather_rows",
+                    &[
+                        Arg::Buffer(table),
+                        Arg::Buffer(idx),
+                        Arg::Buffer(&out),
+                        params,
+                    ],
+                    ComputeEngine::workgroups_1d(n),
+                );
+                self.gpu_output(out, out_shape)
+            }
+            _ => {
+                let table = self.to_vec();
+                let mut out = vec![0.0; n];
+                for (r, id) in valid_ids(&ids.to_vec(), rows) {
+                    out[r * row..][..row].copy_from_slice(&table[id * row..][..row]);
+                }
+                self.host_output(out, &out_shape)
+            }
+        }
+    }
+}
+
+/// `(position, row)` of each id in `ids` that is in `[0, rows)`, matching the
+/// `gather_rows` kernel's `f32` id handling.
+pub(crate) fn valid_ids(ids: &[f32], rows: usize) -> impl Iterator<Item = (usize, usize)> + '_ {
+    ids.iter()
+        .enumerate()
+        .filter(move |&(_, &v)| v >= 0.0 && v < rows as f32)
+        .map(|(r, &v)| (r, v as usize))
 }

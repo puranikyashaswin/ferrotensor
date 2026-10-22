@@ -719,6 +719,32 @@ impl Tensor {
         })
     }
 
+    /// Embedding lookup: rows of this `[vocab, ..]` table picked by the ids
+    /// stored as `f32` in `ids`, with shape `ids.shape + self.shape[1..]`.
+    ///
+    /// Ids outside `[0, vocab)` give rows of zeros and no gradient. On a GPU
+    /// the forward pass reads the ids on the device; the backward pass reads
+    /// them back to scatter the gradient, like [`Tensor::index_select`].
+    pub(crate) fn embedding(&self, ids: &Tensor) -> Tensor {
+        let out = self.gather_rows_by_ids_raw(ids);
+        let ids = ids.detach();
+        let shape = self.shape.clone();
+        out.with_node("embedding", vec![self.clone()], move |g| {
+            let row: usize = shape[1..].iter().product();
+            let grad = g.to_vec();
+            let mut out = vec![0.0f32; shape.iter().product()];
+            for (r, id) in super::raw::valid_ids(&ids.to_vec(), shape[0]) {
+                for (o, &v) in out[id * row..][..row]
+                    .iter_mut()
+                    .zip(&grad[r * row..][..row])
+                {
+                    *o += v;
+                }
+            }
+            vec![Some(g.host_output(out, &shape))]
+        })
+    }
+
     // ========================================================================
     // MATRIX PRODUCT AND SOFTMAX
     // ========================================================================
