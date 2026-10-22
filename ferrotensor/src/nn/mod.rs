@@ -12,7 +12,7 @@ mod module;
 mod normalization;
 
 pub use activation::{LeakyReLU, ReLU, SiLU, Sigmoid, Softmax, Tanh, GELU};
-pub use attention::MultiHeadAttention;
+pub use attention::{KvCache, MultiHeadAttention};
 pub use container::{Layer, ModuleList, Sequential};
 pub use dropout::Dropout;
 pub use embedding::Embedding;
