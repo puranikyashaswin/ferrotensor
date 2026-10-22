@@ -1,6 +1,6 @@
 [package]
 name = "ferrotensor-monitor"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Terminal dashboard for monitoring Ferrotensor training runs"
 authors.workspace = true
@@ -21,4 +21,4 @@ tokio = { version = "1.43.0", features = ["full"] }
 anyhow = "1.0.95"
 chrono = "0.4.39"
 rand = "0.9.2"
-ferrotensor-trainer = { path = "../ferrotensor-trainer", version = "0.1.0" }
+ferrotensor-trainer = { path = "../ferrotensor-trainer", version = "0.2.0" }

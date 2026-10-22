@@ -1,6 +1,6 @@
 [package]
 name = "ferrotensor-loader"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Safetensors model loading and tokenizer support for Ferrotensor"
 authors.workspace = true
@@ -19,7 +19,7 @@ memmap2 = "0.9"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "1.0"
-ferrotensor-backend = { path = "../ferrotensor-backend", version = "0.1.0" }
+ferrotensor-backend = { path = "../ferrotensor-backend", version = "0.2.0" }
 env_logger = "0.11"
 pollster = "0.3"
 bytemuck = "1.14"
