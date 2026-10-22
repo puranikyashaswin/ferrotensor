@@ -1,0 +1,41 @@
+[book]
+title = "Ferrotensor"
+description = "Guide to Ferrotensor, a pure-Rust GPU ML framework on wgpu and WGSL."
+authors = ["Yashaswin Puranik"]
+language = "en"
+src = "src"
+
+[build]
+create-missing = false
+
+[preprocessor.repolinks]
+command = "python3 repolinks.py"
+after = ["links"]
+
+# Book chapter -> repository file it includes. Links inside the included
+# files are rewritten against these paths.
+[preprocessor.repolinks.sources]
+"use-cases.md" = "docs/use-cases.md"
+"examples/lora-sft.md" = "docs/examples/lora-sft.md"
+"architecture.md" = "docs/architecture.md"
+"writing-a-kernel.md" = "docs/writing-a-kernel.md"
+"benchmarks.md" = "benchmarks/RESULTS.md"
+"python-reference.md" = "ferrotensor-py/README.md"
+"good-first-issues.md" = "docs/good-first-issues.md"
+"changelog.md" = "CHANGELOG.md"
+
+[output.html]
+site-url = "/ferrotensor/docs/"
+default-theme = "light"
+preferred-dark-theme = "navy"
+additional-css = ["theme/ferrotensor.css"]
+additional-js = ["theme/home-link.js"]
+git-repository-url = "https://github.com/puranikyashaswin/ferrotensor"
+git-repository-icon = "fab-github"
+no-section-label = true
+
+[output.html.playground]
+runnable = false
+
+[output.html.search]
+enable = true

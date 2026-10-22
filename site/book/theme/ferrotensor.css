@@ -1,0 +1,161 @@
+/* Ferrotensor theme for mdBook: the landing page's palette and type on the
+   "light" theme and on "navy", which is used when the system prefers dark. */
+
+:root {
+  --mono-font: ui-monospace, "SF Mono", SFMono-Regular, "Cascadia Code", "JetBrains Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --content-max-width: 760px;
+  --ft-sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+
+html { font-family: var(--ft-sans); }
+
+html.light {
+  --bg: #f6f3ee;
+  --fg: #1b1815;
+  --sidebar-bg: #eee9e1;
+  --sidebar-fg: #3d3731;
+  --sidebar-non-existant: #8a8076;
+  --sidebar-active: #b03a10;
+  --sidebar-spacer: #d9d1c6;
+  --sidebar-header-border-color: #b03a10;
+  --scrollbar: #b9ae9f;
+  --icons: #6b625a;
+  --icons-hover: #1b1815;
+  --links: #b03a10;
+  --inline-code-color: #1b1815;
+  --theme-popup-bg: #fffdf9;
+  --theme-popup-border: #b9ae9f;
+  --theme-hover: #eee9e1;
+  --quote-bg: #eee9e1;
+  --quote-border: #d9d1c6;
+  --table-border-color: #d9d1c6;
+  --table-header-bg: #e6dfd4;
+  --table-alternate-bg: #f1ece5;
+  --searchbar-border-color: #b9ae9f;
+  --searchbar-bg: #fffdf9;
+  --searchbar-fg: #1b1815;
+  --searchbar-shadow-color: #d9d1c6;
+  --searchresults-header-fg: #4f4841;
+  --searchresults-border-color: #d9d1c6;
+  --searchresults-li-bg: #eee9e1;
+  --search-mark-bg: #f6c7ad;
+  --footnote-highlight: #b03a10;
+  --ft-code-bg: #ece6dc;
+  --ft-inline-bg: rgb(176 58 16 / 0.09);
+}
+
+html.navy {
+  --bg: #141210;
+  --fg: #efe9e1;
+  --sidebar-bg: #1b1815;
+  --sidebar-fg: #c3b9ad;
+  --sidebar-non-existant: #7d7368;
+  --sidebar-active: #f37b45;
+  --sidebar-spacer: #36302a;
+  --sidebar-header-border-color: #f37b45;
+  --scrollbar: #544a40;
+  --icons: #a39889;
+  --icons-hover: #efe9e1;
+  --links: #f37b45;
+  --inline-code-color: #efe9e1;
+  --theme-popup-bg: #1f1b18;
+  --theme-popup-border: #544a40;
+  --theme-hover: #2a2520;
+  --quote-bg: #1f1b18;
+  --quote-border: #36302a;
+  --table-border-color: #36302a;
+  --table-header-bg: #2a2520;
+  --table-alternate-bg: #1a1714;
+  --searchbar-border-color: #544a40;
+  --searchbar-bg: #1f1b18;
+  --searchbar-fg: #efe9e1;
+  --searchbar-shadow-color: #000;
+  --searchresults-header-fg: #c3b9ad;
+  --searchresults-border-color: #36302a;
+  --searchresults-li-bg: #1f1b18;
+  --search-mark-bg: #8a3a17;
+  --footnote-highlight: #f37b45;
+  --ft-code-bg: #0e0d0b;
+  --ft-inline-bg: rgb(243 123 69 / 0.13);
+}
+
+html.light, html.navy {
+  --copy-button-filter: none;
+  --copy-button-filter-hover: none;
+}
+
+.content { line-height: 1.65; }
+/* mdBook's root font size is 10px, so 1.7rem is 17px. */
+.content main { font-size: 1.7rem; }
+
+.content h1, .content h2, .content h3, .content h4 {
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+}
+.content h1 { font-size: 2.3em; font-weight: 800; letter-spacing: -0.035em; }
+.content h2 {
+  margin-top: 2.2em;
+  padding-top: 0.6em;
+  border-top: 1px solid var(--table-border-color);
+}
+.content h1 + h2, .content main > h2:first-child { border-top: 0; }
+
+.content a:link, .content a:visited { color: var(--links); text-underline-offset: 0.18em; }
+.content a:hover { text-decoration-thickness: 2px; }
+
+:focus-visible {
+  outline: 2px solid var(--links);
+  outline-offset: 2px;
+}
+
+html.light :not(pre) > code, html.navy :not(pre) > code {
+  background: var(--ft-inline-bg);
+  padding: 0.08em 0.32em;
+  border-radius: 4px;
+}
+
+html.light pre > code, html.navy pre > code,
+html.light pre, html.navy pre {
+  background: var(--ft-code-bg);
+  border-radius: 8px;
+}
+html.light .hljs, html.navy .hljs { background: var(--ft-code-bg); }
+
+table { border-collapse: collapse; font-size: 0.94em; }
+table thead th { text-align: left; }
+.table-wrapper { overflow-x: auto; }
+/* Right-aligned columns hold numbers: keep each value on one line. */
+table td[style*="right"], table th[style*="right"] { white-space: nowrap; }
+table td, table th { padding: 0.45em 0.8em; }
+
+.sidebar .sidebar-scrollbox { font-size: 1.5rem; }
+.chapter li.part-title {
+  font: 600 1.15rem/1.4 var(--mono-font);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--sidebar-active);
+  margin-top: 1.4em;
+}
+.chapter li a.active { font-weight: 650; }
+
+.menu-title { font-weight: 800; letter-spacing: -0.02em; }
+
+.ft-home {
+  display: inline-flex;
+  align-items: center;
+  height: 100%;
+  padding-inline: 0.8rem;
+  font: 600 1.3rem/1 var(--mono-font);
+  color: var(--icons);
+  text-decoration: none;
+}
+.ft-home:hover { color: var(--icons-hover); }
+
+@media (max-width: 560px) {
+  .ft-home { display: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  *, *::before, *::after { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }
+}
