@@ -9,8 +9,12 @@ the included file's place in the repository and rewritten to
 - the book chapter that includes the target file, when there is one, or
 - the file (or directory) on GitHub otherwise.
 
-Links inside fenced code blocks are left alone. Runs after mdBook's `links`
-preprocessor, so the included text is already in place.
+A page keeps one top-level heading: when an included file has a second `# `
+heading (benchmarks/RESULTS.md does), that heading and every heading after it
+move down one level. Anchors are made from the heading text, so links still work.
+
+Links and headings inside fenced code blocks are left alone. Runs after
+mdBook's `links` preprocessor, so the included text is already in place.
 """
 
 import json
@@ -25,6 +29,7 @@ BRANCH = "main"
 INLINE = re.compile(r"(\]\()([^)\s]+)(\))")
 REFDEF = re.compile(r"^(\s{0,3}\[[^\]]+\]:\s*)(\S+)(.*)$")
 FENCE = re.compile(r"^\s*(```|~~~)")
+HEADING = re.compile(r"^(#{1,5}) ")
 EXTERNAL = re.compile(r"^(?:[a-z][a-z0-9+.-]*:|#|/)", re.IGNORECASE)
 
 
@@ -46,7 +51,7 @@ def rewrite_target(target, chapter, source, by_repo_path, repo_root, problems):
 
 
 def rewrite(content, chapter, source, by_repo_path, repo_root, problems):
-    out, fence = [], None
+    out, fence, h1s = [], None, 0
     for line in content.split("\n"):
         m = FENCE.match(line)
         if m:
@@ -57,6 +62,11 @@ def rewrite(content, chapter, source, by_repo_path, repo_root, problems):
             out.append(line)
             continue
         if fence is None:
+            h = HEADING.match(line)
+            if h and len(h.group(1)) == 1:
+                h1s += 1
+            if h and h1s > 1:
+                line = "#" + line
             fix = lambda t: rewrite_target(t, chapter, source, by_repo_path, repo_root, problems)
             line = INLINE.sub(lambda m: m.group(1) + fix(m.group(2)) + m.group(3), line)
             line = REFDEF.sub(lambda m: m.group(1) + fix(m.group(2)) + m.group(3), line)
