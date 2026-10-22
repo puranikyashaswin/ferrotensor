@@ -1,3 +1,16 @@
+//! Create the wgpu context (adapter, device and queue).
+//!
+//! Run with: `cargo run -p ferrotensor-backend --example init_wgpu`
+//!
+//! Output:
+//!
+//! ```text
+//! Initializing WGPU Context...
+//! WGPU Context initialized successfully!
+//! ```
+//!
+//! Set `RUST_LOG=info` to see which adapter was picked.
+
 use ferrotensor_backend::WgpuContext;
 
 fn main() {

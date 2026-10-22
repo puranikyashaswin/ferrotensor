@@ -50,16 +50,3 @@ criterion = "0.5"
 default = ["metal"]
 metal = []
 vulkan = []
-
-# Examples
-[[example]]
-name = "basic_tensor"
-path = "examples/basic_tensor.rs"
-
-[[example]]
-name = "flash_attention"
-path = "examples/flash_attention.rs"
-
-[[example]]
-name = "lora_finetune"
-path = "examples/lora_finetune.rs"

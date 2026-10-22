@@ -21,10 +21,10 @@ pollster::block_on(async {
 });
 ```
 
-> **Known issue (TODO):** at the time of writing, `ComputeEngine::new` fails
-> with a WGSL parse error ("Invalid sub-access into type") on the current
-> `main`, so this snippet and `examples/ops_test.rs` panic. A fix is in
-> progress; re-verify this example once it lands.
+Runnable versions are in [`examples/`](examples): `init_wgpu`, `tensor_creation`,
+`fused_op`, `ops_test` and `basic_tensor` (each has its real output in its doc
+comment), for example
+`cargo run -p ferrotensor-backend --example ops_test`.
 
 The separate `ferrotensor` crate has its own small kernel set; this crate is the
 backend of `ferrotensor-autograd`, `ferrotensor-graph` and `ferrotensor-trainer`.
