@@ -4,6 +4,8 @@
 
 <p align="center">
   <a href="https://github.com/puranikyashaswin/ferrotensor/actions/workflows/ci.yml"><img src="https://github.com/puranikyashaswin/ferrotensor/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://crates.io/crates/ferrotensor"><img src="https://img.shields.io/crates/v/ferrotensor.svg" alt="crates.io"></a>
+  <a href="https://docs.rs/ferrotensor"><img src="https://img.shields.io/docsrs/ferrotensor" alt="docs.rs"></a>
   <img src="https://img.shields.io/badge/rust-1.88+-orange" alt="Rust 1.88+">
   <img src="https://img.shields.io/badge/GPU-Metal%20%7C%20Vulkan%20%7C%20DX12-purple" alt="GPU backends">
   <img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="MIT OR Apache-2.0">
@@ -21,8 +23,8 @@ people CUDA-first frameworks leave out (laptops, consumer and integrated
 GPUs) and for anyone who wants to read, and change, every layer from the API
 down to the shader. It is young: pre-1.0, f32 only, and small-scale by design.
 
-- [Quickstart](#quickstart) · [Features](#feature-matrix) · [Architecture](#architecture) · [Compared with candle, burn and tch](#compared-with-candle-burn-and-tch) · [Roadmap](#roadmap)
-- Docs: [architecture](docs/architecture.md) · [writing a kernel](docs/writing-a-kernel.md) · [use cases](docs/use-cases.md) · [LoRA SFT walkthrough](docs/examples/lora-sft.md) · [benchmarks](benchmarks/RESULTS.md)
+- [Install](#install) · [Quickstart](#quickstart) · [Python](#python) · [Features](#feature-matrix) · [Architecture](#architecture) · [Compared with candle, burn and tch](#compared-with-candle-burn-and-tch) · [Roadmap](#roadmap)
+- Docs: [architecture](docs/architecture.md) · [writing a kernel](docs/writing-a-kernel.md) · [use cases](docs/use-cases.md) · [LoRA SFT walkthrough](docs/examples/lora-sft.md) · [benchmarks](benchmarks/RESULTS.md) · [API docs](https://docs.rs/ferrotensor)
 
 
 ## Highlights
@@ -36,12 +38,31 @@ Measured on a MacBook Air (Apple M2, 8 GB unified memory) through Metal:
 - **Hand-written WGSL kernels.** matmul reaches **611 GFLOPS** at 4096³
   (5× the first version); causal flash attention forward is 4× faster at
   sequence length 2048. [Benchmarks and method](benchmarks/RESULTS.md).
+- **Batched GPU dispatch.** Through the `Tensor` API, ops are recorded and
+  submitted together instead of one submit per op: 100 element-wise ops on a
+  `[4096]` tensor take 0.84 ms on the GPU (10.73 ms before), an MLP training
+  step 3.98 ms (10.80 ms before), and the 600-step `char_transformer` example
+  31.9 s (105.0 s before; 42.5 s on the CPU). Chains of tiny ops are still
+  faster on the CPU. [Before/after method](benchmarks/RESULTS.md#ferrotensor-tensor-api-cpu-and-gpu-devices).
 - **Checked, not assumed.** Every differentiable op is tested against finite
   differences on the CPU, and every GPU kernel against a CPU reference.
 
-## Quickstart
+## Install
 
 You need Rust 1.88+ (`rustup` is enough). On macOS no other setup is needed.
+
+```bash
+cargo add ferrotensor           # the tensor API, in your project
+cargo install ferrotensor-cli   # the `ferrotensor` command: LoRA train / eval / generate
+pip install ferrotensor         # Python bindings (from 0.2.0)
+```
+
+The Python package is not on PyPI before the 0.2.0 release; until then build
+it from a checkout (see [Python](#python)).
+
+## Quickstart
+
+From a checkout:
 
 ```bash
 git clone https://github.com/puranikyashaswin/ferrotensor.git
@@ -89,6 +110,36 @@ More runnable programs, with their real output, are in
 character-level transformer trained from scratch, a CPU-vs-GPU matmul and
 attention comparison, and similarity search.
 
+## Python
+
+The `ferrotensor-py` crate binds the tensor API to Python (PyTorch-style
+tensors, autograd, `nn`, `optim`, safetensors; CPU or GPU). No NumPy needed.
+
+```bash
+pip install ferrotensor          # from 0.2.0
+# or, from a checkout of this repository:
+pip install ./ferrotensor-py
+```
+
+```python
+import ferrotensor as ft
+from ferrotensor import nn, optim
+import ferrotensor.nn.functional as F
+
+model = nn.Sequential(nn.Linear(2, 16), nn.Tanh(), nn.Linear(16, 2))
+opt = optim.AdamW(model.parameters(), lr=0.05, weight_decay=0.0)
+x = ft.tensor([[0, 0], [0, 1], [1, 0], [1, 1]])
+for _ in range(200):
+    opt.zero_grad()
+    loss = F.cross_entropy(model(x), [0, 1, 1, 0])  # XOR
+    loss.backward()
+    opt.step()
+print(model(x).argmax(dim=1).tolist())  # [0.0, 1.0, 1.0, 0.0]
+```
+
+Devices, the full list of what is covered, and the differences from PyTorch
+are in [ferrotensor-py/README.md](ferrotensor-py/README.md).
+
 ## Feature matrix
 
 "Stable" means implemented, covered by tests, and used by the examples; the
@@ -111,6 +162,7 @@ tested, incomplete, or only checked on one machine.
 | `f16` / `bf16` tensors in the `ferrotensor` API | Planned | |
 | Convolutions, sort/top-k, cumsum in the `ferrotensor` API | Planned | |
 | Batched GPU dispatch in the `ferrotensor` API | **Stable** | Ops submit together at each read back; `char_transformer` trains faster on the GPU than the CPU, but chains of tiny ops are still faster on the CPU ([numbers](benchmarks/RESULTS.md#ferrotensor-tensor-api-cpu-and-gpu-devices)) |
+| Python bindings (`ferrotensor-py`) | **Experimental** | Tensors, autograd, `nn`, `optim`, safetensors; wheels for macOS arm64 and Linux x86_64 from 0.2.0 |
 | Multi-GPU / distributed training | Planned | `ferrotensor-cli` has a file-based gradient sync flag (`--world-size`) that is a prototype |
 | A CUDA backend | Not planned | wgpu is the point of the project |
 
@@ -152,7 +204,8 @@ tensor op reaches a WGSL kernel, are in [docs/architecture.md](docs/architecture
 | [`ferrotensor-cli`](ferrotensor-cli) | `train`, `eval` and `infer` commands |
 | [`ferrotensor-monitor`](ferrotensor-monitor) | Terminal dashboard |
 | [`ferrotensor-hub`](ferrotensor-hub) | Hugging Face Hub download helpers |
-| [`benchmarks`](benchmarks) | GPU kernel benchmarks |
+| [`ferrotensor-py`](ferrotensor-py) | Python bindings for the `ferrotensor` crate (not published to crates.io) |
+| [`benchmarks`](benchmarks) | GPU kernel and tensor-API benchmarks |
 
 ## Fine-tuning a model
 
@@ -198,13 +251,16 @@ against them; kernel-level numbers for Ferrotensor alone are in
 
 - [x] Rebuilt tensor core with a CPU device, checked autograd, differentiable `nn` layers, LR schedules, safetensors state dicts
 - [x] CI: fmt, clippy, tests on Linux and macOS, docs, MSRV, cargo-deny
-- [ ] Reliable end-to-end LoRA SFT run, documented ([walkthrough](docs/examples/lora-sft.md))
-- [ ] Published kernel benchmarks ([benchmarks/RESULTS.md](benchmarks/RESULTS.md))
-- [ ] Faster GPU path for many small ops (command batching, bind-group caching)
+- [x] Reliable end-to-end LoRA SFT run, documented ([walkthrough](docs/examples/lora-sft.md))
+- [x] Published kernel benchmarks ([benchmarks/RESULTS.md](benchmarks/RESULTS.md))
+- [x] First crates.io release (0.1.0)
+- [x] Batched GPU dispatch for many small ops ([before/after numbers](benchmarks/RESULTS.md#ferrotensor-tensor-api-cpu-and-gpu-devices))
+- [x] Python bindings (`ferrotensor-py`)
+- [ ] Python wheels on PyPI (with 0.2.0)
+- [ ] Fuse element-wise op chains into one kernel (tiny-op chains on the GPU are still about 18x slower than the CPU)
 - [ ] Parallel-reduction softmax and layer norm kernels
 - [ ] `f16`/`bf16` tensors, convolutions, sort/top-k
 - [ ] Unify the `ferrotensor` tensor API with the LLM stack
-- [ ] First crates.io release
 
 ## Contributing
 
