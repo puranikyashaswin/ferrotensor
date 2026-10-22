@@ -1,0 +1,4 @@
+/.venv/
+*.so
+/dist/
+.pytest_cache/

@@ -1,0 +1,28 @@
+[package]
+name = "ferrotensor-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+description = "Python bindings for ferrotensor"
+publish = false
+
+[lib]
+name = "_ferrotensor"
+crate-type = ["cdylib"]
+# Linking a test harness would need libpython; the bindings are tested with pytest.
+test = false
+doctest = false
+
+[dependencies]
+ferrotensor = { path = "../ferrotensor" }
+pyo3 = { version = "0.30", features = ["abi3-py39", "extension-module"] }
+
+[build-dependencies]
+pyo3-build-config = "0.30"
+
+[lints]
+workspace = true
