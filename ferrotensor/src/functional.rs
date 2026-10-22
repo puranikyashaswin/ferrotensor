@@ -124,12 +124,9 @@ pub fn scaled_dot_product_attention(q: &Tensor, k: &Tensor, v: &Tensor, causal: 
     let lk = k.shape[k.ndim() - 2];
     let mut scores = q.matmul(&k.transpose()).mul_scalar(1.0 / (d as f32).sqrt());
     if causal {
-        let offset = lk.saturating_sub(lq);
-        let mask: Vec<f32> = (0..lq * lk)
-            .map(|i| if i % lk > i / lk + offset { 1.0 } else { 0.0 })
-            .collect();
-        let mask = Tensor::from_vec(mask, &[lq, lk], q.device());
-        scores = scores.masked_fill(&mask, -1e9);
+        let offset = lk.saturating_sub(lq) as isize;
+        let future = Tensor::ones(&[lq, lk], q.device()).triu(offset + 1);
+        scores = scores.masked_fill(&future, -1e9);
     }
     scores.softmax(-1).matmul(v)
 }

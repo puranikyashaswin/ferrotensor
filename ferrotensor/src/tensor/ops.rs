@@ -162,6 +162,56 @@ impl Tensor {
         Tensor::where_cond(mask, &fill, self)
     }
 
+    /// Lower triangle of the last two dims: keep elements `[.., i, j]` with
+    /// `j - i <= diagonal` and zero the rest. `diagonal = 0` keeps the main
+    /// diagonal, positive values keep that many diagonals above it, negative
+    /// values drop diagonals below it. Leading dims are batch dims.
+    ///
+    /// # Panics
+    /// Panics when the tensor has fewer than two dims.
+    pub fn tril(&self, diagonal: isize) -> Tensor {
+        self.mul(&self.triangle_mask(diagonal, true))
+    }
+
+    /// Upper triangle of the last two dims: keep elements `[.., i, j]` with
+    /// `j - i >= diagonal` and zero the rest (see [`Tensor::tril`]).
+    ///
+    /// `Tensor::ones(&[l, l], &device).triu(1)` is the causal attention mask
+    /// for [`Tensor::masked_fill`]: ones above the diagonal mark the future.
+    ///
+    /// # Panics
+    /// Panics when the tensor has fewer than two dims.
+    pub fn triu(&self, diagonal: isize) -> Tensor {
+        self.mul(&self.triangle_mask(diagonal, false))
+    }
+
+    /// 0/1 mask `[rows, cols]` of the last two dims for `tril` (`lower`) or
+    /// `triu`.
+    fn triangle_mask(&self, diagonal: isize, lower: bool) -> Tensor {
+        assert!(
+            self.ndim() >= 2,
+            "tril/triu need at least 2 dims, got shape {:?}",
+            self.shape
+        );
+        let (rows, cols) = (self.shape[self.ndim() - 2], self.shape[self.ndim() - 1]);
+        let mask: Vec<f32> = (0..rows * cols)
+            .map(|k| {
+                let offset = (k % cols) as isize - (k / cols) as isize;
+                let keep = if lower {
+                    offset <= diagonal
+                } else {
+                    offset >= diagonal
+                };
+                if keep {
+                    1.0
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        Tensor::from_vec(mask, &[rows, cols], &self.device)
+    }
+
     // ========================================================================
     // SCALAR OPERATIONS
     // ========================================================================
