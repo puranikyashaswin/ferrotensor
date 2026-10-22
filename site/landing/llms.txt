@@ -1,0 +1,35 @@
+# Ferrotensor
+
+> Ferrotensor is a pure-Rust GPU machine-learning framework: tensors, reverse-mode autograd, `nn` layers, optimizers and LoRA fine-tuning that run on Metal, Vulkan or DX12 through wgpu and hand-written WGSL compute kernels, plus a CPU device used as the reference in tests. No CUDA, cuDNN or libtorch is needed. Python bindings wrap the same tensor API. Version 0.2.0, pre-1.0, f32 only, single GPU, licensed MIT OR Apache-2.0.
+
+Install:
+
+- Python 3.10+ (wheels for macOS arm64 and Linux x86_64): `pip install ferrotensor`
+- Rust 1.88+ library: `cargo add ferrotensor`
+- LoRA command-line tool (`train`, `eval`, `generate`): `cargo install ferrotensor-cli`
+
+Measured on a MacBook Air (Apple M2, 8 GB): LoRA fine-tuning of SmolLM2-135M took held-out loss from 2.43 to 1.65 in 250 steps with 3.3 GB peak memory; f32 matmul reaches 611 GFLOPS at 4096³.
+
+## Docs
+
+- [Introduction](https://puranikyashaswin.github.io/ferrotensor/docs/): what Ferrotensor is and where to start
+- [Installation](https://puranikyashaswin.github.io/ferrotensor/docs/installation.html): crate, CLI and Python package
+- [Python quickstart](https://puranikyashaswin.github.io/ferrotensor/docs/python.html): train a model from Python, CPU or GPU
+- [Use cases](https://puranikyashaswin.github.io/ferrotensor/docs/use-cases.html): runnable Rust examples with their real output
+- [LoRA fine-tuning on a laptop](https://puranikyashaswin.github.io/ferrotensor/docs/examples/lora-sft.html): end-to-end walkthrough with every command
+- [Architecture](https://puranikyashaswin.github.io/ferrotensor/docs/architecture.html): how a tensor op reaches a WGSL kernel
+- [Writing a kernel](https://puranikyashaswin.github.io/ferrotensor/docs/writing-a-kernel.html): adding a GPU op
+- [Benchmarks](https://puranikyashaswin.github.io/ferrotensor/docs/benchmarks.html): kernel and tensor-API timings with method
+
+## Reference
+
+- [Rust API on docs.rs](https://docs.rs/ferrotensor)
+- [Python API](https://puranikyashaswin.github.io/ferrotensor/docs/python-reference.html): what the bindings cover and how they differ from PyTorch
+- [Changelog](https://puranikyashaswin.github.io/ferrotensor/docs/changelog.html)
+- [Source on GitHub](https://github.com/puranikyashaswin/ferrotensor)
+
+## Optional
+
+- [Comparison with candle, burn and tch-rs](https://github.com/puranikyashaswin/ferrotensor/blob/main/README.md#compared-with-candle-burn-and-tch)
+- [Good first issues](https://puranikyashaswin.github.io/ferrotensor/docs/good-first-issues.html)
+- [crates.io](https://crates.io/crates/ferrotensor) · [PyPI](https://pypi.org/project/ferrotensor/)
