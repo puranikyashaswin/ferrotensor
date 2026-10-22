@@ -3,7 +3,8 @@
 //!
 //! The corpus is tiny, so the model starts to memorise it: this shows the
 //! training loop and the building blocks working end to end, not a useful
-//! language model.
+//! language model. Sampling feeds one new character per step and reuses the
+//! attention keys and values of the earlier ones (`nn::KvCache`).
 //!
 //! Run with: cargo run --release -p ferrotensor --example char_transformer
 //! Set FERROTENSOR_DEVICE=gpu to run on the GPU (the default is the CPU, which is
@@ -52,6 +53,15 @@ impl Block {
         x.add(&h)
     }
 
+    /// `forward` for new positions only, attending to the ones in `cache`.
+    fn forward_cached(&self, x: &T, cache: &mut nn::KvCache) -> T {
+        let x = x.add(&self.attn.forward_cached(&self.ln1.forward(x), cache));
+        let h = self
+            .down
+            .forward(&self.up.forward(&self.ln2.forward(&x)).gelu());
+        x.add(&h)
+    }
+
     fn parameters(&self) -> Vec<T> {
         [
             self.ln1.parameters(),
@@ -94,6 +104,22 @@ impl CharLm {
         self.head.forward(&self.ln_f.forward(&x))
     }
 
+    /// Logits `[1, ids.len(), vocab]` for one sequence continuing at
+    /// position `start`, using and extending one KV cache per block.
+    fn forward_cached(&self, ids: &[usize], start: usize, caches: &mut [nn::KvCache]) -> T {
+        let positions: Vec<usize> = (start..start + ids.len()).collect();
+        let x = self.tok.forward_ids(ids).reshape(&[1, ids.len(), DIM]);
+        let mut x = x.add(&self.pos.forward_ids(&positions));
+        for (block, cache) in self.blocks.iter().zip(caches.iter_mut()) {
+            x = block.forward_cached(&x, cache);
+        }
+        self.head.forward(&self.ln_f.forward(&x))
+    }
+
+    fn new_caches(&self) -> Vec<nn::KvCache> {
+        self.blocks.iter().map(|_| nn::KvCache::new()).collect()
+    }
+
     fn parameters(&self) -> Vec<T> {
         let mut p = [self.tok.parameters(), self.pos.parameters()].concat();
         for b in &self.blocks {
@@ -105,6 +131,11 @@ impl CharLm {
     }
 
     /// Sample `n` characters after `prompt` at the given temperature.
+    ///
+    /// Each step feeds only the new character through the model and reuses
+    /// the cached keys and values of the earlier ones. The position
+    /// embedding has `CONTEXT` slots, so when the cache is full it restarts
+    /// from the last `CONTEXT / 2` characters.
     fn generate(
         &self,
         prompt: &[usize],
@@ -113,9 +144,10 @@ impl CharLm {
         rng: &mut StdRng,
     ) -> Vec<usize> {
         let mut ids = prompt.to_vec();
+        let mut caches = self.new_caches();
+        let window = &ids[ids.len().saturating_sub(CONTEXT)..];
+        let mut logits = no_grad(|| self.forward_cached(window, 0, &mut caches));
         for _ in 0..n {
-            let window = &ids[ids.len().saturating_sub(CONTEXT)..];
-            let logits = no_grad(|| self.forward(window, 1, window.len()));
             let vocab = logits.shape[2];
             let all = logits.to_vec();
             let last = &all[all.len() - vocab..];
@@ -134,8 +166,35 @@ impl CharLm {
                 r -= w;
             }
             ids.push(next);
+            let cached = caches[0].len();
+            logits = if cached < CONTEXT {
+                no_grad(|| self.forward_cached(&[next], cached, &mut caches))
+            } else {
+                caches.iter_mut().for_each(nn::KvCache::clear);
+                let keep = &ids[ids.len() - CONTEXT / 2..];
+                no_grad(|| self.forward_cached(keep, 0, &mut caches))
+            };
         }
         ids
+    }
+
+    /// Largest difference between the logits of `ids` (at most `CONTEXT`
+    /// long) from one full forward and from feeding them one at a time
+    /// through the KV cache.
+    fn cache_error(&self, ids: &[usize]) -> f32 {
+        let full = no_grad(|| self.forward(ids, 1, ids.len())).to_vec();
+        let mut caches = self.new_caches();
+        let stepped: Vec<f32> = ids
+            .iter()
+            .enumerate()
+            .flat_map(|(pos, &id)| {
+                no_grad(|| self.forward_cached(&[id], pos, &mut caches)).to_vec()
+            })
+            .collect();
+        full.iter()
+            .zip(&stepped)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max)
     }
 }
 
@@ -198,7 +257,16 @@ fn main() {
 
     let prompt = "Shall I compare";
     let ids: Vec<usize> = prompt.chars().map(|c| vocab[&c]).collect();
+    println!(
+        "KV cache vs full forward on {CONTEXT} characters: max logit difference {:.1e}",
+        model.cache_error(&data[..CONTEXT])
+    );
+    let start = std::time::Instant::now();
     let out = model.generate(&ids, 200, 0.8, &mut rng);
+    println!(
+        "generated 200 characters in {:.0} ms",
+        start.elapsed().as_secs_f32() * 1e3
+    );
     println!("\n--- sample (prompt: {prompt:?}) ---");
     println!("{}", out.iter().map(|&i| itos[i]).collect::<String>());
 }
