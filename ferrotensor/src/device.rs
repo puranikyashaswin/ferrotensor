@@ -6,7 +6,9 @@
 //! device need no GPU at all, which is what the test suite and CI use.
 
 use std::num::NonZeroU64;
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 use wgpu::{
     Adapter, BindingResource, Buffer, BufferBinding, BufferUsages, CommandEncoder,
     Device as WgpuDevice, Queue,
@@ -21,6 +23,11 @@ const MAX_PENDING_OPS: usize = 256;
 /// Size of the buffer holding the small per-op arguments ([`Arg::Params`],
 /// [`Arg::Meta`]) of one batch.
 const ARGS_BYTES: usize = 256 * 1024;
+
+/// How long a wait polls the GPU before blocking. wgpu's blocking wait on
+/// Metal sleeps in 1 ms steps, which adds up to a millisecond to every read
+/// back of a short batch.
+const SPIN_WAIT: Duration = Duration::from_millis(10);
 
 /// One binding of a kernel dispatch.
 pub(crate) enum Arg<'a> {
@@ -165,6 +172,26 @@ impl GpuContext {
         let mut pending = self.lock();
         self.submit(&mut pending);
         self.queue.write_buffer(buffer, 0, data);
+    }
+
+    /// Poll the device until a GPU callback sends on `rx`: busy-polling for
+    /// up to [`SPIN_WAIT`], then blocking.
+    pub(crate) fn wait_for<T>(&self, rx: &Receiver<T>) -> T {
+        let start = Instant::now();
+        loop {
+            let blocking = start.elapsed() >= SPIN_WAIT;
+            self.device.poll(if blocking {
+                wgpu::Maintain::Wait
+            } else {
+                wgpu::Maintain::Poll
+            });
+            match rx.try_recv() {
+                Ok(value) => return value,
+                Err(TryRecvError::Empty) if !blocking => std::thread::yield_now(),
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => panic!("GPU callback dropped"),
+            }
+        }
     }
 
     fn count_op(&self, pending: &mut Pending) {
@@ -346,7 +373,11 @@ impl Device {
     pub fn synchronize(&self) {
         if let Some(ctx) = self.gpu_ctx() {
             ctx.flush();
-            ctx.device.poll(wgpu::Maintain::Wait);
+            let (tx, rx) = std::sync::mpsc::channel();
+            ctx.queue.on_submitted_work_done(move || {
+                let _ = tx.send(());
+            });
+            ctx.wait_for(&rx);
         }
     }
 

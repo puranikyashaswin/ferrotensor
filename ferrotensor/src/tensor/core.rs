@@ -443,10 +443,7 @@ async fn download(ctx: &GpuContext, buffer: &Buffer, n: usize) -> Vec<f32> {
     slice.map_async(wgpu::MapMode::Read, move |result| {
         let _ = tx.send(result);
     });
-    ctx.device.poll(wgpu::Maintain::Wait);
-    rx.recv()
-        .expect("GPU map callback dropped")
-        .expect("failed to map GPU buffer");
+    ctx.wait_for(&rx).expect("failed to map GPU buffer");
 
     let data = slice.get_mapped_range();
     let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
