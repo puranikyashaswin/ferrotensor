@@ -44,9 +44,11 @@ this is a smoke test of the training stack, not a benchmark. The whole run
 takes about half a second on the CPU.
 
 `FERROTENSOR_DEVICE=gpu` trains the same model on the GPU. It works (final test
-accuracy 99.5% in our run) but takes tens of seconds instead of half a second:
-a 1,218-parameter model gives the GPU nothing to amortise its per-op dispatch
-cost over. Use the CPU device for models this small.
+accuracy 99.5% in our run) and takes about 2 s against about 0.2 s on the CPU
+(1.8-2.2 s in the [benchmark runs](../benchmarks/RESULTS.md#ferrotensor-tensor-api-cpu-and-gpu-devices);
+it was 12-17 s before ops were batched): a 1,218-parameter model gives the GPU
+too little work to amortise the cost of each dispatch. Use the CPU device for
+models this small.
 
 ## 2. A character-level transformer from scratch
 
@@ -92,10 +94,11 @@ What this does and does not show:
   nothing about generalisation.
 - The samples are partly English-shaped, partly garbage. It is a working
   training loop, not a language model.
-- On this machine the GPU path (`FERROTENSOR_DEVICE=gpu`) took 141 s for the same
-  600 steps versus 44-48 s on the CPU. Each op is a separate GPU submission
-  and tiny kernels do not pay for it. Improving that is a known open item (see
-  [good-first-issues](good-first-issues.md)).
+- On this machine the GPU path (`FERROTENSOR_DEVICE=gpu`) trains the same 600
+  steps in 31.9 s versus 42.5 s on the CPU (it took 105 s before GPU ops were
+  [batched](architecture.md#batched-gpu-dispatch); method and numbers in
+  [benchmarks/RESULTS.md](../benchmarks/RESULTS.md#ferrotensor-tensor-api-cpu-and-gpu-devices)).
+  The timings are single-machine and the weights are not seeded.
 
 ## 3. GPU matmul and attention
 
@@ -113,24 +116,25 @@ gpu: Apple M2 (Metal)
 
 matmul [n, n] @ [n, n]
      n     cpu ms     gpu ms   speedup   max |diff|
-   256        2.1        1.4      1.5x      1.53e-5
-   512       10.0        5.2      1.9x      3.05e-5
-  1024       89.5       23.0      3.9x      5.34e-5
-  2048     1213.8      444.4      2.7x      1.07e-4
+   256        1.3        1.4      0.9x      2.29e-5
+   512       10.3        3.7      2.8x      3.05e-5
+  1024       90.2       19.3      4.7x      5.34e-5
+  2048      682.4      145.5      4.7x      1.07e-4
 
 causal scaled-dot-product attention, [1, 8 heads, seq, 64]
    seq     cpu ms     gpu ms   speedup   max |diff|
-   128        3.6        4.7      0.8x      4.77e-7
-   512       51.5       21.5      2.4x      7.15e-7
+   128        3.3        0.9      3.5x      3.58e-7
+   512       53.0        7.9      6.7x      5.96e-7
 ```
 
-Read this honestly: the GPU is 2-4x faster on large matmuls here, not orders
-of magnitude, and slower at small sizes. The 2048x2048 matmul is about 39
-GFLOPS on the GPU (2 n^3 flops / 0.444 s), and that run shared the machine
-with other jobs, so expect noise. The agreement column (differences of
-1e-5 to 1e-4 for matmul, ~1e-7 for attention) is the number the test suite
-enforces. For the project's benchmark harness see `benchmarks/RESULTS.md`
-(TODO: link once the benchmarks branch lands).
+Read this honestly: the GPU is up to about 5x faster on large matmuls here,
+not orders of magnitude, and no faster at small sizes. The 2048x2048 matmul
+is about 118 GFLOPS on the GPU (2 n^3 flops / 0.1455 s; the tuned kernels in
+`ferrotensor-backend` reach 611 GFLOPS at 4096). This is one run on a machine
+that may be doing other work, so expect noise. The agreement column
+(differences of 1e-5 to 1e-4 for matmul, ~1e-7 for attention) is the number
+the test suite enforces. For the project's benchmark harness see
+[benchmarks/RESULTS.md](../benchmarks/RESULTS.md).
 
 ## 4. Similarity search
 
@@ -174,5 +178,5 @@ score 0.154 shows it), which is what a lexical embedding gives you.
 - **Large-model training or multi-GPU.** Not supported. The LoRA fine-tuning
   path for small Llama-style models is experimental; see the README.
 - **Big training jobs on the `ferrotensor` tensor API.** Tensors are `f32` only, there
-  are no convolutions, and per-op dispatch overhead makes small GPU workloads
-  slower than the CPU.
+  are no convolutions, and each tiny op still costs the GPU about 9-13 µs, so
+  chains of small ops run slower than on the CPU.
