@@ -10,6 +10,8 @@ mod embedding;
 mod linear;
 mod module;
 mod normalization;
+#[cfg(test)]
+mod tests;
 
 pub use activation::{LeakyReLU, ReLU, SiLU, Sigmoid, Softmax, Tanh, GELU};
 pub use attention::{KvCache, MultiHeadAttention};
