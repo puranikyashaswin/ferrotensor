@@ -729,8 +729,10 @@ dependencies = [
 name = "ferrotensor-benchmarks"
 version = "0.1.0"
 dependencies = [
+ "ferrotensor",
  "ferrotensor-backend",
  "pollster",
+ "rand 0.8.6",
  "wgpu",
 ]
 

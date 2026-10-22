@@ -25,12 +25,19 @@ name = "bench"
 path = "src/main.rs"
 bench = false
 
+[[bin]]
+name = "tensor-api"
+path = "src/bin/tensor_api.rs"
+bench = false
+
 [[bench]]
 name = "gpu"
 path = "benches/gpu.rs"
 harness = false
 
 [dependencies]
+ferrotensor = { path = "../ferrotensor", version = "0.1.0" }
 ferrotensor-backend = { path = "../ferrotensor-backend", version = "0.1.0" }
 pollster = "0.3"
 wgpu = "0.19"
+rand = "0.8"
