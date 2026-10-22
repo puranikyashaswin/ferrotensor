@@ -28,3 +28,18 @@ test = ["pytest>=7"]
 [tool.maturin]
 python-source = "python"
 module-name = "ferrotensor._ferrotensor"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+# Stubs and signatures keep typing.Optional/Union for Python 3.9 readers.
+ignore = ["UP006", "UP007", "UP035", "UP045"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["ferrotensor", "conftest"]
