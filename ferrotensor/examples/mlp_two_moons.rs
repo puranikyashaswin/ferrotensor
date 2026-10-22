@@ -29,9 +29,10 @@ fn dataset(points: &[[f32; 2]], labels: &[usize]) -> TensorDataset {
         .iter()
         .map(|p| Sample::new(p.to_vec(), vec![2]))
         .collect();
+    // Scalar class ids, so a batch of targets is `[batch]`.
     let targets = labels
         .iter()
-        .map(|&l| Sample::new(vec![l as f32], vec![1]))
+        .map(|&l| Sample::new(vec![l as f32], vec![]))
         .collect();
     TensorDataset::new(inputs, targets)
 }
@@ -79,7 +80,7 @@ fn main() {
             schedule.apply(&mut opt, step);
             step += 1;
             opt.zero_grad();
-            let loss = F::cross_entropy(&model.forward(&x), &y.reshape(&[y.shape[0]]));
+            let loss = F::cross_entropy(&model.forward(&x), &y);
             loss.backward();
             opt.step();
             total += loss.item();

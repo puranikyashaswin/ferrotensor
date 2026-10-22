@@ -330,7 +330,11 @@ def scaled_dot_product_attention(
 
 def one_hot(indices: Tensor | Sequence[int], num_classes: int, *, device: DeviceLike = None) -> Tensor: ...
 def accuracy(logits: Tensor, target: Tensor | Sequence[int]) -> float:
-    """Fraction of rows of ``[N, C]`` logits whose argmax is the target."""
+    """Fraction of rows of ``[N, C]`` logits whose argmax is the target.
+
+    Class indices follow ``cross_entropy``: rows with a negative target (e.g.
+    ``-100``) are ignored.
+    """
 
 def cosine_similarity(x1: Tensor, x2: Tensor, dim: int = -1) -> Tensor: ...
 
