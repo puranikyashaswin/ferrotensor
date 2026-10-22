@@ -52,3 +52,6 @@ venv/
 
 # Documentation build
 /docs/book/
+
+# Website build output
+/site/dist/
