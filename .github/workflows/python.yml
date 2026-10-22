@@ -1,0 +1,117 @@
+name: Python
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+permissions:
+  contents: read
+
+jobs:
+  wheels:
+    name: Wheel (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: PyO3/maturin-action@v1.51.0
+        with:
+          maturin-version: v1.15.0
+          target: ${{ matrix.target }}
+          manylinux: auto
+          working-directory: ferrotensor-py
+          args: --release --locked --out dist
+      - uses: actions/setup-python@v6.3.0
+        with:
+          python-version: |
+            3.10
+            3.14
+      # One abi3 wheel serves every CPython >= 3.10: test the oldest and newest.
+      # Hosted runners have no GPU, so the GPU tests skip themselves.
+      - name: Test the wheel
+        shell: bash
+        run: |
+          cp -r ferrotensor-py/tests "$RUNNER_TEMP/tests"
+          for py in 3.10 3.14; do
+            python$py -m venv "$RUNNER_TEMP/venv-$py"
+            venv="$RUNNER_TEMP/venv-$py/bin"
+            "$venv/pip" install --quiet pytest
+            "$venv/pip" install --quiet --no-index --find-links ferrotensor-py/dist ferrotensor
+            (cd "$RUNNER_TEMP/tests" && "$venv/python" -m pytest -q)
+          done
+      - uses: actions/upload-artifact@v4.4.3
+        with:
+          name: python-wheel-${{ matrix.target }}
+          path: ferrotensor-py/dist/*.whl
+          if-no-files-found: error
+
+  sdist:
+    name: Source distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: PyO3/maturin-action@v1.51.0
+        with:
+          maturin-version: v1.15.0
+          command: sdist
+          working-directory: ferrotensor-py
+          args: --out dist
+      - uses: actions/setup-python@v6.3.0
+        with:
+          python-version: "3.14"
+      # Build and test from the sdist alone, as pip does on platforms without a wheel.
+      - name: Test the sdist
+        run: |
+          cp -r ferrotensor-py/tests "$RUNNER_TEMP/tests"
+          python -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet pytest
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet ferrotensor-py/dist/*.tar.gz
+          cd "$RUNNER_TEMP/tests" && "$RUNNER_TEMP/venv/bin/python" -m pytest -q
+      - uses: actions/upload-artifact@v4.4.3
+        with:
+          name: python-sdist
+          path: ferrotensor-py/dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish to PyPI
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [wheels, sdist]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/ferrotensor/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4.1.8
+        with:
+          pattern: python-*
+          path: dist
+          merge-multiple: true
+      - name: Check that the package version matches the tag
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          ls -l dist
+          shopt -s nullglob
+          files=(dist/ferrotensor-"$version"-*.whl dist/ferrotensor-"$version".tar.gz)
+          test "${#files[@]}" -eq 3
+      - uses: pypa/gh-action-pypi-publish@v1.14.2
