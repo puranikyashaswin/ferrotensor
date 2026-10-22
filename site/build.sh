@@ -13,5 +13,4 @@ rm -rf "${out:?}"/*
 cp -R "$site/landing/." "$out/"
 rm -f "$out/og.svg"
 mdbook build "$site/book" --dest-dir "$out/docs"
-touch "$out/.nojekyll"
 echo "site built in $out"
