@@ -7,4 +7,5 @@ mod compute;
 mod kernels;
 
 pub use compute::ComputeEngine;
+pub(crate) use compute::Dispatch;
 pub(crate) use kernels::{binary_op, reduce_op, unary_op, KERNELS_WGSL};

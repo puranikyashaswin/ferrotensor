@@ -13,16 +13,7 @@ use super::cpu;
 use super::shape::{broadcast_shapes, broadcast_strides, contiguous_strides, split_at_dim};
 use super::Tensor;
 use crate::backend::{reduce_op, ComputeEngine};
-use crate::device::GpuContext;
-
-fn uniform(ctx: &GpuContext, words: [u32; 4]) -> Buffer {
-    ctx.device
-        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Params"),
-            contents: bytemuck::cast_slice(&words),
-            usage: BufferUsages::UNIFORM,
-        })
-}
+use crate::device::{Arg, GpuContext};
 
 /// A read-only `u32` storage buffer (at least one element).
 fn u32_buffer(ctx: &GpuContext, data: &[u32]) -> Buffer {
@@ -74,13 +65,7 @@ impl Tensor {
         match self.gpu() {
             Some((ctx, buffer)) => {
                 let out = alloc(ctx, self.numel());
-                let mut encoder =
-                    ctx.device
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("deep_clone"),
-                        });
-                encoder.copy_buffer_to_buffer(buffer, 0, &out, 0, (self.numel().max(1) * 4) as u64);
-                ctx.queue.submit(std::iter::once(encoder.finish()));
+                ctx.copy(buffer, &out, (self.numel().max(1) * 4) as u64);
                 self.gpu_output(out, self.shape.clone())
             }
             None => self.host_output(self.to_vec(), &self.shape),
@@ -93,12 +78,10 @@ impl Tensor {
         match self.gpu() {
             Some((ctx, input)) if n > 0 => {
                 let out = alloc(ctx, n);
-                let params = uniform(ctx, [op, n as u32, a.to_bits(), b.to_bits()]);
-                ctx.engine.run(
-                    &ctx.device,
-                    &ctx.queue,
+                let params = Arg::Params([op, n as u32, a.to_bits(), b.to_bits()]);
+                ctx.dispatch(
                     "unary",
-                    &[input, &out, &params],
+                    &[Arg::Buffer(input), Arg::Buffer(&out), params],
                     ComputeEngine::workgroups_1d(n),
                 );
                 self.gpu_output(out, self.shape.clone())
@@ -125,13 +108,17 @@ impl Tensor {
         match (self.gpu(), other.gpu()) {
             (Some((ctx, a)), Some((_, b))) if n > 0 => {
                 let out = alloc(ctx, n);
-                let params = uniform(ctx, [op, n as u32, out_shape.len() as u32, 0]);
-                let meta = u32_buffer(ctx, &as_u32(&[&out_shape[..], &sa, &sb].concat()));
-                ctx.engine.run(
-                    &ctx.device,
-                    &ctx.queue,
+                let params = Arg::Params([op, n as u32, out_shape.len() as u32, 0]);
+                let meta = as_u32(&[&out_shape[..], &sa, &sb].concat());
+                ctx.dispatch(
                     "binary",
-                    &[a, b, &out, &params, &meta],
+                    &[
+                        Arg::Buffer(a),
+                        Arg::Buffer(b),
+                        Arg::Buffer(&out),
+                        params,
+                        Arg::Meta(&meta),
+                    ],
                     ComputeEngine::workgroups_1d(n),
                 );
                 self.gpu_output(out, out_shape)
@@ -157,12 +144,10 @@ impl Tensor {
         match self.gpu() {
             Some((ctx, input)) if n > 0 => {
                 let out = alloc(ctx, n);
-                let params = uniform(ctx, [op, outer as u32, size as u32, inner as u32]);
-                ctx.engine.run(
-                    &ctx.device,
-                    &ctx.queue,
+                let params = Arg::Params([op, outer as u32, size as u32, inner as u32]);
+                ctx.dispatch(
                     "reduce",
-                    &[input, &out, &params],
+                    &[Arg::Buffer(input), Arg::Buffer(&out), params],
                     ComputeEngine::workgroups_1d(n),
                 );
                 self.gpu_output(out, out_shape)
@@ -181,12 +166,10 @@ impl Tensor {
         match self.gpu() {
             Some((ctx, input)) if n > 0 && size > 0 => {
                 let out = alloc(ctx, self.numel());
-                let params = uniform(ctx, [log as u32, outer as u32, size as u32, inner as u32]);
-                ctx.engine.run(
-                    &ctx.device,
-                    &ctx.queue,
+                let params = Arg::Params([log as u32, outer as u32, size as u32, inner as u32]);
+                ctx.dispatch(
                     "softmax",
-                    &[input, &out, &params],
+                    &[Arg::Buffer(input), Arg::Buffer(&out), params],
                     ComputeEngine::workgroups_1d(n),
                 );
                 self.gpu_output(out, self.shape.clone())
@@ -244,12 +227,10 @@ impl Tensor {
             (Some((ctx, a)), Some((_, b))) if total > 0 && k > 0 => {
                 let out = alloc(ctx, total);
                 let flags = a_flag as u32 | ((b_flag as u32) << 1);
-                let params = uniform(ctx, [rows as u32, k as u32, n as u32, flags]);
-                ctx.engine.run(
-                    &ctx.device,
-                    &ctx.queue,
+                let params = Arg::Params([rows as u32, k as u32, n as u32, flags]);
+                ctx.dispatch(
                     "matmul",
-                    &[a, b, &out, &params],
+                    &[Arg::Buffer(a), Arg::Buffer(b), Arg::Buffer(&out), params],
                     ComputeEngine::workgroups_matmul(rows, n, batches),
                 );
                 self.gpu_output(out, out_shape)
@@ -282,13 +263,16 @@ impl Tensor {
         match self.gpu() {
             Some((ctx, input)) if n > 0 => {
                 let out = alloc(ctx, n);
-                let params = uniform(ctx, [n as u32, out_shape.len() as u32, offset as u32, 0]);
-                let meta = u32_buffer(ctx, &as_u32(&[out_shape, src_strides].concat()));
-                ctx.engine.run(
-                    &ctx.device,
-                    &ctx.queue,
+                let params = Arg::Params([n as u32, out_shape.len() as u32, offset as u32, 0]);
+                let meta = as_u32(&[out_shape, src_strides].concat());
+                ctx.dispatch(
                     "permute",
-                    &[input, &out, &params, &meta],
+                    &[
+                        Arg::Buffer(input),
+                        Arg::Buffer(&out),
+                        params,
+                        Arg::Meta(&meta),
+                    ],
                     ComputeEngine::workgroups_1d(n),
                 );
                 self.gpu_output(out, out_shape.to_vec())
@@ -334,12 +318,15 @@ impl Tensor {
             Some((ctx, table)) if n > 0 => {
                 let out = alloc(ctx, n);
                 let indices = u32_buffer(ctx, &idx32);
-                let params = uniform(ctx, [idx.len() as u32, row as u32, 0, 0]);
-                ctx.engine.run(
-                    &ctx.device,
-                    &ctx.queue,
+                let params = Arg::Params([idx.len() as u32, row as u32, 0, 0]);
+                ctx.dispatch(
                     "gather_rows",
-                    &[table, &indices, &out, &params],
+                    &[
+                        Arg::Buffer(table),
+                        Arg::Buffer(&indices),
+                        Arg::Buffer(&out),
+                        params,
+                    ],
                     ComputeEngine::workgroups_1d(n),
                 );
                 self.gpu_output(out, out_shape)

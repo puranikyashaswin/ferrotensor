@@ -341,8 +341,7 @@ impl Tensor {
                 .copy_from_slice(data),
             Storage::Gpu(buffer) => {
                 if let Some(ctx) = self.device.gpu_ctx() {
-                    ctx.queue
-                        .write_buffer(buffer, 0, bytemuck::cast_slice(data));
+                    ctx.write_buffer(buffer, bytemuck::cast_slice(data));
                 }
             }
         }
@@ -358,13 +357,7 @@ impl Tensor {
         match (&*self.storage, &*src.storage) {
             (Storage::Gpu(dst), Storage::Gpu(from)) => {
                 let ctx = self.device.gpu_ctx().expect("GPU storage on a CPU device");
-                let mut encoder =
-                    ctx.device
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("assign"),
-                        });
-                encoder.copy_buffer_to_buffer(from, 0, dst, 0, (self.numel() * 4) as u64);
-                ctx.queue.submit(std::iter::once(encoder.finish()));
+                ctx.copy(from, dst, (self.numel() * 4) as u64);
             }
             _ => self.copy_from_slice(&src.to_vec()),
         }
@@ -442,13 +435,8 @@ async fn download(ctx: &GpuContext, buffer: &Buffer, n: usize) -> Vec<f32> {
         usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    let mut encoder = ctx
-        .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Download"),
-        });
-    encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, size);
-    ctx.queue.submit(std::iter::once(encoder.finish()));
+    ctx.copy(buffer, &staging, size);
+    ctx.flush();
 
     let slice = staging.slice(..);
     let (tx, rx) = std::sync::mpsc::channel();

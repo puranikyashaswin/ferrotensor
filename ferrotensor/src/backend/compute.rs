@@ -4,7 +4,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use wgpu::{Buffer, ComputePipeline, Device, Queue};
+use wgpu::{BindGroup, BindGroupLayout, BindingResource, CommandEncoder, ComputePipeline, Device};
 
 use super::KERNELS_WGSL;
 
@@ -24,9 +24,17 @@ const WORKGROUP_1D: u32 = 256;
 /// Largest workgroup count allowed in one grid dimension.
 const MAX_GROUPS_PER_DIM: u32 = 65_535;
 
-/// GPU compute engine: one compiled pipeline per kernel entry point.
+/// A kernel dispatch waiting to be encoded.
+pub(crate) struct Dispatch {
+    kernel: &'static str,
+    bind_group: BindGroup,
+    workgroups: (u32, u32, u32),
+}
+
+/// GPU compute engine: one compiled pipeline per kernel entry point, with its
+/// bind group layout.
 pub struct ComputeEngine {
-    pipelines: HashMap<&'static str, ComputePipeline>,
+    pipelines: HashMap<&'static str, (ComputePipeline, BindGroupLayout)>,
 }
 
 impl ComputeEngine {
@@ -46,7 +54,8 @@ impl ComputeEngine {
                     module: &module,
                     entry_point: name,
                 });
-                (name, pipeline)
+                let layout = pipeline.get_bind_group_layout(0);
+                (name, (pipeline, layout))
             })
             .collect();
 
@@ -55,50 +64,64 @@ impl ComputeEngine {
 
     /// Get a compiled pipeline by entry point name.
     pub fn get_pipeline(&self, name: &str) -> Option<&ComputePipeline> {
-        self.pipelines.get(name)
+        self.pipelines.get(name).map(|(pipeline, _)| pipeline)
     }
 
-    /// Dispatch `kernel`, binding `buffers[i]` to `@binding(i)` of group 0.
-    pub(crate) fn run(
+    /// A dispatch of `kernel` over `workgroups`, with `resources[i]` bound
+    /// to `@binding(i)` of group 0.
+    pub(crate) fn dispatch(
         &self,
         device: &Device,
-        queue: &Queue,
-        kernel: &str,
-        buffers: &[&Buffer],
+        kernel: &'static str,
+        resources: Vec<BindingResource<'_>>,
         workgroups: (u32, u32, u32),
-    ) {
-        let pipeline = self
-            .pipelines
-            .get(kernel)
-            .unwrap_or_else(|| panic!("kernel '{kernel}' is not compiled"));
-        let layout = pipeline.get_bind_group_layout(0);
-        let entries: Vec<wgpu::BindGroupEntry<'_>> = buffers
-            .iter()
+    ) -> Dispatch {
+        let (_, layout) = self.kernel(kernel);
+        let entries: Vec<wgpu::BindGroupEntry<'_>> = resources
+            .into_iter()
             .enumerate()
-            .map(|(i, buffer)| wgpu::BindGroupEntry {
+            .map(|(i, resource)| wgpu::BindGroupEntry {
                 binding: i as u32,
-                resource: buffer.as_entire_binding(),
+                resource,
             })
             .collect();
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(kernel),
-            layout: &layout,
+            layout,
             entries: &entries,
         });
-
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some(kernel),
-        });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some(kernel),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(workgroups.0, workgroups.1, workgroups.2);
+        Dispatch {
+            kernel,
+            bind_group,
+            workgroups,
         }
-        queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    /// Record `dispatches` in order into one compute pass of `encoder`.
+    ///
+    /// wgpu orders the storage reads and writes of consecutive dispatches in
+    /// a pass, so each one sees the results of those before it.
+    pub(crate) fn encode(&self, encoder: &mut CommandEncoder, dispatches: &[Dispatch]) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("Ferrotensor ops"),
+            timestamp_writes: None,
+        });
+        let mut current = None;
+        for d in dispatches {
+            if current != Some(d.kernel) {
+                pass.set_pipeline(&self.kernel(d.kernel).0);
+                current = Some(d.kernel);
+            }
+            pass.set_bind_group(0, &d.bind_group, &[]);
+            let (x, y, z) = d.workgroups;
+            pass.dispatch_workgroups(x, y, z);
+        }
+    }
+
+    fn kernel(&self, name: &str) -> &(ComputePipeline, BindGroupLayout) {
+        self.pipelines
+            .get(name)
+            .unwrap_or_else(|| panic!("kernel '{name}' is not compiled"))
     }
 
     /// Workgroup grid for a 1-D kernel over `n` elements.
