@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+  <defs>
+    <pattern id="grid" width="30" height="30" patternUnits="userSpaceOnUse">
+      <path d="M30 0H0V30" fill="none" stroke="#efe9e1" stroke-opacity="0.05"/>
+    </pattern>
+    <style>
+      .sans { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+      .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+    </style>
+  </defs>
+  <rect width="1200" height="630" fill="#141210"/>
+  <rect width="1200" height="630" fill="url(#grid)"/>
+  <rect x="0" y="0" width="1200" height="8" fill="#f37b45"/>
+
+  <g transform="translate(80 84)">
+    <rect width="76" height="76" rx="10" fill="#f37b45"/>
+    <text class="mono" x="10" y="22" font-size="15" font-weight="600" fill="#141210">26</text>
+    <text class="sans" x="11" y="63" font-size="38" font-weight="700" letter-spacing="-1" fill="#141210">Ft</text>
+  </g>
+  <text class="mono" x="180" y="113" font-size="20" font-weight="600" letter-spacing="2" fill="#f37b45">v0.2.0 · MIT OR APACHE-2.0</text>
+  <text class="mono" x="180" y="148" font-size="20" fill="#a39889">Metal · Vulkan · DX12 · Rust and Python</text>
+
+  <text class="sans" x="76" y="282" font-size="118" font-weight="800" letter-spacing="-5" fill="#efe9e1">Ferrotensor</text>
+  <text class="sans" x="80" y="338" font-size="32" fill="#c3b9ad">A pure-Rust GPU ML framework. No CUDA, no C++ toolchain.</text>
+
+  <g transform="translate(80 400)">
+    <rect width="330" height="150" rx="12" fill="#1f1b18" stroke="#544a40"/>
+    <text class="mono" x="24" y="40" font-size="16" font-weight="600" letter-spacing="1.5" fill="#a39889">LORA ON 8 GB</text>
+    <text class="mono" x="24" y="92" font-size="40" font-weight="700" letter-spacing="-1" fill="#efe9e1">2.43 → 1.65</text>
+    <text class="sans" x="24" y="127" font-size="18" fill="#c3b9ad">held-out loss, SmolLM2-135M</text>
+  </g>
+  <g transform="translate(435 400)">
+    <rect width="330" height="150" rx="12" fill="#1f1b18" stroke="#544a40"/>
+    <text class="mono" x="24" y="40" font-size="16" font-weight="600" letter-spacing="1.5" fill="#a39889">KERNEL SPEED</text>
+    <text class="mono" x="24" y="92" font-size="40" font-weight="700" letter-spacing="-1" fill="#efe9e1">611 <tspan font-size="22" fill="#c3b9ad">GFLOPS</tspan></text>
+    <text class="sans" x="24" y="127" font-size="18" fill="#c3b9ad">f32 matmul in WGSL, Apple M2</text>
+  </g>
+  <g transform="translate(790 400)">
+    <rect width="330" height="150" rx="12" fill="#1f1b18" stroke="#f37b45" stroke-width="1.5"/>
+    <text class="mono" x="24" y="40" font-size="16" font-weight="600" letter-spacing="1.5" fill="#f37b45">CHECKED</text>
+    <text class="mono" x="24" y="92" font-size="40" font-weight="700" letter-spacing="-1" fill="#efe9e1">240/240</text>
+    <text class="sans" x="24" y="127" font-size="18" fill="#c3b9ad">gradients matched PyTorch</text>
+  </g>
+</svg>
