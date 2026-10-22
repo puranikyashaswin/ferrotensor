@@ -5,6 +5,14 @@ The `ferrotensor-cli` command line for [Ferrotensor](../README.md): LoRA fine-tu
 small Llama-style models such as SmolLM2 and TinyLlama, on any GPU wgpu
 supports (Metal, Vulkan, DX12).
 
+Install it from crates.io (the binary is called `ferrotensor`), or run it from
+a checkout with `cargo run -p ferrotensor-cli --release --`:
+
+```bash
+cargo install ferrotensor-cli
+ferrotensor --help
+```
+
 ```bash
 cargo run -p ferrotensor-cli --release -- --help            # commands
 cargo run -p ferrotensor-cli --release -- train --help      # every training flag
