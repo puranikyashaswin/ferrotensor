@@ -13,7 +13,7 @@ use super::cpu;
 use super::shape::{broadcast_shapes, broadcast_strides, contiguous_strides, split_at_dim};
 use super::Tensor;
 use crate::backend::{reduce_op, ComputeEngine};
-use crate::device::{Arg, GpuContext};
+use crate::device::{Arg, GpuBuffer, GpuContext};
 
 /// A read-only `u32` storage buffer (at least one element).
 fn u32_buffer(ctx: &GpuContext, data: &[u32]) -> Buffer {
@@ -42,7 +42,7 @@ impl Tensor {
         }
     }
 
-    fn gpu_output(&self, buffer: Buffer, shape: Vec<usize>) -> Tensor {
+    fn gpu_output(&self, buffer: GpuBuffer, shape: Vec<usize>) -> Tensor {
         Tensor::from_storage(Storage::Gpu(buffer), shape, &self.device)
     }
 

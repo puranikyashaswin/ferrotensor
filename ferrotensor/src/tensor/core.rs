@@ -7,7 +7,7 @@ use wgpu::util::DeviceExt;
 use wgpu::{Buffer, BufferUsages};
 
 use super::autograd::Node;
-use crate::device::GpuContext;
+use crate::device::{GpuBuffer, GpuContext};
 use crate::Device;
 
 /// Where a tensor's values live.
@@ -15,7 +15,7 @@ pub(crate) enum Storage {
     /// Host memory, row-major.
     Cpu(RwLock<Vec<f32>>),
     /// A GPU storage buffer of `f32`, row-major.
-    Gpu(Buffer),
+    Gpu(GpuBuffer),
 }
 
 /// Shared slot holding a tensor's accumulated gradient.
@@ -400,29 +400,42 @@ impl Tensor {
 
 /// Upload `data` into a new storage buffer (at least 4 bytes: wgpu rejects
 /// empty bindings).
-pub(crate) fn upload(ctx: &GpuContext, data: &[f32]) -> Buffer {
+///
+/// The buffer is never taken from the pool: a pooled buffer would need a
+/// queue write, which is ordered before any ops still pending on it.
+pub(crate) fn upload(ctx: &GpuContext, data: &[f32]) -> GpuBuffer {
     let contents: &[u8] = if data.is_empty() {
         &[0u8; 4]
     } else {
         bytemuck::cast_slice(data)
     };
-    ctx.device
-        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Tensor"),
-            contents,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-        })
+    ctx.adopt(
+        ctx.device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Tensor"),
+                contents,
+                usage: TENSOR_USAGE,
+            }),
+    )
 }
 
-/// An uninitialised storage buffer for `n` floats.
-pub(crate) fn alloc(ctx: &GpuContext, n: usize) -> Buffer {
-    ctx.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("Tensor"),
-        size: (n.max(1) * 4) as u64,
-        usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-        mapped_at_creation: false,
+/// A storage buffer for `n` floats with unspecified contents (a freed
+/// tensor's, or zeros).
+pub(crate) fn alloc(ctx: &GpuContext, n: usize) -> GpuBuffer {
+    let size = (n.max(1) * 4) as u64;
+    ctx.buffer(size, || {
+        ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Tensor"),
+            size,
+            usage: TENSOR_USAGE,
+            mapped_at_creation: false,
+        })
     })
 }
+
+const TENSOR_USAGE: BufferUsages = BufferUsages::STORAGE
+    .union(BufferUsages::COPY_SRC)
+    .union(BufferUsages::COPY_DST);
 
 async fn download(ctx: &GpuContext, buffer: &Buffer, n: usize) -> Vec<f32> {
     if n == 0 {

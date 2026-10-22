@@ -5,6 +5,7 @@
 //! runs the reference implementation in `tensor::cpu`. Tensors on the CPU
 //! device need no GPU at all, which is what the test suite and CI use.
 
+use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -28,6 +29,49 @@ const ARGS_BYTES: usize = 256 * 1024;
 /// Metal sleeps in 1 ms steps, which adds up to a millisecond to every read
 /// back of a short batch.
 const SPIN_WAIT: Duration = Duration::from_millis(10);
+
+/// Largest total size of freed tensor buffers kept for reuse.
+const POOL_BYTES: u64 = 128 << 20;
+
+/// Freed tensor buffers by size, reused by later ops.
+///
+/// Reuse needs no synchronisation: the queue runs the new owner's ops after
+/// every op of the old one that was recorded before it.
+#[derive(Default)]
+pub(crate) struct BufferPool {
+    free: HashMap<u64, Vec<Buffer>>,
+    bytes: u64,
+}
+
+/// A tensor's storage buffer; it goes back to its device's pool when dropped.
+pub(crate) struct GpuBuffer {
+    buffer: Option<Buffer>,
+    pool: Arc<Mutex<BufferPool>>,
+}
+
+impl std::ops::Deref for GpuBuffer {
+    type Target = Buffer;
+
+    fn deref(&self) -> &Buffer {
+        self.buffer.as_ref().expect("buffer used after drop")
+    }
+}
+
+impl Drop for GpuBuffer {
+    fn drop(&mut self) {
+        let Some(buffer) = self.buffer.take() else {
+            return;
+        };
+        let Ok(mut pool) = self.pool.lock() else {
+            return;
+        };
+        let size = buffer.size();
+        if pool.bytes + size <= POOL_BYTES {
+            pool.bytes += size;
+            pool.free.entry(size).or_default().push(buffer);
+        }
+    }
+}
 
 /// One binding of a kernel dispatch.
 pub(crate) enum Arg<'a> {
@@ -57,6 +101,7 @@ pub(crate) struct GpuContext {
     /// Offset alignment of uniform and storage bindings.
     align: usize,
     pending: Mutex<Pending>,
+    pool: Arc<Mutex<BufferPool>>,
 }
 
 /// Work recorded since the last submission.
@@ -92,6 +137,29 @@ impl GpuContext {
             args,
             align,
             pending: Mutex::default(),
+            pool: Arc::default(),
+        }
+    }
+
+    /// A tensor buffer of `bytes` bytes: a freed one when available, else a
+    /// new one made by `create`.
+    pub(crate) fn buffer(&self, bytes: u64, create: impl FnOnce() -> Buffer) -> GpuBuffer {
+        let reused = {
+            let mut pool = self.pool.lock().expect("buffer pool lock poisoned");
+            let buffer = pool.free.get_mut(&bytes).and_then(Vec::pop);
+            if buffer.is_some() {
+                pool.bytes -= bytes;
+            }
+            buffer
+        };
+        self.adopt(reused.unwrap_or_else(create))
+    }
+
+    /// Wrap a new tensor buffer so it goes to the pool when dropped.
+    pub(crate) fn adopt(&self, buffer: Buffer) -> GpuBuffer {
+        GpuBuffer {
+            buffer: Some(buffer),
+            pool: Arc::clone(&self.pool),
         }
     }
 
