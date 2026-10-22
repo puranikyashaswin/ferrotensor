@@ -1,0 +1,449 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ferrotensor: a pure-Rust GPU ML framework</title>
+<meta name="description" content="Tensors, autograd, nn and LoRA fine-tuning in pure Rust, on Metal, Vulkan or DX12 through wgpu and hand-written WGSL kernels. No CUDA, no C++ toolchain. Python bindings included.">
+<link rel="canonical" href="https://puranikyashaswin.github.io/ferrotensor/">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#f6f3ee" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#141210" media="(prefers-color-scheme: dark)">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Ferrotensor">
+<meta property="og:title" content="Ferrotensor: a pure-Rust GPU ML framework">
+<meta property="og:description" content="Tensors, autograd and LoRA fine-tuning on Metal, Vulkan or DX12 through hand-written WGSL kernels. No CUDA, no C++ toolchain.">
+<meta property="og:url" content="https://puranikyashaswin.github.io/ferrotensor/">
+<meta property="og:image" content="https://puranikyashaswin.github.io/ferrotensor/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Ferrotensor: a pure-Rust GPU ML framework. LoRA fine-tuning on an 8 GB laptop, 611 GFLOPS matmul in WGSL, every kernel checked against a CPU reference.">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Ferrotensor: a pure-Rust GPU ML framework">
+<meta name="twitter:description" content="Tensors, autograd and LoRA fine-tuning on Metal, Vulkan or DX12 through hand-written WGSL kernels. No CUDA, no C++ toolchain.">
+<meta name="twitter:image" content="https://puranikyashaswin.github.io/ferrotensor/og.png">
+<meta name="twitter:image:alt" content="Ferrotensor: a pure-Rust GPU ML framework.">
+<link rel="stylesheet" href="style.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<p class="sr-only" id="copy-status" aria-live="polite"></p>
+
+<header class="top">
+  <div class="wrap top-in">
+    <a class="brand" href="./" aria-label="Ferrotensor home">
+      <svg class="tile" viewBox="0 0 32 32" aria-hidden="true"><rect x="1" y="1" width="30" height="30" rx="4"/><text x="5" y="10">26</text><text class="tile-sym" x="5.5" y="26">Ft</text></svg>
+      <span>Ferrotensor</span>
+    </a>
+    <nav aria-label="Primary">
+      <ul>
+        <li><a href="docs/">Docs</a></li>
+        <li><a href="docs/benchmarks.html">Benchmarks</a></li>
+        <li><a href="https://github.com/puranikyashaswin/ferrotensor">GitHub</a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+
+<section class="hero" aria-labelledby="hero-title">
+  <div class="wrap hero-in">
+    <div class="hero-copy">
+      <p class="kicker"><span>v0.2.0</span><span>pre-1.0</span><span>MIT OR Apache-2.0</span></p>
+      <h1 id="hero-title">Ferrotensor</h1>
+      <p class="lede">A pure-Rust GPU ML framework: tensors, autograd, <code>nn</code> and LoRA fine-tuning on Metal, Vulkan or DX12 through hand-written WGSL kernels. No CUDA, no C++ toolchain.</p>
+
+      <div class="install" data-tabs>
+        <div class="tablist" role="tablist" aria-label="Install with">
+          <button role="tab" id="tab-pip" aria-controls="panel-pip" aria-selected="true">pip</button>
+          <button role="tab" id="tab-add" aria-controls="panel-add" aria-selected="false" tabindex="-1">cargo add</button>
+          <button role="tab" id="tab-cli" aria-controls="panel-cli" aria-selected="false" tabindex="-1">cargo install</button>
+        </div>
+        <div class="panel" role="tabpanel" id="panel-pip" aria-labelledby="tab-pip">
+          <div class="cmd"><code><span class="prompt" aria-hidden="true">$ </span>pip install ferrotensor</code><button class="copy" type="button" data-copy="pip install ferrotensor">Copy</button></div>
+          <p>Python 3.10+. Wheels for macOS arm64 and Linux x86_64; no NumPy needed.</p>
+        </div>
+        <div class="panel" role="tabpanel" id="panel-add" aria-labelledby="tab-add">
+          <div class="cmd"><code><span class="prompt" aria-hidden="true">$ </span>cargo add ferrotensor</code><button class="copy" type="button" data-copy="cargo add ferrotensor">Copy</button></div>
+          <p>The tensor API in your project. Rust 1.88+; on macOS nothing else to install.</p>
+        </div>
+        <div class="panel" role="tabpanel" id="panel-cli" aria-labelledby="tab-cli">
+          <div class="cmd"><code><span class="prompt" aria-hidden="true">$ </span>cargo install ferrotensor-cli</code><button class="copy" type="button" data-copy="cargo install ferrotensor-cli">Copy</button></div>
+          <p>The <code>ferrotensor</code> command: LoRA <code>train</code>, <code>eval</code> and <code>generate</code>.</p>
+        </div>
+      </div>
+
+      <div class="actions">
+        <a class="btn btn-primary" href="docs/">Read the docs</a>
+        <a class="btn" href="https://github.com/puranikyashaswin/ferrotensor">View on GitHub</a>
+      </div>
+    </div>
+
+    <aside class="sheet" aria-labelledby="sheet-title">
+      <h2 id="sheet-title" class="sheet-h"><span>Datasheet</span><span aria-hidden="true">Ft-0.2.0</span></h2>
+      <dl>
+        <div><dt>GPU</dt><dd>Metal, Vulkan, DX12 via wgpu</dd></div>
+        <div><dt>Kernels</dt><dd>Hand-written WGSL</dd></div>
+        <div><dt>Devices</dt><dd>GPU, plus a CPU reference device</dd></div>
+        <div><dt>Precision</dt><dd>f32</dd></div>
+        <div><dt>Autograd</dt><dd>Reverse mode, checked against finite differences</dd></div>
+        <div><dt>Bindings</dt><dd>Python 3.10+ (abi3 wheels)</dd></div>
+        <div><dt>Needs</dt><dd>Rust 1.88+. No CUDA, cuDNN or libtorch</dd></div>
+      </dl>
+    </aside>
+  </div>
+</section>
+
+<section class="section" id="measured" aria-labelledby="measured-title">
+  <div class="wrap">
+    <header class="sec-head">
+      <p class="eyebrow">01 · Measured</p>
+      <h2 id="measured-title">Numbers from one 8&nbsp;GB laptop</h2>
+      <p>MacBook Air, Apple M2, 8&nbsp;GB unified memory, through Metal. Every figure links to the file that records how it was measured.</p>
+    </header>
+
+    <div class="cards">
+      <article class="card">
+        <p class="card-k">LoRA on a laptop</p>
+        <p class="figure"><a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/docs/examples/lora-sft.md#result">2.43 <span aria-label="to">→</span> 1.65</a></p>
+        <p class="figure-cap">held-out loss, SmolLM2-135M on Alpaca</p>
+        <svg class="spark" viewBox="0 0 260 74" role="img" aria-labelledby="spark-t">
+          <title id="spark-t">Held-out loss by step: 2.425 at 0, 1.815 at 50, 1.698 at 100, 1.670 at 150, 1.658 at 200, 1.652 at 250.</title>
+          <line class="spark-base" x1="0" y1="70" x2="260" y2="70"/>
+          <polyline class="spark-line" points="4,8.0 54,49.1 104,56.9 154,58.8 204,59.6 254,60.0"/>
+          <circle class="spark-dot" cx="4" cy="8" r="3"/>
+          <circle class="spark-dot spark-end" cx="254" cy="60.0" r="3.5"/>
+          <text x="12" y="12">step 0</text>
+          <text x="254" y="50" text-anchor="end">step 250</text>
+        </svg>
+        <ul class="facts">
+          <li><a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/docs/examples/lora-sft.md#result">Perplexity 11.3 → 5.2</a> in 250 steps</li>
+          <li><a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/docs/examples/lora-sft.md#result">3.3&nbsp;GB peak memory</a>, 8.8&nbsp;s per step</li>
+          <li>A <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/docs/examples/lora-sft.md#result">3.7&nbsp;MB adapter</a> that reloads to the same loss</li>
+        </ul>
+        <a class="card-src" href="docs/examples/lora-sft.html">Walkthrough with every command</a>
+      </article>
+
+      <article class="card">
+        <p class="card-k">Kernel speed</p>
+        <p class="figure"><a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/benchmarks/RESULTS.md#before--after">611</a> <span class="unit">GFLOPS</span></p>
+        <p class="figure-cap">f32 matmul at 4096³, hand-written WGSL</p>
+        <svg class="bars" viewBox="0 0 260 74" role="img" aria-labelledby="bars-t">
+          <title id="bars-t">Matmul at 4096 cubed: 123 GFLOPS for the first kernel, 611 GFLOPS now.</title>
+          <rect class="bar-old" x="0" y="8" width="52" height="20" rx="2"/>
+          <text x="58" y="23">123 first kernel</text>
+          <rect class="bar-new" x="0" y="42" width="260" height="20" rx="2"/>
+          <text class="bar-in" x="8" y="57">611 now · 5.0×</text>
+        </svg>
+        <ul class="facts">
+          <li>Causal flash attention forward <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/benchmarks/RESULTS.md#before--after">4.0× faster</a> at sequence 2048</li>
+          <li>100 small ops: <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/benchmarks/RESULTS.md#before--after-1">10.6 → 0.82&nbsp;ms</a> with batched dispatch</li>
+          <li>MLP training step: <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/benchmarks/RESULTS.md#before--after-1">3.98&nbsp;ms on the GPU</a>, 12.45&nbsp;ms on the CPU</li>
+        </ul>
+        <a class="card-src" href="docs/benchmarks.html">Benchmarks and method</a>
+      </article>
+
+      <article class="card">
+        <p class="card-k">Checked correctness</p>
+        <p class="figure"><a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/docs/examples/lora-sft.md#correctness-checks">240<span class="slash">/</span>240</a></p>
+        <p class="figure-cap">LoRA adapter gradients matched PyTorch autograd</p>
+        <svg class="checks" viewBox="0 0 260 58" aria-hidden="true">
+          <g><rect class="cell" x="0" y="0" width="5" height="5" rx="1"/><rect class="cell" x="6.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="13" y="0" width="5" height="5" rx="1"/><rect class="cell" x="19.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="26" y="0" width="5" height="5" rx="1"/><rect class="cell" x="32.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="39" y="0" width="5" height="5" rx="1"/><rect class="cell" x="45.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="52" y="0" width="5" height="5" rx="1"/><rect class="cell" x="58.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="65" y="0" width="5" height="5" rx="1"/><rect class="cell" x="71.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="78" y="0" width="5" height="5" rx="1"/><rect class="cell" x="84.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="91" y="0" width="5" height="5" rx="1"/><rect class="cell" x="97.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="104" y="0" width="5" height="5" rx="1"/><rect class="cell" x="110.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="117" y="0" width="5" height="5" rx="1"/><rect class="cell" x="123.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="130" y="0" width="5" height="5" rx="1"/><rect class="cell" x="136.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="143" y="0" width="5" height="5" rx="1"/><rect class="cell" x="149.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="156" y="0" width="5" height="5" rx="1"/><rect class="cell" x="162.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="169" y="0" width="5" height="5" rx="1"/><rect class="cell" x="175.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="182" y="0" width="5" height="5" rx="1"/><rect class="cell" x="188.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="195" y="0" width="5" height="5" rx="1"/><rect class="cell" x="201.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="208" y="0" width="5" height="5" rx="1"/><rect class="cell" x="214.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="221" y="0" width="5" height="5" rx="1"/><rect class="cell" x="227.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="234" y="0" width="5" height="5" rx="1"/><rect class="cell" x="240.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="247" y="0" width="5" height="5" rx="1"/><rect class="cell" x="253.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="0" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="6.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="13" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="19.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="26" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="32.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="39" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="45.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="52" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="58.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="65" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="71.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="78" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="84.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="91" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="97.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="104" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="110.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="117" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="123.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="130" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="136.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="143" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="149.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="156" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="162.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="169" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="175.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="182" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="188.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="195" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="201.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="208" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="214.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="221" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="227.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="234" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="240.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="247" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="253.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="0" y="13" width="5" height="5" rx="1"/><rect class="cell" x="6.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="13" y="13" width="5" height="5" rx="1"/><rect class="cell" x="19.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="26" y="13" width="5" height="5" rx="1"/><rect class="cell" x="32.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="39" y="13" width="5" height="5" rx="1"/><rect class="cell" x="45.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="52" y="13" width="5" height="5" rx="1"/><rect class="cell" x="58.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="65" y="13" width="5" height="5" rx="1"/><rect class="cell" x="71.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="78" y="13" width="5" height="5" rx="1"/><rect class="cell" x="84.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="91" y="13" width="5" height="5" rx="1"/><rect class="cell" x="97.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="104" y="13" width="5" height="5" rx="1"/><rect class="cell" x="110.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="117" y="13" width="5" height="5" rx="1"/><rect class="cell" x="123.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="130" y="13" width="5" height="5" rx="1"/><rect class="cell" x="136.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="143" y="13" width="5" height="5" rx="1"/><rect class="cell" x="149.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="156" y="13" width="5" height="5" rx="1"/><rect class="cell" x="162.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="169" y="13" width="5" height="5" rx="1"/><rect class="cell" x="175.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="182" y="13" width="5" height="5" rx="1"/><rect class="cell" x="188.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="195" y="13" width="5" height="5" rx="1"/><rect class="cell" x="201.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="208" y="13" width="5" height="5" rx="1"/><rect class="cell" x="214.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="221" y="13" width="5" height="5" rx="1"/><rect class="cell" x="227.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="234" y="13" width="5" height="5" rx="1"/><rect class="cell" x="240.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="247" y="13" width="5" height="5" rx="1"/><rect class="cell" x="253.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="0" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="6.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="13" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="19.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="26" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="32.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="39" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="45.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="52" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="58.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="65" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="71.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="78" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="84.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="91" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="97.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="104" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="110.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="117" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="123.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="130" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="136.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="143" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="149.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="156" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="162.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="169" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="175.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="182" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="188.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="195" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="201.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="208" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="214.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="221" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="227.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="234" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="240.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="247" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="253.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="0" y="26" width="5" height="5" rx="1"/><rect class="cell" x="6.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="13" y="26" width="5" height="5" rx="1"/><rect class="cell" x="19.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="26" y="26" width="5" height="5" rx="1"/><rect class="cell" x="32.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="39" y="26" width="5" height="5" rx="1"/><rect class="cell" x="45.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="52" y="26" width="5" height="5" rx="1"/><rect class="cell" x="58.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="65" y="26" width="5" height="5" rx="1"/><rect class="cell" x="71.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="78" y="26" width="5" height="5" rx="1"/><rect class="cell" x="84.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="91" y="26" width="5" height="5" rx="1"/><rect class="cell" x="97.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="104" y="26" width="5" height="5" rx="1"/><rect class="cell" x="110.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="117" y="26" width="5" height="5" rx="1"/><rect class="cell" x="123.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="130" y="26" width="5" height="5" rx="1"/><rect class="cell" x="136.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="143" y="26" width="5" height="5" rx="1"/><rect class="cell" x="149.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="156" y="26" width="5" height="5" rx="1"/><rect class="cell" x="162.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="169" y="26" width="5" height="5" rx="1"/><rect class="cell" x="175.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="182" y="26" width="5" height="5" rx="1"/><rect class="cell" x="188.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="195" y="26" width="5" height="5" rx="1"/><rect class="cell" x="201.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="208" y="26" width="5" height="5" rx="1"/><rect class="cell" x="214.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="221" y="26" width="5" height="5" rx="1"/><rect class="cell" x="227.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="234" y="26" width="5" height="5" rx="1"/><rect class="cell" x="240.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="247" y="26" width="5" height="5" rx="1"/><rect class="cell" x="253.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="0" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="6.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="13" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="19.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="26" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="32.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="39" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="45.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="52" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="58.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="65" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="71.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="78" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="84.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="91" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="97.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="104" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="110.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="117" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="123.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="130" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="136.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="143" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="149.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="156" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="162.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="169" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="175.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="182" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="188.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="195" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="201.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="208" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="214.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="221" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="227.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="234" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="240.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="247" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="253.5" y="32.5" width="5" height="5" rx="1"/></g>
+          <text x="0" y="54">one square per adapter gradient</text>
+        </svg>
+        <ul class="facts">
+          <li>Every differentiable op <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/README.md#highlights">tested against finite differences</a> on the CPU</li>
+          <li>Every GPU kernel <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/README.md#highlights">tested against a CPU reference</a></li>
+          <li>Model logits matched <code>transformers</code> to <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/docs/examples/lora-sft.md#correctness-checks">about 1e-5</a>; worst gradient error 0.2%</li>
+        </ul>
+        <a class="card-src" href="docs/examples/lora-sft.html#correctness-checks">How it was checked</a>
+      </article>
+    </div>
+  </div>
+</section>
+
+<section class="section section-alt" id="code" aria-labelledby="code-title">
+  <div class="wrap">
+    <header class="sec-head">
+      <p class="eyebrow">02 · Code</p>
+      <h2 id="code-title">Rust or Python, same engine</h2>
+      <p>Both samples run as shown against the 0.2.0 release. The Python bindings wrap the same Rust tensor API.</p>
+    </header>
+
+    <div class="samples">
+      <figure class="sample">
+        <figcaption><span class="lang">Rust</span><a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/ferrotensor/examples/quickstart.rs">ferrotensor/examples/quickstart.rs</a></figcaption>
+<pre class="code" tabindex="0"><code><span class="k">use</span> ferrotensor::prelude::*;
+
+<span class="k">fn</span> <span class="f">main</span>() {
+    <span class="c">// A GPU (Metal/Vulkan/DX12) when one is available, else the CPU.</span>
+    <span class="k">let</span> device = <span class="t">Device</span>::<span class="f">best</span>();
+    <span class="f">println!</span>(<span class="s">"device: {} ({})"</span>, device.<span class="f">name</span>(), device.<span class="f">backend</span>());
+
+    <span class="c">// y = (x @ w).sum(), so dy/dw = x^T @ ones.</span>
+    <span class="k">let</span> x = <span class="t">Tensor</span>::<span class="f">from_data</span>(&amp;[<span class="n">1.</span>, <span class="n">2.</span>, <span class="n">3.</span>, <span class="n">4.</span>, <span class="n">5.</span>, <span class="n">6.</span>], &amp;[<span class="n">2</span>, <span class="n">3</span>], &amp;device);
+    <span class="k">let</span> w = <span class="t">Tensor</span>::<span class="f">from_data</span>(&amp;[<span class="n">0.5</span>, -<span class="n">1.</span>, <span class="n">2.</span>, <span class="n">0.</span>, <span class="n">1.</span>, <span class="n">1.</span>], &amp;[<span class="n">3</span>, <span class="n">2</span>], &amp;device).<span class="f">requires_grad_</span>();
+
+    <span class="k">let</span> y = x.<span class="f">matmul</span>(&amp;w);
+    <span class="f">println!</span>(<span class="s">"x @ w = {:?} (shape {:?})"</span>, y.<span class="f">to_vec</span>(), y.shape);
+
+    y.<span class="f">sum</span>().<span class="f">backward</span>();
+    <span class="f">println!</span>(<span class="s">"dL/dw = {:?}"</span>, w.<span class="f">grad</span>().<span class="f">expect</span>(<span class="s">"w requires grad"</span>).<span class="f">to_vec</span>());
+}</code></pre>
+        <div class="out" aria-label="Output on an Apple M2">
+          <p class="out-h">Output · <code>cargo run --release -p ferrotensor --example quickstart</code></p>
+<pre tabindex="0"><samp>device: Apple M2 (Metal)
+x @ w = [7.5, 2.0, 18.0, 2.0] (shape [2, 2])
+dL/dw = [5.0, 5.0, 7.0, 7.0, 9.0, 9.0]</samp></pre>
+        </div>
+      </figure>
+
+      <figure class="sample">
+        <figcaption><span class="lang">Python</span><a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/README.md#python">README.md · Python</a></figcaption>
+<pre class="code" tabindex="0"><code><span class="k">import</span> ferrotensor <span class="k">as</span> ft
+<span class="k">from</span> ferrotensor <span class="k">import</span> nn, optim
+<span class="k">import</span> ferrotensor.nn.functional <span class="k">as</span> F
+
+model = nn.<span class="t">Sequential</span>(nn.<span class="t">Linear</span>(<span class="n">2</span>, <span class="n">16</span>), nn.<span class="t">Tanh</span>(), nn.<span class="t">Linear</span>(<span class="n">16</span>, <span class="n">2</span>))
+opt = optim.<span class="t">AdamW</span>(model.<span class="f">parameters</span>(), lr=<span class="n">0.05</span>, weight_decay=<span class="n">0.0</span>)
+x = ft.<span class="f">tensor</span>([[<span class="n">0</span>, <span class="n">0</span>], [<span class="n">0</span>, <span class="n">1</span>], [<span class="n">1</span>, <span class="n">0</span>], [<span class="n">1</span>, <span class="n">1</span>]])
+<span class="k">for</span> _ <span class="k">in</span> <span class="f">range</span>(<span class="n">200</span>):
+    opt.<span class="f">zero_grad</span>()
+    loss = F.<span class="f">cross_entropy</span>(<span class="f">model</span>(x), [<span class="n">0</span>, <span class="n">1</span>, <span class="n">1</span>, <span class="n">0</span>])  <span class="c"># XOR</span>
+    loss.<span class="f">backward</span>()
+    opt.<span class="f">step</span>()
+<span class="f">print</span>(<span class="f">model</span>(x).<span class="f">argmax</span>(dim=<span class="n">1</span>).<span class="f">tolist</span>())</code></pre>
+        <div class="out" aria-label="Output with ferrotensor 0.2.0 from PyPI">
+          <p class="out-h">Output · <code>pip install ferrotensor==0.2.0</code></p>
+<pre tabindex="0"><samp>[0.0, 1.0, 1.0, 0.0]</samp></pre>
+        </div>
+      </figure>
+    </div>
+    <p class="more">More runnable programs with their real output (an MLP with a <code>DataLoader</code>, a character-level transformer, similarity search) are in the <a href="docs/use-cases.html">use cases</a>.</p>
+  </div>
+</section>
+
+<section class="section" id="architecture" aria-labelledby="arch-title">
+  <div class="wrap">
+    <header class="sec-head">
+      <p class="eyebrow">03 · Architecture</p>
+      <h2 id="arch-title">Every layer, down to the shader</h2>
+      <p>Two stacks in one workspace. The <code>ferrotensor</code> crate is the PyTorch-style tensor API with its own kernels and a CPU device. The LLM stack has purpose-built kernels for Llama-style models and the LoRA command-line tool. Both reach the GPU through wgpu.</p>
+    </header>
+    <figure class="arch-fig">
+<svg class="arch arch-wide" viewBox="0 0 960 524" role="img" aria-labelledby="arch-wide-t" xmlns="http://www.w3.org/2000/svg">
+<title id="arch-wide-t">Ferrotensor architecture: the ferrotensor tensor API and the LLM stack both run on wgpu, which drives Metal, Vulkan and DX12.</title>
+<defs><marker id="ah-wide" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 8 4 0 8z" class="a-head"/></marker></defs>
+<text class="a-col" x="0" y="16" font-size="13">TENSOR API</text>
+<text class="a-col" x="520" y="16" font-size="13">LLM STACK</text>
+<rect class="a-box a-acc" x="0" y="30" width="440" height="58" rx="6"/>
+<text class="a-t" x="12" y="54.3" font-size="16">Your code: Rust or Python</text>
+<text class="a-s" x="12" y="75.9" font-size="13">cargo add ferrotensor  ·  pip install ferrotensor</text>
+<rect class="a-box" x="0" y="106" width="440" height="134" rx="6"/>
+<text class="a-t" x="12" y="159.2" font-size="16">ferrotensor</text>
+<text class="a-s" x="12" y="180.8" font-size="13">Tensor, autograd, nn, optim, serialize, data</text>
+<text class="a-s" x="12" y="199.0" font-size="13">Python bindings: ferrotensor-py</text>
+<rect class="a-box" x="0" y="258" width="440" height="134" rx="6"/>
+<text class="a-t" x="12" y="311.2" font-size="16">Own WGSL kernels</text>
+<text class="a-s" x="12" y="332.8" font-size="13">plus a CPU device: every GPU kernel is</text>
+<text class="a-s" x="12" y="351.0" font-size="13">checked against the CPU reference</text>
+<line class="a-line" x1="220.0" y1="88" x2="220.0" y2="105" marker-end="url(#ah-wide)"/>
+<line class="a-line" x1="220.0" y1="240" x2="220.0" y2="257" marker-end="url(#ah-wide)"/>
+<rect class="a-box a-acc" x="520" y="30" width="440" height="58" rx="6"/>
+<text class="a-t" x="532" y="54.3" font-size="16">ferrotensor-cli</text>
+<text class="a-s" x="532" y="75.9" font-size="13">train · eval · generate  (+ ferrotensor-monitor)</text>
+<rect class="a-box" x="520" y="106" width="440" height="58" rx="6"/>
+<text class="a-t" x="532" y="130.3" font-size="16">ferrotensor-trainer</text>
+<text class="a-s" x="532" y="151.9" font-size="13">LoRA, loss scaling, checkpoints</text>
+<line class="a-line" x1="740.0" y1="88" x2="740.0" y2="105" marker-end="url(#ah-wide)"/>
+<rect class="a-box" x="520" y="182" width="440" height="58" rx="6"/>
+<text class="a-t" x="532" y="206.3" font-size="16">ferrotensor-graph</text>
+<text class="a-s" x="532" y="227.9" font-size="13">Llama / LFM2-style blocks  (+ ferrotensor-hub)</text>
+<line class="a-line" x1="740.0" y1="164" x2="740.0" y2="181" marker-end="url(#ah-wide)"/>
+<rect class="a-box" x="520" y="258" width="440" height="58" rx="6"/>
+<text class="a-t" x="532" y="282.3" font-size="16">ferrotensor-autograd · ferrotensor-loader</text>
+<text class="a-s" x="532" y="303.9" font-size="13">gradient tape · safetensors and tokenizers</text>
+<line class="a-line" x1="740.0" y1="240" x2="740.0" y2="257" marker-end="url(#ah-wide)"/>
+<rect class="a-box" x="520" y="334" width="440" height="58" rx="6"/>
+<text class="a-t" x="532" y="358.3" font-size="16">ferrotensor-backend</text>
+<text class="a-s" x="532" y="379.9" font-size="13">WGSL: matmul, flash attention, RoPE, RMSNorm, AdamW</text>
+<line class="a-line" x1="740.0" y1="316" x2="740.0" y2="333" marker-end="url(#ah-wide)"/>
+<line class="a-line" x1="220.0" y1="392" x2="220.0" y2="425" marker-end="url(#ah-wide)"/>
+<line class="a-line" x1="740.0" y1="392" x2="740.0" y2="425" marker-end="url(#ah-wide)"/>
+<rect class="a-box a-wgpu" x="0" y="426" width="960" height="40" rx="6"/>
+<text class="a-t a-wgpu-t" x="480.0" y="451.6" font-size="16" text-anchor="middle">wgpu</text>
+<line class="a-line" x1="152.0" y1="466" x2="152.0" y2="487" marker-end="url(#ah-wide)"/>
+<rect class="a-chip" x="0.0" y="488" width="304.0" height="34" rx="17"/>
+<text class="a-s a-chip-t" x="152.0" y="509.6" font-size="13" text-anchor="middle">Metal</text>
+<line class="a-line" x1="480.0" y1="466" x2="480.0" y2="487" marker-end="url(#ah-wide)"/>
+<rect class="a-chip" x="328.0" y="488" width="304.0" height="34" rx="17"/>
+<text class="a-s a-chip-t" x="480.0" y="509.6" font-size="13" text-anchor="middle">Vulkan</text>
+<line class="a-line" x1="808.0" y1="466" x2="808.0" y2="487" marker-end="url(#ah-wide)"/>
+<rect class="a-chip" x="656.0" y="488" width="304.0" height="34" rx="17"/>
+<text class="a-s a-chip-t" x="808.0" y="509.6" font-size="13" text-anchor="middle">DX12</text>
+</svg>
+<svg class="arch arch-narrow" viewBox="0 0 360 498" role="img" aria-labelledby="arch-narrow-t" xmlns="http://www.w3.org/2000/svg">
+<title id="arch-narrow-t">Ferrotensor architecture: the ferrotensor tensor API and the LLM stack both run on wgpu, which drives Metal, Vulkan and DX12.</title>
+<defs><marker id="ah-narrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 8 4 0 8z" class="a-head"/></marker></defs>
+<text class="a-col" x="0" y="16" font-size="11">TENSOR API</text>
+<text class="a-col" x="190" y="16" font-size="11">LLM STACK</text>
+<rect class="a-box a-acc" x="0" y="30" width="170" height="56" rx="6"/>
+<text class="a-t" x="12" y="53.9" font-size="13">Rust or Python</text>
+<text class="a-s" x="12" y="71.4" font-size="11">your code</text>
+<rect class="a-box" x="0" y="100" width="170" height="126" rx="6"/>
+<text class="a-t" x="12" y="143.5" font-size="13">ferrotensor</text>
+<text class="a-s" x="12" y="161.0" font-size="11">Tensor, autograd,</text>
+<text class="a-s" x="12" y="176.4" font-size="11">nn, optim, data</text>
+<text class="a-s" x="12" y="191.8" font-size="11">+ ferrotensor-py</text>
+<rect class="a-box" x="0" y="240" width="170" height="126" rx="6"/>
+<text class="a-t" x="12" y="291.2" font-size="13">WGSL kernels</text>
+<text class="a-s" x="12" y="308.7" font-size="11">+ CPU reference</text>
+<text class="a-s" x="12" y="324.1" font-size="11">device</text>
+<line class="a-line" x1="85.0" y1="86" x2="85.0" y2="99" marker-end="url(#ah-narrow)"/>
+<line class="a-line" x1="85.0" y1="226" x2="85.0" y2="239" marker-end="url(#ah-narrow)"/>
+<rect class="a-box a-acc" x="190" y="30" width="170" height="56" rx="6"/>
+<text class="a-t" x="202" y="53.9" font-size="13">ferrotensor-cli</text>
+<text class="a-s" x="202" y="71.4" font-size="11">train · eval · generate</text>
+<rect class="a-box" x="190" y="100" width="170" height="56" rx="6"/>
+<text class="a-t" x="202" y="123.9" font-size="13">ferrotensor-trainer</text>
+<text class="a-s" x="202" y="141.4" font-size="11">LoRA, checkpoints</text>
+<line class="a-line" x1="275.0" y1="86" x2="275.0" y2="99" marker-end="url(#ah-narrow)"/>
+<rect class="a-box" x="190" y="170" width="170" height="56" rx="6"/>
+<text class="a-t" x="202" y="193.9" font-size="13">ferrotensor-graph</text>
+<text class="a-s" x="202" y="211.4" font-size="11">Llama-style blocks</text>
+<line class="a-line" x1="275.0" y1="156" x2="275.0" y2="169" marker-end="url(#ah-narrow)"/>
+<rect class="a-box" x="190" y="240" width="170" height="56" rx="6"/>
+<text class="a-t" x="202" y="263.9" font-size="13">autograd + loader</text>
+<text class="a-s" x="202" y="281.4" font-size="11">tape, safetensors</text>
+<line class="a-line" x1="275.0" y1="226" x2="275.0" y2="239" marker-end="url(#ah-narrow)"/>
+<rect class="a-box" x="190" y="310" width="170" height="56" rx="6"/>
+<text class="a-t" x="202" y="333.9" font-size="13">ferrotensor-backend</text>
+<text class="a-s" x="202" y="351.4" font-size="11">WGSL kernels</text>
+<line class="a-line" x1="275.0" y1="296" x2="275.0" y2="309" marker-end="url(#ah-narrow)"/>
+<line class="a-line" x1="85.0" y1="366" x2="85.0" y2="399" marker-end="url(#ah-narrow)"/>
+<line class="a-line" x1="275.0" y1="366" x2="275.0" y2="399" marker-end="url(#ah-narrow)"/>
+<rect class="a-box a-wgpu" x="0" y="400" width="360" height="40" rx="6"/>
+<text class="a-t a-wgpu-t" x="180.0" y="424.6" font-size="13" text-anchor="middle">wgpu</text>
+<line class="a-line" x1="56.666666666666664" y1="440" x2="56.666666666666664" y2="461" marker-end="url(#ah-narrow)"/>
+<rect class="a-chip" x="0.0" y="462" width="113.3" height="34" rx="17"/>
+<text class="a-s a-chip-t" x="56.7" y="482.9" font-size="11" text-anchor="middle">Metal</text>
+<line class="a-line" x1="180.0" y1="440" x2="180.0" y2="461" marker-end="url(#ah-narrow)"/>
+<rect class="a-chip" x="123.3" y="462" width="113.3" height="34" rx="17"/>
+<text class="a-s a-chip-t" x="180.0" y="482.9" font-size="11" text-anchor="middle">Vulkan</text>
+<line class="a-line" x1="303.3333333333333" y1="440" x2="303.3333333333333" y2="461" marker-end="url(#ah-narrow)"/>
+<rect class="a-chip" x="246.7" y="462" width="113.3" height="34" rx="17"/>
+<text class="a-s a-chip-t" x="303.3" y="482.9" font-size="11" text-anchor="middle">DX12</text>
+</svg>
+      <figcaption>How a tensor op reaches a WGSL kernel, step by step, is in the <a href="docs/architecture.html">architecture guide</a>; adding your own op is in <a href="docs/writing-a-kernel.html">writing a kernel</a>.</figcaption>
+    </figure>
+  </div>
+</section>
+
+<section class="section section-alt" id="compare" aria-labelledby="compare-title">
+  <div class="wrap">
+    <header class="sec-head">
+      <p class="eyebrow">04 · Context</p>
+      <h2 id="compare-title">Compared with candle, burn and tch-rs</h2>
+      <p>These are good projects; Ferrotensor is not trying to replace them. The honest picture, <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/README.md#compared-with-candle-burn-and-tch">from the README</a>:</p>
+    </header>
+    <div class="table-wrap">
+      <table class="compare">
+        <thead>
+          <tr>
+            <td></td>
+            <th scope="col" class="us">Ferrotensor</th>
+            <th scope="col"><a href="https://github.com/huggingface/candle">candle</a></th>
+            <th scope="col"><a href="https://github.com/tracel-ai/burn">burn</a></th>
+            <th scope="col"><a href="https://github.com/LaurentMazare/tch-rs">tch-rs</a></th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <th scope="row">What it is</th>
+            <td class="us" data-label="Ferrotensor">Small pure-Rust framework on wgpu</td>
+            <td data-label="candle">Minimalist Rust ML framework from Hugging Face</td>
+            <td data-label="burn">Full Rust deep-learning framework with swappable backends</td>
+            <td data-label="tch-rs">Rust bindings to libtorch (PyTorch's C++ library)</td>
+          </tr>
+          <tr>
+            <th scope="row">GPU story</th>
+            <td class="us" data-label="Ferrotensor">wgpu only: Metal, Vulkan, DX12</td>
+            <td data-label="candle">CUDA and Metal, plus CPU</td>
+            <td data-label="burn">wgpu, CUDA, Metal, CPU and others through backends</td>
+            <td data-label="tch-rs">Whatever libtorch supports, notably CUDA</td>
+          </tr>
+          <tr>
+            <th scope="row">Needs a C++/CUDA toolchain</th>
+            <td class="us" data-label="Ferrotensor">No</td>
+            <td data-label="candle">For CUDA builds</td>
+            <td data-label="burn">Depends on backend</td>
+            <td data-label="tch-rs">Yes, libtorch</td>
+          </tr>
+          <tr>
+            <th scope="row">Maturity</th>
+            <td class="us" data-label="Ferrotensor">Young, pre-1.0, one maintainer</td>
+            <td data-label="candle">Widely used, many reference model implementations</td>
+            <td data-label="burn">Widely used, training-focused, large API</td>
+            <td data-label="tch-rs">Mature, full PyTorch op coverage</td>
+          </tr>
+          <tr>
+            <th scope="row">Model zoo / ecosystem</th>
+            <td class="us" data-label="Ferrotensor">Tiny</td>
+            <td data-label="candle">Large</td>
+            <td data-label="burn">Growing</td>
+            <td data-label="tch-rs">The whole PyTorch ecosystem via TorchScript/weights</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="choose">
+      <p>Choose <strong>candle</strong> for inference of popular models, <strong>burn</strong> for a mature all-Rust training framework, <strong>tch-rs</strong> when you need exact PyTorch semantics and CUDA.</p>
+      <p>Choose <strong>Ferrotensor</strong> to learn how the stack works end to end, when you want a dependency-light wgpu-only codebase you can read and modify, or to experiment on a consumer GPU without installing CUDA. It does not match their op coverage, model support or hardening, and it has not been benchmarked against them.</p>
+    </div>
+  </div>
+</section>
+
+<section class="section" id="limits" aria-labelledby="limits-title">
+  <div class="wrap limits-in">
+    <header class="sec-head">
+      <p class="eyebrow">05 · Limits</p>
+      <h2 id="limits-title">What it can't do yet</h2>
+      <p>Small-scale by design, and young. Before you pick it up, know this:</p>
+    </header>
+    <ul class="limits">
+      <li><strong>f32 only.</strong> No <code>f16</code> or <code>bf16</code> tensors in the tensor API yet.</li>
+      <li><strong>One GPU.</strong> No multi-GPU or distributed training; the CLI's <code>--world-size</code> flag is a prototype.</li>
+      <li><strong>Small models.</strong> LoRA fine-tuning is experimental and aimed at small Llama-style models; the measured run is SmolLM2-135M. Released LFM2 checkpoints are not supported.</li>
+      <li><strong>Tiny workloads are faster on the CPU.</strong> A chain of 100 tiny ops still takes <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/benchmarks/RESULTS.md#what-is-still-slow">about 18× as long on the GPU</a> as on the CPU; op fusion is the next step.</li>
+      <li><strong>Not every op.</strong> No convolutions, sort, top-k or cumsum in the tensor API.</li>
+      <li><strong>Far from peak.</strong> Matmul reaches <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/benchmarks/RESULTS.md#context">about 17% of the M2's FP32 peak</a>; WGSL does not expose the matrix instructions that close that gap.</li>
+      <li><strong>Pre-1.0.</strong> The API can still change, and Python wheels exist for macOS arm64 and Linux x86_64 only (other platforms build from source).</li>
+    </ul>
+  </div>
+</section>
+
+</main>
+
+<footer class="foot">
+  <div class="wrap foot-in">
+    <div class="foot-brand">
+      <svg class="tile" viewBox="0 0 32 32" aria-hidden="true"><rect x="1" y="1" width="30" height="30" rx="4"/><text x="5" y="10">26</text><text class="tile-sym" x="5.5" y="26">Ft</text></svg>
+      <p>Ferrotensor 0.2.0 · Licensed under <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/LICENSE-MIT">MIT</a> or <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/LICENSE-APACHE">Apache-2.0</a>, at your option.</p>
+    </div>
+    <nav aria-label="Project links">
+      <ul>
+        <li><a href="https://github.com/puranikyashaswin/ferrotensor">GitHub</a></li>
+        <li><a href="https://crates.io/crates/ferrotensor">crates.io</a></li>
+        <li><a href="https://pypi.org/project/ferrotensor/">PyPI</a></li>
+        <li><a href="https://docs.rs/ferrotensor">docs.rs</a></li>
+        <li><a href="docs/">Guide</a></li>
+        <li><a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/CHANGELOG.md">Changelog</a></li>
+      </ul>
+    </nav>
+  </div>
+</footer>
+</body>
+</html>
