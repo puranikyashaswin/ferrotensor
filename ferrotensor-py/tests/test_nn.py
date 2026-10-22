@@ -21,7 +21,7 @@ def test_linear_matches_functional():
     x = ft.randn(4, 3)
     expected = (x @ layer.weight + layer.bias).tolist()
     got = layer(x).tolist()
-    for row_g, row_e in zip(got, expected):
+    for row_g, row_e in zip(got, expected, strict=True):
         assert row_g == pytest.approx(row_e, abs=1e-5)
     assert nn.functional.linear(x, layer.weight, layer.bias).shape == (4, 2)
 

@@ -24,7 +24,7 @@ def close(a, b, tol=1e-5):
     """Compare nested lists/floats elementwise."""
     if isinstance(a, list):
         assert isinstance(b, list) and len(a) == len(b), (a, b)
-        for x, y in zip(a, b):
+        for x, y in zip(a, b, strict=True):
             close(x, y, tol)
     else:
         assert a == pytest.approx(b, abs=tol, rel=tol), (a, b)

@@ -7,7 +7,7 @@ name = "ferrotensor"
 dynamic = ["version"]
 description = "PyTorch-style tensors, autograd and nn on wgpu (Metal, Vulkan, DX12) or the CPU, written in Rust"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = "MIT OR Apache-2.0"
 authors = [{ name = "Yashaswin Puranik", email = "puranikyashaswinsharma@gmail.com" }]
 keywords = ["machine-learning", "deep-learning", "gpu", "autograd", "wgpu"]
@@ -34,11 +34,11 @@ testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 110
-target-version = "py39"
+target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP"]
-# Stubs and signatures keep typing.Optional/Union for Python 3.9 readers.
+# Keep typing.Optional/Union spellings as written.
 ignore = ["UP006", "UP007", "UP035", "UP045"]
 
 [tool.ruff.lint.isort]
