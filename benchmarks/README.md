@@ -30,6 +30,18 @@ Mode: full
 ...
 ```
 
+## Tensor API benchmark
+
+```bash
+cargo run -p ferrotensor-benchmarks --release --bin tensor-api
+```
+
+times the `ferrotensor` crate's `Tensor` API end to end on the CPU and the GPU:
+a chain of 100 element-wise ops, one AdamW step of a 784-256-10 MLP, and a
+512x512x512 matmul, each ending with a read back. A checksum of each output
+lets two builds be compared bit for bit. Results are in
+[RESULTS.md](RESULTS.md#ferrotensor-tensor-api-cpu-and-gpu-devices).
+
 ## How it measures
 
 Each case first runs 3 warm-up calls. It then dispatches the kernel in batches

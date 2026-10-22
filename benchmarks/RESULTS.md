@@ -83,3 +83,81 @@ Under the same best-of-3 timing, these gave no measurable gain:
 The M2 GPU peaks at about 3.6 TFLOPS FP32, so matmul reaches about 17% of
 peak. Apple's MPS reaches a much larger fraction; closing that gap needs
 `simdgroup_matrix` operations, which WGSL does not expose.
+
+# `ferrotensor` Tensor API: CPU and GPU devices
+
+End-to-end timings through the `ferrotensor` crate's `Tensor` API, including
+the host-side cost of every op (autograd bookkeeping, buffers, bind groups,
+submission) and a read back to the host at the end, as user code does.
+
+## Setup
+
+- Hardware: Apple M2 (10-core GPU), 8 GB unified memory, MacBook Air
+- OS: macOS 27.2; backend: Metal via wgpu 0.19
+- Toolchain: rustc 1.99.1, `--release`
+- Command: `cargo run -p ferrotensor-benchmarks --release --bin tensor-api`
+- Method: three warm-up iterations, then at least 10 timed iterations (up to
+  200 or 2 s); each case reports the median. "Before" and "after" binaries
+  were run alternately three times each; the table shows the best median of
+  the three.
+- "Before" is commit "Add a Tensor API benchmark for CPU and GPU devices"
+  (one submission per op); "after" is commit "Gather embedding rows on the
+  GPU without reading the ids back".
+- The benchmark prints a checksum of each case's output bits. On every case
+  the GPU checksum is the same before and after, so the GPU results are bit
+  for bit unchanged.
+
+## Before / after
+
+| case | CPU | GPU before | GPU after | GPU speed-up |
+|---|---:|---:|---:|---:|
+| 100 element-wise ops on `[64]`, then `to_vec` | 0.046 ms | 10.63 ms | 0.82 ms | 13x |
+| 100 element-wise ops on `[4096]`, then `to_vec` | 1.38 ms | 10.73 ms | 0.84 ms | 12.8x |
+| MLP 784-256-10, one AdamW step, batch 64, then `loss.item()` | 12.45 ms | 10.80 ms | 3.98 ms | 2.7x |
+| matmul 512x512x512, then `to_vec` | 10.30 ms | 5.22 ms | 2.77 ms | 1.9x |
+
+The CPU column is the best of all six runs; the CPU path did not change.
+
+The examples, timed with `/usr/bin/time -p` around
+`FERROTENSOR_DEVICE=cpu|gpu cargo run --release -p ferrotensor --example <name>`
+(binaries built once, then run directly). Their weights are not seeded, so
+the final losses differ from run to run.
+
+| example | CPU | GPU before | GPU after |
+|---|---:|---:|---:|
+| `char_transformer` (600 steps, "trained 600 steps in") | 42.5 s (44.4 s with the before binary) | 105.0 s | 31.9 s |
+| `mlp_two_moons` (60 epochs, wall time, two runs) | 0.19-0.24 s | 12.46 s, 16.60 s | 2.21 s, 1.80 s |
+
+## What changed
+
+- **Batched submission.** Ops are recorded and submitted together at the next
+  read back, host write, or every 256 ops, instead of one submit per op
+  (a submit costs about 117 µs of CPU on this machine).
+- **One compute pass per batch.** On Metal each compute pass costs about
+  40 µs of GPU time; consecutive dispatches in one pass cost about 13 µs each
+  in a 100-dispatch micro test.
+- **Op arguments in one buffer.** Uniforms and shape metadata go into one
+  buffer written once per batch, instead of a new buffer per op. Bind group
+  layouts are cached.
+- **Buffer pool.** Op outputs reuse freed tensor buffers of the same size (up
+  to 128 MiB per device), which also skips wgpu's zero fill of new buffers.
+  This took the 100-op chain on `[4096]` from 1.77 ms to 0.90 ms and the MLP
+  step from 5.1 ms to 4.0 ms in single runs.
+- **Spin-wait for read backs.** wgpu 0.19's blocking wait on Metal sleeps in
+  1 ms steps (`wgpu-hal` `metal/device.rs`, `Device::wait`), so every
+  `to_vec`/`item` cost at least about 1.3 ms. Waits now busy-poll for up to
+  10 ms before blocking; a read back after the GPU is idle takes about
+  0.18 ms.
+
+## What is still slow
+
+- 100 tiny ops on the GPU still take about 18x as long as on the CPU: most of
+  it is GPU time per dispatch (about 9-13 µs each, serialised within the
+  pass), plus one round trip to read the result. Fusing element-wise chains
+  into one kernel would be the next step.
+- Several ops read back to the host on their own and force a sync:
+  `cross_entropy` with class-index targets, `argmax`/`argmin`, `cat`, the
+  backward passes of `index_select` and `Embedding`, and gradient clipping
+  (one `item()` per parameter).
+- Full reductions (`sum()` over a whole tensor) use one GPU thread per
+  output, so a large `sum()` runs on a single thread.

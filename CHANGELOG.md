@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- `ferrotensor`: GPU ops are batched into one submission and one compute pass per sync point, reuse freed buffers, and read back without wgpu's 1 ms sleep on Metal. `char_transformer` trains 600 steps in 31.9 s on an M2 GPU (was 105.0 s). Results are bit for bit unchanged.
+- `ferrotensor`: `Embedding::forward` gathers on the GPU without reading the ids back. Ids outside `[0, vocab)` now give zero rows and no gradient on both devices (before: a panic, or row 0 for negative ids).
+
+### Added
+- `Device::synchronize()` waits for all queued GPU work.
+- `ferrotensor-benchmarks`: `tensor-api` binary timing the `ferrotensor` Tensor API on the CPU and GPU.
+
 ## [0.1.0] - 2026-10-21
 
 First public version.

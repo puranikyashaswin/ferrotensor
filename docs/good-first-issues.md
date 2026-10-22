@@ -64,18 +64,12 @@ before/after numbers and the machine in the PR.
 
 ## 5. `Embedding::forward` reads ids back from the GPU and uploads them again
 
-*easy · `performance`*
-
-`ferrotensor/src/nn/embedding.rs` implements `Module::forward` by calling
-`x.to_vec()` to turn the id tensor into indices, then `functional::embedding`
-uploads them again. On a GPU tensor that is a device-to-host copy plus a
-host-to-device copy per call, and it forces a sync. Either document that
-`forward` expects host-friendly ids and steer users to `forward_ids`, or add a
-gather path that keeps the ids on the device (the `gather_rows` kernel is the
-starting point).
-
-Done when a test shows both paths give identical output on CPU, and (with
-`FERROTENSOR_RUN_GPU_TESTS=1`) on the GPU.
+*Done.* `Embedding::forward` now gathers with the `gather_rows` kernel reading
+the `f32` ids straight from the id tensor's GPU buffer; ids outside
+`[0, vocab)` give zero rows. The tests in `ferrotensor/src/nn/embedding.rs`
+check that `forward` and `forward_ids` agree bit for bit on the CPU and (with
+`FERROTENSOR_RUN_GPU_TESTS=1`) on the GPU. The backward pass still scatters
+the gradient on the host.
 
 ## 6. Make loss-function target types consistent
 
@@ -127,20 +121,13 @@ result, gated the same way as `gpu_training_matches_cpu` in
 
 ## 10. Cut per-op overhead on the GPU path
 
-*harder · `performance`*
-
-Each op creates a uniform buffer, a bind group and a command encoder, and
-submits it on its own (`ComputeEngine::run` in
-`ferrotensor/src/backend/compute.rs`, called from `ferrotensor/src/tensor/raw.rs`). On
-this repo's M2, the 109k-parameter transformer in
-`examples/char_transformer.rs` trains 600 steps in about 47 s on the CPU and
-141 s on the GPU, and the 1.2k-parameter MLP takes about 0.5 s on the CPU and
-tens of seconds on the GPU. Options: cache bind groups and pipelines'
-layouts, pool the small uniform buffers, and record several ops into one
-encoder so they submit together. Needs a design note before a large PR.
-
-Done when the GPU run of `char_transformer` is measurably faster with
-identical results, with before/after numbers in the PR.
+*Done.* GPU ops are recorded into one command encoder and one compute pass
+and submitted at each read back, with pooled output buffers and a shared
+argument buffer. On this repo's M2, `char_transformer` trains 600 steps in
+31.9 s on the GPU (105.0 s before; 42.5 s on the CPU) and `mlp_two_moons`
+takes about 2 s on the GPU (12-17 s before). See
+[benchmarks/RESULTS.md](../benchmarks/RESULTS.md#ferrotensor-tensor-api-cpu-and-gpu-devices)
+for the method and what is still slow.
 
 ## 11. Port the legacy `ferrotensor_backend` examples and verify they run
 
