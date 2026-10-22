@@ -165,6 +165,10 @@ pub(crate) fn cases() -> Vec<Case> {
             );
             x[0].masked_fill(&mask, -1e9).softmax(-1)
         }),
+        case("tril", &[(&[2, 3, 4], U)], |x| x[0].tril(0).exp()),
+        case("tril_negative", &[(&[4, 3], U)], |x| x[0].tril(-1).square()),
+        case("triu", &[(&[3, 5], U)], |x| x[0].triu(1).exp()),
+        case("triu_negative", &[(&[2, 4, 4], U)], |x| x[0].triu(-2).sin()),
         case("shared_subexpression", &[(&[4], U), (&[4], U)], |x| {
             let h = x[0].mul(&x[1]).tanh();
             h.mul(&h).add(&h.mul(&x[0]))
@@ -431,6 +435,33 @@ fn assign_updates_every_clone() {
     let alias = p.clone();
     p.assign(&Tensor::ones(&[2], &d));
     assert_eq!(alias.to_vec(), vec![1.0, 1.0]);
+}
+
+#[test]
+fn tril_and_triu_pick_triangles() {
+    let x = Tensor::arange(1.0, 10.0, 1.0, &Device::cpu()).reshape(&[3, 3]);
+    assert_eq!(
+        x.tril(0).to_vec(),
+        vec![1.0, 0.0, 0.0, 4.0, 5.0, 0.0, 7.0, 8.0, 9.0]
+    );
+    assert_eq!(
+        x.triu(1).to_vec(),
+        vec![0.0, 2.0, 3.0, 0.0, 0.0, 6.0, 0.0, 0.0, 0.0]
+    );
+    assert_eq!(
+        x.tril(-1).to_vec(),
+        vec![0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 7.0, 8.0, 0.0]
+    );
+    // tril(k) + triu(k + 1) splits the matrix, also for non-square shapes.
+    let y = Tensor::randn(&[2, 3, 5], &Device::cpu());
+    let parts = y.tril(1).add(&y.triu(2));
+    assert_eq!(parts.to_vec(), y.to_vec());
+}
+
+#[test]
+#[should_panic(expected = "at least 2 dims")]
+fn tril_needs_a_matrix() {
+    Tensor::ones(&[3], &Device::cpu()).tril(0);
 }
 
 #[test]
