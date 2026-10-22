@@ -29,10 +29,14 @@ site-url = "/ferrotensor/docs/"
 default-theme = "light"
 preferred-dark-theme = "navy"
 additional-css = ["theme/ferrotensor.css"]
-additional-js = ["theme/home-link.js"]
+additional-js = ["theme/ferrotensor.js"]
 git-repository-url = "https://github.com/puranikyashaswin/ferrotensor"
 git-repository-icon = "fab-github"
 no-section-label = true
+
+# The print page repeats the whole guide on one page; the guide has search.
+[output.html.print]
+enable = false
 
 [output.html.playground]
 runnable = false

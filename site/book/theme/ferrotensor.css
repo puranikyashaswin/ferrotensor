@@ -100,7 +100,14 @@ html.light, html.navy {
 }
 .content h1 + h2, .content main > h2:first-child { border-top: 0; }
 
-.content a:link, .content a:visited { color: var(--links); text-underline-offset: 0.18em; }
+/* Links in running text are underlined, not told apart by colour alone. */
+.content a:link, .content a:visited {
+  color: var(--links);
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.18em;
+}
+.content .header:link, .content .header:visited { text-decoration: none; }
 .content a:hover { text-decoration-thickness: 2px; }
 
 :focus-visible {
@@ -138,6 +145,18 @@ table td, table th { padding: 0.45em 0.8em; }
 }
 .chapter li a.active { font-weight: 650; }
 
+/* Touch targets of at least 24px. */
+.chapter li a { padding-block: 4px; }
+.menu-bar .icon-button { min-width: 32px; min-height: 32px; }
+.right-buttons a {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 32px;
+  min-height: 32px;
+}
+button.icon-button { font: inherit; }
+
 .menu-title { font-weight: 800; letter-spacing: -0.02em; }
 
 .ft-home {
@@ -152,7 +171,7 @@ table td, table th { padding: 0.45em 0.8em; }
 .ft-home:hover { color: var(--icons-hover); }
 
 @media (max-width: 560px) {
-  .ft-home { display: none; }
+  .right-buttons .ft-home { display: none; }
 }
 
 @media (prefers-reduced-motion: reduce) {
