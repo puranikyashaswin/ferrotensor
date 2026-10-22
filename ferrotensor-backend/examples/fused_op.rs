@@ -1,3 +1,16 @@
+//! Two kernels in a row on the GPU: `(A + B) * C`, with the intermediate left
+//! on the device.
+//!
+//! Run with: `cargo run -p ferrotensor-backend --example fused_op`
+//!
+//! Output:
+//!
+//! ```text
+//! Executing (A + B) * C...
+//! Result: [12.0, 16.0, 20.0, 24.0]
+//! Verification Successful!
+//! ```
+
 use ferrotensor_backend::{ComputeEngine, UnifiedTensor, WgpuContext};
 
 fn main() {

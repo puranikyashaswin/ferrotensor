@@ -1,108 +1,38 @@
-# Ferrotensor Examples
+# Examples for the `ferrotensor` crate
 
-This directory contains runnable examples demonstrating the Ferrotensor ML framework.
-
-## Quick Start
-
-All examples can be run with:
+Every example runs on the CPU by default. Set `FERROTENSOR_DEVICE=gpu` (where
+the example says so) to use the GPU. Run one with:
 
 ```bash
-cargo run --example <example_name> --release -p ferrotensor
+cargo run --release -p ferrotensor --example <name>
 ```
 
-## Available Examples
+| Example | What it shows |
+|---------|---------------|
+| `quickstart` | A matmul and its gradient on the best available device |
+| `mlp_two_moons` | An MLP trained with `DataLoader` on a synthetic dataset |
+| `char_transformer` | A character-level transformer trained from scratch on a few sonnets, then sampled |
+| `gpu_matmul_attention` | The same matmul and attention on CPU and GPU, checked against each other and timed |
+| `similarity_search` | Nearest-neighbour search over hashed character-trigram embeddings |
 
-### 1. `basic_tensor` - GPU Tensor Operations
+Real output for each is in [docs/use-cases.md](../../docs/use-cases.md).
 
-**Best for:** First-time users, verifying GPU setup
+The low-level examples for the LLM stack live next to the crates they use:
 
-```bash
-cargo run --example basic_tensor --release -p ferrotensor
-```
+- [`ferrotensor-backend/examples`](../../ferrotensor-backend/examples): context
+  creation, tensor upload, and individual kernels through `ComputeEngine`
+- [`ferrotensor-graph/examples`](../../ferrotensor-graph/examples): a Llama
+  block and causal flash attention checked against a CPU reference
 
-**Demonstrates:**
-- GPU initialization with wgpu/Metal
-- Creating tensors on GPU
-- Matrix multiplication
-- Element-wise operations (add, multiply)
-- SiLU activation function
+For fine-tuning a real model, see the
+[LoRA walkthrough](../../docs/examples/lora-sft.md).
 
-**Expected output** (values vary by GPU):
-```
-Ferrotensor ML - Basic Tensor Example
+## Adding an example
 
-[GPU] Apple M2 (Metal)
-
-[INIT] Creating tensors...
-       Tensor A: [32, 32]
-       Tensor B: [32, 32]
-
-[COMPUTE] Performing matrix multiplication...
-          Result shape: [32, 32]
-          First few values: [..., ..., ..., ..., ...]
-
-[DONE] All operations completed successfully!
-```
-
----
-
-### 2. `flash_attention` - Memory-Efficient Attention
-
-**Best for:** Understanding Flash Attention implementation
-
-```bash
-cargo run --example flash_attention --release -p ferrotensor
-```
-
-**Demonstrates:**
-- Flash Attention algorithm
-- O(N) memory vs O(N²) standard attention
-- Tiled computation on GPU
-- Memory savings calculation
-
----
-
-### 3. `lora_finetune` - LoRA Fine-tuning
-
-**Best for:** Understanding parameter-efficient training
-
-```bash
-cargo run --example lora_finetune --release -p ferrotensor
-```
-
-**Demonstrates:**
-- LoRA adapter initialization
-- Low-rank weight matrices
-- Forward pass with LoRA
-- Memory-efficient fine-tuning
-
----
-
-## Adding New Examples
-
-1. Create a new `.rs` file in this directory
-2. Add the example to `ferrotensor/Cargo.toml`:
-   ```toml
-   [[example]]
-   name = "my_example"
-   path = "examples/my_example.rs"
-   ```
-3. Run with: `cargo run --example my_example --release -p ferrotensor`
-
----
+Create a `.rs` file in this directory; Cargo finds it. Put a doc comment at
+the top with the command to run it and its real output.
 
 ## Troubleshooting
 
-### "No GPU found"
-
-Ensure you're on a supported platform:
-- macOS with Apple Silicon (M1/M2/M3)
-- Linux/Windows with Vulkan-capable GPU
-
-### "Permission denied on Cargo.lock"
-
-This can happen with sandbox issues. Try:
-```bash
-rm -f Cargo.lock
-cargo build
-```
+`Device::gpu()` panics or returns an error when wgpu finds no adapter (a
+machine without Metal or Vulkan, or a CI runner). Use `Device::cpu()`.
