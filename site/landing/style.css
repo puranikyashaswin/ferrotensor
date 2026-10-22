@@ -256,9 +256,11 @@ h1, h2, h3 { line-height: 1.1; margin: 0; letter-spacing: -0.02em; }
 }
 .tablist button:focus-visible { outline-offset: -3px; }
 
-/* Without JS every command shows; the tab list only appears with JS. */
-.install:not(.is-live) .tablist { display: none; }
-.install:not(.is-live) .panel + .panel { border-top: 1px dashed var(--line); }
+/* Without JS every command shows; the tab list only appears with JS. The
+   "js" class is set in <head>, so the hidden panels never paint. */
+html:not(.js) .tablist { display: none; }
+html:not(.js) .panel + .panel { border-top: 1px dashed var(--line); }
+.js .install:not(.is-live) .panel + .panel { display: none; }
 
 .panel { padding: 1rem 1rem 1.05rem; }
 .panel[hidden] { display: none; }
@@ -653,6 +655,24 @@ h1, h2, h3 { line-height: 1.1; margin: 0; letter-spacing: -0.02em; }
 }
 .limits strong { color: var(--ink); }
 
+/* FAQ */
+.faq {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 clamp(2rem, 5vw, 4rem);
+}
+.faq-item {
+  padding: 1.25rem 0 1.4rem;
+  border-top: 1px solid var(--line-strong);
+}
+.faq-item h3 {
+  font-size: 1.15rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  line-height: 1.3;
+}
+.faq-item p { margin: 0.6rem 0 0; color: var(--ink-2); }
+
 /* Footer */
 .foot {
   border-top: 1px solid var(--line);
@@ -679,6 +699,7 @@ h1, h2, h3 { line-height: 1.1; margin: 0; letter-spacing: -0.02em; }
   .sheet { max-width: 34rem; }
   .cards { grid-template-columns: minmax(0, 1fr); max-width: 36rem; }
   .limits-in { grid-template-columns: minmax(0, 1fr); }
+  .faq { grid-template-columns: minmax(0, 1fr); }
 }
 
 @media (max-width: 720px) {

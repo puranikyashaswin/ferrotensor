@@ -4,9 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Ferrotensor: a pure-Rust GPU ML framework</title>
-<meta name="description" content="Tensors, autograd, nn and LoRA fine-tuning in pure Rust, on Metal, Vulkan or DX12 through wgpu and hand-written WGSL kernels. No CUDA, no C++ toolchain. Python bindings included.">
+<meta name="description" content="Tensors, autograd, nn and LoRA fine-tuning in pure Rust on Metal, Vulkan or DX12, with hand-written WGSL kernels and Python bindings. No CUDA needed.">
 <link rel="canonical" href="https://puranikyashaswin.github.io/ferrotensor/">
 <meta name="color-scheme" content="light dark">
+<script>document.documentElement.classList.add("js");</script>
 <meta name="theme-color" content="#f6f3ee" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#141210" media="(prefers-color-scheme: dark)">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
@@ -24,6 +25,111 @@
 <meta name="twitter:description" content="Tensors, autograd and LoRA fine-tuning on Metal, Vulkan or DX12 through hand-written WGSL kernels. No CUDA, no C++ toolchain.">
 <meta name="twitter:image" content="https://puranikyashaswin.github.io/ferrotensor/og.png">
 <meta name="twitter:image:alt" content="Ferrotensor: a pure-Rust GPU ML framework.">
+<script type="application/ld+json">
+{
+ "@context": "https://schema.org",
+ "@graph": [
+  {
+   "@type": "SoftwareSourceCode",
+   "@id": "https://puranikyashaswin.github.io/ferrotensor/#code",
+   "name": "Ferrotensor",
+   "description": "A pure-Rust GPU ML framework: tensors, autograd, nn and LoRA fine-tuning on Metal, Vulkan or DX12 through wgpu and hand-written WGSL kernels, with Python bindings.",
+   "url": "https://puranikyashaswin.github.io/ferrotensor/",
+   "codeRepository": "https://github.com/puranikyashaswin/ferrotensor",
+   "programmingLanguage": [
+    "Rust",
+    "WGSL",
+    "Python"
+   ],
+   "license": [
+    "https://opensource.org/licenses/MIT",
+    "https://www.apache.org/licenses/LICENSE-2.0"
+   ],
+   "version": "0.2.0",
+   "author": {
+    "@type": "Person",
+    "name": "Yashaswin Puranik Sharma",
+    "url": "https://github.com/puranikyashaswin"
+   }
+  },
+  {
+   "@type": "SoftwareApplication",
+   "@id": "https://puranikyashaswin.github.io/ferrotensor/#cli",
+   "name": "ferrotensor-cli",
+   "description": "The ferrotensor command: LoRA fine-tuning (train), evaluation (eval) and text generation (generate) for small Llama-style models.",
+   "applicationCategory": "DeveloperApplication",
+   "operatingSystem": "macOS, Linux",
+   "softwareVersion": "0.2.0",
+   "downloadUrl": "https://github.com/puranikyashaswin/ferrotensor/releases",
+   "installUrl": "https://crates.io/crates/ferrotensor-cli",
+   "offers": {
+    "@type": "Offer",
+    "price": "0",
+    "priceCurrency": "USD"
+   },
+   "author": {
+    "@type": "Person",
+    "name": "Yashaswin Puranik Sharma",
+    "url": "https://github.com/puranikyashaswin"
+   }
+  },
+  {
+   "@type": "FAQPage",
+   "@id": "https://puranikyashaswin.github.io/ferrotensor/#faq",
+   "mainEntity": [
+    {
+     "@type": "Question",
+     "name": "What is Ferrotensor?",
+     "acceptedAnswer": {
+      "@type": "Answer",
+      "text": "Ferrotensor is a pure-Rust GPU machine-learning framework. It runs tensors, autograd, neural-network layers and LoRA fine-tuning on Apple Silicon through Metal, or on Vulkan and DX12 GPUs on Linux and Windows, using wgpu and hand-written WGSL compute kernels. It has Python bindings and is licensed MIT OR Apache-2.0."
+     }
+    },
+    {
+     "@type": "Question",
+     "name": "Does Ferrotensor need CUDA or an NVIDIA GPU?",
+     "acceptedAnswer": {
+      "@type": "Answer",
+      "text": "No. Ferrotensor reaches the GPU through wgpu, so it runs on Metal, Vulkan or DX12, and there is no CUDA, cuDNN or libtorch to install. A CUDA backend is not planned. Without a GPU, the same code runs on the CPU device."
+     }
+    },
+    {
+     "@type": "Question",
+     "name": "Can I fine-tune a model on a MacBook?",
+     "acceptedAnswer": {
+      "@type": "Answer",
+      "text": "Yes, a small one. On a MacBook Air with an Apple M2 and 8 GB of memory, LoRA fine-tuning of SmolLM2-135M on 2,000 Alpaca examples took the held-out loss from 2.43 to 1.65 in 250 steps, at 8.8 s per step and 3.3 GB peak memory. The LoRA path is experimental and aimed at small Llama-style models; the LoRA walkthrough lists every command."
+     }
+    },
+    {
+     "@type": "Question",
+     "name": "How do I install Ferrotensor in Python or Rust?",
+     "acceptedAnswer": {
+      "@type": "Answer",
+      "text": "For Python 3.10 or newer, run pip install ferrotensor; wheels are built for macOS arm64 and Linux x86_64. In a Rust 1.88+ project, run cargo add ferrotensor. For the LoRA command-line tool, run cargo install ferrotensor-cli. The installation guide has the details."
+     }
+    },
+    {
+     "@type": "Question",
+     "name": "How does Ferrotensor compare with candle and burn?",
+     "acceptedAnswer": {
+      "@type": "Answer",
+      "text": "candle is a minimalist Rust framework from Hugging Face, a good choice for inference of popular models; burn is a mature all-Rust training framework with swappable backends. Ferrotensor is smaller and younger: it targets wgpu only, needs no C++ or CUDA toolchain, and is written to be read and modified end to end. It does not match their op coverage, model support or hardening, and it has not been benchmarked against them."
+     }
+    },
+    {
+     "@type": "Question",
+     "name": "What are Ferrotensor’s limits?",
+     "acceptedAnswer": {
+      "@type": "Answer",
+      "text": "It is pre-1.0 and f32 only, runs on a single GPU, and has no convolutions, sort or top-k in the tensor API yet. Chains of tiny ops are still faster on the CPU. LoRA fine-tuning is experimental and tested on small Llama-style models. The limits section above has the details."
+     }
+    }
+   ]
+  }
+ ]
+}
+</script>
 <link rel="stylesheet" href="style.css">
 <script src="app.js" defer></script>
 </head>
@@ -33,7 +139,7 @@
 
 <header class="top">
   <div class="wrap top-in">
-    <a class="brand" href="./" aria-label="Ferrotensor home">
+    <a class="brand" href="./">
       <svg class="tile" viewBox="0 0 32 32" aria-hidden="true"><rect x="1" y="1" width="30" height="30" rx="4"/><text x="5" y="10">26</text><text class="tile-sym" x="5.5" y="26">Ft</text></svg>
       <span>Ferrotensor</span>
     </a>
@@ -422,6 +528,41 @@ x = ft.<span class="f">tensor</span>([[<span class="n">0</span>, <span class="n"
       <li><strong>Far from peak.</strong> Matmul reaches <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/benchmarks/RESULTS.md#context">about 17% of the M2's FP32 peak</a>; WGSL does not expose the matrix instructions that close that gap.</li>
       <li><strong>Pre-1.0.</strong> The API can still change, and Python wheels exist for macOS arm64 and Linux x86_64 only (other platforms build from source).</li>
     </ul>
+  </div>
+</section>
+
+<section class="section section-alt" id="faq" aria-labelledby="faq-title">
+  <div class="wrap">
+    <header class="sec-head">
+      <p class="eyebrow">06 · FAQ</p>
+      <h2 id="faq-title">Questions, answered plainly</h2>
+    </header>
+    <div class="faq">
+      <div class="faq-item">
+        <h3 id="faq-what">What is Ferrotensor?</h3>
+        <p>Ferrotensor is a pure-Rust GPU machine-learning framework. It runs tensors, autograd, neural-network layers and LoRA fine-tuning on Apple Silicon through Metal, or on Vulkan and DX12 GPUs on Linux and Windows, using <a href="https://wgpu.rs">wgpu</a> and hand-written WGSL compute kernels. It has Python bindings and is licensed MIT OR Apache-2.0.</p>
+      </div>
+      <div class="faq-item">
+        <h3 id="faq-cuda">Does Ferrotensor need CUDA or an NVIDIA GPU?</h3>
+        <p>No. Ferrotensor reaches the GPU through wgpu, so it runs on Metal, Vulkan or DX12, and there is no CUDA, cuDNN or libtorch to install. A CUDA backend is not planned. Without a GPU, the same code runs on the CPU device.</p>
+      </div>
+      <div class="faq-item">
+        <h3 id="faq-macbook">Can I fine-tune a model on a MacBook?</h3>
+        <p>Yes, a small one. On a MacBook Air with an Apple M2 and 8&nbsp;GB of memory, LoRA fine-tuning of SmolLM2-135M on 2,000 Alpaca examples took the held-out loss from 2.43 to 1.65 in 250 steps, at 8.8&nbsp;s per step and 3.3&nbsp;GB peak memory. The LoRA path is experimental and aimed at small Llama-style models; the <a href="docs/examples/lora-sft.html">LoRA walkthrough</a> lists every command.</p>
+      </div>
+      <div class="faq-item">
+        <h3 id="faq-install">How do I install Ferrotensor in Python or Rust?</h3>
+        <p>For Python 3.10 or newer, run <code>pip install ferrotensor</code>; wheels are built for macOS arm64 and Linux x86_64. In a Rust 1.88+ project, run <code>cargo add ferrotensor</code>. For the LoRA command-line tool, run <code>cargo install ferrotensor-cli</code>. The <a href="docs/installation.html">installation guide</a> has the details.</p>
+      </div>
+      <div class="faq-item">
+        <h3 id="faq-compare">How does Ferrotensor compare with candle and burn?</h3>
+        <p>candle is a minimalist Rust framework from Hugging Face, a good choice for inference of popular models; burn is a mature all-Rust training framework with swappable backends. Ferrotensor is smaller and younger: it targets wgpu only, needs no C++ or CUDA toolchain, and is written to be read and modified end to end. It does not match their op coverage, model support or hardening, and it has not been benchmarked against them.</p>
+      </div>
+      <div class="faq-item">
+        <h3 id="faq-limits">What are Ferrotensor’s limits?</h3>
+        <p>It is pre-1.0 and f32 only, runs on a single GPU, and has no convolutions, sort or top-k in the tensor API yet. Chains of tiny ops are still faster on the CPU. LoRA fine-tuning is experimental and tested on small Llama-style models. The <a href="#limits">limits section</a> above has the details.</p>
+      </div>
+    </div>
   </div>
 </section>
 
