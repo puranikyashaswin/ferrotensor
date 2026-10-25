@@ -1,6 +1,6 @@
 [package]
 name = "ferrotensor-cli"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Command-line interface for training and running models with Ferrotensor"
 authors.workspace = true
@@ -19,12 +19,12 @@ name = "ferrotensor"
 path = "src/main.rs"
 
 [dependencies]
-ferrotensor-backend = { path = "../ferrotensor-backend", version = "0.2.0" }
-ferrotensor-graph = { path = "../ferrotensor-graph", version = "0.2.0" }
-ferrotensor-loader = { path = "../ferrotensor-loader", version = "0.2.0" }
-ferrotensor-autograd = { path = "../ferrotensor-autograd", version = "0.2.0" }
-ferrotensor-trainer = { path = "../ferrotensor-trainer", version = "0.2.0" }
-ferrotensor-monitor = { path = "../ferrotensor-monitor", version = "0.2.0" }
+ferrotensor-backend = { path = "../ferrotensor-backend", version = "0.2.1" }
+ferrotensor-graph = { path = "../ferrotensor-graph", version = "0.2.1" }
+ferrotensor-loader = { path = "../ferrotensor-loader", version = "0.2.1" }
+ferrotensor-autograd = { path = "../ferrotensor-autograd", version = "0.2.1" }
+ferrotensor-trainer = { path = "../ferrotensor-trainer", version = "0.2.1" }
+ferrotensor-monitor = { path = "../ferrotensor-monitor", version = "0.2.1" }
 clap = { version = "4.5", features = ["derive"] }
 pollster = "0.3"
 env_logger = "0.11"
