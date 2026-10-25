@@ -120,18 +120,10 @@ impl FlashAttention {
         output
     }
 
-    /// Multi-head attention forward pass with automatic head splitting.
+    /// Same as [`forward`](Self::forward), which already splits heads.
     ///
-    /// This method automatically splits the input into heads and applies
-    /// Flash Attention to each head in parallel.
-    ///
-    /// # Arguments
-    /// * `q` - Query tensor [batch, seq_q, dim]
-    /// * `k` - Key tensor [batch, seq_k, dim]
-    /// * `v` - Value tensor [batch, seq_k, dim]
-    ///
-    /// # Returns
-    /// Output tensor [batch, seq_q, dim]
+    /// Kept for compatibility; it will be removed in 0.3.
+    #[deprecated(since = "0.2.1", note = "use `forward`, which already splits heads")]
     pub fn forward_multi_head(
         &self,
         q: &UnifiedTensor,
@@ -140,34 +132,39 @@ impl FlashAttention {
         ctx: &WgpuContext,
         engine: &ComputeEngine,
     ) -> UnifiedTensor {
-        // TODO: Implement proper head splitting and parallel computation
-        // For now, delegate to simple forward
         self.forward(q, k, v, ctx, engine)
     }
 
-    /// Multi-head attention with Flash Attention.
+    /// Self-attention with `hidden` used directly as Q, K and V.
     ///
-    /// Handles Q, K, V projection and output projection internally.
+    /// There are no Q, K, V or output projections: project `hidden` yourself
+    /// and call [`forward`](Self::forward). Kept for compatibility; it will be
+    /// removed in 0.3.
+    #[deprecated(
+        since = "0.2.1",
+        note = "applies no projections; project the input and call `forward`"
+    )]
     pub fn multi_head_forward(
         &self,
         hidden: &UnifiedTensor,
         ctx: &WgpuContext,
         engine: &ComputeEngine,
     ) -> UnifiedTensor {
-        // For simple case, treat as self-attention
         self.forward(hidden, hidden, hidden, ctx, engine)
     }
 
-    /// Get memory savings compared to standard attention.
+    /// Memory for one head's attention scores: the full `seq x seq` matrix
+    /// that standard attention stores versus the `seq x head_dim` accumulator
+    /// Flash Attention keeps instead (f32, per head, scores only).
     pub fn memory_savings(&self, seq_len: usize) -> String {
-        let standard_memory = seq_len * seq_len * 4; // O(N²) for attention matrix
-        let flash_memory = seq_len * self.head_dim * 4; // O(N) for accumulator
+        let standard_memory = seq_len * seq_len * 4;
+        let flash_memory = seq_len * self.head_dim * 4;
         let savings = standard_memory as f32 / flash_memory as f32;
         format!(
-            "{:.1}x less memory ({}MB vs {}MB for seq={})",
+            "{:.1}x less memory ({} vs {} per head for seq={})",
             savings,
-            flash_memory / 1_000_000,
-            standard_memory / 1_000_000,
+            format_bytes(flash_memory),
+            format_bytes(standard_memory),
             seq_len
         )
     }
@@ -244,6 +241,22 @@ impl std::fmt::Debug for FlashAttention {
     }
 }
 
+/// Format a byte count with a binary unit (B, KiB, MiB, GiB).
+fn format_bytes(bytes: usize) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,6 +266,20 @@ mod tests {
         let attn = FlashAttention::new(512, 8, true);
         let savings = attn.memory_savings(2048);
         assert!(savings.contains("x less memory"));
+        // head_dim 64: 512*64*4 = 128 KiB vs 512*512*4 = 1 MiB.
+        let attn = FlashAttention::new(512, 8, true);
+        assert_eq!(
+            attn.memory_savings(512),
+            "8.0x less memory (128.0 KiB vs 1.0 MiB per head for seq=512)"
+        );
+    }
+
+    #[test]
+    fn test_format_bytes() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(1023), "1023 B");
+        assert_eq!(format_bytes(1536), "1.5 KiB");
+        assert_eq!(format_bytes(3 * 1024 * 1024 * 1024), "3.0 GiB");
     }
 
     #[test]
