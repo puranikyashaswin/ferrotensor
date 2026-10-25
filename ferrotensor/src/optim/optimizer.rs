@@ -36,11 +36,13 @@ pub trait Optimizer {
 pub fn clip_grad_norm(params: &[Tensor], max_norm: f32) -> f32 {
     no_grad(|| {
         let grads: Vec<Tensor> = params.iter().filter_map(Tensor::grad).collect();
-        let total: f32 = grads
+        // Add the per-parameter squared norms on the device and read the total
+        // back once, so a GPU run syncs once instead of once per parameter.
+        let total = grads
             .iter()
-            .map(|g| g.square().sum().item())
-            .sum::<f32>()
-            .sqrt();
+            .map(|g| g.square().sum())
+            .reduce(|acc, s| acc.add(&s))
+            .map_or(0.0, |sq| sq.item().sqrt());
         if total > max_norm {
             let scale = max_norm / (total + 1e-6);
             for g in &grads {
