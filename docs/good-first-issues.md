@@ -157,6 +157,8 @@ is unchanged and tested.
 
 ## 13. `FlashAttention::memory_savings` prints "0MB vs 1MB"
 
+*Done in 0.2.1.* Sizes print in B/KiB/MiB/GiB per head, and the test checks the exact string for `seq = 512`.
+
 *easy · `bug`, `docs`, `good first issue`*
 
 `ferrotensor-graph/src/flash_attention.rs` formats the two sizes with integer
@@ -169,6 +171,8 @@ Done when the string for `seq = 512` shows non-zero sizes and the existing
 `test_memory_savings` is extended to check the numbers.
 
 ## 14. `FlashAttention::forward_multi_head` and `multi_head_forward` are stubs
+
+*Done in 0.2.1.* Both methods are `#[deprecated]` with docs that say what they do; they go in 0.3.
 
 *easy · `cleanup`, `good first issue`*
 
@@ -227,6 +231,8 @@ within f32 tolerance and is measurably faster than before (report numbers and
 the machine).
 
 ## 18. `clip_grad_norm` reads one scalar back per parameter
+
+*Done in 0.2.1.* The squared norms are added on the device and read back once.
 
 *easy · `performance`, `good first issue`*
 
