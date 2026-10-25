@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-25
+
+### Fixed
+- `ferrotensor-graph`: `FlashAttention::memory_savings` printed `0MB` for short sequences because sizes were divided by 1,000,000 as integers. Sizes now print in binary units and are labelled per head, e.g. `8.0x less memory (128.0 KiB vs 1.0 MiB per head for seq=512)`.
+- `ferrotensor`: `optim::clip_grad_norm` reads the gradient norm back once instead of once per parameter, so a GPU run syncs once. The returned norm and the clipping are unchanged.
+
+### Security
+- Updated tokio from 1.51.0 to 1.54.1 for [RUSTSEC-2026-0386](https://rustsec.org/advisories/RUSTSEC-2026-0386) (unsound `AsyncFd` constructors). Only `ferrotensor-monitor` uses tokio.
+
+### Deprecated
+- `ferrotensor-graph`: `FlashAttention::forward_multi_head` (same as `forward`) and `FlashAttention::multi_head_forward` (applies no projections). Both will be removed in 0.3.
+
 ## [0.2.0] - 2026-10-22
 
 ### Added
@@ -48,6 +60,7 @@ First public version.
 - Renamed the project from Rusty to Ferrotensor; crates are now `ferrotensor-*` and the CLI binary is `ferrotensor`.
 - Licensed under MIT OR Apache-2.0 (previously MIT only).
 
-[Unreleased]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/puranikyashaswin/ferrotensor/releases/tag/v0.1.0
