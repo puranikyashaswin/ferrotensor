@@ -17,7 +17,7 @@
     <text class="mono" x="10" y="22" font-size="15" font-weight="600" fill="#141210">26</text>
     <text class="sans" x="11" y="63" font-size="38" font-weight="700" letter-spacing="-1" fill="#141210">Ft</text>
   </g>
-  <text class="mono" x="180" y="113" font-size="20" font-weight="600" letter-spacing="2" fill="#f37b45">v0.2.0 · MIT OR APACHE-2.0</text>
+  <text class="mono" x="180" y="113" font-size="20" font-weight="600" letter-spacing="2" fill="#f37b45">MIT OR APACHE-2.0</text>
   <text class="mono" x="180" y="148" font-size="20" fill="#a39889">Metal · Vulkan · DX12 · Rust and Python</text>
 
   <text class="sans" x="76" y="282" font-size="118" font-weight="800" letter-spacing="-5" fill="#efe9e1">Ferrotensor</text>
