@@ -106,11 +106,12 @@ pub fn dropout(x: &Tensor, p: f32, training: bool) -> Tensor {
         return x.clone();
     }
     use rand::Rng;
-    let mut rng = rand::thread_rng();
     let scale = 1.0 / (1.0 - p);
-    let mask: Vec<f32> = (0..x.numel())
-        .map(|_| if rng.gen::<f32>() < p { 0.0 } else { scale })
-        .collect();
+    let mask: Vec<f32> = crate::random::with_rng(|rng| {
+        (0..x.numel())
+            .map(|_| if rng.gen::<f32>() < p { 0.0 } else { scale })
+            .collect()
+    });
     x.mul(&Tensor::from_vec(mask, &x.shape, x.device()))
 }
 

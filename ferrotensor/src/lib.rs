@@ -51,18 +51,21 @@ pub mod data;
 pub mod functional;
 pub mod nn;
 pub mod optim;
+pub mod random;
 pub mod serialize;
 pub mod tensor;
 
 mod device;
 
 pub use device::Device;
+pub use random::manual_seed;
 pub use tensor::{no_grad, Tensor};
 
 /// Prelude module - import everything you need with `use ferrotensor::prelude::*`
 pub mod prelude {
     pub use crate::data::{DataLoader, Dataset};
     pub use crate::functional as F;
+    pub use crate::manual_seed;
     pub use crate::nn;
     pub use crate::nn::Module;
     pub use crate::optim;
