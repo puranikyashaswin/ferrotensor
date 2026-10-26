@@ -46,7 +46,7 @@
     "https://opensource.org/licenses/MIT",
     "https://www.apache.org/licenses/LICENSE-2.0"
    ],
-   "version": "0.2.0",
+   "version": "{{ft_version}}",
    "author": {
     "@type": "Person",
     "name": "Yashaswin Puranik Sharma",
@@ -60,7 +60,7 @@
    "description": "The ferrotensor command: LoRA fine-tuning (train), evaluation (eval) and text generation (generate) for small Llama-style models.",
    "applicationCategory": "DeveloperApplication",
    "operatingSystem": "macOS, Linux",
-   "softwareVersion": "0.2.0",
+   "softwareVersion": "{{ft_version}}",
    "downloadUrl": "https://github.com/puranikyashaswin/ferrotensor/releases",
    "installUrl": "https://crates.io/crates/ferrotensor-cli",
    "offers": {
@@ -159,7 +159,7 @@
 <section class="hero" aria-labelledby="hero-title">
   <div class="wrap hero-in">
     <div class="hero-copy">
-      <p class="kicker"><span>v0.2.0</span><span>pre-1.0</span><span>MIT OR Apache-2.0</span></p>
+      <p class="kicker"><span>v{{ft_version}}</span><span>pre-1.0</span><span>MIT OR Apache-2.0</span></p>
       <h1 id="hero-title">Ferrotensor</h1>
       <p class="lede">A pure-Rust GPU ML framework: tensors, autograd, <code>nn</code> and LoRA fine-tuning on Metal, Vulkan or DX12 through hand-written WGSL kernels. No CUDA, no C++ toolchain.</p>
 
@@ -190,7 +190,7 @@
     </div>
 
     <aside class="sheet" aria-labelledby="sheet-title">
-      <h2 id="sheet-title" class="sheet-h"><span>Datasheet</span><span aria-hidden="true">Ft-0.2.0</span></h2>
+      <h2 id="sheet-title" class="sheet-h"><span>Datasheet</span><span aria-hidden="true">Ft-{{ft_version}}</span></h2>
       <dl>
         <div><dt>GPU</dt><dd>Metal, Vulkan, DX12 via wgpu</dd></div>
         <div><dt>Kernels</dt><dd>Hand-written WGSL</dd></div>
@@ -203,6 +203,8 @@
     </aside>
   </div>
 </section>
+
+<!-- whats-new -->
 
 <section class="section" id="measured" aria-labelledby="measured-title">
   <div class="wrap">
@@ -277,7 +279,7 @@
     <header class="sec-head">
       <p class="eyebrow">02 · Code</p>
       <h2 id="code-title">Rust or Python, same engine</h2>
-      <p>Both samples run as shown against the 0.2.0 release. The Python bindings wrap the same Rust tensor API.</p>
+      <p>Both samples were run as shown against the 0.2.1 release. The Python bindings wrap the same Rust tensor API.</p>
     </header>
 
     <div class="samples">
@@ -323,8 +325,8 @@ x = ft.<span class="f">tensor</span>([[<span class="n">0</span>, <span class="n"
     loss.<span class="f">backward</span>()
     opt.<span class="f">step</span>()
 <span class="f">print</span>(<span class="f">model</span>(x).<span class="f">argmax</span>(dim=<span class="n">1</span>).<span class="f">tolist</span>())</code></pre>
-        <div class="out" aria-label="Output with ferrotensor 0.2.0 from PyPI">
-          <p class="out-h">Output · <code>pip install ferrotensor==0.2.0</code></p>
+        <div class="out" aria-label="Output with ferrotensor 0.2.1 from PyPI">
+          <p class="out-h">Output · <code>pip install ferrotensor==0.2.1</code></p>
 <pre tabindex="0"><samp>[0.0, 1.0, 1.0, 0.0]</samp></pre>
         </div>
       </figure>
@@ -573,7 +575,7 @@ x = ft.<span class="f">tensor</span>([[<span class="n">0</span>, <span class="n"
   <div class="wrap foot-in">
     <div class="foot-brand">
       <svg class="tile" viewBox="0 0 32 32" aria-hidden="true"><rect x="1" y="1" width="30" height="30" rx="4"/><text x="5" y="10">26</text><text class="tile-sym" x="5.5" y="26">Ft</text></svg>
-      <p>Ferrotensor 0.2.0 · Licensed under <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/LICENSE-MIT">MIT</a> or <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/LICENSE-APACHE">Apache-2.0</a>, at your option.</p>
+      <p>Ferrotensor {{ft_version}} · Licensed under <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/LICENSE-MIT">MIT</a> or <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/LICENSE-APACHE">Apache-2.0</a>, at your option.</p>
     </div>
     <nav aria-label="Project links">
       <ul>

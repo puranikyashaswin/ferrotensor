@@ -16,6 +16,10 @@ Source of <https://puranikyashaswin.github.io/ferrotensor/>.
   JSON-LD differ: edit both together.
 - `landing/llms.txt`: summary and key links for language models
   ([llmstxt.org](https://llmstxt.org)).
+- `release.py`: run by `build.sh` after mdBook. Fills `{{ft_version}}` from the
+  workspace `Cargo.toml` everywhere it appears, and replaces the
+  `<!-- whats-new -->` marker on the landing page with the newest
+  `CHANGELOG.md` release. The build fails if the two versions disagree.
 - `build.sh`: builds everything into `site/dist/` (gitignored).
 
 ```bash
