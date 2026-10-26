@@ -172,7 +172,7 @@ Done when the string for `seq = 512` shows non-zero sizes and the existing
 
 ## 14. `FlashAttention::forward_multi_head` and `multi_head_forward` are stubs
 
-*Done in 0.2.1.* Both methods are `#[deprecated]` with docs that say what they do; they go in 0.3.
+*Done.* Both methods were deprecated in 0.2.1 and removed in 0.3.0.
 
 *easy · `cleanup`, `good first issue`*
 

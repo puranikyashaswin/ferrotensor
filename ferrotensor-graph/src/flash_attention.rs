@@ -120,39 +120,6 @@ impl FlashAttention {
         output
     }
 
-    /// Same as [`forward`](Self::forward), which already splits heads.
-    ///
-    /// Kept for compatibility; it will be removed in 0.3.
-    #[deprecated(since = "0.2.1", note = "use `forward`, which already splits heads")]
-    pub fn forward_multi_head(
-        &self,
-        q: &UnifiedTensor,
-        k: &UnifiedTensor,
-        v: &UnifiedTensor,
-        ctx: &WgpuContext,
-        engine: &ComputeEngine,
-    ) -> UnifiedTensor {
-        self.forward(q, k, v, ctx, engine)
-    }
-
-    /// Self-attention with `hidden` used directly as Q, K and V.
-    ///
-    /// There are no Q, K, V or output projections: project `hidden` yourself
-    /// and call [`forward`](Self::forward). Kept for compatibility; it will be
-    /// removed in 0.3.
-    #[deprecated(
-        since = "0.2.1",
-        note = "applies no projections; project the input and call `forward`"
-    )]
-    pub fn multi_head_forward(
-        &self,
-        hidden: &UnifiedTensor,
-        ctx: &WgpuContext,
-        engine: &ComputeEngine,
-    ) -> UnifiedTensor {
-        self.forward(hidden, hidden, hidden, ctx, engine)
-    }
-
     /// Memory for one head's attention scores: the full `seq x seq` matrix
     /// that standard attention stores versus the `seq x head_dim` accumulator
     /// Flash Attention keeps instead (f32, per head, scores only).
