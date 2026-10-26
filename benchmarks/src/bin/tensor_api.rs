@@ -163,4 +163,51 @@ fn main() {
             row(name, d, time(|| drop(a.matmul(&b).to_vec())), sum);
         }
     }
+
+    for shape in [&[4096, 4096][..], &[1_000_000]] {
+        let name = format!("sum() {shape:?} + read back");
+        if !wants(&name) {
+            continue;
+        }
+        for d in &devices {
+            let mut rng = StdRng::seed_from_u64(3);
+            let x = Tensor::randn_with(shape, &mut rng, d);
+            let sum = checksum(&[x.sum().item()]);
+            row(
+                &name,
+                d,
+                time(|| {
+                    x.sum().item();
+                }),
+                sum,
+            );
+        }
+    }
+
+    let name = "argmax_dim(-1) [1024, 4096] + read back";
+    if wants(name) {
+        for d in &devices {
+            let mut rng = StdRng::seed_from_u64(4);
+            let x = Tensor::randn_with(&[1024, 4096], &mut rng, d);
+            let sum = checksum(&x.argmax_dim(-1).to_vec());
+            row(name, d, time(|| drop(x.argmax_dim(-1).to_vec())), sum);
+        }
+    }
+
+    let name = "argmax() [4096, 4096]";
+    if wants(name) {
+        for d in &devices {
+            let mut rng = StdRng::seed_from_u64(5);
+            let x = Tensor::randn_with(&[4096, 4096], &mut rng, d);
+            let sum = checksum(&[x.argmax() as f32]);
+            row(
+                name,
+                d,
+                time(|| {
+                    x.argmax();
+                }),
+                sum,
+            );
+        }
+    }
 }
