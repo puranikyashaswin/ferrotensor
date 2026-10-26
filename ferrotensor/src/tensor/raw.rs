@@ -33,7 +33,7 @@ fn as_u32(values: &[usize]) -> Vec<u32> {
         .collect()
 }
 
-/// Threads per workgroup of `reduce_all`.
+/// Threads per workgroup of `reduce_all` and `arg_reduce`.
 const GROUP: usize = 256;
 /// Workgroups the first pass of a full reduction is spread over.
 const FIRST_PASS_GROUPS: usize = 256;
@@ -63,6 +63,45 @@ fn reduce_all(ctx: &GpuContext, input: &Buffer, out: &Buffer, op: u32, n: usize)
         &[Arg::Buffer(&partials), Arg::Buffer(out), params(groups)],
         (1, 1, 1),
     );
+}
+
+/// The `arg_reduce` kernel over `input` viewed as `[outputs / inner, dim,
+/// inner]`. Gives one `f32` index per output, or with `pairs` a (value bits,
+/// index) pair per output. When there are too few outputs to fill the GPU,
+/// each one is split over several workgroups and a second pass combines them.
+fn arg_reduce(
+    ctx: &GpuContext,
+    input: &Buffer,
+    smallest: bool,
+    pairs: bool,
+    outputs: usize,
+    dim: usize,
+    inner: usize,
+) -> GpuBuffer {
+    const MIN: u32 = 1;
+    const PAIRS_IN: u32 = 2;
+    const PAIRS_OUT: u32 = 4;
+    let flags = if smallest { MIN } else { 0 };
+    let last = if pairs { flags | PAIRS_OUT } else { flags };
+    let out = alloc(ctx, if pairs { 2 * outputs } else { outputs });
+    let run =
+        |input: &Buffer, out: &Buffer, flags: u32, dim: usize, inner: usize, splits: usize| {
+            let meta = as_u32(&[flags as usize, outputs, dim, inner, splits]);
+            ctx.dispatch(
+                "arg_reduce",
+                &[Arg::Buffer(input), Arg::Buffer(out), Arg::Meta(&meta)],
+                ComputeEngine::workgroup_grid(outputs * splits),
+            );
+        };
+    let splits = (FIRST_PASS_GROUPS / outputs).clamp(1, dim.div_ceil(GROUP));
+    if splits == 1 {
+        run(input, &out, last, dim, inner, 1);
+    } else {
+        let partials = alloc(ctx, 2 * outputs * splits);
+        run(input, &partials, flags | PAIRS_OUT, dim, inner, splits);
+        run(&partials, &out, last | PAIRS_IN, splits, 1, 1);
+    }
+    out
 }
 
 impl Tensor {
@@ -193,6 +232,38 @@ impl Tensor {
                 let data = cpu::reduce(op, &self.to_vec(), outer, size, inner);
                 self.host_output(data, &out_shape)
             }
+        }
+    }
+
+    /// Index along `dim` (removed from the shape) of the first largest
+    /// element, or with `smallest` the first smallest, as `f32`.
+    pub(crate) fn arg_reduce_raw(&self, dim: usize, smallest: bool) -> Tensor {
+        let (outer, size, inner) = split_at_dim(&self.shape, dim);
+        let mut out_shape = self.shape.clone();
+        out_shape.remove(dim);
+        match self.gpu() {
+            Some((ctx, input)) if outer * inner > 0 && size > 0 => {
+                let out = arg_reduce(ctx, input, smallest, false, outer * inner, size, inner);
+                self.gpu_output(out, out_shape)
+            }
+            _ => {
+                let data = cpu::arg_reduce(smallest, &self.to_vec(), outer, size, inner);
+                self.host_output(data, &out_shape)
+            }
+        }
+    }
+
+    /// Flat index of the first largest element, or with `smallest` the first
+    /// smallest; 0 for an empty tensor. On a GPU only the index is read back.
+    pub(crate) fn arg_index_raw(&self, smallest: bool) -> usize {
+        let n = self.numel();
+        match self.gpu() {
+            Some((ctx, input)) if n > 0 => {
+                let out = arg_reduce(ctx, input, smallest, true, 1, n, 1);
+                let pair = self.gpu_output(out, vec![2]).to_vec();
+                pair[1].to_bits() as usize
+            }
+            _ => cpu::arg_extreme(smallest, &self.to_vec()),
         }
     }
 

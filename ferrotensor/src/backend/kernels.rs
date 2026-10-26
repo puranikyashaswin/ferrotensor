@@ -296,6 +296,98 @@ fn reduce_all(@builtin(local_invocation_index) lid: u32,
     }
 }
 
+// --- Argmax / argmin along an axis ------------------------------------------
+// The input is viewed as [outer, dim, inner] and each of the outer * inner
+// outputs is split into `splits` workgroups, each taking every
+// (splits * 256)-th element of its share of dim. Values travel as u32 bits so
+// nothing is flushed or canonicalised on the way.
+// meta = [flags, outputs, dim, inner, splits]; flags bit 0: argmin,
+// bit 1: the input is (value bits, index) pairs from an earlier pass (inner
+// must be 1), bit 2: write (value bits, index) pairs for workgroup w at
+// [2w, 2w + 1] instead of the f32 index.
+// Ties go to the lower index; for argmax NaN beats every number, for argmin
+// every number beats NaN, as in the CPU path.
+
+@group(0) @binding(0) var<storage, read> arg_in: array<u32>;
+@group(0) @binding(1) var<storage, read_write> arg_out: array<u32>;
+@group(0) @binding(2) var<storage, read> arg_meta: array<u32>;
+
+var<workgroup> arg_val: array<u32, 256>;
+var<workgroup> arg_idx: array<u32, 256>;
+
+const ARG_NONE: u32 = 0xffffffffu;
+
+fn is_nan_bits(v: u32) -> bool {
+    return (v & 0x7fffffffu) > 0x7f800000u;
+}
+
+// Whether candidate (v, i) replaces the current best (bv, bi).
+fn arg_better(smallest: bool, v: u32, i: u32, bv: u32, bi: u32) -> bool {
+    if (i == ARG_NONE) { return false; }
+    if (bi == ARG_NONE) { return true; }
+    let vn = is_nan_bits(v);
+    let bn = is_nan_bits(bv);
+    if (vn && bn) { return i < bi; }
+    if (vn || bn) { return vn != smallest; }
+    let a = bitcast<f32>(v);
+    let b = bitcast<f32>(bv);
+    if (a == b) { return i < bi; }
+    return select(a > b, a < b, smallest);
+}
+
+@compute @workgroup_size(256)
+fn arg_reduce(@builtin(local_invocation_index) lid: u32,
+              @builtin(workgroup_id) wid: vec3<u32>,
+              @builtin(num_workgroups) nwg: vec3<u32>) {
+    let flags = arg_meta[0];
+    let dim = arg_meta[2];
+    let inner = arg_meta[3];
+    let splits = arg_meta[4];
+    let smallest = (flags & 1u) != 0u;
+    let pairs_in = (flags & 2u) != 0u;
+    let w = wid.x + wid.y * nwg.x;
+    let live = w < arg_meta[1] * splits;
+    let o_flat = w / splits;
+    let base = (o_flat / inner) * dim * inner + o_flat % inner;
+    var bv = 0u;
+    var bi = ARG_NONE;
+    if (live) {
+        for (var j = (w % splits) * 256u + lid; j < dim; j = j + splits * 256u) {
+            var v = 0u;
+            var i = j;
+            if (pairs_in) {
+                v = arg_in[2u * (o_flat * dim + j)];
+                i = arg_in[2u * (o_flat * dim + j) + 1u];
+            } else {
+                v = arg_in[base + j * inner];
+            }
+            if (arg_better(smallest, v, i, bv, bi)) {
+                bv = v;
+                bi = i;
+            }
+        }
+    }
+    arg_val[lid] = bv;
+    arg_idx[lid] = bi;
+    workgroupBarrier();
+    for (var half = 128u; half > 0u; half = half >> 1u) {
+        if (lid < half && arg_better(smallest, arg_val[lid + half], arg_idx[lid + half],
+                                     arg_val[lid], arg_idx[lid])) {
+            arg_val[lid] = arg_val[lid + half];
+            arg_idx[lid] = arg_idx[lid + half];
+        }
+        workgroupBarrier();
+    }
+    if (lid == 0u && live) {
+        if ((flags & 4u) != 0u) {
+            arg_out[2u * w] = arg_val[0];
+            arg_out[2u * w + 1u] = arg_idx[0];
+        } else {
+            arg_out[o_flat] = bitcast<u32>(f32(arg_idx[0]));
+        }
+    }
+}
+
 // --- Softmax / log-softmax along an axis -------------------------------------
 // op 0 = softmax, op 1 = log_softmax.
 

@@ -509,3 +509,57 @@ fn full_reductions_match_cpu_on_gpu() {
         );
     }
 }
+
+/// Values with many ties, and NaN at `nans`.
+fn tied(n: usize, nans: &[usize]) -> Vec<f32> {
+    let mut data: Vec<f32> = (0..n).map(|i| ((i * 7919) % 13) as f32 - 6.0).collect();
+    for &i in nans {
+        data[i] = f32::NAN;
+    }
+    data
+}
+
+#[test]
+fn arg_reductions_match_cpu_on_gpu() {
+    let Some(gpu) = test_gpu() else { return };
+    let cpu = Device::cpu();
+    let cases: [(&[usize], &[usize]); 6] = [
+        (&[1_000_003], &[]),
+        (&[1_000_003], &[500_000, 900_000]),
+        (&[3, 5, 4], &[]),
+        (&[3, 5, 4], &[7, 9, 30, 31, 59]),
+        (&[2, 100_000], &[150_000]),
+        (&[70_000, 3], &[4, 5, 100]),
+    ];
+    for (shape, nans) in cases {
+        let data = tied(shape.iter().product(), nans);
+        let (c, g) = (
+            Tensor::from_data(&data, shape, &cpu),
+            Tensor::from_data(&data, shape, &gpu),
+        );
+        assert_eq!(g.argmax(), c.argmax(), "argmax {shape:?}");
+        assert_eq!(g.argmin(), c.argmin(), "argmin {shape:?}");
+        for d in 0..shape.len() {
+            for smallest in [false, true] {
+                assert_eq!(
+                    g.arg_reduce_raw(d, smallest).to_vec(),
+                    c.arg_reduce_raw(d, smallest).to_vec(),
+                    "arg_reduce {shape:?} dim {d} smallest {smallest}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn gpu_argmax_index_is_exact_past_f32_integers() {
+    let Some(gpu) = test_gpu() else { return };
+    // 2^24 + 1 is the first integer f32 cannot hold.
+    let n = (1 << 24) + 2;
+    let mut data = vec![0.0; n];
+    data[n - 1] = 1.0;
+    data[n - 2] = -1.0;
+    let x = Tensor::from_vec(data, &[n], &gpu);
+    assert_eq!(x.argmax(), n - 1);
+    assert_eq!(x.argmin(), n - 2);
+}
