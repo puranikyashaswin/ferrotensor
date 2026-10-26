@@ -1,6 +1,6 @@
 # Installation
 
-Ferrotensor 0.2.0 is published to crates.io and PyPI.
+Ferrotensor {{ft_version}} is published to crates.io and PyPI.
 
 ## Rust library
 

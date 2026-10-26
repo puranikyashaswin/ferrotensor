@@ -9,6 +9,7 @@ on:
       - "benchmarks/RESULTS.md"
       - "README.md"
       - "CHANGELOG.md"
+      - "Cargo.toml"
       - "ferrotensor-py/README.md"
       - "ferrotensor-py/examples/**"
       - ".github/workflows/pages.yml"
