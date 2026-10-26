@@ -190,11 +190,15 @@ Done when no public method's doc comment promises something it does not do.
 
 *medium · `performance`, `kernels`*
 
+*`argmax`/`argmin` done:* the `arg_reduce` kernel keeps `argmax_dim` on the
+GPU, and `argmax()`/`argmin()` read back only the index. Ties go to the lower
+index and NaN counts as the largest value, as on the CPU.
+
 Since GPU ops are [batched](architecture.md#batched-gpu-dispatch), every op
 that copies values to the host in the middle of its work splits the batch.
-The ones that do (see "What is still slow" in
+The ones that still do (see "What is still slow" in
 [benchmarks/RESULTS.md](../benchmarks/RESULTS.md#ferrotensor-tensor-api-cpu-and-gpu-devices)):
-`cross_entropy` with class-index targets, `argmax`/`argmin` and `cat`. Pick
+`cross_entropy` with class-index targets and `cat`. Pick
 one, write the kernel (see [writing-a-kernel.md](writing-a-kernel.md)) and
 keep the CPU reference as the oracle.
 
@@ -218,17 +222,9 @@ Done when the gradient checks in `ferrotensor/src/tensor/tests.rs` and
 
 ## 17. Full reductions (`sum()`) use a single GPU thread
 
-*medium · `performance`, `kernels`*
-
-A reduction over a whole tensor (`x.sum()`) runs one GPU thread per output,
-so for a scalar output the `reduce` kernel in
-`ferrotensor/src/backend/kernels.rs` uses one thread to add every element.
-Write a two-stage or workgroup-tree reduction for the full-reduction case and
-leave the per-axis path alone.
-
-Done when `sum()` over a `[4096, 4096]` tensor on the GPU matches the CPU
-within f32 tolerance and is measurably faster than before (report numbers and
-the machine).
+*Done.* `sum()`, `max()` and `min()` over a whole tensor run the two-pass
+`reduce_all` kernel; see "Full reductions and argmax on the GPU" in
+[benchmarks/RESULTS.md](../benchmarks/RESULTS.md).
 
 ## 18. `clip_grad_norm` reads one scalar back per parameter
 
