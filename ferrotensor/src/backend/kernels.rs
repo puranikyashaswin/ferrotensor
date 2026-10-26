@@ -243,6 +243,59 @@ fn reduce(@builtin(global_invocation_id) gid: vec3<u32>,
     red_out[i] = acc;
 }
 
+// --- Full reductions (two stages) ---------------------------------------------
+// Workgroup w adds elements w*256 + lid, stepping by the whole grid, then
+// combines its 256 partials in a tree and writes red_part_out[w]. The first
+// dispatch leaves one partial per workgroup, a one-workgroup dispatch over
+// those partials gives the result.
+
+struct AllParams {
+    op: u32,
+    n: u32,
+    _pad0: u32,
+    _pad1: u32,
+};
+
+@group(0) @binding(0) var<storage, read> all_in: array<f32>;
+@group(0) @binding(1) var<storage, read_write> all_out: array<f32>;
+@group(0) @binding(2) var<uniform> all_p: AllParams;
+
+var<workgroup> all_part: array<f32, 256>;
+
+fn reduce_combine(op: u32, a: f32, b: f32) -> f32 {
+    switch op {
+        case 1u: { return max(a, b); }
+        case 2u: { return min(a, b); }
+        default: { return a + b; }
+    }
+}
+
+@compute @workgroup_size(256)
+fn reduce_all(@builtin(local_invocation_index) lid: u32,
+              @builtin(workgroup_id) wid: vec3<u32>,
+              @builtin(num_workgroups) nwg: vec3<u32>) {
+    let op = all_p.op;
+    // Identity: 0 for sum, -inf for max, +inf for min.
+    var acc = 0.0;
+    if (op == 1u) { acc = bitcast<f32>(0xff800000u); }
+    if (op == 2u) { acc = bitcast<f32>(0x7f800000u); }
+    let step = nwg.x * 256u;
+    for (var i = wid.x * 256u + lid; i < all_p.n; i = i + step) {
+        acc = reduce_combine(op, acc, all_in[i]);
+    }
+    all_part[lid] = acc;
+    workgroupBarrier();
+    for (var half = 128u; half > 0u; half = half >> 1u) {
+        if (lid < half) {
+            all_part[lid] = reduce_combine(op, all_part[lid], all_part[lid + half]);
+        }
+        workgroupBarrier();
+    }
+    if (lid == 0u) {
+        all_out[wid.x] = all_part[0];
+    }
+}
+
 // --- Softmax / log-softmax along an axis -------------------------------------
 // op 0 = softmax, op 1 = log_softmax.
 

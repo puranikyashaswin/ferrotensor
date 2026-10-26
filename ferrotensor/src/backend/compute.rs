@@ -9,10 +9,11 @@ use wgpu::{BindGroup, BindGroupLayout, BindingResource, CommandEncoder, ComputeP
 use super::KERNELS_WGSL;
 
 /// Entry points compiled from [`KERNELS_WGSL`].
-pub(crate) const KERNEL_NAMES: [&str; 7] = [
+pub(crate) const KERNEL_NAMES: [&str; 8] = [
     "unary",
     "binary",
     "reduce",
+    "reduce_all",
     "softmax",
     "matmul",
     "permute",
@@ -129,7 +130,14 @@ impl ComputeEngine {
     /// Spills into the y dimension past 65535 workgroups; the kernels rebuild
     /// the flat index as `x + y * nx * 256`.
     pub fn workgroups_1d(n: usize) -> (u32, u32, u32) {
-        let groups = (n as u32).div_ceil(WORKGROUP_1D).max(1);
+        Self::workgroup_grid(n.div_ceil(WORKGROUP_1D as usize))
+    }
+
+    /// Grid of at least `groups` workgroups (at least one), spilling into the
+    /// y dimension past 65535; the kernels rebuild the workgroup index as
+    /// `x + y * nx`.
+    pub fn workgroup_grid(groups: usize) -> (u32, u32, u32) {
+        let groups = u32::try_from(groups.max(1)).expect("too many workgroups");
         if groups <= MAX_GROUPS_PER_DIM {
             (groups, 1, 1)
         } else {
