@@ -754,3 +754,56 @@ html:not(.js) .panel + .panel { border-top: 1px dashed var(--line); }
   }
   .btn:hover { transform: none; }
 }
+
+/* What's new: filled from CHANGELOG.md at build time (site/release.py). */
+.news {
+  border-block: 1px solid var(--line);
+  background: var(--bg-alt);
+}
+.news-in {
+  display: grid;
+  grid-template-columns: minmax(12rem, 16rem) 1fr;
+  gap: 0.75rem 2.5rem;
+  align-items: start;
+  padding-block: 1.75rem;
+}
+.news-h {
+  font: 600 0.78rem/1.5 var(--mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+}
+.news-h time {
+  display: block;
+  color: var(--ink-3);
+  font-weight: 500;
+}
+.news-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.6rem;
+  color: var(--ink-2);
+  font-size: 0.95rem;
+}
+.news-list li { display: flex; gap: 0.75rem; align-items: baseline; }
+.news-list .txt { min-width: 0; overflow-wrap: anywhere; }
+.news-list .tag {
+  flex: none;
+  min-width: 5.75rem;
+  font: 600 0.7rem/1.4 var(--mono);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+.news-more {
+  grid-column: 2;
+  margin: 0.25rem 0 0;
+  font-size: 0.9rem;
+}
+@media (max-width: 44rem) {
+  .news-in { grid-template-columns: 1fr; }
+  .news-more { grid-column: 1; }
+  .news-list li { flex-direction: column; gap: 0.15rem; }
+}
