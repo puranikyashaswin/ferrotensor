@@ -149,15 +149,47 @@ the final losses differ from run to run.
   10 ms before blocking; a read back after the GPU is idle takes about
   0.18 ms.
 
+## Full reductions and argmax on the GPU
+
+Same machine, toolchain and method as above (best median of three
+alternating runs of each binary), with
+`cargo run -p ferrotensor-benchmarks --release --bin tensor-api`. "Before" is
+commit "Benchmark full sum and argmax in tensor-api"; "after" is commit "Run
+argmax and argmin on the GPU without reading the tensor back". Inputs are
+seeded `randn`.
+
+| case | CPU | GPU before | GPU after | GPU speed-up |
+|---|---:|---:|---:|---:|
+| `sum()` of `[4096, 4096]`, then `item` | 18.27 ms | 2169.35 ms | 1.19 ms | 1820x |
+| `sum()` of `[1000000]`, then `item` | 0.96 ms | 129.20 ms | 0.35 ms | 374x |
+| `argmax_dim(-1)` of `[1024, 4096]`, then `to_vec` | 5.66 ms | 8.40 ms | 0.99 ms | 8.5x |
+| `argmax()` of `[4096, 4096]` | 17.25 ms | 27.69 ms | 1.19 ms | 23x |
+
+The CPU column is the best of all six runs; the CPU path did not change.
+
+- `sum()`, `max()` and `min()` over a whole tensor used one GPU thread. The
+  `reduce_all` kernel now spreads the first pass over 256 workgroups of 256
+  threads (1024 workgroups measured 1.23 ms and 0.39 ms on the two `sum()`
+  cases in a single run, so 256 stays) and a one-workgroup pass adds the 256 partials.
+- The GPU now adds in a different order from the CPU's left-to-right loop,
+  so the GPU `sum()` checksums changed; the other cases' checksums are the
+  same before and after, so `argmax` gives the same indices. Against an
+  `f64` sum of 16.7M uniform values in `[-2, 2)` (printed from
+  `full_reductions_match_cpu_on_gpu`), the GPU's error is 4.5e-11 of
+  `sum(|x|)` and the CPU's 5.9e-9.
+- `argmax_dim` read the whole tensor back to the host; `argmax()`/`argmin()`
+  did too. The `arg_reduce` kernel keeps them on the GPU; `argmax()` and
+  `argmin()` read back only the index.
+
 ## What is still slow
 
-- 100 tiny ops on the GPU still take about 18x as long as on the CPU: most of
-  it is GPU time per dispatch (about 9-13 µs each, serialised within the
-  pass), plus one round trip to read the result. Fusing element-wise chains
+- 100 tiny ops on `[64]` on the GPU still take about 17x as long as on the
+  CPU (0.82 ms against 0.049 ms in the runs above): most of it is GPU time
+  per dispatch (about 9-13 µs each, serialised within the pass), plus one
+  round trip to read the result. Fusing element-wise chains
   into one kernel would be the next step.
 - Several ops read back to the host on their own and force a sync:
-  `cross_entropy` with class-index targets, `argmax`/`argmin`, `cat`, the
-  backward passes of `index_select` and `Embedding`, and gradient clipping
-  (one `item()` per parameter).
-- Full reductions (`sum()` over a whole tensor) use one GPU thread per
-  output, so a large `sum()` runs on a single thread.
+  `cross_entropy` with class-index targets, `cat`, and the backward passes
+  of `index_select` and `Embedding`.
+- `argmax_dim` gives each output row a workgroup of 256 threads, so on a
+  short axis (10 classes) most threads idle.
