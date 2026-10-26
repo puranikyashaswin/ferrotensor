@@ -30,6 +30,9 @@ class MLP(nn.Module):
 
 
 def test_mlp_loss_drops_and_fits(tmp_path):
+    # Without a seed the random initialisation occasionally lands where 300
+    # steps reach only ~78% accuracy, which made this test flaky.
+    ft.manual_seed(0)
     x, y = make_spirals()
     model = MLP()
     opt = optim.AdamW(model.parameters(), lr=0.02, weight_decay=0.0)

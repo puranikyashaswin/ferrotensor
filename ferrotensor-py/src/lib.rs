@@ -27,6 +27,7 @@ fn _ferrotensor(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(tensor::zeros_like, m)?)?;
     m.add_function(wrap_pyfunction!(tensor::ones_like, m)?)?;
     m.add_function(wrap_pyfunction!(tensor::full_like, m)?)?;
+    m.add_function(wrap_pyfunction!(tensor::manual_seed, m)?)?;
     m.add_function(wrap_pyfunction!(tensor::randn, m)?)?;
     m.add_function(wrap_pyfunction!(tensor::rand, m)?)?;
     m.add_function(wrap_pyfunction!(tensor::arange, m)?)?;
