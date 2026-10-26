@@ -507,32 +507,18 @@ impl Tensor {
 
     /// Index of the first largest element (NaN counts as largest).
     pub fn argmax(&self) -> usize {
-        arg_extreme(&self.to_vec(), |a, b| a > b || (a.is_nan() && !b.is_nan()))
+        self.arg_index_raw(false)
     }
 
     /// Index of the first smallest element (NaN counts as largest).
     pub fn argmin(&self) -> usize {
-        arg_extreme(&self.to_vec(), |a, b| a < b || (b.is_nan() && !a.is_nan()))
+        self.arg_index_raw(true)
     }
 
     /// Indices of the largest elements along `dim`, as an `f32` tensor with
     /// `dim` removed.
     pub fn argmax_dim(&self, dim: isize) -> Tensor {
-        let d = normalize_dim(dim, self.ndim());
-        let (outer, size, inner) = super::shape::split_at_dim(&self.shape, d);
-        let data = self.to_vec();
-        let mut out = Vec::with_capacity(outer * inner);
-        for o in 0..outer {
-            for k in 0..inner {
-                let column: Vec<f32> = (0..size)
-                    .map(|j| data[(o * size + j) * inner + k])
-                    .collect();
-                out.push(arg_extreme(&column, |a, b| a > b || (a.is_nan() && !b.is_nan())) as f32);
-            }
-        }
-        let mut shape = self.shape.clone();
-        shape.remove(d);
-        self.host_output(out, &shape)
+        self.arg_reduce_raw(normalize_dim(dim, self.ndim()), false)
     }
 
     // ========================================================================
@@ -857,16 +843,6 @@ fn index_add(grad: &Tensor, dim: usize, indices: &[usize], shape: &[usize]) -> T
         }
     }
     grad.host_output(out, shape)
-}
-
-fn arg_extreme(data: &[f32], better: impl Fn(f32, f32) -> bool) -> usize {
-    let mut best = 0;
-    for (i, &v) in data.iter().enumerate().skip(1) {
-        if better(v, data[best]) {
-            best = i;
-        }
-    }
-    best
 }
 
 // ============================================================================

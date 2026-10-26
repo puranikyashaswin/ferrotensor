@@ -166,6 +166,46 @@ pub(crate) fn reduce(op: u32, x: &[f32], outer: usize, dim: usize, inner: usize)
     out
 }
 
+/// Index of the first largest element of `x` (with `smallest`, the first
+/// smallest); NaN counts as larger than every number. 0 when `x` is empty.
+pub(crate) fn arg_extreme(smallest: bool, x: &[f32]) -> usize {
+    let better = |a: f32, b: f32| {
+        if smallest {
+            a < b || (b.is_nan() && !a.is_nan())
+        } else {
+            a > b || (a.is_nan() && !b.is_nan())
+        }
+    };
+    let mut best = 0;
+    for (i, &v) in x.iter().enumerate().skip(1) {
+        if better(v, x[best]) {
+            best = i;
+        }
+    }
+    best
+}
+
+/// The `arg_reduce` kernel over a `[outer, dim, inner]` view: the index along
+/// `dim` of each extreme, as `f32`.
+pub(crate) fn arg_reduce(
+    smallest: bool,
+    x: &[f32],
+    outer: usize,
+    dim: usize,
+    inner: usize,
+) -> Vec<f32> {
+    let mut out = Vec::with_capacity(outer * inner);
+    let mut column = Vec::with_capacity(dim);
+    for o in 0..outer {
+        for k in 0..inner {
+            column.clear();
+            column.extend((0..dim).map(|j| x[(o * dim + j) * inner + k]));
+            out.push(arg_extreme(smallest, &column) as f32);
+        }
+    }
+    out
+}
+
 /// The `softmax` kernel (or log-softmax) over a `[outer, dim, inner]` view.
 pub(crate) fn softmax(x: &[f32], outer: usize, dim: usize, inner: usize, log: bool) -> Vec<f32> {
     let mut out = vec![0.0; x.len()];
@@ -297,6 +337,20 @@ mod tests {
         assert!((s[3..].iter().sum::<f32>() - 1.0).abs() < 1e-6);
         let ls = softmax(&x, 2, 3, 1, true);
         assert!((ls[0].exp() - s[0]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn arg_reduce_takes_first_extreme() {
+        let x = [1.0, 3.0, 3.0, f32::NAN, 1.0, 0.0];
+        // NaN counts as larger than every number.
+        assert_eq!(arg_extreme(false, &x), 3);
+        assert_eq!(arg_extreme(true, &x), 5);
+        assert_eq!(arg_extreme(false, &x[..3]), 1);
+        assert_eq!(arg_extreme(true, &x[..5]), 0);
+        assert_eq!(arg_extreme(true, &[f32::NAN, f32::NAN]), 0);
+        // [3, 2] along dim 0.
+        assert_eq!(arg_reduce(false, &x, 1, 3, 2), vec![1.0, 1.0]);
+        assert_eq!(arg_reduce(true, &x, 1, 3, 2), vec![0.0, 2.0]);
     }
 
     #[test]

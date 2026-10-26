@@ -9,11 +9,12 @@ use wgpu::{BindGroup, BindGroupLayout, BindingResource, CommandEncoder, ComputeP
 use super::KERNELS_WGSL;
 
 /// Entry points compiled from [`KERNELS_WGSL`].
-pub(crate) const KERNEL_NAMES: [&str; 8] = [
+pub(crate) const KERNEL_NAMES: [&str; 9] = [
     "unary",
     "binary",
     "reduce",
     "reduce_all",
+    "arg_reduce",
     "softmax",
     "matmul",
     "permute",
