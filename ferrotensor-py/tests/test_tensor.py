@@ -227,3 +227,17 @@ def test_device_basics():
     assert best.is_gpu == ft.Device.gpu_available()
     assert ft.zeros(1).to("cpu").device == cpu
     assert ft.__version__
+
+
+def test_manual_seed_makes_random_tensors_and_init_reproducible():
+    from ferrotensor import nn
+
+    def draw():
+        return ft.randn(5).tolist(), nn.Linear(3, 2).weight.tolist()
+
+    ft.manual_seed(123)
+    first = draw()
+    ft.manual_seed(123)
+    assert draw() == first
+    ft.manual_seed(124)
+    assert draw()[0] != first[0]

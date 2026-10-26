@@ -233,6 +233,12 @@ def full(
 def zeros_like(input: Tensor, *, requires_grad: bool = False) -> Tensor: ...
 def ones_like(input: Tensor, *, requires_grad: bool = False) -> Tensor: ...
 def full_like(input: Tensor, fill_value: float, *, requires_grad: bool = False) -> Tensor: ...
+def manual_seed(seed: int) -> None:
+    """Seed the generator behind ``randn``, ``rand``, layer initialisation and dropout.
+
+    Like ``torch.manual_seed``: the same seed gives the same numbers on every run.
+    """
+
 def arange(
     start: float,
     end: float | None = None,

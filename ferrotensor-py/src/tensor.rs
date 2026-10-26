@@ -1253,6 +1253,12 @@ pub(crate) fn ones(
     create(size, device, requires_grad, Tensor::ones)
 }
 
+/// Seed the generator behind `randn`, `rand`, layer initialisation and dropout.
+#[pyfunction]
+pub(crate) fn manual_seed(seed: u64) {
+    ferrotensor::manual_seed(seed);
+}
+
 /// Standard-normal samples.
 #[pyfunction]
 #[pyo3(signature = (*size, device = None, requires_grad = false))]
