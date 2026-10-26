@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-26
+
+### Added
+- `ferrotensor`: `manual_seed(seed)` (also in the prelude) seeds the generator behind `Tensor::randn`, `rand`, `uniform`, every `nn` layer's initialisation and `functional::dropout`, so a program gives the same numbers on every run. Unseeded behaviour is unchanged. Python: `ferrotensor.manual_seed(seed)`.
+
+### Changed
+- `ferrotensor`: reducing a whole tensor on the GPU (`sum()` and the other full reductions) uses a two-pass workgroup tree instead of one thread for every element. On an Apple M2, `sum()` of `[4096, 4096]` went from 2169 ms to 1.19 ms.
+- `ferrotensor`: `argmax` and `argmin` run entirely on the GPU, so they no longer split the batched dispatch. `argmax_dim(-1)` of `[1024, 4096]` went from 8.40 ms to 0.99 ms on an M2. Ties resolve to the same index as on the CPU.
+- The website takes its version from the workspace `Cargo.toml` and shows the newest CHANGELOG release.
+
+### Removed
+- `ferrotensor-graph`: `FlashAttention::forward_multi_head` and `FlashAttention::multi_head_forward`, deprecated in 0.2.1. Use `forward` (it already splits heads), projecting the input yourself.
+
+### Fixed
+- The Python MLP training test seeds its weight initialisation, so it no longer fails on a rare unlucky start.
+
 ## [0.2.1] - 2026-10-25
 
 ### Fixed
@@ -60,7 +76,8 @@ First public version.
 - Renamed the project from Rusty to Ferrotensor; crates are now `ferrotensor-*` and the CLI binary is `ferrotensor`.
 - Licensed under MIT OR Apache-2.0 (previously MIT only).
 
-[Unreleased]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/puranikyashaswin/ferrotensor/releases/tag/v0.1.0

@@ -1,6 +1,6 @@
 [package]
 name = "ferrotensor-graph"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 description = "Neural network modules and transformer building blocks for Ferrotensor"
 authors.workspace = true
@@ -14,9 +14,9 @@ keywords = ["neural-networks", "transformer", "machine-learning", "gpu", "llm"]
 categories = ["science", "algorithms"]
 
 [dependencies]
-ferrotensor-backend = { path = "../ferrotensor-backend", version = "0.2.1" }
-ferrotensor-autograd = { path = "../ferrotensor-autograd", version = "0.2.1" }
-ferrotensor-loader = { path = "../ferrotensor-loader", version = "0.2.1" }
+ferrotensor-backend = { path = "../ferrotensor-backend", version = "0.3.0" }
+ferrotensor-autograd = { path = "../ferrotensor-autograd", version = "0.3.0" }
+ferrotensor-loader = { path = "../ferrotensor-loader", version = "0.3.0" }
 env_logger = "0.11"
 pollster = "0.3"
 log = "0.4"
