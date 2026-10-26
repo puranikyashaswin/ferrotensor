@@ -139,8 +139,10 @@ impl Tensor {
     }
 
     /// Create a tensor with random normal values (mean 0, std 1).
+    ///
+    /// Draws from the generator [`manual_seed`](crate::manual_seed) seeds.
     pub fn randn(shape: &[usize], device: &Device) -> Self {
-        Self::randn_with(shape, &mut rand::thread_rng(), device)
+        crate::random::with_rng(|mut rng| Self::randn_with(shape, &mut rng, device))
     }
 
     /// Like [`Tensor::randn`], drawing from `rng` (for reproducible runs).
@@ -164,7 +166,7 @@ impl Tensor {
 
     /// Create a tensor with random uniform values in [low, high).
     pub fn uniform(shape: &[usize], low: f32, high: f32, device: &Device) -> Self {
-        Self::uniform_with(shape, low, high, &mut rand::thread_rng(), device)
+        crate::random::with_rng(|mut rng| Self::uniform_with(shape, low, high, &mut rng, device))
     }
 
     /// Like [`Tensor::uniform`], drawing from `rng`.
