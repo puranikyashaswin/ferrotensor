@@ -33,6 +33,38 @@ fn as_u32(values: &[usize]) -> Vec<u32> {
         .collect()
 }
 
+/// Threads per workgroup of `reduce_all`.
+const GROUP: usize = 256;
+/// Workgroups the first pass of a full reduction is spread over.
+const FIRST_PASS_GROUPS: usize = 256;
+
+/// Reduce the first `n` elements of `input` into `out[0]`: one pass of
+/// `FIRST_PASS_GROUPS` workgroups leaves a partial per workgroup and a
+/// one-workgroup pass combines them.
+fn reduce_all(ctx: &GpuContext, input: &Buffer, out: &Buffer, op: u32, n: usize) {
+    let params = |n: usize| Arg::Params([op, n as u32, 0, 0]);
+    let groups = n.div_ceil(GROUP).min(FIRST_PASS_GROUPS);
+    if groups == 1 {
+        ctx.dispatch(
+            "reduce_all",
+            &[Arg::Buffer(input), Arg::Buffer(out), params(n)],
+            (1, 1, 1),
+        );
+        return;
+    }
+    let partials = alloc(ctx, groups);
+    ctx.dispatch(
+        "reduce_all",
+        &[Arg::Buffer(input), Arg::Buffer(&partials), params(n)],
+        (groups as u32, 1, 1),
+    );
+    ctx.dispatch(
+        "reduce_all",
+        &[Arg::Buffer(&partials), Arg::Buffer(out), params(groups)],
+        (1, 1, 1),
+    );
+}
+
 impl Tensor {
     /// The GPU context and buffer, when this tensor lives on a GPU.
     fn gpu(&self) -> Option<(&GpuContext, &Buffer)> {
@@ -142,6 +174,11 @@ impl Tensor {
         }
         let n = outer * inner;
         match self.gpu() {
+            Some((ctx, input)) if n == 1 => {
+                let out = alloc(ctx, 1);
+                reduce_all(ctx, input, &out, op, size);
+                self.gpu_output(out, out_shape)
+            }
             Some((ctx, input)) if n > 0 => {
                 let out = alloc(ctx, n);
                 let params = Arg::Params([op, outer as u32, size as u32, inner as u32]);

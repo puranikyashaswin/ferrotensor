@@ -470,3 +470,42 @@ fn incompatible_shapes_panic() {
     let d = Device::cpu();
     Tensor::zeros(&[2, 3], &d).add(&Tensor::zeros(&[2], &d));
 }
+
+// ============================================================================
+// GPU REDUCTIONS
+// ============================================================================
+
+/// The GPU when `FERROTENSOR_RUN_GPU_TESTS=1`.
+fn test_gpu() -> Option<Device> {
+    if std::env::var("FERROTENSOR_RUN_GPU_TESTS").as_deref() != Ok("1") {
+        eprintln!("skipping GPU reductions; set FERROTENSOR_RUN_GPU_TESTS=1 to enable");
+        return None;
+    }
+    Some(Device::gpu().expect("FERROTENSOR_RUN_GPU_TESTS=1 but no GPU is available"))
+}
+
+#[test]
+fn full_reductions_match_cpu_on_gpu() {
+    let Some(gpu) = test_gpu() else { return };
+    let cpu = Device::cpu();
+    let mut rng = StdRng::seed_from_u64(11);
+    for n in [1, 255, 256, 257, 65_537, 1_000_003, 4096 * 4096] {
+        let data: Vec<f32> = (0..n).map(|_| rng.gen_range(-2.0..2.0)).collect();
+        let (c, g) = (
+            Tensor::from_data(&data, &[n], &cpu),
+            Tensor::from_data(&data, &[n], &gpu),
+        );
+        // max and min do not depend on the order of the elements.
+        assert_eq!(g.max().item(), c.max().item(), "max of {n}");
+        assert_eq!(g.min().item(), c.min().item(), "min of {n}");
+        // The GPU adds in a different order than the CPU's left-to-right loop;
+        // each order's rounding error is a few f32 epsilons per element of
+        // sum(|x|) at most, so allow 1e-6 of sum(|x|) between them.
+        let abs: f64 = data.iter().map(|v| v.abs() as f64).sum();
+        let (gs, cs) = (g.sum().item(), c.sum().item());
+        assert!(
+            ((gs - cs) as f64).abs() <= 1e-6 * abs,
+            "sum of {n}: gpu {gs} vs cpu {cs}"
+        );
+    }
+}
