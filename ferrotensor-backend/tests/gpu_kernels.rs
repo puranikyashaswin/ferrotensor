@@ -1272,3 +1272,25 @@ fn large_dispatches_use_a_2d_grid() {
         1e-4,
     );
 }
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn self_check_passes_and_an_adapter_is_selected() {
+    let g = gpu();
+    for r in pollster::block_on(ferrotensor_backend::adapters::self_check(&g.ctx)) {
+        assert!(
+            r.passed(),
+            "{}: max error {} > {}",
+            r.name,
+            r.max_abs_err,
+            r.tolerance
+        );
+    }
+    let adapters = ferrotensor_backend::adapters::list_adapters();
+    assert!(!adapters.is_empty());
+    assert_eq!(
+        adapters.iter().filter(|a| a.selected).count(),
+        1,
+        "{adapters:#?}"
+    );
+}

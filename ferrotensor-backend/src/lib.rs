@@ -25,6 +25,7 @@
 /// The `wgpu` version this crate is built on, re-exported for callers.
 pub use wgpu; // Re-export wgpu for downstream crates
 
+pub mod adapters;
 mod context;
 mod engine;
 /// Size-keyed reuse of GPU buffers.
