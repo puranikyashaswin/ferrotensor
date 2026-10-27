@@ -5,7 +5,10 @@
 //! ferrotensor-cli train    --model DIR --data train.jsonl --out runs/sft
 //! ferrotensor-cli eval     --model DIR --data val.jsonl --lora runs/sft/lora_adapters.safetensors
 //! ferrotensor-cli generate --model DIR --lora runs/sft/lora_adapters.safetensors --prompt "Hi"
+//! ferrotensor-cli info --check
 //! ```
+
+mod info;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use ferrotensor_autograd::{AdamW, WarmupCosineScheduler};
@@ -58,6 +61,8 @@ enum Command {
     /// Terminal dashboard that follows a run's training_state.json.
     #[command(long_flag = "monitor")]
     Monitor,
+    /// Show the GPUs wgpu can use and, with --check, test the kernels on one.
+    Info(info::InfoArgs),
     /// Print how to run the kernel benchmarks.
     #[command(long_flag = "benchmark")]
     Benchmark,
@@ -277,6 +282,7 @@ fn main() {
             ferrotensor_trainer::run_demo(ferrotensor_trainer::DemoConfig::default());
             Ok(())
         }
+        Command::Info(args) => info::run(args),
         Command::Monitor => ferrotensor_monitor::run().map_err(|e| format!("monitor: {e}").into()),
         Command::Benchmark => {
             println!(
@@ -1139,6 +1145,21 @@ mod tests {
         };
         assert_eq!(g.top_k, 5);
         assert_eq!(g.prompt, "hi");
+    }
+
+    #[test]
+    fn info_parses_its_flags() {
+        let Command::Info(i) = parse(&["info", "--check", "--json"])
+            .expect("parse")
+            .command
+        else {
+            panic!("expected info");
+        };
+        assert!(i.check && i.json);
+        let Command::Info(i) = parse(&["info"]).expect("parse").command else {
+            panic!("expected info");
+        };
+        assert!(!i.check && !i.json);
     }
 
     #[test]
