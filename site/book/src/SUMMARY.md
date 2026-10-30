@@ -13,6 +13,7 @@
 - [LoRA fine-tuning on a laptop](examples/lora-sft.md)
 - [Architecture](architecture.md)
 - [Writing a kernel](writing-a-kernel.md)
+- [Testing on your GPU](testing-on-your-gpu.md)
 
 # Reference
 

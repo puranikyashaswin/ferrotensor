@@ -58,6 +58,11 @@ PAGES = {
         "Add a GPU op to Ferrotensor step by step: the WGSL case, a CPU reference, the public method "
         "with its gradient, and the tests that check it.",
     ),
+    "testing-on-your-gpu.html": (
+        "Test Ferrotensor on your GPU: AMD, Intel, NVIDIA",
+        "Run ferrotensor info --check, the GPU tests and the benchmark on AMD, Intel or NVIDIA "
+        "GPUs through Vulkan or DX12, and report what you find.",
+    ),
     "benchmarks.html": (
         "Ferrotensor benchmarks: WGSL kernels on an Apple M2",
         "Ferrotensor benchmarks on an Apple M2: 611 GFLOPS f32 matmul in WGSL, flash attention, and "
