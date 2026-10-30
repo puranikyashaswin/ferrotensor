@@ -19,6 +19,7 @@ after = ["links"]
 "examples/lora-sft.md" = "docs/examples/lora-sft.md"
 "architecture.md" = "docs/architecture.md"
 "writing-a-kernel.md" = "docs/writing-a-kernel.md"
+"testing-on-your-gpu.md" = "docs/testing-on-your-gpu.md"
 "benchmarks.md" = "benchmarks/RESULTS.md"
 "python-reference.md" = "ferrotensor-py/README.md"
 "good-first-issues.md" = "docs/good-first-issues.md"
