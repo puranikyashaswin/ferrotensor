@@ -148,13 +148,14 @@ tested, incomplete, or only checked on one machine.
 
 | Area | Status | Notes |
 |------|--------|-------|
-| `Tensor` on GPU (wgpu) and CPU | **Stable** | `f32`; broadcasting element-wise ops, reductions, batched matmul, softmax, permute, slice/cat, gathers |
+| `Tensor` on GPU (wgpu) and CPU | **Stable** | `f32`; broadcasting element-wise ops, reductions, batched matmul, softmax, permute, slice/cat, gathers. Whole-tensor reductions and `argmax`/`argmin` run fully on the GPU |
 | Autograd | **Stable** | Reverse mode; every op's gradient is checked against finite differences, and GPU gradients against the CPU |
-| `nn` layers | **Stable** | `Linear`, `Embedding`, `LayerNorm`, `RMSNorm`, `Dropout`, causal `MultiHeadAttention`, activations, `Sequential` |
+| `nn` layers | **Stable** | `Linear`, `Embedding`, `LayerNorm`, `RMSNorm`, `Dropout`, causal `MultiHeadAttention` with a KV cache, activations, `Sequential` |
 | Optimizers and LR schedules | **Stable** | `SGD` (momentum, Nesterov), `AdamW`, gradient clipping, constant/step/cosine/warmup schedules |
 | Safetensors save/load, state dicts | **Stable** | `ferrotensor::serialize` |
-| `DataLoader` | **Stable** | Batching and seeded shuffling; single-threaded |
-| LoRA fine-tuning of Llama-style models (`ferrotensor-cli`) | **Experimental** | Small models (TinyLlama class) on ~8 GB machines; see the [LoRA walkthrough](docs/examples/lora-sft.md) |
+| `DataLoader` | **Stable** | Batching, seeded shuffling, optional prefetching on a background thread (`epoch_prefetched`) |
+| Reproducible randomness | **Stable** | `manual_seed` (Rust and Python) seeds random tensors, layer initialisation and dropout |
+| LoRA fine-tuning of Llama-style models (`ferrotensor-cli`) | **Experimental** | Measured with SmolLM2-135M on an 8 GB Apple M2; see the [LoRA walkthrough](docs/examples/lora-sft.md). Larger models are untested |
 | Llama / LFM2-style blocks (`ferrotensor-graph`) | **Experimental** | Attention with RoPE, SwiGLU MLP, RMSNorm, KV cache |
 | Flash attention kernels (`ferrotensor-backend`) | **Experimental** | Forward v2 and a backward kernel; see `tests/flash_grad_check.rs` |
 | FP16 loss scaling, checkpoint/resume (`ferrotensor-trainer`) | **Experimental** | |
@@ -163,6 +164,7 @@ tested, incomplete, or only checked on one machine.
 | Convolutions, sort/top-k, cumsum in the `ferrotensor` API | Planned | |
 | Batched GPU dispatch in the `ferrotensor` API | **Stable** | Ops submit together at each read back; `char_transformer` trains faster on the GPU than the CPU, but chains of tiny ops are still faster on the CPU ([numbers](benchmarks/RESULTS.md#ferrotensor-tensor-api-cpu-and-gpu-devices)) |
 | Python bindings (`ferrotensor-py`) | **Experimental** | Tensors, autograd, `nn`, `optim`, safetensors; wheels for macOS arm64 and Linux x86_64 from 0.2.0 |
+| GPU report and kernel self-check (`ferrotensor info`) | **Experimental** | Lists adapters and checks matmul, softmax and RMSNorm against the CPU; only run on an Apple M2 so far ([help test it](docs/testing-on-your-gpu.md)) |
 | Multi-GPU / distributed training | Planned | `ferrotensor-cli` has a file-based gradient sync flag (`--world-size`) that is a prototype |
 | A CUDA backend | Not planned | wgpu is the point of the project |
 
