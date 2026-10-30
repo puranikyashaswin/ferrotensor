@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `ferrotensor info` lists every GPU adapter wgpu can open (name, vendor, backend, driver, the limits the kernels depend on) and marks the one Ferrotensor uses. `--check` runs matmul, softmax and RMSNorm on it against an f64 CPU reference and exits non-zero if one is out of tolerance; `--json` prints the same for bug reports.
+- `ferrotensor-backend`: `adapters::list_adapters` and `adapters::self_check`, the library side of `ferrotensor info`.
+- A guide to testing Ferrotensor on other GPUs (`docs/testing-on-your-gpu.md`), and a field for `ferrotensor info --check --json` output in the bug report template.
+
 ## [0.3.0] - 2026-10-26
 
 ### Added
