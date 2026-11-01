@@ -139,4 +139,4 @@ jobs:
           shopt -s nullglob
           files=(dist/ferrotensor-"$version"-*.whl dist/ferrotensor-"$version".tar.gz)
           test "${#files[@]}" -eq 3
-      - uses: pypa/gh-action-pypi-publish@v1.14.2
+      - uses: pypa/gh-action-pypi-publish@v1.14.3
