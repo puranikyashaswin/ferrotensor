@@ -758,6 +758,22 @@ impl Tensor {
         })
     }
 
+    /// Cross-entropy of each row of these `[.., classes]` logits against
+    /// the class ids stored as `f32` in `targets` (one per row; an id <= -1
+    /// skips its row). Returns the `[rows]` losses, differentiable in the
+    /// logits, and the `[rows]` 1/0 flags of the rows that count.
+    ///
+    /// On a GPU both passes run on the device. There an id that is NaN or
+    /// not below `classes` gives a NaN loss; on the CPU it panics.
+    pub(crate) fn cross_entropy_rows(&self, targets: &Tensor) -> (Tensor, Tensor) {
+        let [loss, lse, valid] = self.cross_entropy_rows_raw(targets);
+        let (logits, targets) = (self.detach(), targets.detach());
+        let loss = loss.with_node("cross_entropy", vec![self.clone()], move |g| {
+            vec![Some(logits.cross_entropy_grad_raw(&targets, &lse, g))]
+        });
+        (loss, valid)
+    }
+
     // ========================================================================
     // MATRIX PRODUCT AND SOFTMAX
     // ========================================================================

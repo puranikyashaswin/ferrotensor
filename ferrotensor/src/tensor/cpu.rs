@@ -296,6 +296,67 @@ pub(crate) fn gather_rows(table: &[f32], idx: &[u32], row: usize) -> Vec<f32> {
     out
 }
 
+/// The class of a cross-entropy target stored as `f32`: `None` to skip the
+/// row (an id that is negative as an integer, such as -100), else the
+/// truncated id, as in the `cross_entropy_rows` kernel.
+///
+/// # Panics
+/// Panics when the id is NaN or not below `classes`.
+pub(crate) fn target_class(f: f32, classes: usize) -> Option<usize> {
+    if f <= -1.0 {
+        return None;
+    }
+    assert!(
+        f < classes as f32,
+        "target class {f} out of range for {classes} classes"
+    );
+    Some(f.max(0.0) as usize)
+}
+
+/// Per row of `x` (`[rows, classes]`): the cross-entropy loss against
+/// `targets` (0 for a skipped row), the log-sum-exp, and 1 or 0 for whether
+/// the row counts.
+pub(crate) fn cross_entropy_rows(
+    x: &[f32],
+    targets: &[f32],
+    classes: usize,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let rows = targets.len();
+    let (mut loss, mut lse, mut valid) = (vec![0.0; rows], vec![0.0; rows], vec![0.0; rows]);
+    for r in 0..rows {
+        let row = &x[r * classes..][..classes];
+        let m = row.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+        let s: f32 = row.iter().map(|&v| (v - m).exp()).sum();
+        lse[r] = m + s.ln();
+        if let Some(t) = target_class(targets[r], classes) {
+            loss[r] = lse[r] - row[t];
+            valid[r] = 1.0;
+        }
+    }
+    (loss, lse, valid)
+}
+
+/// Gradient of [`cross_entropy_rows`]'s loss with respect to `x`, given the
+/// gradient `grad` of each row's loss.
+pub(crate) fn cross_entropy_grad(
+    x: &[f32],
+    targets: &[f32],
+    lse: &[f32],
+    grad: &[f32],
+    classes: usize,
+) -> Vec<f32> {
+    let mut out = vec![0.0; x.len()];
+    for (r, &f) in targets.iter().enumerate() {
+        if let Some(t) = target_class(f, classes) {
+            for (c, o) in out[r * classes..][..classes].iter_mut().enumerate() {
+                let p = (x[r * classes + c] - lse[r]).exp();
+                *o = (p - if c == t { 1.0 } else { 0.0 }) * grad[r];
+            }
+        }
+    }
+    out
+}
+
 /// Concatenate `parts` (values, block length), each viewed as
 /// `[outer, block]`, along the block dim.
 pub(crate) fn cat(parts: &[(&[f32], usize)], outer: usize) -> Vec<f32> {

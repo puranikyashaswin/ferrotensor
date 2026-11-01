@@ -547,6 +547,81 @@ impl Tensor {
             }
         }
     }
+    /// Cross-entropy of each row of these `[.., classes]` logits against the
+    /// class ids stored as `f32` in `targets` (one per row): the losses, the
+    /// log-sum-exps and the 1/0 flags of the rows that count, each `[rows]`.
+    pub(crate) fn cross_entropy_rows_raw(&self, targets: &Tensor) -> [Tensor; 3] {
+        let classes = self.shape[self.ndim() - 1];
+        let rows = targets.numel();
+        let targets = targets.to_device(&self.device);
+        match (self.gpu(), targets.gpu()) {
+            (Some((ctx, logits)), Some((_, t))) if rows > 0 && classes > 0 => {
+                let [loss, lse, valid] = [0; 3].map(|_| alloc(ctx, rows));
+                ctx.dispatch(
+                    "cross_entropy_rows",
+                    &[
+                        Arg::Buffer(logits),
+                        Arg::Buffer(t),
+                        Arg::Buffer(&loss),
+                        Arg::Buffer(&lse),
+                        Arg::Buffer(&valid),
+                        Arg::Params([rows as u32, classes as u32, 0, 0]),
+                    ],
+                    ComputeEngine::workgroup_grid(rows),
+                );
+                [loss, lse, valid].map(|b| self.gpu_output(b, vec![rows]))
+            }
+            _ => {
+                let (loss, lse, valid) =
+                    cpu::cross_entropy_rows(&self.to_vec(), &targets.to_vec(), classes);
+                [loss, lse, valid].map(|v| self.host_output(v, &[rows]))
+            }
+        }
+    }
+
+    /// Gradient of [`Tensor::cross_entropy_rows_raw`]'s losses with respect
+    /// to these logits, given `grad`, the gradient of each row's loss.
+    pub(crate) fn cross_entropy_grad_raw(
+        &self,
+        targets: &Tensor,
+        lse: &Tensor,
+        grad: &Tensor,
+    ) -> Tensor {
+        let classes = self.shape[self.ndim() - 1];
+        let rows = targets.numel();
+        let targets = targets.to_device(&self.device);
+        match (self.gpu(), targets.gpu(), lse.gpu(), grad.gpu()) {
+            (Some((ctx, logits)), Some((_, t)), Some((_, l)), Some((_, g)))
+                if rows * classes > 0 =>
+            {
+                let out = alloc(ctx, rows * classes);
+                ctx.dispatch(
+                    "cross_entropy_grad",
+                    &[
+                        Arg::Buffer(logits),
+                        Arg::Buffer(t),
+                        Arg::Buffer(l),
+                        Arg::Buffer(g),
+                        Arg::Buffer(&out),
+                        Arg::Params([rows as u32, classes as u32, 0, 0]),
+                    ],
+                    ComputeEngine::workgroups_1d(rows * classes),
+                );
+                self.gpu_output(out, self.shape.clone())
+            }
+            _ => {
+                let data = cpu::cross_entropy_grad(
+                    &self.to_vec(),
+                    &targets.to_vec(),
+                    &lse.to_vec(),
+                    &grad.to_vec(),
+                    classes,
+                );
+                self.host_output(data, &self.shape)
+            }
+        }
+    }
+
     /// Concatenate `tensors` along `dim`; the shapes are already checked.
     pub(crate) fn cat_raw(tensors: &[Tensor], dim: usize) -> Tensor {
         let first = &tensors[0];

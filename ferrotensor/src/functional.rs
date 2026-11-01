@@ -300,21 +300,47 @@ targets_from_ids!(i32, usize);
 ///   positions;
 /// - or a `&Tensor` distribution (one-hot or soft labels) with the shape of
 ///   `logits`.
+///
+/// With class ids on a GPU, the loss and its gradient are computed on the
+/// device with no copy to the host. An id that is not below the number of
+/// classes panics, except for an id tensor on a GPU, which is not read
+/// back: there it gives a NaN loss.
 pub fn cross_entropy<'a>(logits: &Tensor, targets: impl Into<Targets<'a>>) -> Tensor {
     let targets = targets.into();
-    let log_probs = logits.log_softmax(-1);
-    if let Targets::Tensor(t) = targets {
-        if t.shape == logits.shape {
-            let rows = (logits.numel() / logits.shape[logits.ndim() - 1]).max(1);
-            return log_probs.mul(t).sum().div_scalar(-(rows as f32));
+    let classes = logits.shape[logits.ndim() - 1];
+    let rows = logits.numel() / classes.max(1);
+    let ids = match targets {
+        Targets::Tensor(t) if t.shape == logits.shape => {
+            let rows = rows.max(1);
+            return logits
+                .log_softmax(-1)
+                .mul(t)
+                .sum()
+                .div_scalar(-(rows as f32));
         }
-        assert_eq!(
-            t.shape,
-            logits.shape[..logits.ndim() - 1],
-            "class-id targets must have the logits shape without the class dim"
-        );
-    }
-    nll_loss_indices(&log_probs, &targets.ids())
+        Targets::Tensor(t) => {
+            assert_eq!(
+                t.shape,
+                logits.shape[..logits.ndim() - 1],
+                "class-id targets must have the logits shape without the class dim"
+            );
+            t.clone()
+        }
+        Targets::Ids(ids) => {
+            assert_eq!(ids.len(), rows, "one target per row of log-probabilities");
+            for &t in ids.iter() {
+                assert!(
+                    t < classes as i64,
+                    "target class {t} out of range for {classes} classes"
+                );
+            }
+            let ids = ids.iter().map(|&t| t.max(-1) as f32).collect();
+            Tensor::from_vec(ids, &[rows], logits.device())
+        }
+    };
+    // Mean over the rows that count; 0 when none does.
+    let (losses, valid) = logits.cross_entropy_rows(&ids);
+    losses.sum().div(&valid.sum().clamp(1.0, f32::INFINITY))
 }
 
 /// Negative log-likelihood of class `targets` (see [`Targets`]) under
@@ -428,6 +454,7 @@ pub fn accuracy<'a>(logits: &Tensor, targets: impl Into<Targets<'a>>) -> f32 {
 mod tests {
     use super::*;
     use crate::tensor::tests::{check_gpu_parity, check_gradients, Case, Init};
+    use rand::{Rng, SeedableRng};
 
     const U: Init = Init::Uniform(-2.0, 2.0);
     const PROB: Init = Init::Uniform(0.05, 0.95);
@@ -631,5 +658,73 @@ mod tests {
         assert_eq!(one_hot(&[2, -100, 0], 3, &d).to_vec(), want);
         let t = cpu(&[2.0, -1.0, 0.0], &[3]);
         assert_eq!(one_hot(&t, 3, &d).to_vec(), want);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn cross_entropy_rejects_out_of_range_tensor_targets_on_the_cpu() {
+        cross_entropy(&cpu(&[0.0; 6], &[2, 3]), &cpu(&[1.0, 3.0], &[2]));
+    }
+
+    #[test]
+    fn cross_entropy_with_every_row_skipped_is_zero() {
+        let logits = cpu(&[1.0, 2.0, 3.0, 4.0], &[2, 2]).requires_grad_();
+        let loss = cross_entropy(&logits, &[-100, -100]);
+        assert_eq!(loss.item(), 0.0);
+        loss.backward();
+        assert_eq!(logits.grad().unwrap().to_vec(), vec![0.0; 4]);
+    }
+
+    /// With `FERROTENSOR_RUN_GPU_TESTS=1`: class-id cross-entropy on the GPU
+    /// (loss and logits gradient) matches the CPU on wide rows, 3-D logits,
+    /// skipped and fractional ids, and gives NaN for an id out of range.
+    #[test]
+    fn cross_entropy_matches_cpu_on_gpu() {
+        if std::env::var("FERROTENSOR_RUN_GPU_TESTS").as_deref() != Ok("1") {
+            eprintln!("skipping GPU cross_entropy; set FERROTENSOR_RUN_GPU_TESTS=1 to enable");
+            return;
+        }
+        let gpu = Device::gpu().expect("FERROTENSOR_RUN_GPU_TESTS=1 but no GPU is available");
+        let mut rng = rand::rngs::StdRng::seed_from_u64(13);
+        for shape in [
+            &[1, 1][..],
+            &[5, 3],
+            &[37, 1000],
+            &[2, 3, 300],
+            &[64, 32_000],
+        ] {
+            let classes = shape[shape.len() - 1];
+            let rows: usize = shape[..shape.len() - 1].iter().product();
+            let logits: Vec<f32> = (0..rows * classes)
+                .map(|_| rng.gen_range(-8.0..8.0))
+                .collect();
+            let mut targets: Vec<f32> = (0..rows).map(|r| ((r * 7919) % classes) as f32).collect();
+            if rows > 2 {
+                targets[0] = -100.0;
+                targets[1] += 0.5;
+                targets[2] = -0.5;
+            }
+            let run = |d: &Device| {
+                let x = Tensor::from_data(&logits, shape, d).requires_grad_();
+                let t = Tensor::from_data(&targets, &shape[..shape.len() - 1], d);
+                let loss = cross_entropy(&x, &t);
+                loss.backward();
+                (loss.item(), x.grad().unwrap().to_vec())
+            };
+            let ((gl, gg), (cl, cg)) = (run(&gpu), run(&Device::cpu()));
+            assert!(
+                (gl - cl).abs() <= 1e-5 * cl.abs().max(1.0),
+                "{shape:?}: {gl} vs {cl}"
+            );
+            let worst = gg
+                .iter()
+                .zip(&cg)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f32::max);
+            assert!(worst <= 1e-6, "{shape:?}: gradient differs by {worst}");
+        }
+        let x = Tensor::from_data(&[0.0; 6], &[2, 3], &gpu);
+        let t = Tensor::from_data(&[1.0, 3.0], &[2], &gpu);
+        assert!(cross_entropy(&x, &t).item().is_nan());
     }
 }
