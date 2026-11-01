@@ -181,6 +181,60 @@ The CPU column is the best of all six runs; the CPU path did not change.
   did too. The `arg_reduce` kernel keeps them on the GPU; `argmax()` and
   `argmin()` read back only the index.
 
+## Index backward passes, `cat` and `cross_entropy` on the GPU
+
+Same machine, toolchain and method as above (best median of three
+alternating runs of each binary), with
+`cargo run -p ferrotensor-benchmarks --release --bin tensor-api`. "Before" is
+commit "Benchmark embedding, index_select, cat and cross_entropy in
+tensor-api"; "after" is commit "Compute class-id cross_entropy on the GPU".
+Inputs are seeded `randn`; each case ends with a read back.
+
+| case | CPU before | CPU after | GPU before | GPU after | GPU speed-up |
+|---|---:|---:|---:|---:|---:|
+| `Embedding` `[32000, 256]`, 4096 ids, forward + backward, read the gradient | 7.10 ms | 7.08 ms | 13.83 ms | 8.89 ms | 1.6x |
+| `index_select(0, 1024 ids)` of `[2048, 2048]`, backward | 8.75 ms | 8.74 ms | 8.68 ms | 5.04 ms | 1.7x |
+| `index_select(1, 1024 ids)` of `[2048, 2048]`, backward | 27.29 ms | 26.58 ms | 14.16 ms | 7.91 ms | 1.8x |
+| `cat` of 8 `[512, 512]` along dim 0 | 0.55 ms | 0.56 ms | 5.58 ms | 1.50 ms | 3.7x |
+| `cat` of 8 `[512, 512]` along dim 1 | 0.58 ms | 0.60 ms | 5.58 ms | 1.48 ms | 3.8x |
+| `cross_entropy` `[4096, 32000]`, class ids, forward + backward | 4226.86 ms | 517.16 ms | 749.64 ms | 64.58 ms | 11.6x |
+| MLP 784-256-10 AdamW step, batch 64 | 12.16 ms | 12.26 ms | 3.69 ms | 2.13 ms | 1.7x |
+
+- **Index backward passes.** The new `scatter_rows` kernel gives each
+  output element a thread that adds its row's incoming gradient rows. It
+  reads them through `(row, position)` pairs sorted by row, then position,
+  and a table of where each row's pairs start. `index_select` sorts its
+  indices on the host, where they already are. `Embedding` keeps its ids on
+  the device and sorts them there with a bitonic sort (`sort_ids`, one
+  dispatch per compare-and-swap step: 78 for 4096 ids). WGSL has no float
+  atomics; adding with a compare-and-swap loop on `u32` bits would make the
+  order of the additions, and so the rounding, change from run to run. The
+  sorted version adds in position order, as the CPU loop does, so the
+  gradients are deterministic and match the CPU bit for bit (same checksums
+  as before, and `scatter_backward_matches_cpu_on_gpu` compares them with
+  `assert_eq!`). The `Embedding` case is still slower on the GPU than on the
+  CPU because it reads back the whole 32.8 MB gradient.
+- **`cat`** read every input back and uploaded the result; the
+  `copy_block` kernel now copies each input into its slice of the output on
+  the device. Same checksums: the values are copied exactly.
+- **`cross_entropy` with class ids** read the targets back and built a
+  dense `[rows, classes]` weight tensor on the host (524 MB here), then took
+  `log_softmax`, a product and a sum. The `cross_entropy_rows` kernel now
+  gives each row a workgroup of 256 threads that writes the row's loss
+  (log-sum-exp minus the target logit); `cross_entropy_grad` writes softmax
+  minus one-hot times the row's incoming gradient. The CPU path uses the same
+  per-row reference, which is why it got faster too. The "before" runs
+  peaked at 3.1 GB resident (`/usr/bin/time -l`) on this 8 GB machine and
+  their medians varied (CPU 4.2 s to 8.8 s, GPU 0.75 s to 1.17 s across the
+  three runs); the "after" runs peaked at 1.6 GB and varied by under 4%.
+  The loss is now computed in a different order, so the `cross_entropy` and
+  MLP checksums changed; `cross_entropy_matches_cpu_on_gpu` checks the GPU
+  against the CPU to 1e-5 relative on the loss and 1e-6 absolute on the
+  gradient, up to `[64, 32000]`.
+- The other cases' checksums are the same before and after, and their times
+  moved by at most 11% (`sum()` of `[4096, 4096]` on the GPU, 1.08 to 1.20 ms;
+  that op did not change).
+
 ## What is still slow
 
 - 100 tiny ops on `[64]` on the GPU still take about 17x as long as on the
@@ -188,8 +242,12 @@ The CPU column is the best of all six runs; the CPU path did not change.
   per dispatch (about 9-13 µs each, serialised within the pass), plus one
   round trip to read the result. Fusing element-wise chains
   into one kernel would be the next step.
-- Several ops read back to the host on their own and force a sync:
-  `cross_entropy` with class-index targets, `cat`, and the backward passes
-  of `index_select` and `Embedding`.
+- `F::nll_loss` with class ids still reads tensor targets back and builds a
+  dense weight tensor on the host, as `cross_entropy` did. `cross_entropy`
+  with soft labels uses `log_softmax`, whose kernel gives each row one
+  thread: slow on wide rows such as a 32000-token vocabulary.
+- The `Embedding` sort uses one dispatch per bitonic step (78 for 4096 ids,
+  136 for 65536); sorting blocks of 512 in workgroup memory would cut that
+  to a handful.
 - `argmax_dim` gives each output row a workgroup of 256 threads, so on a
   short axis (10 classes) most threads idle.

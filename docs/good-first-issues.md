@@ -188,37 +188,20 @@ Done when no public method's doc comment promises something it does not do.
 
 ## 15. Run the reductions in `cross_entropy`, `argmax` and `cat` on the GPU
 
-*medium · `performance`, `kernels`*
-
-*`argmax`/`argmin` done:* the `arg_reduce` kernel keeps `argmax_dim` on the
-GPU, and `argmax()`/`argmin()` read back only the index. Ties go to the lower
-index and NaN counts as the largest value, as on the CPU.
-
-Since GPU ops are [batched](architecture.md#batched-gpu-dispatch), every op
-that copies values to the host in the middle of its work splits the batch.
-The ones that still do (see "What is still slow" in
-[benchmarks/RESULTS.md](../benchmarks/RESULTS.md#ferrotensor-tensor-api-cpu-and-gpu-devices)):
-`cross_entropy` with class-index targets and `cat`. Pick
-one, write the kernel (see [writing-a-kernel.md](writing-a-kernel.md)) and
-keep the CPU reference as the oracle.
-
-Done when the op's GPU path no longer calls `to_vec` or `item`, the GPU parity
-test passes, and `cargo run -p ferrotensor-benchmarks --release --bin
-tensor-api` shows the case you touched no slower (report both numbers and the
-machine).
+*Done.* `argmax_dim` runs the `arg_reduce` kernel, and `argmax()`/`argmin()`
+read back only the index. `cat` copies each input into the output with the
+`copy_block` kernel. `cross_entropy` with class ids runs `cross_entropy_rows`
+(one workgroup per row) and `cross_entropy_grad` with the targets on the
+device. See "Index backward passes, `cat` and `cross_entropy` on the GPU" in
+[benchmarks/RESULTS.md](../benchmarks/RESULTS.md). `F::nll_loss` still builds
+its weights on the host; moving it onto the same kernels is a good follow-up.
 
 ## 16. Index backward passes (`index_select`, `Embedding`) scatter on the host
 
-*medium · `performance`, `kernels`*
-
-The backward pass of `index_select` and of `nn::Embedding` reads the ids and
-the incoming gradient back to the host and scatters there, which forces a
-sync on the GPU. Add a scatter-add kernel (atomics on `u32`-encoded floats or
-a sorted-ids reduction; note WGSL has no float atomics) and use it from both.
-
-Done when the gradient checks in `ferrotensor/src/tensor/tests.rs` and
-`ferrotensor/src/nn/embedding.rs` pass on the CPU and, with
-`FERROTENSOR_RUN_GPU_TESTS=1`, on the GPU, and neither backward calls `to_vec`.
+*Done.* Both backward passes run the `scatter_rows` kernel over ids sorted by
+row (on the host for `index_select`, on the device for `Embedding`), so they
+add in position order and match the CPU bit for bit; see
+[benchmarks/RESULTS.md](../benchmarks/RESULTS.md).
 
 ## 17. Full reductions (`sum()`) use a single GPU thread
 
