@@ -92,6 +92,21 @@ impl Mlp {
     }
 }
 
+/// Forward and backward of an `nn::Embedding` lookup; returns the weight
+/// gradient.
+fn embedding_step(emb: &nn::Embedding, ids: &Tensor) -> Vec<f32> {
+    emb.weight.zero_grad();
+    emb.forward(ids).sum().backward();
+    emb.weight.grad().expect("embedding gradient").to_vec()
+}
+
+/// Backward of `index_select` along `dim`; returns the gradient.
+fn index_select_step(x: &Tensor, dim: isize, indices: &[usize]) -> Vec<f32> {
+    x.zero_grad();
+    x.index_select(dim, indices).sum().backward();
+    x.grad().expect("index_select gradient").to_vec()
+}
+
 fn main() {
     let filter = std::env::args().skip_while(|a| a != "--filter").nth(1);
     let mut devices = vec![Device::cpu()];
@@ -208,6 +223,84 @@ fn main() {
                 }),
                 sum,
             );
+        }
+    }
+
+    let name = "Embedding 32000x256 fwd+bwd, 4096 ids";
+    if wants(name) {
+        for d in &devices {
+            let mut rng = StdRng::seed_from_u64(6);
+            let weight = Tensor::randn_with(&[32_000, 256], &mut rng, d).requires_grad_();
+            let emb = nn::Embedding::from_weights(weight);
+            let ids: Vec<f32> = (0..4096u64)
+                .map(|i| ((i * 7919 + i * i * 31) % 32_000) as f32)
+                .collect();
+            let ids = Tensor::from_vec(ids, &[4096], d);
+            let sum = checksum(&embedding_step(&emb, &ids));
+            row(name, d, time(|| drop(embedding_step(&emb, &ids))), sum);
+        }
+    }
+
+    for dim in [0isize, 1] {
+        let name = format!("index_select({dim}) bwd [2048, 2048], 1024 ids");
+        if !wants(&name) {
+            continue;
+        }
+        for d in &devices {
+            let mut rng = StdRng::seed_from_u64(7);
+            let x = Tensor::randn_with(&[2048, 2048], &mut rng, d).requires_grad_();
+            let indices: Vec<usize> = (0..1024).map(|i| (i * 37 + i * i) % 2048).collect();
+            let sum = checksum(&index_select_step(&x, dim, &indices));
+            row(
+                &name,
+                d,
+                time(|| drop(index_select_step(&x, dim, &indices))),
+                sum,
+            );
+        }
+    }
+
+    for dim in [0isize, 1] {
+        let name = format!("cat 8 x [512, 512] dim {dim} + read back");
+        if !wants(&name) {
+            continue;
+        }
+        for d in &devices {
+            let mut rng = StdRng::seed_from_u64(8);
+            let parts: Vec<Tensor> = (0..8)
+                .map(|_| Tensor::randn_with(&[512, 512], &mut rng, d))
+                .collect();
+            let sum = checksum(&Tensor::cat(&parts, dim).to_vec());
+            row(
+                &name,
+                d,
+                time(|| drop(Tensor::cat(&parts, dim).to_vec())),
+                sum,
+            );
+        }
+    }
+
+    let name = "cross_entropy [4096, 32000] class ids fwd+bwd";
+    if wants(name) {
+        for d in &devices {
+            let mut rng = StdRng::seed_from_u64(9);
+            let logits = Tensor::randn_with(&[4096, 32_000], &mut rng, d).requires_grad_();
+            let targets: Vec<f32> = (0..4096u64)
+                .map(|i| ((i * 104_729) % 32_000) as f32)
+                .collect();
+            let targets = Tensor::from_vec(targets, &[4096], d);
+            let step = || {
+                logits.zero_grad();
+                let loss = F::cross_entropy(&logits, &targets);
+                loss.backward();
+                let grad = logits.grad().expect("logits gradient");
+                // Read back the loss and one value per row, not 500 MB.
+                let mut out = vec![loss.item()];
+                out.extend(grad.narrow(1, 0, 1).to_vec());
+                out
+            };
+            let sum = checksum(&step());
+            row(name, d, time(|| drop(step())), sum);
         }
     }
 }
