@@ -7,10 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-01
+
 ### Added
 - `ferrotensor info` lists every GPU adapter wgpu can open (name, vendor, backend, driver, the limits the kernels depend on) and marks the one Ferrotensor uses. `--check` runs matmul, softmax and RMSNorm on it against an f64 CPU reference and exits non-zero if one is out of tolerance; `--json` prints the same for bug reports.
 - `ferrotensor-backend`: `adapters::list_adapters` and `adapters::self_check`, the library side of `ferrotensor info`.
 - A guide to testing Ferrotensor on other GPUs (`docs/testing-on-your-gpu.md`), and a field for `ferrotensor info --check --json` output in the bug report template.
+
+### Changed
+- `ferrotensor`: the backward passes of `index_select` and `nn::Embedding` scatter-add their gradients on the GPU instead of reading ids and gradients back to the host. The sums run in a fixed order, so the gradients are deterministic and match the CPU bit for bit.
+- `ferrotensor`: `cat` concatenates on the GPU, and `cross_entropy` with class-id targets runs forward and backward on the GPU. On an Apple M2, `cross_entropy` over `[4096, 32000]` went from 749.6 ms to 64.6 ms on the GPU and from 4226.9 ms to 517.2 ms on the CPU, and an MLP training step from 3.69 ms to 2.13 ms on the GPU.
+- `cross_entropy` with class ids computes the loss per row (log-sum-exp minus the target logit), so its last bits can differ from 0.3.0.
+- The README feature matrix and the website list what is measured and what is not: the LoRA row now names SmolLM2-135M, the one model measured.
 
 ## [0.3.0] - 2026-10-26
 
@@ -81,7 +89,8 @@ First public version.
 - Renamed the project from Rusty to Ferrotensor; crates are now `ferrotensor-*` and the CLI binary is `ferrotensor`.
 - Licensed under MIT OR Apache-2.0 (previously MIT only).
 
-[Unreleased]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.1.0...v0.2.0

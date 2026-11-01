@@ -8,12 +8,11 @@ GPUs, and from Vulkan or DX12, are the most useful thing you can contribute.
 ## 1. See which GPU Ferrotensor uses
 
 ```bash
-cargo install --git https://github.com/puranikyashaswin/ferrotensor ferrotensor-cli
+cargo install ferrotensor-cli
 ferrotensor info
 ```
 
-`info` is not in a crates.io release yet, so this installs the CLI from the
-repository's `main` branch.
+`info` is in `ferrotensor-cli` 0.4.0 and later.
 
 This lists every adapter wgpu can open on your machine and marks the one
 Ferrotensor picks with `*`. If your discrete GPU is not the one marked, say so
