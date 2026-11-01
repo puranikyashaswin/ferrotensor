@@ -547,6 +547,49 @@ impl Tensor {
             }
         }
     }
+    /// Concatenate `tensors` along `dim`; the shapes are already checked.
+    pub(crate) fn cat_raw(tensors: &[Tensor], dim: usize) -> Tensor {
+        let first = &tensors[0];
+        let mut out_shape = first.shape.clone();
+        out_shape[dim] = tensors.iter().map(|t| t.shape[dim]).sum();
+        let (outer, total, inner) = split_at_dim(&out_shape, dim);
+        let n = outer * total * inner;
+        let inputs: Option<Vec<_>> = tensors.iter().map(Tensor::gpu).collect();
+        match (first.gpu(), inputs) {
+            (Some((ctx, _)), Some(inputs)) if n > 0 => {
+                let out = alloc(ctx, n);
+                let mut offset = 0;
+                for (t, (_, input)) in tensors.iter().zip(inputs) {
+                    let block = t.shape[dim] * inner;
+                    if block > 0 {
+                        let params = [
+                            (outer * block) as u32,
+                            block as u32,
+                            (total * inner) as u32,
+                            offset as u32,
+                        ];
+                        ctx.dispatch(
+                            "copy_block",
+                            &[Arg::Buffer(input), Arg::Buffer(&out), Arg::Params(params)],
+                            ComputeEngine::workgroups_1d(outer * block),
+                        );
+                    }
+                    offset += block;
+                }
+                first.gpu_output(out, out_shape)
+            }
+            _ => {
+                let datas: Vec<Vec<f32>> = tensors.iter().map(Tensor::to_vec).collect();
+                let parts: Vec<(&[f32], usize)> = tensors
+                    .iter()
+                    .zip(&datas)
+                    .map(|(t, d)| (&d[..], t.shape[dim] * inner))
+                    .collect();
+                first.host_output(cpu::cat(&parts, outer), &out_shape)
+            }
+        }
+    }
+
     /// Scatter-add along `dim`, the inverse of `index_select(dim, indices)`:
     /// entry `p` of this gradient's `dim` is added to entry `indices[p]` of a
     /// result whose `dim` has size `rows`.
