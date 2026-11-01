@@ -250,7 +250,8 @@
         <ul class="facts">
           <li>Causal flash attention forward <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/benchmarks/RESULTS.md#before--after">4.0× faster</a> at sequence 2048</li>
           <li>100 small ops: <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/benchmarks/RESULTS.md#before--after-1">10.6 → 0.82&nbsp;ms</a> with batched dispatch</li>
-          <li>MLP training step: <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/benchmarks/RESULTS.md#before--after-1">3.98&nbsp;ms on the GPU</a>, 12.45&nbsp;ms on the CPU</li>
+          <li>MLP training step: <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/benchmarks/RESULTS.md#index-backward-passes-cat-and-cross_entropy-on-the-gpu">2.13&nbsp;ms on the GPU</a>, 12.26&nbsp;ms on the CPU</li>
+          <li><code>cross_entropy</code> over a 32,000-token vocabulary: <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/benchmarks/RESULTS.md#index-backward-passes-cat-and-cross_entropy-on-the-gpu">749.6 → 64.6&nbsp;ms</a> on the GPU</li>
         </ul>
         <a class="card-src" href="docs/benchmarks.html">Benchmarks and method</a>
       </article>
@@ -526,7 +527,7 @@ x = ft.<span class="f">tensor</span>([[<span class="n">0</span>, <span class="n"
       <li><strong>f32 only.</strong> No <code>f16</code> or <code>bf16</code> tensors in the tensor API yet.</li>
       <li><strong>One GPU.</strong> No multi-GPU or distributed training; the CLI's <code>--world-size</code> flag is a prototype.</li>
       <li><strong>Small models.</strong> LoRA fine-tuning is experimental and aimed at small Llama-style models; the measured run is SmolLM2-135M. Released LFM2 checkpoints are not supported.</li>
-      <li><strong>Tiny workloads are faster on the CPU.</strong> A chain of 100 tiny ops still takes <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/benchmarks/RESULTS.md#what-is-still-slow">about 18× as long on the GPU</a> as on the CPU; op fusion is the next step.</li>
+      <li><strong>Tiny workloads are faster on the CPU.</strong> A chain of 100 tiny ops still takes <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/benchmarks/RESULTS.md#what-is-still-slow">about 17× as long on the GPU</a> as on the CPU; op fusion is the next step.</li>
       <li><strong>Not every op.</strong> No convolutions, sort, top-k or cumsum in the tensor API.</li>
       <li><strong>Far from peak.</strong> Matmul reaches <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/benchmarks/RESULTS.md#context">about 17% of the M2's FP32 peak</a>; WGSL does not expose the matrix instructions that close that gap.</li>
       <li><strong>Pre-1.0.</strong> The API can still change, and Python wheels exist for macOS arm64 and Linux x86_64 only (other platforms build from source).</li>
