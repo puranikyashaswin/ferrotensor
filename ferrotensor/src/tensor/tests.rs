@@ -563,3 +563,70 @@ fn gpu_argmax_index_is_exact_past_f32_integers() {
     assert_eq!(x.argmax(), n - 1);
     assert_eq!(x.argmin(), n - 2);
 }
+
+// ============================================================================
+// GPU SCATTER-ADD
+// ============================================================================
+
+/// The weight gradient of an embedding lookup of `ids` (stored as `f32`)
+/// with a seeded upstream gradient, on `device`.
+fn embedding_grad(ids: &[f32], vocab: usize, dim: usize, device: &Device) -> Vec<f32> {
+    let weight = Tensor::zeros(&[vocab, dim], device).requires_grad_();
+    let x = Tensor::from_data(ids, &[ids.len()], device);
+    let seed: Vec<f32> = (0..ids.len() * dim)
+        .map(|i| ((i * 7919) % 101) as f32 * 0.37 - 17.0)
+        .collect();
+    let seed = Tensor::from_data(&seed, &[ids.len(), dim], device);
+    weight.embedding(&x).mul(&seed).sum().backward();
+    weight.grad().unwrap().to_vec()
+}
+
+/// The gradient of `index_select(dim, indices)` on a `shape` tensor with a
+/// seeded upstream gradient, on `device`.
+fn index_select_grad(shape: &[usize], dim: usize, indices: &[usize], device: &Device) -> Vec<f32> {
+    let x = Tensor::zeros(shape, device).requires_grad_();
+    let y = x.index_select(dim as isize, indices);
+    let seed: Vec<f32> = (0..y.numel())
+        .map(|i| ((i * 104_729) % 97) as f32 * 0.29 - 13.0)
+        .collect();
+    y.mul(&Tensor::from_data(&seed, &y.shape, device))
+        .sum()
+        .backward();
+    x.grad().unwrap().to_vec()
+}
+
+/// The GPU scatter-add adds each row's gradients in position order, as the
+/// CPU does, so the gradients match bit for bit: repeated ids, ids out of
+/// range (negative, too large, NaN), fractional ids and id counts that are
+/// not powers of two.
+#[test]
+fn scatter_backward_matches_cpu_on_gpu() {
+    let Some(gpu) = test_gpu() else { return };
+    let cpu = Device::cpu();
+    for (n, vocab, dim) in [(1, 3, 2), (5, 4, 1), (300, 17, 3), (4097, 1000, 5)] {
+        let mut ids: Vec<f32> = (0..n).map(|i| ((i * i * 31 + 7) % vocab) as f32).collect();
+        if n > 4 {
+            ids[1] = -1.0;
+            ids[2] = vocab as f32;
+            ids[3] = f32::NAN;
+            ids[4] = 2.5;
+        }
+        assert_eq!(
+            embedding_grad(&ids, vocab, dim, &gpu),
+            embedding_grad(&ids, vocab, dim, &cpu),
+            "embedding, {n} ids"
+        );
+    }
+    for (shape, dim, indices) in [
+        (&[5, 3][..], 0, &[4, 0, 4, 2][..]),
+        (&[2, 4, 3], 1, &[1, 1, 3, 1, 0]),
+        (&[3, 2, 6], 2, &[5, 5, 5, 0]),
+        (&[64, 9], 0, &[]),
+    ] {
+        assert_eq!(
+            index_select_grad(shape, dim, indices, &gpu),
+            index_select_grad(shape, dim, indices, &cpu),
+            "index_select({dim}) of {shape:?}"
+        );
+    }
+}

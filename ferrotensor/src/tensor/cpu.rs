@@ -296,6 +296,29 @@ pub(crate) fn gather_rows(table: &[f32], idx: &[u32], row: usize) -> Vec<f32> {
     out
 }
 
+/// Scatter-add along the middle dim: `grad` viewed as `[outer, n, row]`,
+/// the result as `[outer, rows, row]`, whose row `r` is the sum, in position
+/// order, of the gradient rows `p` of every pair `(p, r)`.
+pub(crate) fn scatter_rows(
+    grad: &[f32],
+    pairs: &[(usize, usize)],
+    outer: usize,
+    rows: usize,
+    row: usize,
+) -> Vec<f32> {
+    let n = grad.len() / (outer * row).max(1);
+    let mut out = vec![0.0f32; outer * rows * row];
+    for o in 0..outer {
+        for &(p, r) in pairs {
+            let src = &grad[(o * n + p) * row..][..row];
+            for (v, &g) in out[(o * rows + r) * row..][..row].iter_mut().zip(src) {
+                *v += g;
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

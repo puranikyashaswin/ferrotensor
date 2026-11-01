@@ -748,10 +748,10 @@ impl Tensor {
                 .gather_rows_raw(indices)
                 .permute_raw(&perm)
         };
-        let shape = self.shape.clone();
+        let rows = self.shape[d];
         let indices = indices.to_vec();
         out.with_node("index_select", vec![self.clone()], move |g| {
-            vec![Some(index_add(g, d, &indices, &shape))]
+            vec![Some(g.scatter_rows_raw(d, &indices, rows))]
         })
     }
 
@@ -759,25 +759,14 @@ impl Tensor {
     /// stored as `f32` in `ids`, with shape `ids.shape + self.shape[1..]`.
     ///
     /// Ids outside `[0, vocab)` give rows of zeros and no gradient. On a GPU
-    /// the forward pass reads the ids on the device; the backward pass reads
-    /// them back to scatter the gradient, like [`Tensor::index_select`].
+    /// both passes read the ids on the device: the backward pass sorts them
+    /// there and scatter-adds the gradient rows, with no copy to the host.
     pub(crate) fn embedding(&self, ids: &Tensor) -> Tensor {
         let out = self.gather_rows_by_ids_raw(ids);
         let ids = ids.detach();
-        let shape = self.shape.clone();
+        let vocab = self.shape[0];
         out.with_node("embedding", vec![self.clone()], move |g| {
-            let row: usize = shape[1..].iter().product();
-            let grad = g.to_vec();
-            let mut out = vec![0.0f32; shape.iter().product()];
-            for (r, id) in super::raw::valid_ids(&ids.to_vec(), shape[0]) {
-                for (o, &v) in out[id * row..][..row]
-                    .iter_mut()
-                    .zip(&grad[r * row..][..row])
-                {
-                    *o += v;
-                }
-            }
-            vec![Some(g.host_output(out, &shape))]
+            vec![Some(g.scatter_rows_by_ids_raw(&ids, vocab))]
         })
     }
 
@@ -824,25 +813,6 @@ impl Tensor {
             vec![Some(g.sub(&y.exp().mul(&total)))]
         })
     }
-}
-
-/// Gradient of `index_select`: scatter-add `grad` back into a zero tensor of
-/// `shape` along `dim`.
-fn index_add(grad: &Tensor, dim: usize, indices: &[usize], shape: &[usize]) -> Tensor {
-    let (outer, size, inner) = super::shape::split_at_dim(shape, dim);
-    let g = grad.to_vec();
-    let mut out = vec![0.0f32; shape.iter().product()];
-    let n_idx = indices.len();
-    for o in 0..outer {
-        for (j, &idx) in indices.iter().enumerate() {
-            let src = (o * n_idx + j) * inner;
-            let dst = (o * size + idx) * inner;
-            for k in 0..inner {
-                out[dst + k] += g[src + k];
-            }
-        }
-    }
-    grad.host_output(out, shape)
 }
 
 // ============================================================================

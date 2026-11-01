@@ -9,7 +9,7 @@ use wgpu::{BindGroup, BindGroupLayout, BindingResource, CommandEncoder, ComputeP
 use super::KERNELS_WGSL;
 
 /// Entry points compiled from [`KERNELS_WGSL`].
-pub(crate) const KERNEL_NAMES: [&str; 9] = [
+pub(crate) const KERNEL_NAMES: [&str; 11] = [
     "unary",
     "binary",
     "reduce",
@@ -19,6 +19,8 @@ pub(crate) const KERNEL_NAMES: [&str; 9] = [
     "matmul",
     "permute",
     "gather_rows",
+    "sort_ids",
+    "scatter_rows",
 ];
 
 /// Threads per workgroup of the 1-D kernels.
