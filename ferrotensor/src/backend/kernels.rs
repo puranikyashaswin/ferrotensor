@@ -547,4 +547,115 @@ fn gather_rows(@builtin(global_invocation_id) gid: vec3<u32>,
     }
     gat_out[i] = gat_table[id * gat_p.row + c];
 }
+
+// --- Row scatter-add (index_select and embedding backward) -------------------
+// WGSL has no float atomics, so the gradient rows are not added with atomics.
+// Instead the (row, position) pairs of the ids are sorted by row, then by
+// position; head[row] is the index of the row's first pair, or SORT_NONE when
+// no id picks it. One thread per output element adds its row's gradients in
+// position order, as the CPU loop does, so the result is deterministic and
+// matches the CPU bit for bit.
+
+const SORT_NONE: u32 = 0xffffffffu;
+
+// sort_ids builds the pairs and the head table on the GPU from f32 ids.
+// op 0: pair i = (row of id i, i) for i < n, padded with (SORT_NONE, i) up to
+//       a = the power-of-two pair count; b = rows. An id outside [0, rows)
+//       gets row SORT_NONE: it sorts last and adds nothing.
+// op 1: one compare-and-swap step of a bitonic sort of n pairs (a = k, b = j).
+// op 2: head[r] = SORT_NONE for r < n.
+// op 3: head[row] = i for each pair i < n that is the first of its row.
+
+struct SortParams {
+    op: u32,
+    n: u32,
+    a: u32,
+    b: u32,
+};
+
+@group(0) @binding(0) var<storage, read> srt_ids: array<f32>;
+@group(0) @binding(1) var<storage, read_write> srt_keys: array<u32>;
+@group(0) @binding(2) var<storage, read_write> srt_head: array<u32>;
+@group(0) @binding(3) var<uniform> srt_p: SortParams;
+
+@compute @workgroup_size(256)
+fn sort_ids(@builtin(global_invocation_id) gid: vec3<u32>,
+            @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = flat_index(gid, nwg);
+    switch srt_p.op {
+        case 0u: {
+            if (i >= srt_p.a) { return; }
+            var row = SORT_NONE;
+            if (i < srt_p.n) {
+                let f = srt_ids[i];
+                if (f >= 0.0 && f < f32(srt_p.b)) { row = u32(f); }
+            }
+            srt_keys[2u * i] = row;
+            srt_keys[2u * i + 1u] = i;
+        }
+        case 1u: {
+            let l = i ^ srt_p.b;
+            if (i >= srt_p.n || l <= i) { return; }
+            let ri = srt_keys[2u * i];
+            let pi = srt_keys[2u * i + 1u];
+            let rl = srt_keys[2u * l];
+            let pl = srt_keys[2u * l + 1u];
+            let greater = ri > rl || (ri == rl && pi > pl);
+            if (greater == ((i & srt_p.a) == 0u)) {
+                srt_keys[2u * i] = rl;
+                srt_keys[2u * i + 1u] = pl;
+                srt_keys[2u * l] = ri;
+                srt_keys[2u * l + 1u] = pi;
+            }
+        }
+        case 2u: {
+            if (i >= srt_p.n) { return; }
+            srt_head[i] = SORT_NONE;
+        }
+        default: {
+            if (i >= srt_p.n) { return; }
+            let row = srt_keys[2u * i];
+            if (row == SORT_NONE) { return; }
+            if (i == 0u || srt_keys[2u * i - 2u] != row) {
+                srt_head[row] = i;
+            }
+        }
+    }
+}
+
+// The gradient is viewed as [outer, n, row] and the output as
+// [outer, rows, row].
+struct ScatterParams {
+    rows: u32,
+    row: u32,
+    n: u32,
+    outer: u32,
+};
+
+@group(0) @binding(0) var<storage, read> sct_grad: array<f32>;
+@group(0) @binding(1) var<storage, read> sct_keys: array<u32>;
+@group(0) @binding(2) var<storage, read> sct_head: array<u32>;
+@group(0) @binding(3) var<storage, read_write> sct_out: array<f32>;
+@group(0) @binding(4) var<uniform> sct_p: ScatterParams;
+
+@compute @workgroup_size(256)
+fn scatter_rows(@builtin(global_invocation_id) gid: vec3<u32>,
+                @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = flat_index(gid, nwg);
+    if (i >= sct_p.outer * sct_p.rows * sct_p.row) { return; }
+    let o = i / (sct_p.rows * sct_p.row);
+    let r = (i / sct_p.row) % sct_p.rows;
+    let c = i % sct_p.row;
+    let base = o * sct_p.n * sct_p.row + c;
+    var acc = 0.0;
+    var t = sct_head[r];
+    if (t != SORT_NONE) {
+        loop {
+            if (t >= sct_p.n || sct_keys[2u * t] != r) { break; }
+            acc = acc + sct_grad[base + sct_keys[2u * t + 1u] * sct_p.row];
+            t = t + 1u;
+        }
+    }
+    sct_out[i] = acc;
+}
 "#;

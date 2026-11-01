@@ -104,6 +104,70 @@ fn arg_reduce(
     out
 }
 
+/// The `scatter_rows` kernel: with `grad` viewed as `[outer, n, row]`, an
+/// `[outer, rows, row]` buffer whose row `r` adds, in position order, the
+/// gradient rows at the positions of the sorted `(row, position)` pairs in
+/// `keys`; `head[r]` is the index of row `r`'s first pair.
+fn scatter_rows(
+    ctx: &GpuContext,
+    grad: &Buffer,
+    keys: &Buffer,
+    head: &Buffer,
+    [outer, rows, row]: [usize; 3],
+    n: usize,
+) -> GpuBuffer {
+    let len = outer * rows * row;
+    let out = alloc(ctx, len);
+    ctx.dispatch(
+        "scatter_rows",
+        &[
+            Arg::Buffer(grad),
+            Arg::Buffer(keys),
+            Arg::Buffer(head),
+            Arg::Buffer(&out),
+            Arg::Params([rows as u32, row as u32, n as u32, outer as u32]),
+        ],
+        ComputeEngine::workgroups_1d(len),
+    );
+    out
+}
+
+/// Sort the `n` ids stored as `f32` in `ids` on the GPU: the
+/// `(row, position)` pairs sorted by row, then position (ids outside
+/// `[0, rows)` last), and the index of each row's first pair. A bitonic
+/// sort, one dispatch per compare-and-swap step.
+fn sort_ids(ctx: &GpuContext, ids: &Buffer, n: usize, rows: usize) -> (GpuBuffer, GpuBuffer) {
+    let count = n.next_power_of_two();
+    let keys = alloc(ctx, 2 * count);
+    let head = alloc(ctx, rows);
+    // `threads` covers the pairs (ops 0, 1, 3) or the rows (op 2).
+    let run = |op: u32, n: usize, a: usize, b: usize, threads: usize| {
+        ctx.dispatch(
+            "sort_ids",
+            &[
+                Arg::Buffer(ids),
+                Arg::Buffer(&keys),
+                Arg::Buffer(&head),
+                Arg::Params([op, n as u32, a as u32, b as u32]),
+            ],
+            ComputeEngine::workgroups_1d(threads),
+        );
+    };
+    run(0, n, count, rows, count);
+    let mut k = 2;
+    while k <= count {
+        let mut j = k / 2;
+        while j > 0 {
+            run(1, count, k, j, count);
+            j /= 2;
+        }
+        k *= 2;
+    }
+    run(2, rows, 0, 0, rows);
+    run(3, count, 0, 0, count);
+    (keys, head)
+}
+
 impl Tensor {
     /// The GPU context and buffer, when this tensor lives on a GPU.
     fn gpu(&self) -> Option<(&GpuContext, &Buffer)> {
@@ -480,6 +544,69 @@ impl Tensor {
                     out[r * row..][..row].copy_from_slice(&table[id * row..][..row]);
                 }
                 self.host_output(out, &out_shape)
+            }
+        }
+    }
+    /// Scatter-add along `dim`, the inverse of `index_select(dim, indices)`:
+    /// entry `p` of this gradient's `dim` is added to entry `indices[p]` of a
+    /// result whose `dim` has size `rows`.
+    pub(crate) fn scatter_rows_raw(&self, dim: usize, indices: &[usize], rows: usize) -> Tensor {
+        let (outer, _, row) = split_at_dim(&self.shape, dim);
+        let mut out_shape = self.shape.clone();
+        out_shape[dim] = rows;
+        for &r in indices {
+            assert!(
+                r < rows,
+                "index {r} out of range for dimension of size {rows}"
+            );
+        }
+        let pairs: Vec<(usize, usize)> = indices.iter().copied().enumerate().collect();
+        let len = outer * rows * row;
+        match self.gpu() {
+            Some((ctx, grad)) if len > 0 => {
+                // The sorted (row, position) pairs and head table, built here.
+                let mut order = pairs;
+                order.sort_by_key(|&(_, r)| r);
+                let mut keys = Vec::with_capacity(2 * order.len());
+                let mut head = vec![u32::MAX; rows];
+                for (t, &(p, r)) in order.iter().enumerate() {
+                    if head[r] == u32::MAX {
+                        head[r] = t as u32;
+                    }
+                    keys.extend(as_u32(&[r, p]));
+                }
+                let keys = u32_buffer(ctx, &keys);
+                let head = u32_buffer(ctx, &head);
+                let out = scatter_rows(ctx, grad, &keys, &head, [outer, rows, row], indices.len());
+                self.gpu_output(out, out_shape)
+            }
+            _ => {
+                let data = cpu::scatter_rows(&self.to_vec(), &pairs, outer, rows, row);
+                self.host_output(data, &out_shape)
+            }
+        }
+    }
+
+    /// Scatter-add the rows of this `[ids.shape.., ..]` gradient into a
+    /// `[rows, ..]` result by the ids stored as `f32` in `ids`; ids outside
+    /// `[0, rows)` add nothing.
+    ///
+    /// On a GPU the ids are sorted on the device, with no copy to the host.
+    pub(crate) fn scatter_rows_by_ids_raw(&self, ids: &Tensor, rows: usize) -> Tensor {
+        let n = ids.numel();
+        let row: usize = self.shape[ids.ndim()..].iter().product();
+        let out_shape = [&[rows][..], &self.shape[ids.ndim()..]].concat();
+        let ids = ids.to_device(&self.device);
+        match (self.gpu(), ids.gpu()) {
+            (Some((ctx, grad)), Some((_, idx))) if rows * row > 0 => {
+                let (keys, head) = sort_ids(ctx, idx, n, rows);
+                let out = scatter_rows(ctx, grad, &keys, &head, [1, rows, row], n);
+                self.gpu_output(out, out_shape)
+            }
+            _ => {
+                let pairs: Vec<_> = valid_ids(&ids.to_vec(), rows).collect();
+                let data = cpu::scatter_rows(&self.to_vec(), &pairs, 1, rows, row);
+                self.host_output(data, &out_shape)
             }
         }
     }
