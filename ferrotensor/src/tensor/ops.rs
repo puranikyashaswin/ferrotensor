@@ -701,19 +701,7 @@ impl Tensor {
                 );
             }
         }
-        let mut out_shape = first.shape.clone();
-        out_shape[d] = tensors.iter().map(|t| t.shape[d]).sum();
-        let outer: usize = first.shape[..d].iter().product();
-        let inner: usize = first.shape[d + 1..].iter().product();
-        let datas: Vec<Vec<f32>> = tensors.iter().map(Tensor::to_vec).collect();
-        let mut data = Vec::with_capacity(out_shape.iter().product());
-        for o in 0..outer {
-            for (t, values) in tensors.iter().zip(&datas) {
-                let block = t.shape[d] * inner;
-                data.extend_from_slice(&values[o * block..(o + 1) * block]);
-            }
-        }
-        let out = first.host_output(data, &out_shape);
+        let out = Tensor::cat_raw(tensors, d);
         let sizes: Vec<usize> = tensors.iter().map(|t| t.shape[d]).collect();
         out.with_node("cat", tensors.to_vec(), move |g| {
             let mut start = 0;

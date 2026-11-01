@@ -658,4 +658,28 @@ fn scatter_rows(@builtin(global_invocation_id) gid: vec3<u32>,
     }
     sct_out[i] = acc;
 }
+
+// --- Block copy (cat) --------------------------------------------------------
+// Copies an input viewed as [outer, block_in] into columns
+// [offset, offset + block_in) of an output viewed as [outer, block_out].
+
+struct CopyParams {
+    n: u32,
+    block_in: u32,
+    block_out: u32,
+    offset: u32,
+};
+
+@group(0) @binding(0) var<storage, read> cpy_in: array<f32>;
+@group(0) @binding(1) var<storage, read_write> cpy_out: array<f32>;
+@group(0) @binding(2) var<uniform> cpy_p: CopyParams;
+
+@compute @workgroup_size(256)
+fn copy_block(@builtin(global_invocation_id) gid: vec3<u32>,
+              @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = flat_index(gid, nwg);
+    if (i >= cpy_p.n) { return; }
+    let o = i / cpy_p.block_in;
+    cpy_out[o * cpy_p.block_out + cpy_p.offset + i % cpy_p.block_in] = cpy_in[i];
+}
 "#;

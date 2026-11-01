@@ -630,3 +630,36 @@ fn scatter_backward_matches_cpu_on_gpu() {
         );
     }
 }
+
+/// `cat` copies on the GPU and gives the CPU's values exactly, along every
+/// dim and with an empty part.
+#[test]
+fn cat_matches_cpu_on_gpu() {
+    let Some(gpu) = test_gpu() else { return };
+    let cpu = Device::cpu();
+    let mut rng = StdRng::seed_from_u64(12);
+    for dim in 0..3 {
+        let shapes: Vec<Vec<usize>> = [3, 0, 1, 4]
+            .iter()
+            .map(|&k| {
+                let mut s = vec![2, 5, 3];
+                s[dim] = k;
+                s
+            })
+            .collect();
+        let datas: Vec<Vec<f32>> = shapes
+            .iter()
+            .map(|s| (0..s.iter().product()).map(|_| rng.gen()).collect())
+            .collect();
+        let on = |d: &Device| {
+            let parts: Vec<Tensor> = shapes
+                .iter()
+                .zip(&datas)
+                .map(|(s, v)| Tensor::from_data(v, s, d))
+                .collect();
+            let out = Tensor::cat(&parts, dim as isize);
+            (out.shape.clone(), out.to_vec())
+        };
+        assert_eq!(on(&gpu), on(&cpu), "cat along {dim}");
+    }
+}

@@ -296,6 +296,18 @@ pub(crate) fn gather_rows(table: &[f32], idx: &[u32], row: usize) -> Vec<f32> {
     out
 }
 
+/// Concatenate `parts` (values, block length), each viewed as
+/// `[outer, block]`, along the block dim.
+pub(crate) fn cat(parts: &[(&[f32], usize)], outer: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(parts.iter().map(|(d, _)| d.len()).sum());
+    for o in 0..outer {
+        for &(values, block) in parts {
+            out.extend_from_slice(&values[o * block..(o + 1) * block]);
+        }
+    }
+    out
+}
+
 /// Scatter-add along the middle dim: `grad` viewed as `[outer, n, row]`,
 /// the result as `[outer, rows, row]`, whose row `r` is the sum, in position
 /// order, of the gradient rows `p` of every pair `(p, r)`.
