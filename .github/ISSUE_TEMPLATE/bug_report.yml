@@ -34,7 +34,7 @@ body:
     id: info
     attributes:
       label: Output of `ferrotensor info --check --json`
-      description: Lists the GPUs wgpu sees, the one Ferrotensor uses, and whether its kernels pass on it. Leave empty if your version has no `info` command (see docs/testing-on-your-gpu.md).
+      description: Lists the GPUs wgpu sees, the one Ferrotensor uses, and whether its kernels pass on it. Needs ferrotensor-cli 0.4.0 or later; leave empty if your version has no `info` command.
       render: json
   - type: textarea
     id: logs
