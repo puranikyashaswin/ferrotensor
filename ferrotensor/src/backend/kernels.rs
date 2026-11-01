@@ -682,4 +682,106 @@ fn copy_block(@builtin(global_invocation_id) gid: vec3<u32>,
     let o = i / cpy_p.block_in;
     cpy_out[o * cpy_p.block_out + cpy_p.offset + i % cpy_p.block_in] = cpy_in[i];
 }
+
+// --- Cross-entropy with class-id targets ---------------------------------------
+// Logits are viewed as [rows, classes]; targets hold one f32 class id per row.
+// A target <= -1 (an id that is negative as an integer, such as -100) skips
+// its row: loss 0, valid 0, gradient 0. Otherwise the id is truncated to an
+// integer; one that is not below `classes` (or NaN) gives a NaN loss.
+// cross_entropy_rows: one workgroup per row writes the row's loss
+// (lse - logit[target]), its log-sum-exp and whether it counts.
+// cross_entropy_grad: d loss[r] / d logit[r, c] = softmax[r, c] - [c == target],
+// times the incoming gradient of the row's loss.
+
+struct CeParams {
+    rows: u32,
+    classes: u32,
+    _pad0: u32,
+    _pad1: u32,
+};
+
+@group(0) @binding(0) var<storage, read> ce_logits: array<f32>;
+@group(0) @binding(1) var<storage, read> ce_targets: array<f32>;
+@group(0) @binding(2) var<storage, read_write> ce_loss: array<f32>;
+@group(0) @binding(3) var<storage, read_write> ce_lse: array<f32>;
+@group(0) @binding(4) var<storage, read_write> ce_valid: array<f32>;
+@group(0) @binding(5) var<uniform> ce_p: CeParams;
+
+var<workgroup> ce_part: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn cross_entropy_rows(@builtin(local_invocation_index) lid: u32,
+                      @builtin(workgroup_id) wid: vec3<u32>,
+                      @builtin(num_workgroups) nwg: vec3<u32>) {
+    let r = wid.x + wid.y * nwg.x;
+    // Uniform per workgroup, so every thread reaches the barriers or none.
+    if (r >= ce_p.rows) { return; }
+    let c = ce_p.classes;
+    let base = r * c;
+    var m = bitcast<f32>(0xff800000u);
+    for (var j = lid; j < c; j = j + 256u) {
+        m = max(m, ce_logits[base + j]);
+    }
+    ce_part[lid] = m;
+    workgroupBarrier();
+    for (var half = 128u; half > 0u; half = half >> 1u) {
+        if (lid < half) {
+            ce_part[lid] = max(ce_part[lid], ce_part[lid + half]);
+        }
+        workgroupBarrier();
+    }
+    m = ce_part[0];
+    workgroupBarrier();
+    var s = 0.0;
+    for (var j = lid; j < c; j = j + 256u) {
+        s = s + exp(ce_logits[base + j] - m);
+    }
+    ce_part[lid] = s;
+    workgroupBarrier();
+    for (var half = 128u; half > 0u; half = half >> 1u) {
+        if (lid < half) {
+            ce_part[lid] = ce_part[lid] + ce_part[lid + half];
+        }
+        workgroupBarrier();
+    }
+    if (lid == 0u) {
+        let lse = m + log(ce_part[0]);
+        let f = ce_targets[r];
+        ce_lse[r] = lse;
+        if (f <= -1.0) {
+            ce_loss[r] = 0.0;
+            ce_valid[r] = 0.0;
+        } else {
+            ce_valid[r] = 1.0;
+            if (f < f32(c)) {
+                ce_loss[r] = lse - ce_logits[base + u32(max(f, 0.0))];
+            } else {
+                ce_loss[r] = bitcast<f32>(0x7fc00000u);
+            }
+        }
+    }
+}
+
+@group(0) @binding(0) var<storage, read> ceg_logits: array<f32>;
+@group(0) @binding(1) var<storage, read> ceg_targets: array<f32>;
+@group(0) @binding(2) var<storage, read> ceg_lse: array<f32>;
+@group(0) @binding(3) var<storage, read> ceg_grad: array<f32>;
+@group(0) @binding(4) var<storage, read_write> ceg_out: array<f32>;
+@group(0) @binding(5) var<uniform> ceg_p: CeParams;
+
+@compute @workgroup_size(256)
+fn cross_entropy_grad(@builtin(global_invocation_id) gid: vec3<u32>,
+                      @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = flat_index(gid, nwg);
+    if (i >= ceg_p.rows * ceg_p.classes) { return; }
+    let r = i / ceg_p.classes;
+    let f = ceg_targets[r];
+    if (f <= -1.0) {
+        ceg_out[i] = 0.0;
+        return;
+    }
+    let p = exp(ceg_logits[i] - ceg_lse[r]);
+    let hit = f < f32(ceg_p.classes) && i % ceg_p.classes == u32(max(f, 0.0));
+    ceg_out[i] = (p - select(0.0, 1.0, hit)) * ceg_grad[r];
+}
 "#;
