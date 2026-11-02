@@ -74,9 +74,10 @@ fn uniform(ctx: &WgpuContext, bytes: &[u8]) -> Buffer {
 
 /// Compiled WGSL kernels and the methods that dispatch them.
 ///
-/// Every method records and submits its own command buffer and returns
-/// without waiting; reading a result (e.g. with
-/// [`UnifiedTensor::to_vec`](crate::UnifiedTensor::to_vec)) waits for the GPU.
+/// Every method records its work into the context's pending command encoder
+/// (see [`WgpuContext`]) and returns without waiting; reading a result (e.g.
+/// with [`UnifiedTensor::to_vec`](crate::UnifiedTensor::to_vec)) submits it
+/// and waits for the GPU.
 /// Tensors are dense, row-major `f32` unless stated otherwise.
 pub struct ComputeEngine {
     matmul: Kernel,
@@ -175,8 +176,8 @@ impl ComputeEngine {
         }
     }
 
-    /// Binds `entries` (binding index, buffer) to `kernel` and dispatches
-    /// `groups` workgroups in its own command buffer.
+    /// Binds `entries` (binding index, buffer) to `kernel` and records a
+    /// dispatch of `groups` workgroups into `ctx`'s pending work.
     fn run(
         &self,
         ctx: &WgpuContext,
@@ -196,16 +197,12 @@ impl ComputeEngine {
             layout: &kernel.layout,
             entries: &entries,
         });
-        let mut encoder = ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        {
+        ctx.record(|encoder| {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
             pass.set_pipeline(&kernel.pipeline);
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(groups.0, groups.1, groups.2);
-        }
-        ctx.queue.submit(Some(encoder.finish()));
+        });
     }
 
     /// Copies all of `src` into `dst`, starting at byte offset `dst_offset`.
@@ -216,17 +213,15 @@ impl ComputeEngine {
         dst: &UnifiedTensor,
         dst_offset: usize,
     ) {
-        let mut encoder = ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        encoder.copy_buffer_to_buffer(
-            src.buffer(),
-            0,
-            dst.buffer(),
-            dst_offset as u64,
-            src.size_in_bytes(),
-        );
-        ctx.queue.submit(Some(encoder.finish()));
+        ctx.record(|encoder| {
+            encoder.copy_buffer_to_buffer(
+                src.buffer(),
+                0,
+                dst.buffer(),
+                dst_offset as u64,
+                src.size_in_bytes(),
+            );
+        });
     }
 }
 

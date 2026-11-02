@@ -1476,3 +1476,35 @@ fn self_check_passes_and_an_adapter_is_selected() {
         "{adapters:#?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Batched submission
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn write_data_runs_after_recorded_reads() {
+    let g = gpu();
+    let a = upload(&[1.0, 2.0, 3.0], &[3]);
+    let b = zeros(&[3]);
+    // The copy is only recorded; the write must not overtake it.
+    g.engine.copy_tensor(&g.ctx, &a, &b, 0);
+    a.write_data(&g.ctx, bytemuck::cast_slice(&[9.0f32, 9.0, 9.0]));
+    assert_eq!(read(&b), vec![1.0, 2.0, 3.0]);
+    assert_eq!(read(&a), vec![9.0, 9.0, 9.0]);
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn long_op_chains_keep_their_order() {
+    // More ops than one submission holds, each depending on the last.
+    let g = gpu();
+    let one = upload(&[1.0; 64], &[64]);
+    let mut x = zeros(&[64]);
+    for _ in 0..1000 {
+        let y = UnifiedTensor::empty(&g.ctx, &[64]);
+        g.engine.add(&g.ctx, &x, &one, &y);
+        x = y;
+    }
+    assert_eq!(read(&x), vec![1000.0; 64]);
+}

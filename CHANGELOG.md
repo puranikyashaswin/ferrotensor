@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - `ferrotensor-autograd`: the backward passes of RMSNorm and RoPE run on the GPU (`ComputeEngine::rms_norm_backward`, `ComputeEngine::rope_theta_inverse`) instead of reading the input, weight and gradient back to the host. LoRA training made about 2,000 blocking GPU-to-host reads per step through these two ops.
 - `ferrotensor-trainer`: `masked_cross_entropy` computes the loss and its gradient on the GPU (`ComputeEngine::masked_cross_entropy`) and reads back only one loss per position. Before, it read the whole `[seq, vocab]` logits to the host and uploaded a gradient of the same size, about 50 MB each way per SmolLM2 sequence. It now takes the `&ComputeEngine` as a fourth argument.
+- `ferrotensor-backend`: `ComputeEngine` records kernel dispatches and copies into one pending command encoder on the `WgpuContext` and submits them together (every 128 ops, and when a tensor is read or written) instead of one queue submission per op. `WgpuContext::flush` submits the pending work; call it before submitting your own commands on `queue` or waiting on `device`.
 - `ferrotensor-trainer`: the global gradient norm sums squares on the GPU (`ComputeEngine::sum_squares_partial`) and reads back once per optimizer step instead of once per gradient tensor.
 
 ### Fixed
