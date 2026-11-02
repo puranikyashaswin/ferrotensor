@@ -51,7 +51,20 @@ cargo run -p ferrotensor-benchmarks --release --bin tensor-api
 The first command runs every kernel against its CPU reference on your GPU.
 The second prints CPU and GPU timings for the Tensor API.
 
-## 4. Report what you found
+## 4. Or measure everything in one go
+
+From a checkout of the repository:
+
+```bash
+scripts/hardware-report.sh           # add --quick for a short run
+```
+
+This builds in release mode, runs `ferrotensor info --check`, the kernel
+benchmarks and the Tensor API benchmarks, and writes one JSON report (plus the
+raw tables) to `reports/`. Attach the JSON to your issue: it is the same
+measurement every other number in this repository comes from.
+
+## 5. Report what you found
 
 Open an issue with the output of:
 

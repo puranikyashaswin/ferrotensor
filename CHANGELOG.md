@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - The `WGPU_BACKEND` environment variable (`vulkan`, `metal`, `dx12`, `gl` or a comma list) restricts which backends `Device::new`/`gpu`/`best`, `WgpuContext::new` and `ferrotensor info` try.
 - CI runs the GPU test suites on Mesa lavapipe (Vulkan on the CPU) for every PR, so the Vulkan path is checked without a GPU.
+- `scripts/hardware-report.sh` runs `ferrotensor info --check`, the kernel benchmarks and the Tensor API benchmarks and writes one JSON report, so every machine is measured the same way. CI runs it in quick mode on software Vulkan.
 
 ## [0.4.0] - 2026-11-01
 
