@@ -1,6 +1,6 @@
 //! Normalisation and softmax kernels.
 
-use super::{grid, uniform, ComputeEngine};
+use super::{grid, groups64, uniform, ComputeEngine};
 use crate::{UnifiedTensor, WgpuContext};
 
 impl ComputeEngine {
@@ -41,6 +41,60 @@ impl ComputeEngine {
                 (3, &params),
             ],
             grid(rows as u32),
+        );
+    }
+
+    /// Gradients of [`rms_norm_eps`](Self::rms_norm_eps) with respect to
+    /// `input` and `weight`, given the output gradient `grad_out`.
+    ///
+    /// `grad_input` has `input`'s shape; `grad_weight` has `weight`'s and is
+    /// summed over all rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rms_norm_backward(
+        &self,
+        ctx: &WgpuContext,
+        input: &UnifiedTensor,
+        weight: &UnifiedTensor,
+        grad_out: &UnifiedTensor,
+        grad_input: &UnifiedTensor,
+        grad_weight: &UnifiedTensor,
+        eps: f32,
+    ) {
+        let size = *input.shape.last().unwrap_or(&1);
+        let rows = input.shape.iter().product::<usize>() / size.max(1);
+        if rows == 0 || size == 0 {
+            return;
+        }
+        let inv_rms = UnifiedTensor::empty(ctx, &[rows]);
+        let params = uniform(
+            ctx,
+            bytemuck::cast_slice(&[size as u32, rows as u32, eps.to_bits(), 0]),
+        );
+        self.run(
+            ctx,
+            &self.rms_norm_bw,
+            &[
+                (0, input.buffer()),
+                (1, grad_out.buffer()),
+                (2, weight.buffer()),
+                (3, grad_input.buffer()),
+                (4, inv_rms.buffer()),
+                (5, &params),
+            ],
+            grid(rows as u32),
+        );
+        let params = uniform(ctx, bytemuck::cast_slice(&[size as u32, rows as u32, 0, 0]));
+        self.run(
+            ctx,
+            &self.rms_norm_bw_weight,
+            &[
+                (0, input.buffer()),
+                (1, grad_out.buffer()),
+                (2, inv_rms.buffer()),
+                (3, grad_weight.buffer()),
+                (4, &params),
+            ],
+            groups64(size),
         );
     }
 

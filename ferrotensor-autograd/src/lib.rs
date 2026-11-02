@@ -439,21 +439,14 @@ impl AutogradNode for RoPENode {
         vec![self.input.clone()]
     }
     /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
-    fn backward(&self, grad: &UnifiedTensor, _engine: &ComputeEngine) -> Vec<UnifiedTensor> {
-        let mut grad_cpu = pollster::block_on(grad.to_vec(&self.input.ctx));
-        apply_rope_theta_in_place(
-            &mut grad_cpu,
-            &self.input.data.shape,
-            self.head_dim,
-            self.pos,
-            self.theta,
-            true,
-        );
-        vec![UnifiedTensor::new(
-            &self.input.ctx,
-            &grad_cpu,
-            &self.input.data.shape,
-        )]
+    fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
+        // The gradient of a rotation is the inverse rotation; rotate a copy
+        // so the upstream gradient is left untouched.
+        let ctx = &self.input.ctx;
+        let grad_in = UnifiedTensor::empty(ctx, &self.input.data.shape);
+        engine.copy_tensor(ctx, grad, &grad_in, 0);
+        engine.rope_theta_inverse(ctx, &grad_in, self.head_dim, self.pos, self.theta);
+        vec![grad_in]
     }
 }
 
@@ -502,20 +495,20 @@ impl AutogradNode for RMSNormNode {
         vec![self.input.clone(), self.weight.clone()]
     }
     /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
-    fn backward(&self, grad: &UnifiedTensor, _engine: &ComputeEngine) -> Vec<UnifiedTensor> {
-        let input_shape = self.input.data.shape.clone();
-        let hidden = *input_shape.last().expect("RMSNorm input must be non-empty");
-
-        let x = pollster::block_on(self.input.data.to_vec(&self.input.ctx));
-        let g = pollster::block_on(grad.to_vec(&self.input.ctx));
-        let w = pollster::block_on(self.weight.data.to_vec(&self.weight.ctx));
-
-        let (grad_x, grad_w) = rms_norm_backward_cpu(&x, &g, &w, self.eps, hidden);
-
-        vec![
-            UnifiedTensor::new(&self.input.ctx, &grad_x, &input_shape),
-            UnifiedTensor::new(&self.weight.ctx, &grad_w, &self.weight.data.shape),
-        ]
+    fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
+        let ctx = &self.input.ctx;
+        let grad_x = UnifiedTensor::empty(ctx, &self.input.data.shape);
+        let grad_w = UnifiedTensor::empty(ctx, &self.weight.data.shape);
+        engine.rms_norm_backward(
+            ctx,
+            &self.input.data,
+            &self.weight.data,
+            grad,
+            &grad_x,
+            &grad_w,
+            self.eps,
+        );
+        vec![grad_x, grad_w]
     }
 }
 

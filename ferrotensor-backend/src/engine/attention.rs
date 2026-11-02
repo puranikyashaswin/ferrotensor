@@ -23,6 +23,33 @@ impl ComputeEngine {
         pos: usize,
         theta: f32,
     ) {
+        self.rotate(ctx, tensor, head_dim, pos, theta, false);
+    }
+
+    /// The inverse of [`rope_theta`](Self::rope_theta), in place: rotates by
+    /// the negated angles. RoPE is a rotation, so this is also its backward
+    /// pass (the gradient of a rotation is the transposed rotation).
+    pub fn rope_theta_inverse(
+        &self,
+        ctx: &WgpuContext,
+        tensor: &UnifiedTensor,
+        head_dim: usize,
+        pos: usize,
+        theta: f32,
+    ) {
+        self.rotate(ctx, tensor, head_dim, pos, theta, true);
+    }
+
+    /// Shared body of [`rope_theta`](Self::rope_theta) and its inverse.
+    fn rotate(
+        &self,
+        ctx: &WgpuContext,
+        tensor: &UnifiedTensor,
+        head_dim: usize,
+        pos: usize,
+        theta: f32,
+        inverse: bool,
+    ) {
         let (seq_len, tokens) = match tensor.shape.len() {
             0 | 1 => (1, 1),
             2 => (tensor.shape[0], tensor.shape[0]),
@@ -38,7 +65,7 @@ impl ComputeEngine {
                 pos as u32,
                 heads as u32,
                 theta.to_bits(),
-                0,
+                inverse as u32,
                 0,
                 0,
             ]),
