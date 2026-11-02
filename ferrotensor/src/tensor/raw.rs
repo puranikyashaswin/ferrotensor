@@ -5,6 +5,7 @@
 //! reference kernel in [`super::cpu`]. The public ops in `ops.rs` build on
 //! these and attach backward nodes.
 
+use std::sync::Arc;
 use wgpu::util::DeviceExt;
 use wgpu::{Buffer, BufferUsages};
 
@@ -13,7 +14,7 @@ use super::cpu;
 use super::shape::{broadcast_shapes, broadcast_strides, contiguous_strides, split_at_dim};
 use super::Tensor;
 use crate::backend::{reduce_op, ComputeEngine};
-use crate::device::{Arg, GpuBuffer, GpuContext};
+use crate::device::{Arg, ElementwiseStep, GpuBuffer, GpuContext};
 
 /// A read-only `u32` storage buffer (at least one element).
 fn u32_buffer(ctx: &GpuContext, data: &[u32]) -> Buffer {
@@ -213,6 +214,19 @@ impl Tensor {
         match self.gpu() {
             Some((ctx, input)) if n > 0 => {
                 let out = alloc(ctx, n);
+                if ctx.fusion() {
+                    let output = Arc::new(Storage::Gpu(out));
+                    ctx.elementwise(ElementwiseStep {
+                        kind: 0,
+                        op,
+                        a,
+                        b,
+                        inputs: vec![Arc::clone(&self.storage)],
+                        output: Arc::clone(&output),
+                        n,
+                    });
+                    return Tensor::from_shared_storage(output, self.shape.clone(), &self.device);
+                }
                 let params = Arg::Params([op, n as u32, a.to_bits(), b.to_bits()]);
                 ctx.dispatch(
                     "unary",
@@ -243,6 +257,20 @@ impl Tensor {
         match (self.gpu(), other.gpu()) {
             (Some((ctx, a)), Some((_, b))) if n > 0 => {
                 let out = alloc(ctx, n);
+                // Fusion handles same-shape operands; broadcasting stays unfused.
+                if ctx.fusion() && self.shape == other.shape {
+                    let output = Arc::new(Storage::Gpu(out));
+                    ctx.elementwise(ElementwiseStep {
+                        kind: 1,
+                        op,
+                        a: 0.0,
+                        b: 0.0,
+                        inputs: vec![Arc::clone(&self.storage), Arc::clone(&other.storage)],
+                        output: Arc::clone(&output),
+                        n,
+                    });
+                    return Tensor::from_shared_storage(output, out_shape, &self.device);
+                }
                 let params = Arg::Params([op, n as u32, out_shape.len() as u32, 0]);
                 let meta = as_u32(&[&out_shape[..], &sa, &sb].concat());
                 ctx.dispatch(

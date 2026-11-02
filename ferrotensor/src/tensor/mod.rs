@@ -14,4 +14,5 @@ mod shape;
 pub(crate) mod tests;
 
 pub use autograd::{is_grad_enabled, no_grad, NoGradGuard};
+pub(crate) use core::Storage;
 pub use core::Tensor;

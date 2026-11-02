@@ -97,8 +97,17 @@ impl Tensor {
     }
 
     pub(crate) fn from_storage(storage: Storage, shape: Vec<usize>, device: &Device) -> Self {
+        Self::from_shared_storage(Arc::new(storage), shape, device)
+    }
+
+    /// A new tensor (no autograd) over storage that is already shared.
+    pub(crate) fn from_shared_storage(
+        storage: Arc<Storage>,
+        shape: Vec<usize>,
+        device: &Device,
+    ) -> Self {
         Self {
-            storage: Arc::new(storage),
+            storage,
             shape,
             device: device.clone(),
             grad: Arc::new(RwLock::new(None)),
