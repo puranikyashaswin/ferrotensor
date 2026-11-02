@@ -9,7 +9,7 @@ use wgpu::{BindGroup, BindGroupLayout, BindingResource, CommandEncoder, ComputeP
 use super::KERNELS_WGSL;
 
 /// Entry points compiled from [`KERNELS_WGSL`].
-pub(crate) const KERNEL_NAMES: [&str; 14] = [
+pub(crate) const KERNEL_NAMES: [&str; 15] = [
     "unary",
     "binary",
     "reduce",
@@ -24,7 +24,13 @@ pub(crate) const KERNEL_NAMES: [&str; 14] = [
     "copy_block",
     "cross_entropy_rows",
     "cross_entropy_grad",
+    "fused",
 ];
+
+/// Storage buffers the `fused` kernel binds: seven tensor slots and its
+/// program. Devices with fewer per-stage bindings do not compile it, and
+/// element-wise ops then run unfused.
+pub(crate) const FUSED_STORAGE_BINDINGS: u32 = 8;
 
 /// Threads per workgroup of the 1-D kernels.
 const WORKGROUP_1D: u32 = 256;
@@ -52,8 +58,11 @@ impl ComputeEngine {
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(KERNELS_WGSL)),
         });
 
+        let fused_fits =
+            device.limits().max_storage_buffers_per_shader_stage >= FUSED_STORAGE_BINDINGS;
         let pipelines = KERNEL_NAMES
             .iter()
+            .filter(|&&name| name != "fused" || fused_fits)
             .map(|&name| {
                 let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some(name),
@@ -67,6 +76,11 @@ impl ComputeEngine {
             .collect();
 
         Self { pipelines }
+    }
+
+    /// Whether `name` was compiled for this device.
+    pub(crate) fn has(&self, name: &str) -> bool {
+        self.pipelines.contains_key(name)
     }
 
     /// Get a compiled pipeline by entry point name.
