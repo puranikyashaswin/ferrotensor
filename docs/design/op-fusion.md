@@ -1,7 +1,8 @@
 # Design: fusing chains of element-wise ops (issue #19)
 
-Status: proposed. Implementation follows in separate PRs, measured against
-the `tensor-api` benchmark and its checksums.
+Status: step 1 implemented, off by default (`FERROTENSOR_FUSION=1` turns it on).
+The remaining steps are measured against the `tensor-api` benchmark and its
+checksums.
 
 ## Problem
 
