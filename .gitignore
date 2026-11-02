@@ -55,3 +55,6 @@ venv/
 
 # Website build output
 /site/dist/
+
+# Hardware reports from scripts/hardware-report.sh
+/reports/
