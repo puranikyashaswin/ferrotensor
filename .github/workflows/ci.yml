@@ -78,6 +78,8 @@ jobs:
         run: cargo run --release -p ferrotensor-cli -- info --check
       - name: GPU suites (ignored tests)
         run: cargo test --release --workspace -- --ignored --test-threads=1
+      - name: Autograd finite-difference checks
+        run: cargo test --release -p ferrotensor-autograd --test grad_check -- --test-threads=1
       - name: Tensor API GPU parity
         run: cargo test --release -p ferrotensor --lib -- --test-threads=1
       - name: Tensor API GPU parity with op fusion on
