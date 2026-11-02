@@ -44,9 +44,9 @@ PAGES = {
         "character-level transformer, GPU matmul and attention, similarity search.",
     ),
     "examples/lora-sft.html": (
-        "LoRA fine-tuning on an 8 GB MacBook | Ferrotensor",
-        "Fine-tune SmolLM2-135M with LoRA on an 8 GB Apple M2 MacBook: held-out loss 2.43 to 1.65 "
-        "in 250 steps, 3.3 GB peak memory, every command shown.",
+        "LoRA fine-tuning on a MacBook or NVIDIA GPU | Ferrotensor",
+        "Fine-tune SmolLM2 with LoRA: 135M on an 8 GB Apple M2 (held-out loss 2.43 to 1.65), and "
+        "135M to 1.7B on an NVIDIA A10G, every command shown.",
     ),
     "architecture.html": (
         "Ferrotensor architecture: from tensor op to WGSL kernel",
@@ -64,9 +64,9 @@ PAGES = {
         "GPUs through Vulkan or DX12, and report what you find.",
     ),
     "benchmarks.html": (
-        "Ferrotensor benchmarks: WGSL kernels on an Apple M2",
-        "Ferrotensor benchmarks on an Apple M2: 611 GFLOPS f32 matmul in WGSL, flash attention, and "
-        "tensor-API timings on CPU and GPU, with the method.",
+        "Ferrotensor benchmarks: WGSL kernels on Apple M2 and NVIDIA",
+        "Ferrotensor benchmarks on an Apple M2, an NVIDIA A10G and a Tesla T4: WGSL matmul, flash "
+        "attention and tensor-API timings on CPU and GPU, with the method.",
     ),
     "python-reference.html": (
         "Ferrotensor Python API: coverage and PyTorch differences",

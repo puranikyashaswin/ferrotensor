@@ -49,8 +49,10 @@ cargo test -p ferrotensor --lib tensor::tests     # one module
 
 ### GPU tests are opt-in
 
-CI runners have no GPU, so tests that need one are skipped unless you set
-`FERROTENSOR_RUN_GPU_TESTS=1`:
+Tests that need a GPU are skipped unless you set `FERROTENSOR_RUN_GPU_TESTS=1`.
+CI sets it in one job that runs the GPU suites on Mesa lavapipe (Vulkan on the
+CPU), so every PR is checked on the Vulkan path; behaviour on a real GPU still
+needs a local run:
 
 ```bash
 FERROTENSOR_RUN_GPU_TESTS=1 cargo test -p ferrotensor --lib

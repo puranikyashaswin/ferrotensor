@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- The README, CONTRIBUTING, the GPU testing guide, the architecture notes and the website's benchmarks and LoRA pages describe the NVIDIA results, the software-Vulkan CI job and op fusion; the README no longer says the Python package is missing from PyPI.
+
 ## [0.5.0] - 2026-11-02
 
 ### Added
