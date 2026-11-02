@@ -330,7 +330,9 @@ pub struct Device {
 impl Device {
     /// Create a GPU device with the best available backend.
     ///
-    /// On macOS this is Metal; on Windows/Linux, Vulkan or DX12.
+    /// On macOS this is Metal; on Windows/Linux, Vulkan or DX12. Set the
+    /// `WGPU_BACKEND` environment variable (e.g. `vulkan`) to restrict the
+    /// choice.
     ///
     /// # Panics
     /// Panics when no GPU adapter is available. Use [`Device::gpu`] to get an
@@ -351,8 +353,9 @@ impl Device {
 
     /// Async version of [`Device::gpu`].
     pub async fn gpu_async() -> Option<Self> {
+        // WGPU_BACKEND (e.g. "vulkan", "metal", "dx12", "gl") restricts the backends tried.
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
+            backends: wgpu::util::backend_bits_from_env().unwrap_or(wgpu::Backends::all()),
             ..Default::default()
         });
         let adapter = instance

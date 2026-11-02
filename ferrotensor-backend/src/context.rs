@@ -29,7 +29,8 @@ impl WgpuContext {
     }
 
     /// Opens an adapter with the given power preference, optionally forcing
-    /// the software fallback adapter.
+    /// the software fallback adapter. The `WGPU_BACKEND` environment variable
+    /// (e.g. `vulkan`) restricts which backends are tried.
     ///
     /// # Panics
     /// Panics if no adapter or device is available.
@@ -37,7 +38,10 @@ impl WgpuContext {
         power_preference: wgpu::PowerPreference,
         force_fallback_adapter: bool,
     ) -> Self {
-        let instance = Instance::default();
+        let instance = Instance::new(wgpu::InstanceDescriptor {
+            backends: crate::adapters::backends(),
+            ..Default::default()
+        });
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference,
