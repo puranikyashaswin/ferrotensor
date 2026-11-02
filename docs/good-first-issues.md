@@ -226,6 +226,8 @@ Done when the existing clipping tests pass unchanged and
 
 ## 19. Fuse chains of element-wise ops into one kernel
 
+*Design written: [docs/design/op-fusion.md](design/op-fusion.md). Implementation follows it.*
+
 *harder · `performance`, `kernels`*
 
 100 tiny element-wise ops on the GPU still take about 18x as long as on the
