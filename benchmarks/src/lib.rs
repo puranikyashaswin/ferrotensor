@@ -53,10 +53,7 @@ struct Measurement {
 
 /// Times `op` and returns the median per-call duration.
 fn time_op(ctx: &WgpuContext, mut op: impl FnMut()) -> Duration {
-    let sync = || {
-        ctx.flush();
-        ctx.device.poll(wgpu::Maintain::Wait);
-    };
+    let sync = || ctx.synchronize();
     // Warm up and estimate the cost of one call.
     let start = Instant::now();
     for _ in 0..3 {

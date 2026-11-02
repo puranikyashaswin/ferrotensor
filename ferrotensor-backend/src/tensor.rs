@@ -2,6 +2,7 @@
 
 use crate::pool::BufferPool;
 use crate::WgpuContext;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use wgpu::{util::DeviceExt, Buffer};
 
@@ -195,10 +196,12 @@ impl UnifiedTensor {
         context.flush();
 
         let slice = staging.slice(..);
-        let (tx, rx) = futures_intrusive::channel::shared::oneshot_channel();
-        slice.map_async(wgpu::MapMode::Read, move |_| tx.send(()).unwrap());
-        context.device.poll(wgpu::Maintain::Wait);
-        rx.receive().await;
+        let mapped = Arc::new(AtomicBool::new(false));
+        let flag = mapped.clone();
+        slice.map_async(wgpu::MapMode::Read, move |_| {
+            flag.store(true, Ordering::Release)
+        });
+        context.poll_until(|| mapped.load(Ordering::Acquire));
 
         let data = slice.get_mapped_range();
         let res = bytemuck::cast_slice(&data).to_vec();
