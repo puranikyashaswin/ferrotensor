@@ -8,10 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `scripts/lora-run.sh MODEL` runs the LoRA SFT walkthrough on any Llama-style Hugging Face model with the walkthrough's data and settings and writes a JSON summary (held-out loss before and after, loss curve, seconds per step, peak memory, greedy generations).
 - Op fusion, off by default: with `FERROTENSOR_FUSION=1`, consecutive same-size element-wise ops on the GPU run as one `fused` dispatch of up to six steps instead of one dispatch each, still writing every intermediate. Results are checked bit-identical to unfused runs. See `docs/design/op-fusion.md`.
 - The `WGPU_BACKEND` environment variable (`vulkan`, `metal`, `dx12`, `gl` or a comma list) restricts which backends `Device::new`/`gpu`/`best`, `WgpuContext::new` and `ferrotensor info` try.
 - CI runs the GPU test suites on Mesa lavapipe (Vulkan on the CPU) for every PR, so the Vulkan path is checked without a GPU.
 - `scripts/hardware-report.sh` runs `ferrotensor info --check`, the kernel benchmarks and the Tensor API benchmarks and writes one JSON report, so every machine is measured the same way. CI runs it in quick mode on software Vulkan.
+
+### Fixed
+- The LoRA walkthrough called `target/release/ferrotensor-cli`; the binary has been `ferrotensor` since the rename.
 
 ## [0.4.0] - 2026-11-01
 
