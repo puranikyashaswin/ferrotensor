@@ -7,17 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-02
+
 ### Added
-- LoRA results on an NVIDIA A10G for SmolLM2-135M, 360M and 1.7B in the LoRA walkthrough (`docs/examples/lora-sft.md`): held-out loss 1.6521, 1.3228 and 1.0667 after 250 steps, at 1.33, 1.69 and 2.47 s per step. With the GPU changes below, SmolLM2-135M on the A10G went from 20.2 s to 1.33 s per step with the same held-out loss.
+- LoRA results on an NVIDIA A10G for SmolLM2-135M, 360M and 1.7B in the LoRA walkthrough (`docs/examples/lora-sft.md`): held-out loss 1.6521, 1.3228 and 1.0667 after 250 steps, at 1.33, 1.69 and 2.47 s per step. With the GPU changes below, SmolLM2-135M on the A10G went from 20.2 s to 1.33 s per step; its held-out loss is 1.6521 (1.6519 before, as on an Apple M2).
+- Kernel and Tensor API benchmark results on an NVIDIA A10G and a Tesla T4 through Vulkan in `benchmarks/RESULTS.md`, with op fusion off and on.
 - `scripts/lora-run.sh MODEL` runs the LoRA SFT walkthrough on any Llama-style Hugging Face model with the walkthrough's data and settings and writes a JSON summary (held-out loss before and after, loss curve, seconds per step, peak memory, greedy generations).
 - Op fusion, off by default: with `FERROTENSOR_FUSION=1`, consecutive same-size element-wise ops on the GPU run as one `fused` dispatch of up to six steps instead of one dispatch each, still writing every intermediate. Results are checked bit-identical to unfused runs. See `docs/design/op-fusion.md`.
 - The `WGPU_BACKEND` environment variable (`vulkan`, `metal`, `dx12`, `gl` or a comma list) restricts which backends `Device::new`/`gpu`/`best`, `WgpuContext::new` and `ferrotensor info` try.
-- CI runs the GPU test suites on Mesa lavapipe (Vulkan on the CPU) for every PR, so the Vulkan path is checked without a GPU.
+- CI runs the GPU test suites and the autograd finite-difference checks on Mesa lavapipe (Vulkan on the CPU) for every PR, so the Vulkan path is checked without a GPU.
 - `scripts/hardware-report.sh` runs `ferrotensor info --check`, the kernel benchmarks and the Tensor API benchmarks and writes one JSON report, so every machine is measured the same way. CI runs it in quick mode on software Vulkan.
 
 ### Changed
 - `ferrotensor-autograd`: the backward passes of RMSNorm and RoPE run on the GPU (`ComputeEngine::rms_norm_backward`, `ComputeEngine::rope_theta_inverse`) instead of reading the input, weight and gradient back to the host. LoRA training made about 2,000 blocking GPU-to-host reads per step through these two ops.
-- `ferrotensor-trainer`: `masked_cross_entropy` computes the loss and its gradient on the GPU (`ComputeEngine::masked_cross_entropy`) and reads back only one loss per position. Before, it read the whole `[seq, vocab]` logits to the host and uploaded a gradient of the same size, about 50 MB each way per SmolLM2 sequence. It now takes the `&ComputeEngine` as a fourth argument.
+- **Breaking**, `ferrotensor-trainer`: `masked_cross_entropy` computes the loss and its gradient on the GPU (`ComputeEngine::masked_cross_entropy`) and reads back only one loss per position. Before, it read the whole `[seq, vocab]` logits to the host and uploaded a gradient of the same size, about 50 MB each way per SmolLM2 sequence. It now takes the `&ComputeEngine` as a fourth argument.
 - `ferrotensor-backend`: `ComputeEngine` records kernel dispatches and copies into one pending command encoder on the `WgpuContext` and submits them together (every 128 ops, and when a tensor is read or written) instead of one queue submission per op. `WgpuContext::flush` submits the pending work; call it before submitting your own commands on `queue`. `WgpuContext::synchronize` waits for the GPU to finish.
 - `ferrotensor-backend`: reading a tensor no longer blocks in wgpu's `Maintain::Wait`, which in wgpu-core 0.19 gives up after 5 s and frees the still-running submission's resources; it polls until the GPU is done.
 - `ferrotensor-trainer`: the global gradient norm sums squares on the GPU (`ComputeEngine::sum_squares_partial`) and reads back once per optimizer step instead of once per gradient tensor.
@@ -108,7 +111,8 @@ First public version.
 - Renamed the project from Rusty to Ferrotensor; crates are now `ferrotensor-*` and the CLI binary is `ferrotensor`.
 - Licensed under MIT OR Apache-2.0 (previously MIT only).
 
-[Unreleased]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.2.0...v0.2.1
