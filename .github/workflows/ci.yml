@@ -55,6 +55,32 @@ jobs:
       # Hosted runners have no GPU: GPU tests are #[ignore]d and skipped here.
       - run: cargo test --workspace
 
+  gpu-vulkan:
+    name: GPU tests (software Vulkan)
+    # Hosted runners have no GPU. Mesa's lavapipe implements Vulkan on the CPU,
+    # so the GPU suites run here through the real wgpu Vulkan path: it checks
+    # correctness, not speed.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      WGPU_BACKEND: vulkan
+      FERROTENSOR_RUN_GPU_TESTS: "1"
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - name: Install Mesa lavapipe
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q mesa-vulkan-drivers vulkan-tools
+      - run: vulkaninfo --summary
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.2
+      - name: Adapter and kernel self-check
+        run: cargo run --release -p ferrotensor-cli -- info --check
+      - name: GPU suites (ignored tests)
+        run: cargo test --release --workspace -- --ignored --test-threads=1
+      - name: Tensor API GPU parity
+        run: cargo test --release -p ferrotensor --lib -- --test-threads=1
+
   doc:
     name: Docs
     runs-on: ubuntu-latest
