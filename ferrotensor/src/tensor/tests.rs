@@ -663,3 +663,133 @@ fn cat_matches_cpu_on_gpu() {
         assert_eq!(on(&gpu), on(&cpu), "cat along {dim}");
     }
 }
+
+// ============================================================================
+// OP FUSION
+// ============================================================================
+
+/// Runs `f` on the GPU with fusion off and then on and checks that the
+/// results are bit-identical.
+fn assert_fusion_matches(name: &str, gpu: &Device, f: impl Fn(&Device) -> Vec<f32>) {
+    let ctx = gpu.gpu_ctx().expect("GPU device");
+    if !ctx.engine.has("fused") {
+        eprintln!("skipping {name}: this GPU cannot bind enough buffers for the fused kernel");
+        return;
+    }
+    let was = ctx.fusion();
+    ctx.set_fusion(false);
+    let off = f(gpu);
+    ctx.set_fusion(true);
+    let on = f(gpu);
+    ctx.set_fusion(was);
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(off.len(), on.len(), "{name}: lengths differ");
+    assert_eq!(
+        bits(&on),
+        bits(&off),
+        "{name}: fused result differs from unfused"
+    );
+}
+
+fn seeded(shape: &[usize], seed: u64, device: &Device) -> Tensor {
+    let mut rng = StdRng::seed_from_u64(seed);
+    Tensor::randn_with(shape, &mut rng, device)
+}
+
+#[test]
+fn fused_chains_match_unfused_on_gpu() {
+    let Some(gpu) = test_gpu() else { return };
+
+    // The tensor-api benchmark's chain: 100 ops, with x re-read every 4.
+    assert_fusion_matches("op chain", &gpu, |d| {
+        let x = seeded(&[1000], 1, d);
+        let mut y = x.clone();
+        for i in 0..25 {
+            y = y
+                .mul_scalar(1.001)
+                .add_scalar(0.01 * i as f32)
+                .tanh()
+                .add(&x);
+        }
+        y.to_vec()
+    });
+
+    // Every unary op code that has a public method, chained.
+    assert_fusion_matches("unary ops", &gpu, |d| {
+        let x = seeded(&[777], 2, d);
+        let y = x
+            .relu()
+            .add(&x.sigmoid())
+            .add(&x.tanh())
+            .add(&x.silu())
+            .add(&x.gelu());
+        let z = y
+            .abs()
+            .add_scalar(0.5)
+            .sqrt()
+            .log()
+            .exp()
+            .neg()
+            .square()
+            .clamp(-2.0, 2.0);
+        let w = z
+            .mul(&x)
+            .sub(&x.sin())
+            .add(&x.cos())
+            .div(&z.add_scalar(3.0));
+        w.maximum(&x).minimum(&y).to_vec()
+    });
+
+    // Groups closed by a matmul, a broadcasting add and a reduction.
+    assert_fusion_matches("interrupted", &gpu, |d| {
+        let a = seeded(&[16, 32], 3, d);
+        let w = seeded(&[32, 8], 4, d);
+        let bias = seeded(&[8], 5, d);
+        let h = a.mul_scalar(0.5).tanh().matmul(&w);
+        let h = h.add(&bias).relu().mul_scalar(2.0);
+        let s = h.sum();
+        let mut out = h.add_scalar(1.0).to_vec();
+        out.push(s.item());
+        out
+    });
+
+    // The same buffer on both sides, and a chain longer than a batch.
+    assert_fusion_matches("aliasing and length", &gpu, |d| {
+        let x = seeded(&[300], 6, d);
+        let mut y = x.add(&x).mul(&x);
+        for i in 0..300 {
+            y = if i % 2 == 0 {
+                y.mul_scalar(0.999)
+            } else {
+                y.add_scalar(0.001)
+            };
+        }
+        y.to_vec()
+    });
+
+    // Large enough to need the second grid dimension.
+    assert_fusion_matches("large", &gpu, |d| {
+        let x = seeded(&[70_000], 7, d);
+        x.mul_scalar(3.0).add_scalar(-1.0).tanh().mul(&x).to_vec()
+    });
+}
+
+#[test]
+fn fused_gradients_match_unfused_on_gpu() {
+    let Some(gpu) = test_gpu() else { return };
+    assert_fusion_matches("gradients", &gpu, |d| {
+        let w = seeded(&[64], 8, d).requires_grad_();
+        let x = seeded(&[64], 9, d);
+        let loss = w
+            .mul(&x)
+            .tanh()
+            .mul_scalar(2.0)
+            .add(&w.sigmoid())
+            .square()
+            .sum();
+        loss.backward();
+        let mut out = w.grad().expect("gradient").to_vec();
+        out.push(loss.item());
+        out
+    });
+}

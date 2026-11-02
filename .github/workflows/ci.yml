@@ -80,6 +80,10 @@ jobs:
         run: cargo test --release --workspace -- --ignored --test-threads=1
       - name: Tensor API GPU parity
         run: cargo test --release -p ferrotensor --lib -- --test-threads=1
+      - name: Tensor API GPU parity with op fusion on
+        run: cargo test --release -p ferrotensor --lib -- --test-threads=1
+        env:
+          FERROTENSOR_FUSION: "1"
       - name: Hardware report (quick)
         run: scripts/hardware-report.sh --quick
       - uses: actions/upload-artifact@v4.4.3
