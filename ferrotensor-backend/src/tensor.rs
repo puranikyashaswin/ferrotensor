@@ -64,8 +64,11 @@ impl UnifiedTensor {
         self.data.size_in_bytes
     }
 
-    /// Uploads `data` to the start of the buffer.
+    /// Uploads `data` to the start of the buffer, after all recorded work.
     pub fn write_data(&self, context: &WgpuContext, data: &[u8]) {
+        // A queue write runs before commands not yet submitted, so submit
+        // them first: ops recorded earlier must see the old contents.
+        context.flush();
         context.queue.write_buffer(self.buffer(), 0, data);
     }
 }
@@ -186,11 +189,10 @@ impl UnifiedTensor {
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let mut encoder = context
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        encoder.copy_buffer_to_buffer(&self.data.buffer, 0, &staging, 0, size);
-        context.queue.submit(Some(encoder.finish()));
+        context.record(|encoder| {
+            encoder.copy_buffer_to_buffer(&self.data.buffer, 0, &staging, 0, size);
+        });
+        context.flush();
 
         let slice = staging.slice(..);
         let (tx, rx) = futures_intrusive::channel::shared::oneshot_channel();
