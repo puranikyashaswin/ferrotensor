@@ -518,6 +518,59 @@ fn rms_norm_matches_cpu() {
     assert_close("rms_norm_eps", &read(&out), &want, 1e-5, 1e-4);
 }
 
+/// Gradients of RMSNorm over rows of `len`: `(grad_x, grad_w)`.
+fn cpu_rms_norm_backward(
+    x: &[f32],
+    g: &[f32],
+    w: &[f32],
+    len: usize,
+    eps: f32,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut gx = vec![0.0f32; x.len()];
+    let mut gw = vec![0.0f32; len];
+    for ((xr, gr), gxr) in x.chunks(len).zip(g.chunks(len)).zip(gx.chunks_mut(len)) {
+        let inv = 1.0 / (xr.iter().map(|v| v * v).sum::<f32>() / len as f32 + eps).sqrt();
+        let dot: f32 = (0..len).map(|i| gr[i] * w[i] * xr[i]).sum();
+        for i in 0..len {
+            gw[i] += gr[i] * xr[i] * inv;
+            gxr[i] = gr[i] * w[i] * inv - xr[i] * dot * inv.powi(3) / len as f32;
+        }
+    }
+    (gx, gw)
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn rms_norm_backward_matches_cpu() {
+    let g = gpu();
+    for &(rows, len, eps) in &[
+        (1, 1, 1e-5),
+        (5, 37, 1e-5),
+        (3, 64, 0.1),
+        (2, 4096, 1e-5),
+        (130, 576, 1e-5),
+    ] {
+        let x = rand_vec(rows * len, 70 + len as u64);
+        let w = rand_vec(len, 71 + len as u64);
+        let go = rand_vec(rows * len, 72 + len as u64);
+        let gx = zeros(&[rows, len]);
+        let gw = zeros(&[len]);
+        g.engine.rms_norm_backward(
+            &g.ctx,
+            &upload(&x, &[rows, len]),
+            &upload(&w, &[len]),
+            &upload(&go, &[rows, len]),
+            &gx,
+            &gw,
+            eps,
+        );
+        let (want_x, want_w) = cpu_rms_norm_backward(&x, &go, &w, len, eps);
+        let name = format!("rms_norm_backward {rows}x{len}");
+        assert_close(&format!("{name} grad_x"), &read(&gx), &want_x, 1e-4, 1e-3);
+        assert_close(&format!("{name} grad_w"), &read(&gw), &want_w, 1e-4, 1e-3);
+    }
+}
+
 #[test]
 #[ignore = "needs a GPU; run with --ignored --test-threads=1"]
 fn rms_norm_residual_matches_cpu() {
@@ -546,6 +599,19 @@ fn rms_norm_residual_matches_cpu() {
 /// Rotate-half RoPE over [batch, seq, heads * head_dim]; position of token s
 /// is `pos + s` for every head.
 fn cpu_rope(x: &[f32], batch: usize, seq: usize, heads: usize, hd: usize, pos: usize) -> Vec<f32> {
+    cpu_rope_dir(x, batch, seq, heads, hd, pos, 1.0)
+}
+
+/// [`cpu_rope`] rotating by `dir` times the angle (-1.0 is the inverse).
+fn cpu_rope_dir(
+    x: &[f32],
+    batch: usize,
+    seq: usize,
+    heads: usize,
+    hd: usize,
+    pos: usize,
+    dir: f32,
+) -> Vec<f32> {
     let mut out = x.to_vec();
     let half = hd / 2;
     for b in 0..batch {
@@ -555,7 +621,7 @@ fn cpu_rope(x: &[f32], batch: usize, seq: usize, heads: usize, hd: usize, pos: u
                 let p = (pos + s) as f32;
                 for i in 0..half {
                     let freq = 10000f32.powf(-2.0 * i as f32 / hd as f32);
-                    let (sin, cos) = (p * freq).sin_cos();
+                    let (sin, cos) = (dir * p * freq).sin_cos();
                     let (x1, x2) = (x[base + i], x[base + i + half]);
                     out[base + i] = x1 * cos - x2 * sin;
                     out[base + i + half] = x1 * sin + x2 * cos;
@@ -590,6 +656,27 @@ fn rope_matches_cpu() {
     g.engine.rope(&g.ctx, &t, hd, pos);
     let want = cpu_rope(&x, 1, seq, heads, hd, pos);
     assert_close("rope 2-D", &read(&t), &want, 1e-4, 1e-4);
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn rope_inverse_matches_cpu_and_undoes_rope() {
+    let g = gpu();
+    for &(batch, seq, heads, hd, pos) in &[(1, 1, 1, 8, 0), (1, 5, 1, 64, 3), (2, 7, 4, 32, 11)] {
+        let x = rand_vec(batch * seq * heads * hd, 13);
+        let shape = [batch, seq, heads * hd];
+        let name = format!("rope inverse b{batch} s{seq} h{heads} d{hd}");
+
+        let t = upload(&x, &shape);
+        g.engine.rope_theta_inverse(&g.ctx, &t, hd, pos, 10000.0);
+        let want = cpu_rope_dir(&x, batch, seq, heads, hd, pos, -1.0);
+        assert_close(&name, &read(&t), &want, 1e-4, 1e-4);
+
+        let t = upload(&x, &shape);
+        g.engine.rope(&g.ctx, &t, hd, pos);
+        g.engine.rope_theta_inverse(&g.ctx, &t, hd, pos, 10000.0);
+        assert_close(&format!("{name} round trip"), &read(&t), &x, 1e-4, 1e-4);
+    }
 }
 
 // ---------------------------------------------------------------------------

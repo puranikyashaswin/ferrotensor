@@ -228,9 +228,9 @@ training normally (losses 1.4960 and 1.6540).
 ## Known limits
 
 - Speed is bound by kernel dispatch and host round trips. Every op is its
-  own GPU submission, and RMSNorm and RoPE backward and the loss run on the
-  CPU. The GPU is far from saturated; 8.8 s per 8-sequence step is a
-  baseline, not a ceiling.
+  own GPU submission, and the loss runs on the CPU. The GPU is far from
+  saturated; 8.8 s per 8-sequence step is a baseline, not a ceiling. (This
+  run predates moving the RMSNorm and RoPE backward passes to the GPU.)
 - Each step trains one sequence at a time. `--batch-size` only changes how
   many sequences share one optimizer step.
 - The tested architecture is Llama-style. Released LFM2 checkpoints are

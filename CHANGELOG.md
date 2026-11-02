@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI runs the GPU test suites on Mesa lavapipe (Vulkan on the CPU) for every PR, so the Vulkan path is checked without a GPU.
 - `scripts/hardware-report.sh` runs `ferrotensor info --check`, the kernel benchmarks and the Tensor API benchmarks and writes one JSON report, so every machine is measured the same way. CI runs it in quick mode on software Vulkan.
 
+### Changed
+- `ferrotensor-autograd`: the backward passes of RMSNorm and RoPE run on the GPU (`ComputeEngine::rms_norm_backward`, `ComputeEngine::rope_theta_inverse`) instead of reading the input, weight and gradient back to the host. LoRA training made about 2,000 blocking GPU-to-host reads per step through these two ops.
+
 ### Fixed
 - The LoRA walkthrough called `target/release/ferrotensor-cli`; the binary has been `ferrotensor` since the rename.
 

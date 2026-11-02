@@ -43,7 +43,7 @@ fn row_max(lid: u32, v: f32) -> f32 {
 
 // --- 2. Rotary Positional Embeddings (RoPE) ---
 @group(0) @binding(0) var<storage, read_write> rope_data: array<f32>;
-@group(0) @binding(1) var<uniform> rope_params: array<vec4<u32>, 2>; // [head_dim, seq, pos, heads], [theta bits, 0, 0, 0]
+@group(0) @binding(1) var<uniform> rope_params: array<vec4<u32>, 2>; // [head_dim, seq, pos, heads], [theta bits, inverse, 0, 0]
 
 @compute @workgroup_size(64)
 fn rope(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
@@ -58,7 +58,9 @@ fn rope(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     let heads = max(rope_params[0].w, 1u); // head vectors per token
     let pos = f32(base_pos + (token_idx / heads) % seq_len);
     let freq_exp = -2.0 * f32(dim_idx) / f32(head_dim);
-    let angle = pos * pow(bitcast<f32>(rope_params[1].x), freq_exp);
+    // inverse = 1 rotates by -angle: the transposed rotation, i.e. the backward pass.
+    let dir = select(1.0, -1.0, rope_params[1].y != 0u);
+    let angle = dir * pos * pow(bitcast<f32>(rope_params[1].x), freq_exp);
     let cos_a = cos(angle);
     let sin_a = sin(angle);
     let idx1 = token_idx * head_dim + dim_idx;
@@ -93,6 +95,59 @@ fn rms_norm(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wg
     for (var i = lid; i < size; i += ROW_WG) {
         rms_out[off + i] = rms_input[off + i] * inv_rms * rms_weight[i];
     }
+}
+
+// RMSNorm backward, one workgroup per row. With inv = 1 / rms(x):
+// grad_x = g * w * inv - x * inv^3 * sum(g * w * x) / size.
+// Each row's inv is kept for rms_norm_backward_weight.
+@group(0) @binding(0) var<storage, read> rmsb_x: array<f32>;
+@group(0) @binding(1) var<storage, read> rmsb_g: array<f32>;
+@group(0) @binding(2) var<storage, read> rmsb_w: array<f32>;
+@group(0) @binding(3) var<storage, read_write> rmsb_gx: array<f32>;
+@group(0) @binding(4) var<storage, read_write> rmsb_inv: array<f32>;
+@group(0) @binding(5) var<uniform> rmsb_params: vec4<u32>; // size, rows, eps bits, 0
+
+@compute @workgroup_size(256)
+fn rms_norm_backward(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wg: vec3<u32>,
+                     @builtin(num_workgroups) nwg: vec3<u32>) {
+    let row = row_index(wg, nwg);
+    let size = rmsb_params.x;
+    if (row >= rmsb_params.y) { return; } // uniform: whole workgroup exits
+    let off = row * size;
+    var ss = 0.0;
+    var gwx = 0.0;
+    for (var i = lid; i < size; i += ROW_WG) {
+        let xv = rmsb_x[off + i];
+        ss += xv * xv;
+        gwx += rmsb_g[off + i] * rmsb_w[i] * xv;
+    }
+    ss = row_sum(lid, ss);
+    gwx = row_sum(lid, gwx);
+    let inv = 1.0 / sqrt(ss / f32(size) + bitcast<f32>(rmsb_params.z));
+    let coef = gwx * inv * inv * inv / f32(size);
+    for (var i = lid; i < size; i += ROW_WG) {
+        rmsb_gx[off + i] = rmsb_g[off + i] * rmsb_w[i] * inv - rmsb_x[off + i] * coef;
+    }
+    if (lid == 0u) { rmsb_inv[row] = inv; }
+}
+
+// grad_w[i] = sum over rows of g * x * inv, one thread per feature.
+@group(0) @binding(0) var<storage, read> rmsw_x: array<f32>;
+@group(0) @binding(1) var<storage, read> rmsw_g: array<f32>;
+@group(0) @binding(2) var<storage, read> rmsw_inv: array<f32>;
+@group(0) @binding(3) var<storage, read_write> rmsw_gw: array<f32>;
+@group(0) @binding(4) var<uniform> rmsw_params: vec4<u32>; // size, rows, 0, 0
+
+@compute @workgroup_size(64)
+fn rms_norm_backward_weight(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = gid.x + gid.y * nwg.x * 64u;
+    let size = rmsw_params.x;
+    if (i >= size) { return; }
+    var acc = 0.0;
+    for (var r = 0u; r < rmsw_params.y; r += 1u) {
+        acc += rmsw_g[r * size + i] * rmsw_x[r * size + i] * rmsw_inv[r];
+    }
+    rmsw_gw[i] = acc;
 }
 // --- 4. SiLU ---
 @group(0) @binding(0) var<storage, read> silu_input: array<f32>;
