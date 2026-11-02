@@ -27,10 +27,11 @@ const MAX_PENDING_OPS: usize = 256;
 /// [`Arg::Meta`]) of one batch.
 const ARGS_BYTES: usize = 256 * 1024;
 
-/// How long a wait polls the GPU before blocking. wgpu's blocking wait on
-/// Metal sleeps in 1 ms steps, which adds up to a millisecond to every read
-/// back of a short batch.
+/// How long a wait busy-polls the GPU before sleeping between polls.
+/// Sleeping costs up to its length on every read back of a short batch.
 const SPIN_WAIT: Duration = Duration::from_millis(10);
+/// Sleep between polls once [`SPIN_WAIT`] has passed.
+const POLL_SLEEP: Duration = Duration::from_micros(50);
 
 /// Largest total size of freed tensor buffers kept for reuse.
 const POOL_BYTES: u64 = 128 << 20;
@@ -420,20 +421,20 @@ impl GpuContext {
     }
 
     /// Poll the device until a GPU callback sends on `rx`: busy-polling for
-    /// up to [`SPIN_WAIT`], then blocking.
+    /// up to [`SPIN_WAIT`], then sleeping [`POLL_SLEEP`] between polls.
+    ///
+    /// Never blocks in `Maintain::Wait`: wgpu-core 0.19 gives up waiting
+    /// there after 5 s and then frees the still-running submission's
+    /// resources as if it had finished, which crashes drivers that are still
+    /// reading them.
     pub(crate) fn wait_for<T>(&self, rx: &Receiver<T>) -> T {
         let start = Instant::now();
         loop {
-            let blocking = start.elapsed() >= SPIN_WAIT;
-            self.device.poll(if blocking {
-                wgpu::Maintain::Wait
-            } else {
-                wgpu::Maintain::Poll
-            });
+            self.device.poll(wgpu::Maintain::Poll);
             match rx.try_recv() {
                 Ok(value) => return value,
-                Err(TryRecvError::Empty) if !blocking => std::thread::yield_now(),
-                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Empty) if start.elapsed() < SPIN_WAIT => std::thread::yield_now(),
+                Err(TryRecvError::Empty) => std::thread::sleep(POLL_SLEEP),
                 Err(TryRecvError::Disconnected) => panic!("GPU callback dropped"),
             }
         }
