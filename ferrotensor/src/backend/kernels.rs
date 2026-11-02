@@ -100,16 +100,9 @@ struct UnaryParams {
 @group(0) @binding(1) var<storage, read_write> un_out: array<f32>;
 @group(0) @binding(2) var<uniform> un_p: UnaryParams;
 
-@compute @workgroup_size(256)
-fn unary(@builtin(global_invocation_id) gid: vec3<u32>,
-         @builtin(num_workgroups) nwg: vec3<u32>) {
-    let i = flat_index(gid, nwg);
-    if (i >= un_p.n) { return; }
-    let x = un_in[i];
-    let a = un_p.a;
-    let b = un_p.b;
+fn unary_apply(op: u32, x: f32, a: f32, b: f32) -> f32 {
     var y = x;
-    switch un_p.op {
+    switch op {
         case 0u: { y = max(x, 0.0); }
         case 1u: { y = x * sigmoid_f(x); }
         case 2u: { y = gelu_tanh(x); }
@@ -152,7 +145,15 @@ fn unary(@builtin(global_invocation_id) gid: vec3<u32>,
         case 25u: { y = select(a, 1.0, x > 0.0); }
         default: { y = x; }
     }
-    un_out[i] = y;
+    return y;
+}
+
+@compute @workgroup_size(256)
+fn unary(@builtin(global_invocation_id) gid: vec3<u32>,
+         @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = flat_index(gid, nwg);
+    if (i >= un_p.n) { return; }
+    un_out[i] = unary_apply(un_p.op, un_in[i], un_p.a, un_p.b);
 }
 
 // --- Broadcasting binary ops ------------------------------------------------
@@ -172,6 +173,25 @@ struct BinaryParams {
 @group(0) @binding(3) var<uniform> bin_p: BinaryParams;
 @group(0) @binding(4) var<storage, read> bin_meta: array<u32>;
 
+fn binary_apply(op: u32, x: f32, y: f32) -> f32 {
+    var r = 0.0;
+    switch op {
+        case 0u: { r = x + y; }
+        case 1u: { r = x - y; }
+        case 2u: { r = x * y; }
+        case 3u: { r = x / y; }
+        case 4u: { r = max(x, y); }
+        case 5u: { r = min(x, y); }
+        case 6u: { r = select(0.0, 1.0, x > y); }
+        case 7u: { r = select(0.0, 1.0, x < y); }
+        case 8u: { r = select(0.0, 1.0, x == y); }
+        case 9u: { r = select(0.0, 1.0, x >= y); }
+        case 10u: { r = select(0.0, 1.0, x <= y); }
+        default: { r = x; }
+    }
+    return r;
+}
+
 @compute @workgroup_size(256)
 fn binary(@builtin(global_invocation_id) gid: vec3<u32>,
           @builtin(num_workgroups) nwg: vec3<u32>) {
@@ -189,24 +209,78 @@ fn binary(@builtin(global_invocation_id) gid: vec3<u32>,
         ia = ia + idx * bin_meta[nd + axis];
         ib = ib + idx * bin_meta[2u * nd + axis];
     }
-    let x = bin_a[ia];
-    let y = bin_b[ib];
-    var r = 0.0;
-    switch bin_p.op {
-        case 0u: { r = x + y; }
-        case 1u: { r = x - y; }
-        case 2u: { r = x * y; }
-        case 3u: { r = x / y; }
-        case 4u: { r = max(x, y); }
-        case 5u: { r = min(x, y); }
-        case 6u: { r = select(0.0, 1.0, x > y); }
-        case 7u: { r = select(0.0, 1.0, x < y); }
-        case 8u: { r = select(0.0, 1.0, x == y); }
-        case 9u: { r = select(0.0, 1.0, x >= y); }
-        case 10u: { r = select(0.0, 1.0, x <= y); }
-        default: { r = x; }
+    bin_out[i] = binary_apply(bin_p.op, bin_a[ia], bin_b[ib]);
+}
+
+// --- Fused element-wise chains ---------------------------------------------
+// A chain of same-size unary and non-broadcasting binary ops in one dispatch
+// (FERROTENSOR_FUSION=1, see docs/design/op-fusion.md). Each step is 8 words:
+// [kind, op, src0, src1, dst, a bits, b bits, 0]; kind 0 applies a unary op
+// to src0, kind 1 a binary op to src0 and src1. Sources and destinations are
+// binding slots 0..6. Every step stores its result and later steps load it
+// back, as separate dispatches would.
+
+struct FusedParams {
+    n: u32,
+    steps: u32,
+    _pad0: u32,
+    _pad1: u32,
+};
+
+@group(0) @binding(0) var<storage, read_write> fb0: array<f32>;
+@group(0) @binding(1) var<storage, read_write> fb1: array<f32>;
+@group(0) @binding(2) var<storage, read_write> fb2: array<f32>;
+@group(0) @binding(3) var<storage, read_write> fb3: array<f32>;
+@group(0) @binding(4) var<storage, read_write> fb4: array<f32>;
+@group(0) @binding(5) var<storage, read_write> fb5: array<f32>;
+@group(0) @binding(6) var<storage, read_write> fb6: array<f32>;
+@group(0) @binding(7) var<storage, read> fused_prog: array<u32>;
+@group(0) @binding(8) var<uniform> fused_p: FusedParams;
+
+fn fused_load(slot: u32, i: u32) -> f32 {
+    var v = 0.0;
+    switch slot {
+        case 0u: { v = fb0[i]; }
+        case 1u: { v = fb1[i]; }
+        case 2u: { v = fb2[i]; }
+        case 3u: { v = fb3[i]; }
+        case 4u: { v = fb4[i]; }
+        case 5u: { v = fb5[i]; }
+        default: { v = fb6[i]; }
     }
-    bin_out[i] = r;
+    return v;
+}
+
+fn fused_store(slot: u32, i: u32, v: f32) {
+    switch slot {
+        case 0u: { fb0[i] = v; }
+        case 1u: { fb1[i] = v; }
+        case 2u: { fb2[i] = v; }
+        case 3u: { fb3[i] = v; }
+        case 4u: { fb4[i] = v; }
+        case 5u: { fb5[i] = v; }
+        default: { fb6[i] = v; }
+    }
+}
+
+@compute @workgroup_size(256)
+fn fused(@builtin(global_invocation_id) gid: vec3<u32>,
+         @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = flat_index(gid, nwg);
+    if (i >= fused_p.n) { return; }
+    for (var k = 0u; k < fused_p.steps; k = k + 1u) {
+        let w = k * 8u;
+        let x = fused_load(fused_prog[w + 2u], i);
+        var r = 0.0;
+        if (fused_prog[w] == 0u) {
+            let a = bitcast<f32>(fused_prog[w + 5u]);
+            let b = bitcast<f32>(fused_prog[w + 6u]);
+            r = unary_apply(fused_prog[w + 1u], x, a, b);
+        } else {
+            r = binary_apply(fused_prog[w + 1u], x, fused_load(fused_prog[w + 3u], i));
+        }
+        fused_store(fused_prog[w + 4u], i, r);
+    }
 }
 
 // --- Axis reductions --------------------------------------------------------
