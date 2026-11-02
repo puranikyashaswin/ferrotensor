@@ -36,7 +36,7 @@ mkdir -p "$run_dir" data/alpaca
 command -v hf >/dev/null || { echo "needs the hf CLI: pip install huggingface_hub" >&2; exit 1; }
 
 echo "== model $repo"
-hf download "$repo" --include "*.safetensors" "*.json" --local-dir "$model_dir" >/dev/null
+hf download "$repo" --include "*.safetensors" --include "*.json" --local-dir "$model_dir" >/dev/null
 
 if [ ! -s data/alpaca/train.jsonl ] || [ ! -s data/alpaca/val.jsonl ]; then
   echo "== data (alpaca-cleaned, walkthrough split)"
