@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- LoRA results on an NVIDIA A10G for SmolLM2-135M, 360M and 1.7B in the LoRA walkthrough (`docs/examples/lora-sft.md`): held-out loss 1.6521, 1.3228 and 1.0667 after 250 steps, at 1.33, 1.69 and 2.47 s per step. With the GPU changes below, SmolLM2-135M on the A10G went from 20.2 s to 1.33 s per step with the same held-out loss.
 - `scripts/lora-run.sh MODEL` runs the LoRA SFT walkthrough on any Llama-style Hugging Face model with the walkthrough's data and settings and writes a JSON summary (held-out loss before and after, loss curve, seconds per step, peak memory, greedy generations).
 - Op fusion, off by default: with `FERROTENSOR_FUSION=1`, consecutive same-size element-wise ops on the GPU run as one `fused` dispatch of up to six steps instead of one dispatch each, still writing every intermediate. Results are checked bit-identical to unfused runs. See `docs/design/op-fusion.md`.
 - The `WGPU_BACKEND` environment variable (`vulkan`, `metal`, `dx12`, `gl` or a comma list) restricts which backends `Device::new`/`gpu`/`best`, `WgpuContext::new` and `ferrotensor info` try.

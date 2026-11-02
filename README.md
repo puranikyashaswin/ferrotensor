@@ -47,6 +47,11 @@ Measured on a MacBook Air (Apple M2, 8 GB unified memory) through Metal:
 - **Checked, not assumed.** Every differentiable op is tested against finite
   differences on the CPU, and every GPU kernel against a CPU reference.
 
+On an NVIDIA A10G through Vulkan, the same walkthrough fine-tunes
+**SmolLM2-1.7B**: held-out loss 2.65 → **1.07** in 250 steps at 2.5 s/step
+(SmolLM2-135M: 1.33 s/step, held-out loss 1.65 as on the M2).
+[Three model sizes](docs/examples/lora-sft.md#on-an-nvidia-gpu-three-model-sizes).
+
 ## Install
 
 You need Rust 1.88+ (`rustup` is enough). On macOS no other setup is needed.
@@ -155,7 +160,7 @@ tested, incomplete, or only checked on one machine.
 | Safetensors save/load, state dicts | **Stable** | `ferrotensor::serialize` |
 | `DataLoader` | **Stable** | Batching, seeded shuffling, optional prefetching on a background thread (`epoch_prefetched`) |
 | Reproducible randomness | **Stable** | `manual_seed` (Rust and Python) seeds random tensors, layer initialisation and dropout |
-| LoRA fine-tuning of Llama-style models (`ferrotensor-cli`) | **Experimental** | Measured with SmolLM2-135M on an 8 GB Apple M2; see the [LoRA walkthrough](docs/examples/lora-sft.md). Larger models are untested |
+| LoRA fine-tuning of Llama-style models (`ferrotensor-cli`) | **Experimental** | Measured with SmolLM2-135M on an 8 GB Apple M2, and SmolLM2-135M, 360M and 1.7B on an NVIDIA A10G; see the [LoRA walkthrough](docs/examples/lora-sft.md). Larger models are untested |
 | Llama / LFM2-style blocks (`ferrotensor-graph`) | **Experimental** | Attention with RoPE, SwiGLU MLP, RMSNorm, KV cache |
 | Flash attention kernels (`ferrotensor-backend`) | **Experimental** | Forward v2 and a backward kernel; see `tests/flash_grad_check.rs` |
 | FP16 loss scaling, checkpoint/resume (`ferrotensor-trainer`) | **Experimental** | |

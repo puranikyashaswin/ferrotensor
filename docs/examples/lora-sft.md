@@ -84,6 +84,35 @@ about 2,300 to 3,000 tokens; the held-out loss is the cleaner signal.
 (Grad norm is the global norm of the last optimizer step in each window,
 before clipping to 1.0.)
 
+## On an NVIDIA GPU: three model sizes
+
+`scripts/lora-run.sh MODEL` repeats this walkthrough (same data split, LoRA
+rank 8 on q/k/v/o, lr 5e-4, 20 warmup steps, 250 steps of 8 sequences,
+sequence length 256) on any Llama-style checkpoint. Run on an NVIDIA A10G
+(24 GB, Vulkan, driver 595.112.07, rustc 1.99.1) at commit `1b6709f`:
+
+| Model | Layers, hidden | Trainable params | Held-out loss before → after | Perplexity before → after | Time per step | Peak host memory | Adapter |
+|---|---|---:|---|---|---:|---:|---:|
+| [SmolLM2-135M](https://huggingface.co/HuggingFaceTB/SmolLM2-135M) | 30, 576 | 921,600 | 2.4250 → **1.6521** | 11.30 → **5.22** | 1.33 s | 2.06 GB | 3.7 MB |
+| [SmolLM2-360M](https://huggingface.co/HuggingFaceTB/SmolLM2-360M) | 32, 960 | 1,638,400 | 2.0852 → **1.3228** | 8.05 → **3.75** | 1.69 s | 4.75 GB | 6.6 MB |
+| [SmolLM2-1.7B](https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B) | 24, 2048 | 3,145,728 | 2.6474 → **1.0667** | 14.12 → **2.91** | 2.47 s | 20.01 GB | 12.6 MB |
+
+- Time per step is the median over the run, for one optimizer step of 8
+  sequences; 250 steps of the 1.7B model take about 10 minutes.
+- The 135M result matches the M2 run above: the same held-out loss before
+  tuning (2.4250) and 1.6521 after, against 1.6519. The last digits differ
+  because the loss and the gradient norm are now summed on the GPU. An
+  earlier build that computed them on the CPU gave 1.6519 on the A10G too,
+  at 20.2 s per step.
+- With the adapter, all three answer instead of echoing the prompt.
+  Greedy outputs for "Give three tips for staying healthy.": 135M as in the
+  table above; 360M `1. Eat a balanced diet. 2. Get enough sleep. 3. Exercise
+  regularly.`; 1.7B `1. Eat a balanced diet that includes fruits,
+  vegetables, lean proteins, and whole grains. 2. Exercise regularly to
+  maintain a healthy weight …`.
+- Greedy generation with the KV cache runs at 35.9, 21.8 and 10.1 tokens/s
+  for the base models.
+
 ## Correctness checks
 
 Two checks were run against PyTorch with `transformers` before trusting the
@@ -227,9 +256,11 @@ training normally (losses 1.4960 and 1.6540).
 
 ## Known limits
 
-- The GPU is far from saturated; 8.8 s per 8-sequence step is a baseline,
-  not a ceiling. This run predates moving the RMSNorm and RoPE backward
-  passes and the loss to the GPU and batching kernel submissions.
+- The M2 run above predates moving the RMSNorm and RoPE backward passes and
+  the loss to the GPU and batching kernel submissions; its 8.8 s per step is
+  not current.
+- Peak host memory grows with the model: 20 GB for SmolLM2-1.7B, about three
+  times its fp32 weights. Models above 1.7B are untested.
 - Each step trains one sequence at a time. `--batch-size` only changes how
   many sequences share one optimizer step.
 - The tested architecture is Llama-style. Released LFM2 checkpoints are
