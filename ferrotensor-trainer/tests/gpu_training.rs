@@ -58,8 +58,8 @@ fn frozen_base_weights_receive_no_gradient() {
     let (_, lora) = sorted_lora_params(&model);
     let seq = pattern_sequence();
     let logits = model.forward(&gpu.engine, &seq[..8], 0, None, None);
-    let loss =
-        ferrotensor_trainer::masked_cross_entropy(&logits, &seq[1..9], &[1; 8]).expect("loss");
+    let loss = ferrotensor_trainer::masked_cross_entropy(&logits, &seq[1..9], &[1; 8], &gpu.engine)
+        .expect("loss");
     loss.tensor.backward(&gpu.engine);
 
     for (name, t) in model.named_params() {

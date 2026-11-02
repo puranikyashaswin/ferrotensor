@@ -33,5 +33,5 @@ pub mod pool;
 mod tensor;
 
 pub use context::WgpuContext;
-pub use engine::{AdamParams, AttentionOptions, ComputeEngine};
+pub use engine::{AdamParams, AttentionOptions, ComputeEngine, MASKED_CE_SKIP, SUM_SQUARES_CHUNK};
 pub use tensor::{DType, UnifiedTensor};
