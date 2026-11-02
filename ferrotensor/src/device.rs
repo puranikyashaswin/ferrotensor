@@ -246,6 +246,8 @@ impl GpuContext {
     }
 
     /// Turn fusion on or off (on only where the `fused` kernel compiled).
+    /// Tests use it to compare fused and unfused runs on one device.
+    #[cfg(test)]
     pub(crate) fn set_fusion(&self, on: bool) {
         self.fusion
             .store(on && self.engine.has("fused"), Ordering::Relaxed);
