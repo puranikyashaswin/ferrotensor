@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Ferrotensor: a pure-Rust GPU ML framework</title>
+<title>Ferrotensor (Ferro Tensor): a pure-Rust GPU ML framework</title>
 <meta name="description" content="Tensors, autograd, nn and LoRA fine-tuning in pure Rust on Metal, Vulkan or DX12, with hand-written WGSL kernels and Python bindings. No CUDA needed.">
 <meta name="google-site-verification" content="l0rdpJ2u3IDZ3tYvyRXBufrQao6aw862u_PVg9fvwkE">
 <link rel="canonical" href="https://puranikyashaswin.github.io/ferrotensor/">
@@ -14,7 +14,7 @@
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="Ferrotensor">
-<meta property="og:title" content="Ferrotensor: a pure-Rust GPU ML framework">
+<meta property="og:title" content="Ferrotensor (Ferro Tensor): a pure-Rust GPU ML framework">
 <meta property="og:description" content="Tensors, autograd and LoRA fine-tuning on Metal, Vulkan or DX12 through hand-written WGSL kernels. No CUDA, no C++ toolchain.">
 <meta property="og:url" content="https://puranikyashaswin.github.io/ferrotensor/">
 <meta property="og:image" content="https://puranikyashaswin.github.io/ferrotensor/og.png">
@@ -22,7 +22,7 @@
 <meta property="og:image:height" content="630">
 <meta property="og:image:alt" content="Ferrotensor: a pure-Rust GPU ML framework. LoRA fine-tuning on an 8 GB laptop, 611 GFLOPS matmul in WGSL, every kernel checked against a CPU reference.">
 <meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="Ferrotensor: a pure-Rust GPU ML framework">
+<meta name="twitter:title" content="Ferrotensor (Ferro Tensor): a pure-Rust GPU ML framework">
 <meta name="twitter:description" content="Tensors, autograd and LoRA fine-tuning on Metal, Vulkan or DX12 through hand-written WGSL kernels. No CUDA, no C++ toolchain.">
 <meta name="twitter:image" content="https://puranikyashaswin.github.io/ferrotensor/og.png">
 <meta name="twitter:image:alt" content="Ferrotensor: a pure-Rust GPU ML framework.">
@@ -34,6 +34,16 @@
    "@type": "SoftwareSourceCode",
    "@id": "https://puranikyashaswin.github.io/ferrotensor/#code",
    "name": "Ferrotensor",
+   "alternateName": [
+    "Ferro Tensor",
+    "ferro-tensor"
+   ],
+   "sameAs": [
+    "https://github.com/puranikyashaswin/ferrotensor",
+    "https://crates.io/crates/ferrotensor",
+    "https://docs.rs/ferrotensor",
+    "https://pypi.org/project/ferrotensor/"
+   ],
    "description": "A pure-Rust GPU ML framework: tensors, autograd, nn and LoRA fine-tuning on Metal, Vulkan or DX12 through wgpu and hand-written WGSL kernels, with Python bindings.",
    "url": "https://puranikyashaswin.github.io/ferrotensor/",
    "codeRepository": "https://github.com/puranikyashaswin/ferrotensor",
@@ -83,7 +93,7 @@
      "name": "What is Ferrotensor?",
      "acceptedAnswer": {
       "@type": "Answer",
-      "text": "Ferrotensor is a pure-Rust GPU machine-learning framework. It runs tensors, autograd, neural-network layers and LoRA fine-tuning on Apple Silicon through Metal, or on Vulkan and DX12 GPUs on Linux and Windows, using wgpu and hand-written WGSL compute kernels. It has Python bindings and is licensed MIT OR Apache-2.0."
+      "text": "Ferrotensor (also written Ferro Tensor) is a pure-Rust GPU machine-learning framework. It runs tensors, autograd, neural-network layers and LoRA fine-tuning on Apple Silicon through Metal, or on Vulkan and DX12 GPUs on Linux and Windows, using wgpu and hand-written WGSL compute kernels. It has Python bindings and is licensed MIT OR Apache-2.0."
      }
     },
     {
@@ -544,7 +554,7 @@ x = ft.<span class="f">tensor</span>([[<span class="n">0</span>, <span class="n"
     <div class="faq">
       <div class="faq-item">
         <h3 id="faq-what">What is Ferrotensor?</h3>
-        <p>Ferrotensor is a pure-Rust GPU machine-learning framework. It runs tensors, autograd, neural-network layers and LoRA fine-tuning on Apple Silicon through Metal, or on Vulkan and DX12 GPUs on Linux and Windows, using <a href="https://wgpu.rs">wgpu</a> and hand-written WGSL compute kernels. It has Python bindings and is licensed MIT OR Apache-2.0.</p>
+        <p>Ferrotensor (also written Ferro Tensor) is a pure-Rust GPU machine-learning framework. It runs tensors, autograd, neural-network layers and LoRA fine-tuning on Apple Silicon through Metal, or on Vulkan and DX12 GPUs on Linux and Windows, using <a href="https://wgpu.rs">wgpu</a> and hand-written WGSL compute kernels. It has Python bindings and is licensed MIT OR Apache-2.0.</p>
       </div>
       <div class="faq-item">
         <h3 id="faq-cuda">Does Ferrotensor need CUDA or an NVIDIA GPU?</h3>

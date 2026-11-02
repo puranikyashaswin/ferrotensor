@@ -12,7 +12,7 @@
   <img src="https://img.shields.io/badge/status-pre--1.0-yellow" alt="pre-1.0">
 </p>
 
-Ferrotensor runs tensors, autograd and neural networks on whatever GPU you have
+Ferrotensor (Ferro Tensor) runs tensors, autograd and neural networks on whatever GPU you have
 (Apple Silicon through Metal, or Vulkan/DX12 on Windows and Linux) using
 [wgpu](https://wgpu.rs) and hand-written WGSL compute kernels. There is no
 CUDA, cuDNN or libtorch to install and no Python at runtime: `cargo build` is
