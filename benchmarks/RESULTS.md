@@ -251,3 +251,63 @@ Inputs are seeded `randn`; each case ends with a read back.
   to a handful.
 - `argmax_dim` gives each output row a workgroup of 256 threads, so on a
   short axis (10 classes) most threads idle.
+
+# NVIDIA GPUs through Vulkan
+
+An NVIDIA A10G (24 GB) and a Tesla T4 (16 GB) on Linux, NVIDIA driver 595.112.07,
+Vulkan backend (`WGPU_BACKEND=vulkan`), rustc 1.99.1, commit `165921d`. Each machine ran `scripts/hardware-report.sh` twice,
+with `FERROTENSOR_FUSION=0` and `=1`, and the GPU test suites first (229 tests
+passed on each GPU, none skipped). The JSON reports are the source of every
+number here.
+
+## Kernel suite
+
+| kernel | shape | A10G | T4 |
+|---|---|---:|---:|
+| matmul | 512x512x512 | 0.077 ms (3501.5 GFLOPS) | 0.154 ms (1737.9 GFLOPS) |
+| matmul | 1024x1024x1024 | 0.335 ms (6417.9 GFLOPS) | 1.049 ms (2047.8 GFLOPS) |
+| matmul | 2048x2048x2048 | 1.880 ms (9140.6 GFLOPS) | 8.353 ms (2056.6 GFLOPS) |
+| matmul | 4096x4096x4096 | 15.057 ms (9127.9 GFLOPS) | 65.883 ms (2086.1 GFLOPS) |
+| matmul | 512x2048x8192 | 1.957 ms (8778.4 GFLOPS) | 8.465 ms (2029.6 GFLOPS) |
+| matmul | 1000x1000x1000 | 0.316 ms (6326.7 GFLOPS) | 1.041 ms (1920.6 GFLOPS) |
+| matmul_bt | 1024x1024x1024 | 0.378 ms (5682.9 GFLOPS) | 1.257 ms (1709.0 GFLOPS) |
+| matmul_at | 1024x1024x1024 | 0.270 ms (7953.2 GFLOPS) | 0.865 ms (2483.3 GFLOPS) |
+| attention_fwd | b1 h16 s512 d64 causal | 2.094 ms (256.4 GFLOPS) | 2.679 ms (200.4 GFLOPS) |
+| attention_fwd | b1 h16 s1024 d64 causal | 5.296 ms (405.5 GFLOPS) | 10.549 ms (203.6 GFLOPS) |
+| attention_fwd | b1 h16 s2048 d64 causal | 19.974 ms (430.0 GFLOPS) | 69.027 ms (124.4 GFLOPS) |
+| attention_fwd | b1 h8 s1024 d128 causal | 8.941 ms (240.2 GFLOPS) | 12.377 ms (173.5 GFLOPS) |
+| attention_bwd | b1 h16 s512 d64 causal | 6.766 ms (198.4 GFLOPS) | 15.447 ms (86.9 GFLOPS) |
+| attention_bwd | b1 h16 s1024 d64 causal | 29.456 ms (182.3 GFLOPS) | 86.459 ms (62.1 GFLOPS) |
+| softmax | 4096x1024 | 0.099 ms (338.3 GB/s) | 0.169 ms (198.1 GB/s) |
+| rms_norm | 2048x4096 | 0.226 ms (297.3 GB/s) | 0.386 ms (173.8 GB/s) |
+| add | 4M | 0.118 ms (405.5 GB/s) | 0.208 ms (230.3 GB/s) |
+| silu | 4M | 0.084 ms (383.0 GB/s) | 0.151 ms (211.7 GB/s) |
+
+## Tensor API, fusion off and on
+
+GPU medians with op fusion off and on. Checksums are identical with fusion
+off and on for every case on both GPUs: fusion is bit-exact here too. CPU is
+the A10G machine's own CPU.
+
+| case | CPU | A10G off | A10G on | T4 off | T4 on |
+|---|---:|---:|---:|---:|---:|
+| 100 element-wise ops, [64] | 0.080 ms | 0.676 ms | 0.322 ms | 0.668 ms | 0.305 ms |
+| 100 element-wise ops, [4096] | 3.303 ms | 0.677 ms | 0.315 ms | 0.669 ms | 0.301 ms |
+| MLP 784-256-10 AdamW step, batch 64 | 13.441 ms | 0.855 ms | 0.673 ms | 0.929 ms | 0.752 ms |
+| matmul 512x512x512 + read back | 16.684 ms | 0.528 ms | 0.532 ms | 0.616 ms | 0.613 ms |
+| sum() [4096, 4096] + read back | 100.515 ms | 0.258 ms | 0.258 ms | 0.366 ms | 0.364 ms |
+| sum() [1000000] + read back | 3.528 ms | 0.114 ms | 0.114 ms | 0.073 ms | 0.073 ms |
+| argmax_dim(-1) [1024, 4096] + read back | 8.031 ms | 0.147 ms | 0.146 ms | 0.146 ms | 0.145 ms |
+| argmax() [4096, 4096] | 60.121 ms | 0.268 ms | 0.270 ms | 0.417 ms | 0.396 ms |
+| Embedding 32000x256 fwd+bwd, 4096 ids | 62.797 ms | 11.626 ms | 11.640 ms | 13.376 ms | 13.303 ms |
+| index_select(0) bwd [2048, 2048], 1024 ids | 19.408 ms | 5.550 ms | 5.593 ms | 5.837 ms | 5.148 ms |
+| index_select(1) bwd [2048, 2048], 1024 ids | 62.935 ms | 5.905 ms | 5.947 ms | 6.749 ms | 5.639 ms |
+| cat 8 x [512, 512] dim 0 + read back | 2.058 ms | 2.817 ms | 2.826 ms | 2.443 ms | 2.247 ms |
+| cat 8 x [512, 512] dim 1 + read back | 2.201 ms | 2.818 ms | 2.823 ms | 2.391 ms | 2.247 ms |
+| cross_entropy [4096, 32000] class ids fwd+bwd | 2557.350 ms | 49.483 ms | 49.355 ms | 44.720 ms | 44.769 ms |
+
+Op fusion halves the 100-op chain on both GPUs (0.676 to 0.322 ms on the
+A10G, 0.668 to 0.305 ms on the T4) and takes 21% off the A10G's MLP step.
+Ops that are not element-wise chains (matmul, `cross_entropy`, reductions)
+are unchanged, as expected. The chain is still about 4x the CPU time here,
+down from about 8x unfused.
