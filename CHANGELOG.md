@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ferrotensor-trainer`: the global gradient norm sums squares on the GPU (`ComputeEngine::sum_squares_partial`) and reads back once per optimizer step instead of once per gradient tensor.
 
 ### Fixed
+- `ferrotensor`: waiting for the GPU no longer falls back to wgpu's blocking `Maintain::Wait`, which in wgpu-core 0.19 gives up after 5 s and frees the still-running submission's resources. A batch of more than 5 s of GPU work could crash the driver.
 - The LoRA walkthrough called `target/release/ferrotensor-cli`; the binary has been `ferrotensor` since the rename.
 
 ## [0.4.0] - 2026-11-01
