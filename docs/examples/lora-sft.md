@@ -98,6 +98,12 @@ loss numbers above. The scripts are not part of the repository.
 
 ## Reproduce it
 
+`scripts/lora-run.sh HuggingFaceTB/SmolLM2-135M` runs steps 1 to 4 below with
+the same settings and writes `data/runs/SmolLM2-135M/summary.json` (held-out
+loss before and after, loss curve, seconds per step, peak memory, greedy
+generations with and without the adapter). Pass another Llama-style model to
+measure it the same way. The steps it runs:
+
 ### 1. Download the model and the data
 
 Everything goes under `data/`, which is gitignored.
@@ -146,7 +152,7 @@ loss.
 
 ```bash
 cargo build --release -p ferrotensor-cli
-/usr/bin/time -l ./target/release/ferrotensor-cli train \
+/usr/bin/time -l ./target/release/ferrotensor train \
   --model data/models/SmolLM2-135M \
   --data data/alpaca/train.jsonl --eval-data data/alpaca/val.jsonl \
   --out data/runs/sft --seq-len 256 \
@@ -188,12 +194,12 @@ processed but not counted.
 ### 4. Reload the adapter: evaluate and generate
 
 ```bash
-./target/release/ferrotensor-cli eval --model data/models/SmolLM2-135M \
+./target/release/ferrotensor eval --model data/models/SmolLM2-135M \
   --data data/alpaca/val.jsonl \
   --lora data/runs/sft/lora_adapters.safetensors
 # eval: 64 examples, 2744 tokens, loss 1.6519, perplexity 5.217 (9.7s)
 
-./target/release/ferrotensor-cli generate --model data/models/SmolLM2-135M \
+./target/release/ferrotensor generate --model data/models/SmolLM2-135M \
   --lora data/runs/sft/lora_adapters.safetensors \
   --prompt "Translate 'good morning' into French." --temperature 0
 # Bonjour, bonne journe!
@@ -208,7 +214,7 @@ Without `--lora`, the same commands give the base-model rows above.
 ### 5. Resume
 
 ```bash
-./target/release/ferrotensor-cli train --model data/models/SmolLM2-135M \
+./target/release/ferrotensor train --model data/models/SmolLM2-135M \
   --data data/alpaca/train.jsonl --out data/runs/sft --seq-len 256 \
   --lr 5e-4 --warmup-steps 20 --grad-accum 8 --max-steps 300 \
   --resume data/runs/sft/lora_adapters.safetensors
