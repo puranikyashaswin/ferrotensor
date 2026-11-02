@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::num::NonZeroU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -15,7 +16,8 @@ use wgpu::{
     Device as WgpuDevice, Queue,
 };
 
-use crate::backend::{ComputeEngine, Dispatch};
+use crate::backend::{ComputeEngine, Dispatch, FUSED_STORAGE_BINDINGS};
+use crate::tensor::Storage;
 
 /// Ops recorded before the pending commands are submitted anyway, so the GPU
 /// starts on long op sequences that never read back to the host.
@@ -32,6 +34,82 @@ const SPIN_WAIT: Duration = Duration::from_millis(10);
 
 /// Largest total size of freed tensor buffers kept for reuse.
 const POOL_BYTES: u64 = 128 << 20;
+
+/// Tensor buffers one `fused` dispatch binds (its last binding is the program).
+const FUSED_SLOTS: usize = (FUSED_STORAGE_BINDINGS - 1) as usize;
+
+/// One element-wise op for [`GpuContext::elementwise`].
+pub(crate) struct ElementwiseStep {
+    /// 0 for a `unary_op`, 1 for a `binary_op`.
+    pub(crate) kind: u32,
+    pub(crate) op: u32,
+    /// Scalars of a unary op.
+    pub(crate) a: f32,
+    pub(crate) b: f32,
+    /// One input for a unary op, two for a binary op, each with `n` elements.
+    pub(crate) inputs: Vec<Arc<Storage>>,
+    /// A new buffer of `n` elements.
+    pub(crate) output: Arc<Storage>,
+    pub(crate) n: usize,
+}
+
+/// Element-wise steps over the same element count, recorded as one `fused`
+/// dispatch when the group closes. Holding each slot's storage keeps its
+/// buffer out of the pool until then.
+struct FusionGroup {
+    n: usize,
+    /// The storage bound to each slot, in slot order.
+    slots: Vec<Arc<Storage>>,
+    /// Eight words per step; see the `fused` kernel.
+    program: Vec<u32>,
+}
+
+impl FusionGroup {
+    fn position(&self, storage: &Arc<Storage>) -> Option<usize> {
+        self.slots.iter().position(|s| Arc::ptr_eq(s, storage))
+    }
+
+    /// Number of slots the group would use with `step` added.
+    fn slots_with(&self, step: &ElementwiseStep) -> usize {
+        let mut added: Vec<&Arc<Storage>> = Vec::new();
+        for s in step.inputs.iter().chain(std::iter::once(&step.output)) {
+            if self.position(s).is_none() && !added.iter().any(|a| Arc::ptr_eq(a, s)) {
+                added.push(s);
+            }
+        }
+        self.slots.len() + added.len()
+    }
+
+    fn slot(&mut self, storage: &Arc<Storage>) -> u32 {
+        let index = match self.position(storage) {
+            Some(index) => index,
+            None => {
+                self.slots.push(Arc::clone(storage));
+                self.slots.len() - 1
+            }
+        };
+        index as u32
+    }
+
+    fn push(&mut self, step: &ElementwiseStep) {
+        let src0 = self.slot(&step.inputs[0]);
+        let src1 = match step.inputs.get(1) {
+            Some(s) => self.slot(s),
+            None => 0,
+        };
+        let dst = self.slot(&step.output);
+        self.program.extend_from_slice(&[
+            step.kind,
+            step.op,
+            src0,
+            src1,
+            dst,
+            step.a.to_bits(),
+            step.b.to_bits(),
+            0,
+        ]);
+    }
+}
 
 /// Freed tensor buffers by size, reused by later ops.
 ///
@@ -102,6 +180,11 @@ pub(crate) struct GpuContext {
     align: usize,
     pending: Mutex<Pending>,
     pool: Arc<Mutex<BufferPool>>,
+    /// Whether element-wise ops are fused (`FERROTENSOR_FUSION=1`).
+    fusion: AtomicBool,
+    /// Placeholders for the unused slots of a `fused` dispatch: one each, so
+    /// no buffer is bound twice as read-write.
+    fused_dummies: Vec<Buffer>,
 }
 
 /// Work recorded since the last submission.
@@ -113,6 +196,8 @@ struct Pending {
     /// Contents of [`GpuContext::args`] for this batch.
     args: Vec<u8>,
     ops: usize,
+    /// Element-wise steps not yet recorded as a `fused` dispatch.
+    group: Option<FusionGroup>,
 }
 
 impl GpuContext {
@@ -129,6 +214,18 @@ impl GpuContext {
             usage: BufferUsages::UNIFORM | BufferUsages::STORAGE | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let fused_dummies = (0..FUSED_SLOTS)
+            .map(|_| {
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Fused slot placeholder"),
+                    size: 4,
+                    usage: BufferUsages::STORAGE,
+                    mapped_at_creation: false,
+                })
+            })
+            .collect();
+        let fusion =
+            engine.has("fused") && std::env::var("FERROTENSOR_FUSION").as_deref() == Ok("1");
         Self {
             adapter,
             device,
@@ -138,7 +235,73 @@ impl GpuContext {
             align,
             pending: Mutex::default(),
             pool: Arc::default(),
+            fusion: AtomicBool::new(fusion),
+            fused_dummies,
         }
+    }
+
+    /// Whether element-wise ops go through [`GpuContext::elementwise`].
+    pub(crate) fn fusion(&self) -> bool {
+        self.fusion.load(Ordering::Relaxed)
+    }
+
+    /// Turn fusion on or off (on only where the `fused` kernel compiled).
+    pub(crate) fn set_fusion(&self, on: bool) {
+        self.fusion
+            .store(on && self.engine.has("fused"), Ordering::Relaxed);
+    }
+
+    /// Record an element-wise op, joining the open fusion group when it has
+    /// the same element count and room for the op's buffers.
+    pub(crate) fn elementwise(&self, step: ElementwiseStep) {
+        let mut pending = self.lock();
+        let joins = pending
+            .group
+            .as_ref()
+            .is_some_and(|g| g.n == step.n && g.slots_with(&step) <= FUSED_SLOTS);
+        if !joins {
+            self.close_group(&mut pending);
+            pending.group = Some(FusionGroup {
+                n: step.n,
+                slots: Vec::new(),
+                program: Vec::new(),
+            });
+        }
+        if let Some(group) = pending.group.as_mut() {
+            group.push(&step);
+        }
+        self.count_op(&mut pending);
+    }
+
+    /// Record the open fusion group, if any, as one `fused` dispatch.
+    fn close_group(&self, pending: &mut Pending) {
+        let Some(group) = pending.group.take() else {
+            return;
+        };
+        let buffers: Vec<&Buffer> = group
+            .slots
+            .iter()
+            .map(|s| match &**s {
+                Storage::Gpu(buffer) => &**buffer,
+                Storage::Cpu(_) => unreachable!("fused step on a CPU tensor"),
+            })
+            .collect();
+        let mut args: Vec<Arg<'_>> = (0..FUSED_SLOTS)
+            .map(|i| Arg::Buffer(buffers.get(i).copied().unwrap_or(&self.fused_dummies[i])))
+            .collect();
+        args.push(Arg::Meta(&group.program));
+        args.push(Arg::Params([
+            group.n as u32,
+            (group.program.len() / 8) as u32,
+            0,
+            0,
+        ]));
+        self.stage(
+            pending,
+            "fused",
+            &args,
+            ComputeEngine::workgroups_1d(group.n),
+        );
     }
 
     /// A tensor buffer of `bytes` bytes: a freed one when available, else a
@@ -174,6 +337,20 @@ impl GpuContext {
         args: &[Arg<'_>],
         workgroups: (u32, u32, u32),
     ) {
+        let mut pending = self.lock();
+        self.close_group(&mut pending);
+        self.stage(&mut pending, kernel, args, workgroups);
+        self.count_op(&mut pending);
+    }
+
+    /// Stage `args` in the batch's argument buffer and queue the dispatch.
+    fn stage(
+        &self,
+        pending: &mut Pending,
+        kernel: &'static str,
+        args: &[Arg<'_>],
+        workgroups: (u32, u32, u32),
+    ) {
         let padded = |bytes: usize| bytes.div_ceil(self.align) * self.align;
         let needed: usize = args
             .iter()
@@ -188,9 +365,8 @@ impl GpuContext {
             "kernel arguments exceed {ARGS_BYTES} bytes"
         );
 
-        let mut pending = self.lock();
         if pending.args.len() + needed > ARGS_BYTES {
-            self.submit(&mut pending);
+            self.submit(pending);
         }
         let staged = &mut pending.args;
         let resources = args
@@ -216,7 +392,6 @@ impl GpuContext {
             .engine
             .dispatch(&self.device, kernel, resources, workgroups);
         pending.dispatches.push(dispatch);
-        self.count_op(&mut pending);
     }
 
     /// Record a copy of the first `bytes` bytes of `src` into `dst`.
@@ -269,8 +444,10 @@ impl GpuContext {
         }
     }
 
-    /// The batch's encoder, with the pending dispatches encoded into it.
+    /// The batch's encoder, with the pending dispatches (and the open
+    /// fusion group) encoded into it.
     fn encoder<'p>(&self, pending: &'p mut Pending) -> &'p mut CommandEncoder {
+        self.close_group(pending);
         let encoder = pending.encoder.get_or_insert_with(|| {
             self.device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
