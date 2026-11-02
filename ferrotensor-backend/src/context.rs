@@ -1,7 +1,9 @@
 //! GPU device setup.
 
 use crate::pool::BufferPool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use wgpu::{Adapter, CommandEncoder, Device, Instance, Queue};
 
 /// Recorded GPU work is submitted once this many ops are pending, so the GPU
@@ -16,7 +18,8 @@ const MAX_PENDING_OPS: u32 = 128;
 /// ([`UnifiedTensor::to_vec`](crate::UnifiedTensor::to_vec)) or a buffer is
 /// written ([`UnifiedTensor::write_data`](crate::UnifiedTensor::write_data)).
 /// Call [`flush`](Self::flush) before submitting work of your own on
-/// `queue` or waiting on `device`, so it runs after the recorded ops.
+/// `queue`, so it runs after the recorded ops, and
+/// [`synchronize`](Self::synchronize) to wait for the GPU.
 #[derive(Debug)]
 pub struct WgpuContext {
     /// The wgpu instance the adapter came from.
@@ -126,6 +129,39 @@ impl WgpuContext {
     pub fn flush(&self) {
         let mut pending = self.pending.lock().unwrap();
         self.submit(&mut pending);
+    }
+
+    /// Submits all recorded work and blocks until the GPU has finished
+    /// everything submitted so far.
+    pub fn synchronize(&self) {
+        self.flush();
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = done.clone();
+        self.queue
+            .on_submitted_work_done(move || flag.store(true, Ordering::Release));
+        self.poll_until(|| done.load(Ordering::Acquire));
+    }
+
+    /// Polls the device until `done` returns true.
+    ///
+    /// Never blocks in `Maintain::Wait`: wgpu-core 0.19 gives up waiting
+    /// there after 5 s and then frees the still-running submission's
+    /// resources as if it had finished, which crashes drivers that are still
+    /// reading them (seen with long batches on lavapipe).
+    pub(crate) fn poll_until(&self, done: impl Fn() -> bool) {
+        let mut polls = 0u32;
+        loop {
+            self.device.poll(wgpu::Maintain::Poll);
+            if done() {
+                return;
+            }
+            if polls < 100 {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(Duration::from_micros(50));
+            }
+            polls += 1;
+        }
     }
 
     fn submit(&self, pending: &mut Pending) {
