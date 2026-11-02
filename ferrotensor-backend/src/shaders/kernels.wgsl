@@ -570,6 +570,70 @@ fn clip_grad_by_norm(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num
     gclip_grad[idx] = gclip_grad[idx] * gclip_scale;
 }
 
+// Masked cross-entropy over [rows, vocab] logits, one workgroup per row.
+// mce_targets[row] is the target id, or MCE_SKIP for a row outside the loss.
+// Writes the row's loss (log-sum-exp minus the target logit; 0 when skipped)
+// and its gradient (softmax - onehot) * inv, where inv = 1 / supervised rows.
+const MCE_SKIP: u32 = 0xffffffffu;
+@group(0) @binding(0) var<storage, read> mce_logits: array<f32>;
+@group(0) @binding(1) var<storage, read> mce_targets: array<u32>;
+@group(0) @binding(2) var<storage, read_write> mce_grad: array<f32>;
+@group(0) @binding(3) var<storage, read_write> mce_loss: array<f32>;
+@group(0) @binding(4) var<uniform> mce_params: vec4<u32>; // vocab, rows, inv bits, 0
+
+@compute @workgroup_size(256)
+fn masked_cross_entropy(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wg: vec3<u32>,
+                        @builtin(num_workgroups) nwg: vec3<u32>) {
+    let row = row_index(wg, nwg);
+    let vocab = mce_params.x;
+    if (row >= mce_params.y) { return; } // uniform: whole workgroup exits
+    let off = row * vocab;
+    let tgt = mce_targets[row];
+    if (tgt == MCE_SKIP) { // uniform: one target per row
+        for (var i = lid; i < vocab; i += ROW_WG) { mce_grad[off + i] = 0.0; }
+        if (lid == 0u) { mce_loss[row] = 0.0; }
+        return;
+    }
+    var m = -3.4e38;
+    for (var i = lid; i < vocab; i += ROW_WG) { m = max(m, mce_logits[off + i]); }
+    m = row_max(lid, m);
+    var se = 0.0;
+    for (var i = lid; i < vocab; i += ROW_WG) { se += exp(mce_logits[off + i] - m); }
+    se = row_sum(lid, se);
+    let log_z = m + log(se);
+    let inv = bitcast<f32>(mce_params.z);
+    for (var i = lid; i < vocab; i += ROW_WG) {
+        var gv = exp(mce_logits[off + i] - log_z) * inv;
+        if (i == tgt) { gv -= inv; }
+        mce_grad[off + i] = gv;
+    }
+    if (lid == 0u) { mce_loss[row] = log_z - mce_logits[off + tgt]; }
+}
+
+// Sum of squares of sq_in in chunks of SQ_CHUNK elements, one workgroup per
+// chunk; chunk b's sum goes to sq_out[offset + b].
+const SQ_CHUNK: u32 = 4096u;
+@group(0) @binding(0) var<storage, read> sq_in: array<f32>;
+@group(0) @binding(1) var<storage, read_write> sq_out: array<f32>;
+@group(0) @binding(2) var<uniform> sq_params: vec4<u32>; // n, offset, 0, 0
+
+@compute @workgroup_size(256)
+fn sum_squares_partial(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wg: vec3<u32>,
+                       @builtin(num_workgroups) nwg: vec3<u32>) {
+    let block = row_index(wg, nwg);
+    let n = sq_params.x;
+    let start = block * SQ_CHUNK;
+    if (start >= n) { return; } // uniform: whole workgroup exits
+    let end = min(start + SQ_CHUNK, n);
+    var acc = 0.0;
+    for (var i = start + lid; i < end; i += ROW_WG) {
+        let v = sq_in[i];
+        acc += v * v;
+    }
+    acc = row_sum(lid, acc);
+    if (lid == 0u) { sq_out[sq_params.y + block] = acc; }
+}
+
 // --- 18. Fused SiLU-Gate (for Llama MLP) ---
 // out = SiLU(up) * gate = (up * sigmoid(up)) * gate
 // Reduces memory bandwidth by 2x compared to separate ops

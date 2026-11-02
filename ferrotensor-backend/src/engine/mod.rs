@@ -13,7 +13,7 @@ mod quant;
 mod training;
 
 pub use attention::AttentionOptions;
-pub use training::AdamParams;
+pub use training::{AdamParams, MASKED_CE_SKIP, SUM_SQUARES_CHUNK};
 
 /// The full WGSL source compiled into the engine's shader module.
 fn shader_source() -> String {
@@ -113,6 +113,8 @@ pub struct ComputeEngine {
     rms_residual: Kernel,
     grad_accum: Kernel,
     grad_scale: Kernel,
+    masked_ce: Kernel,
+    sum_squares: Kernel,
     flash_attn_v2: Kernel,
     flash_attn_v2_bw_dq: Kernel,
     flash_attn_v2_bw_dkdv: Kernel,
@@ -165,6 +167,8 @@ impl ComputeEngine {
             rms_residual: k("rms_norm_residual"),
             grad_accum: k("gradient_accumulate"),
             grad_scale: k("gradient_scale"),
+            masked_ce: k("masked_cross_entropy"),
+            sum_squares: k("sum_squares_partial"),
             flash_attn_v2: k("flash_attention_v2_metal"),
             flash_attn_v2_bw_dq: k("flash_bwd_dq"),
             flash_attn_v2_bw_dkdv: k("flash_bwd_dk_dv"),

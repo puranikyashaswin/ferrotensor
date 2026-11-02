@@ -11,7 +11,9 @@
 #![warn(missing_docs)]
 
 use ferrotensor_autograd::{AutogradNode, LRScheduler, Optimizer, Tensor};
-use ferrotensor_backend::{ComputeEngine, UnifiedTensor, WgpuContext};
+use ferrotensor_backend::{
+    ComputeEngine, UnifiedTensor, WgpuContext, MASKED_CE_SKIP, SUM_SQUARES_CHUNK,
+};
 use ferrotensor_graph::lfm::Lfm2Model;
 use std::sync::Arc;
 
@@ -212,7 +214,7 @@ impl Trainer {
             grad_norm: None,
             lr: None,
         };
-        if let Some(loss) = masked_cross_entropy(&logits, &targets, &mask) {
+        if let Some(loss) = masked_cross_entropy(&logits, &targets, &mask, &self.engine) {
             stats.loss = loss.value;
             stats.tokens = loss.tokens;
             // Seed backward with d(total)/d(loss): the accumulation average
@@ -270,7 +272,7 @@ impl Trainer {
             }
         }
 
-        let norm = global_grad_norm(&grads, &self.ctx);
+        let norm = global_grad_norm(&grads, &self.ctx, &self.engine);
         stats.grad_norm = Some(norm);
         if !norm.is_finite() {
             log::warn!("gradient norm is {norm}; skipping optimizer step");
@@ -335,16 +337,29 @@ impl Trainer {
     }
 }
 
-/// L2 norm over all gradient tensors (host reduction).
-fn global_grad_norm(grads: &[UnifiedTensor], ctx: &WgpuContext) -> f32 {
-    let sum_sq: f64 = grads
+/// L2 norm over all gradient tensors: partial sums of squares on the GPU,
+/// read back once and added up on the host in f64.
+fn global_grad_norm(grads: &[UnifiedTensor], ctx: &WgpuContext, engine: &ComputeEngine) -> f32 {
+    let chunks: usize = grads
         .iter()
         .map(|g| {
-            pollster::block_on(g.to_vec(ctx))
+            g.shape
                 .iter()
-                .map(|&x| (x as f64) * (x as f64))
-                .sum::<f64>()
+                .product::<usize>()
+                .div_ceil(SUM_SQUARES_CHUNK)
         })
+        .sum();
+    if chunks == 0 {
+        return 0.0;
+    }
+    let partials = UnifiedTensor::empty(ctx, &[chunks]);
+    let mut offset = 0;
+    for grad in grads {
+        offset += engine.sum_squares_partial(ctx, grad, &partials, offset);
+    }
+    let sum_sq: f64 = pollster::block_on(partials.to_vec(ctx))
+        .iter()
+        .map(|&x| x as f64)
         .sum();
     sum_sq.sqrt() as f32
 }
@@ -360,10 +375,10 @@ pub struct MaskedLoss {
 }
 
 /// Backward node of [`masked_cross_entropy`]: holds `d loss / d logits`,
-/// computed together with the loss from one host read of the logits.
+/// computed on the GPU together with the loss.
 struct MaskedCrossEntropyNode {
     logits: Tensor,
-    grad_logits: Vec<f32>,
+    grad_logits: UnifiedTensor,
 }
 
 impl AutogradNode for MaskedCrossEntropyNode {
@@ -371,61 +386,72 @@ impl AutogradNode for MaskedCrossEntropyNode {
         vec![self.logits.clone()]
     }
 
-    fn backward(&self, grad: &UnifiedTensor, _engine: &ComputeEngine) -> Vec<UnifiedTensor> {
+    fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
         let ctx = &self.logits.ctx;
         let upstream = pollster::block_on(grad.to_vec(ctx))
             .first()
             .copied()
             .unwrap_or(1.0);
-        let scaled: Vec<f32> = self.grad_logits.iter().map(|g| g * upstream).collect();
-        vec![UnifiedTensor::new(ctx, &scaled, &self.logits.data.shape)]
+        let scaled = UnifiedTensor::empty(ctx, &self.grad_logits.shape);
+        engine.copy_tensor(ctx, &self.grad_logits, &scaled, 0);
+        if (upstream - 1.0).abs() > f32::EPSILON {
+            engine.gradient_scale(ctx, &scaled, upstream);
+        }
+        vec![scaled]
     }
 }
 
 /// Mean cross-entropy of `logits` (`[.., seq, vocab]`) against `target_ids`
 /// over the positions where `loss_mask` is 1, as a differentiable scalar.
 ///
-/// The logits are read to the host once; the loss and its gradient
-/// (`(softmax - onehot) / tokens` at supervised positions, zero elsewhere)
-/// are computed there. Returns `None` when no position is supervised.
+/// The loss and its gradient (`(softmax - onehot) / tokens` at supervised
+/// positions, zero elsewhere) are computed on the GPU; only the per-position
+/// losses are read back. Returns `None` when no position is supervised.
 // Autograd nodes are shared through `Arc` but used on one thread.
 #[allow(clippy::arc_with_non_send_sync)]
 pub fn masked_cross_entropy(
     logits: &Tensor,
     target_ids: &[u32],
     loss_mask: &[u8],
+    engine: &ComputeEngine,
 ) -> Option<MaskedLoss> {
     let vocab = *logits.data.shape.last()?;
     if vocab == 0 {
         return None;
     }
-    let host = pollster::block_on(logits.data.to_vec(&logits.ctx));
-    let seq = host.len() / vocab;
-    let positions = seq.min(target_ids.len()).min(loss_mask.len());
-    let supervised: Vec<usize> = (0..positions)
-        .filter(|&p| loss_mask[p] != 0 && (target_ids[p] as usize) < vocab)
+    let rows = logits.data.shape.iter().product::<usize>() / vocab;
+    let positions = rows.min(target_ids.len()).min(loss_mask.len());
+    let targets: Vec<u32> = (0..rows)
+        .map(|p| {
+            let supervised = p < positions && loss_mask[p] != 0 && (target_ids[p] as usize) < vocab;
+            if supervised {
+                target_ids[p]
+            } else {
+                MASKED_CE_SKIP
+            }
+        })
         .collect();
-    if supervised.is_empty() {
+    let tokens = targets.iter().filter(|&&t| t != MASKED_CE_SKIP).count();
+    if tokens == 0 {
         return None;
     }
-    let inv = 1.0 / supervised.len() as f32;
-    let mut grad = vec![0.0f32; host.len()];
-    let mut loss_sum = 0.0f64;
-    for &p in &supervised {
-        let row = &host[p * vocab..(p + 1) * vocab];
-        let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let sum_exp: f32 = row.iter().map(|x| (x - max).exp()).sum();
-        let log_z = max + sum_exp.ln();
-        let target = target_ids[p] as usize;
-        loss_sum += (log_z - row[target]) as f64;
-        let g = &mut grad[p * vocab..(p + 1) * vocab];
-        for (gi, &x) in g.iter_mut().zip(row) {
-            *gi = (x - log_z).exp() * inv;
-        }
-        g[target] -= inv;
-    }
-    let value = (loss_sum / supervised.len() as f64) as f32;
     let ctx = logits.ctx.clone();
+    let target_buf = UnifiedTensor::from_bytes(&ctx, bytemuck::cast_slice(&targets), &[rows]);
+    let grad = UnifiedTensor::empty(&ctx, &logits.data.shape);
+    let row_loss = UnifiedTensor::empty(&ctx, &[rows]);
+    engine.masked_cross_entropy(
+        &ctx,
+        &logits.data,
+        &target_buf,
+        1.0 / tokens as f32,
+        &grad,
+        &row_loss,
+    );
+    let loss_sum: f64 = pollster::block_on(row_loss.to_vec(&ctx))
+        .iter()
+        .map(|&l| l as f64)
+        .sum();
+    let value = (loss_sum / tokens as f64) as f32;
     let node = Arc::new(MaskedCrossEntropyNode {
         logits: logits.clone(),
         grad_logits: grad,
@@ -434,7 +460,7 @@ pub fn masked_cross_entropy(
     Some(MaskedLoss {
         tensor,
         value,
-        tokens: supervised.len(),
+        tokens,
     })
 }
 

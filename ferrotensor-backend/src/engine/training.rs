@@ -1,7 +1,14 @@
 //! Losses, optimisers and gradient utilities.
 
-use super::{groups64, uniform, ComputeEngine};
+use super::{grid, groups64, uniform, ComputeEngine};
 use crate::{UnifiedTensor, WgpuContext};
+
+/// Target id that excludes a row from [`ComputeEngine::masked_cross_entropy`].
+pub const MASKED_CE_SKIP: u32 = u32::MAX;
+
+/// Elements summed by one workgroup of
+/// [`ComputeEngine::sum_squares_partial`].
+pub const SUM_SQUARES_CHUNK: usize = 4096;
 
 /// Hyper-parameters for [`ComputeEngine::adamw_update`]; laid out to match
 /// the WGSL uniform.
@@ -187,5 +194,70 @@ impl ComputeEngine {
             &[(0, grad.buffer()), (1, &params)],
             groups64(grad.shape.iter().product()),
         );
+    }
+
+    /// Masked cross-entropy of `logits` (`[rows, vocab]`, any leading
+    /// dimensions) against one target id per row, without leaving the GPU.
+    ///
+    /// `targets` holds `rows` `u32` ids; [`MASKED_CE_SKIP`] leaves a row out.
+    /// Writes each row's loss (log-sum-exp minus the target logit, 0 for a
+    /// skipped row) to `row_loss` (`[rows]`) and `(softmax - onehot) * inv`
+    /// (zero for a skipped row) to `grad` (the shape of `logits`). With
+    /// `inv = 1 / supervised rows` the gradient is that of the mean loss.
+    pub fn masked_cross_entropy(
+        &self,
+        ctx: &WgpuContext,
+        logits: &UnifiedTensor,
+        targets: &UnifiedTensor,
+        inv: f32,
+        grad: &UnifiedTensor,
+        row_loss: &UnifiedTensor,
+    ) {
+        let vocab = *logits.shape.last().unwrap_or(&1);
+        let rows = logits.shape.iter().product::<usize>() / vocab.max(1);
+        if rows == 0 || vocab == 0 {
+            return;
+        }
+        let params = uniform(
+            ctx,
+            bytemuck::cast_slice(&[vocab as u32, rows as u32, inv.to_bits(), 0]),
+        );
+        self.run(
+            ctx,
+            &self.masked_ce,
+            &[
+                (0, logits.buffer()),
+                (1, targets.buffer()),
+                (2, grad.buffer()),
+                (3, row_loss.buffer()),
+                (4, &params),
+            ],
+            grid(rows as u32),
+        );
+    }
+
+    /// Sums the squares of `input` in chunks of [`SUM_SQUARES_CHUNK`]
+    /// elements, writing chunk `b`'s sum to `out[offset + b]`. Returns the
+    /// number of chunks written; adding them up gives the squared L2 norm.
+    pub fn sum_squares_partial(
+        &self,
+        ctx: &WgpuContext,
+        input: &UnifiedTensor,
+        out: &UnifiedTensor,
+        offset: usize,
+    ) -> usize {
+        let n = input.shape.iter().product::<usize>();
+        let chunks = n.div_ceil(SUM_SQUARES_CHUNK);
+        if chunks == 0 {
+            return 0;
+        }
+        let params = uniform(ctx, bytemuck::cast_slice(&[n as u32, offset as u32, 0, 0]));
+        self.run(
+            ctx,
+            &self.sum_squares,
+            &[(0, input.buffer()), (1, out.buffer()), (2, &params)],
+            grid(chunks as u32),
+        );
+        chunks
     }
 }

@@ -10,7 +10,8 @@
 //! unreliable on some drivers).
 
 use ferrotensor_backend::{
-    AdamParams, AttentionOptions, ComputeEngine, UnifiedTensor, WgpuContext,
+    AdamParams, AttentionOptions, ComputeEngine, UnifiedTensor, WgpuContext, MASKED_CE_SKIP,
+    SUM_SQUARES_CHUNK,
 };
 use std::sync::OnceLock;
 
@@ -590,6 +591,100 @@ fn rms_norm_residual_matches_cpu() {
     let sum: Vec<f32> = x.iter().zip(&r).map(|(a, b)| a + b).collect();
     let want = cpu_rms_norm(&sum, &w, len, 1e-5);
     assert_close("rms_norm_residual", &read(&out), &want, 1e-5, 1e-4);
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn masked_cross_entropy_matches_cpu() {
+    let g = gpu();
+    for &(rows, vocab) in &[(1, 1), (4, 7), (9, 300), (3, 49152)] {
+        let logits: Vec<f32> = rand_vec(rows * vocab, 80 + vocab as u64)
+            .iter()
+            .map(|v| v * 8.0)
+            .collect();
+        // Every third row is skipped; the others target a varying id.
+        let targets: Vec<u32> = (0..rows)
+            .map(|r| {
+                if r % 3 == 1 {
+                    MASKED_CE_SKIP
+                } else {
+                    ((r * 7919) % vocab) as u32
+                }
+            })
+            .collect();
+        let supervised = targets.iter().filter(|&&t| t != MASKED_CE_SKIP).count();
+        let inv = 1.0 / supervised as f32;
+        let target_buf = UnifiedTensor::from_bytes(&g.ctx, bytemuck::cast_slice(&targets), &[rows]);
+        let grad = zeros(&[rows, vocab]);
+        let loss = zeros(&[rows]);
+        g.engine.masked_cross_entropy(
+            &g.ctx,
+            &upload(&logits, &[rows, vocab]),
+            &target_buf,
+            inv,
+            &grad,
+            &loss,
+        );
+
+        let probs = cpu_softmax_rows(&logits, vocab);
+        let mut want_grad = vec![0.0f32; rows * vocab];
+        let mut want_loss = vec![0.0f32; rows];
+        for (r, &t) in targets.iter().enumerate() {
+            if t == MASKED_CE_SKIP {
+                continue;
+            }
+            let t = t as usize;
+            want_loss[r] = -probs[r * vocab + t].ln();
+            for i in 0..vocab {
+                want_grad[r * vocab + i] = probs[r * vocab + i] * inv;
+            }
+            want_grad[r * vocab + t] -= inv;
+        }
+        let name = format!("masked_cross_entropy {rows}x{vocab}");
+        assert_close(
+            &format!("{name} loss"),
+            &read(&loss),
+            &want_loss,
+            1e-4,
+            1e-4,
+        );
+        assert_close(
+            &format!("{name} grad"),
+            &read(&grad),
+            &want_grad,
+            1e-6,
+            1e-3,
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn sum_squares_partial_adds_up_to_the_squared_norm() {
+    let g = gpu();
+    let sizes = [
+        1,
+        SUM_SQUARES_CHUNK - 1,
+        SUM_SQUARES_CHUNK,
+        3 * SUM_SQUARES_CHUNK + 5,
+    ];
+    let inputs: Vec<Vec<f32>> = sizes.iter().map(|&n| rand_vec(n, 90 + n as u64)).collect();
+    let chunks: usize = sizes.iter().map(|n| n.div_ceil(SUM_SQUARES_CHUNK)).sum();
+    let out = zeros(&[chunks]);
+    let mut offset = 0;
+    let mut want = Vec::new();
+    for x in &inputs {
+        let written = g
+            .engine
+            .sum_squares_partial(&g.ctx, &upload(x, &[x.len()]), &out, offset);
+        assert_eq!(written, x.len().div_ceil(SUM_SQUARES_CHUNK));
+        offset += written;
+        want.extend(
+            x.chunks(SUM_SQUARES_CHUNK)
+                .map(|c| c.iter().map(|v| v * v).sum::<f32>()),
+        );
+    }
+    assert_close("sum_squares_partial", &read(&out), &want, 1e-4, 1e-4);
 }
 
 // ---------------------------------------------------------------------------
