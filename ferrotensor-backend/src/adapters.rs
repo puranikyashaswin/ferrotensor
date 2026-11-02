@@ -80,11 +80,17 @@ fn report(adapter: &wgpu::Adapter, selected: Option<&wgpu::AdapterInfo>) -> Adap
     }
 }
 
-/// Every adapter wgpu can open on this machine, across all backends, with the
-/// one [`WgpuContext::new`] would pick marked `selected`.
+/// The backends to try: those named in `WGPU_BACKEND` (a comma list such as
+/// `vulkan` or `metal,gl`), or all of them when it is unset.
+pub fn backends() -> wgpu::Backends {
+    wgpu::util::backend_bits_from_env().unwrap_or(wgpu::Backends::all())
+}
+
+/// Every adapter wgpu can open on this machine, across the [`backends`] in
+/// use, with the one [`WgpuContext::new`] would pick marked `selected`.
 pub fn list_adapters() -> Vec<AdapterReport> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::all(),
+        backends: backends(),
         ..Default::default()
     });
     let chosen = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -94,7 +100,7 @@ pub fn list_adapters() -> Vec<AdapterReport> {
     }))
     .map(|a| a.get_info());
     instance
-        .enumerate_adapters(wgpu::Backends::all())
+        .enumerate_adapters(backends())
         .iter()
         .map(|a| report(a, chosen.as_ref()))
         .collect()

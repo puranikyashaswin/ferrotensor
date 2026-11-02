@@ -18,6 +18,16 @@ This lists every adapter wgpu can open on your machine and marks the one
 Ferrotensor picks with `*`. If your discrete GPU is not the one marked, say so
 in your report: wgpu chooses the high-performance adapter it finds first.
 
+To try one backend only, set `WGPU_BACKEND` (`vulkan`, `metal`, `dx12` or
+`gl`, or a comma list):
+
+```bash
+WGPU_BACKEND=vulkan ferrotensor info --check
+```
+
+Ferrotensor's tests and the CLI respect it too. On Windows this is the way to
+compare Vulkan with DX12 on the same GPU.
+
 ## 2. Check that the kernels are correct on it
 
 ```bash
