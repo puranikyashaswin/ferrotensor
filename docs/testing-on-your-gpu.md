@@ -1,9 +1,10 @@
 # Testing Ferrotensor on your GPU
 
 Ferrotensor runs on any GPU wgpu supports: Metal on macOS, Vulkan on Linux and
-Windows, DX12 on Windows. So far every number in this repository was measured
-on one machine, an Apple M2 through Metal. Results from AMD, Intel and NVIDIA
-GPUs, and from Vulkan or DX12, are the most useful thing you can contribute.
+Windows, DX12 on Windows. So far the numbers in this repository come from an
+Apple M2 through Metal and from an NVIDIA A10G and a Tesla T4 through Vulkan
+([results](../benchmarks/RESULTS.md)). Results from AMD and Intel GPUs, and
+from DX12, are the most useful thing you can contribute.
 
 ## 1. See which GPU Ferrotensor uses
 

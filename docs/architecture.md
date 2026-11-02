@@ -166,8 +166,9 @@ Things to know when writing an op:
   splits the batch. Prefer a kernel that stays on the device.
 - Each dispatch in a pass still costs the GPU roughly 9-13 µs on an M2, so a
   chain of 100 tiny element-wise ops is about 18x slower than on the CPU even
-  though it is 13x faster than before batching. Fusing such chains into one
-  kernel is the next step.
+  though it is 13x faster than before batching. Op fusion, opt-in with
+  `FERROTENSOR_FUSION=1`, runs such chains as one dispatch
+  ([design](design/op-fusion.md)).
 
 Before/after numbers and the method are in
 [benchmarks/RESULTS.md](../benchmarks/RESULTS.md#ferrotensor-tensor-api-cpu-and-gpu-devices);

@@ -59,11 +59,12 @@ You need Rust 1.88+ (`rustup` is enough). On macOS no other setup is needed.
 ```bash
 cargo add ferrotensor           # the tensor API, in your project
 cargo install ferrotensor-cli   # the `ferrotensor` command: LoRA train / eval / generate
-pip install ferrotensor         # Python bindings (from 0.2.0)
+pip install ferrotensor         # Python bindings (macOS arm64 and Linux x86_64 wheels)
 ```
 
-The Python package is not on PyPI before the 0.2.0 release; until then build
-it from a checkout (see [Python](#python)).
+To check your GPU in one command, `ferrotensor info --check` lists the adapters
+wgpu can see and runs the matmul, softmax and RMSNorm kernels against a CPU
+reference ([details](docs/testing-on-your-gpu.md)).
 
 ## Quickstart
 
@@ -121,7 +122,7 @@ The `ferrotensor-py` crate binds the tensor API to Python (PyTorch-style
 tensors, autograd, `nn`, `optim`, safetensors; CPU or GPU). No NumPy needed.
 
 ```bash
-pip install ferrotensor          # from 0.2.0
+pip install ferrotensor
 # or, from a checkout of this repository:
 pip install ./ferrotensor-py
 ```
@@ -168,8 +169,9 @@ tested, incomplete, or only checked on one machine.
 | `f16` / `bf16` tensors in the `ferrotensor` API | Planned | |
 | Convolutions, sort/top-k, cumsum in the `ferrotensor` API | Planned | |
 | Batched GPU dispatch in the `ferrotensor` API | **Stable** | Ops submit together at each read back; `char_transformer` trains faster on the GPU than the CPU, but chains of tiny ops are still faster on the CPU ([numbers](benchmarks/RESULTS.md#ferrotensor-tensor-api-cpu-and-gpu-devices)) |
-| Python bindings (`ferrotensor-py`) | **Experimental** | Tensors, autograd, `nn`, `optim`, safetensors; wheels for macOS arm64 and Linux x86_64 from 0.2.0 |
-| GPU report and kernel self-check (`ferrotensor info`) | **Experimental** | Lists adapters and checks matmul, softmax and RMSNorm against the CPU; only run on an Apple M2 so far ([help test it](docs/testing-on-your-gpu.md)) |
+| Python bindings (`ferrotensor-py`) | **Experimental** | Tensors, autograd, `nn`, `optim`, safetensors; wheels for macOS arm64 and Linux x86_64 on PyPI |
+| GPU report and kernel self-check (`ferrotensor info`) | **Experimental** | Lists adapters and checks matmul, softmax and RMSNorm against the CPU; passes on an Apple M2 (Metal), an NVIDIA A10G and a Tesla T4 (Vulkan), and software Vulkan in CI. AMD and Intel GPUs are untested ([help test it](docs/testing-on-your-gpu.md)) |
+| Op fusion in the `ferrotensor` API | **Experimental** | Off by default; `FERROTENSOR_FUSION=1` runs chains of same-size element-wise ops as one dispatch, bit-identical to unfused. Halves a 100-op chain on an NVIDIA A10G ([design](docs/design/op-fusion.md)) |
 | Multi-GPU / distributed training | Planned | `ferrotensor-cli` has a file-based gradient sync flag (`--world-size`) that is a prototype |
 | A CUDA backend | Not planned | wgpu is the point of the project |
 
@@ -263,8 +265,13 @@ against them; kernel-level numbers for Ferrotensor alone are in
 - [x] First crates.io release (0.1.0)
 - [x] Batched GPU dispatch for many small ops ([before/after numbers](benchmarks/RESULTS.md#ferrotensor-tensor-api-cpu-and-gpu-devices))
 - [x] Python bindings (`ferrotensor-py`)
-- [ ] Python wheels on PyPI (with 0.2.0)
-- [ ] Fuse element-wise op chains into one kernel (tiny-op chains on the GPU are still about 18x slower than the CPU)
+- [x] Python wheels on PyPI
+- [x] Fuse element-wise op chains into one kernel (opt-in with `FERROTENSOR_FUSION=1`)
+- [x] Tested on NVIDIA GPUs through Vulkan, and the GPU suites run in CI on software Vulkan ([results](benchmarks/RESULTS.md))
+- [x] LoRA measured up to SmolLM2-1.7B, with the backward passes and the loss on the GPU ([walkthrough](docs/examples/lora-sft.md#on-an-nvidia-gpu-three-model-sizes))
+- [ ] Op fusion on by default (needs a measurement on more GPUs)
+- [ ] Lower host memory when loading models (SmolLM2-1.7B needs about 20 GB)
+- [ ] Results from AMD and Intel GPUs, and from DX12
 - [ ] Parallel-reduction softmax and layer norm kernels
 - [ ] `f16`/`bf16` tensors, convolutions, sort/top-k
 - [ ] Unify the `ferrotensor` tensor API with the LLM stack
