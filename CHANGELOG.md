@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- The `WGPU_BACKEND` environment variable (`vulkan`, `metal`, `dx12`, `gl` or a comma list) restricts which backends `Device::new`/`gpu`/`best`, `WgpuContext::new` and `ferrotensor info` try.
+- CI runs the GPU test suites on Mesa lavapipe (Vulkan on the CPU) for every PR, so the Vulkan path is checked without a GPU.
+
 ## [0.4.0] - 2026-11-01
 
 ### Added
