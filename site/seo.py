@@ -218,8 +218,19 @@ def check_lengths(where, title, desc, problems):
         problems.append(f"{where}: description is {len(desc)} characters")
 
 
+def check_guide(site, problems):
+    """The how-to guide page: title and description lengths, one <h1>."""
+    text = open(os.path.join(site, "guide", "index.html"), encoding="utf-8").read()
+    title = re.search(r"<title>(.*?)</title>", text, re.S).group(1)
+    desc = re.search(r'<meta name="description" content="([^"]*)">', text).group(1)
+    check_lengths("guide/index.html", html.unescape(title), html.unescape(desc), problems)
+    if count_h1(text) != 1:
+        problems.append(f"guide/index.html: {count_h1(text)} <h1> elements")
+    return len(re.findall(r'<article class="g"', text))
+
+
 def write_sitemap(site):
-    urls = [BASE] + [page_url(rel) for rel in PAGES]
+    urls = [BASE, BASE + "guide/"] + [page_url(rel) for rel in PAGES]
     entries = "\n".join(f"  <url><loc>{html.escape(u)}</loc></url>" for u in urls)
     with open(os.path.join(site, "sitemap.xml"), "w", encoding="utf-8") as f:
         f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
@@ -239,12 +250,13 @@ def main():
             problems.append(f"PAGES has a repeated {kind}")
     fix_docs(site, problems)
     faqs = check_landing(site, problems)
+    guides = check_guide(site, problems)
     urls = write_sitemap(site)
     for p in problems:
         print(f"seo: {p}", file=sys.stderr)
     if problems:
         sys.exit(1)
-    print(f"seo: {urls} URLs in sitemap.xml, {faqs} FAQ answers match their JSON-LD")
+    print(f"seo: {urls} URLs in sitemap.xml, {faqs} FAQ answers match their JSON-LD, {guides} how-to guides")
 
 
 if __name__ == "__main__":

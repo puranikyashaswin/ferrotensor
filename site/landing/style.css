@@ -737,7 +737,7 @@ html:not(.js) .panel + .panel { border-top: 1px dashed var(--line); }
 @media (max-width: 480px) {
   body { font-size: 1rem; }
   .top nav ul { gap: 0.25rem 0.9rem; }
-  .top nav li:nth-child(2) { display: none; }
+  .top nav li.nav-wide { display: none; }
   .brand span { font-size: 0.98rem; }
   .card { padding: 1.25rem 1.1rem 1.1rem; }
   .sheet dl > div { grid-template-columns: 5.25rem minmax(0, 1fr); }

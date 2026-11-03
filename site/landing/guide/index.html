@@ -1,0 +1,593 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How-to guide: Ferrotensor step by step</title>
+<meta name="description" content="Step-by-step Ferrotensor guides: install it, check your GPU, fine-tune a model with LoRA, train in Rust or Python, and fix common problems.">
+<link rel="canonical" href="https://puranikyashaswin.github.io/ferrotensor/guide/">
+<meta name="color-scheme" content="light dark">
+<script>document.documentElement.classList.add("js");</script>
+<meta name="theme-color" content="#f6f3ee" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#141210" media="(prefers-color-scheme: dark)">
+<link rel="icon" href="../favicon.svg" type="image/svg+xml">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Ferrotensor">
+<meta property="og:title" content="How-to guide: Ferrotensor step by step">
+<meta property="og:description" content="Install Ferrotensor, check your GPU, fine-tune a model with LoRA and train in Rust or Python, with real output at every step.">
+<meta property="og:url" content="https://puranikyashaswin.github.io/ferrotensor/guide/">
+<meta property="og:image" content="https://puranikyashaswin.github.io/ferrotensor/og.png">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="stylesheet" href="../style.css">
+<link rel="stylesheet" href="guide.css">
+<script src="../app.js" defer></script>
+<script src="guide.js" defer></script>
+</head>
+<body class="guide-page">
+<a class="skip" href="#main">Skip to the guide</a>
+<p class="sr-only" id="copy-status" aria-live="polite"></p>
+
+<header class="top">
+  <div class="wrap top-in">
+    <a class="brand" href="../"><svg class="tile" viewBox="0 0 32 32" aria-hidden="true"><rect x="1" y="1" width="30" height="30" rx="4"/><text x="5" y="10">26</text><text class="tile-sym" x="5.5" y="26">Ft</text></svg><span>Ferrotensor</span></a>
+    <nav aria-label="Primary">
+      <ul>
+        <li><a href="./" aria-current="page">How-to guide</a></li>
+        <li><a href="../docs/">Docs</a></li>
+        <li class="nav-wide"><a href="../docs/benchmarks.html">Benchmarks</a></li>
+        <li><a href="https://github.com/puranikyashaswin/ferrotensor">GitHub</a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap gbar">
+  <p class="gbar-t"><a href="#start">How-to guide</a><span>Ferrotensor {{ft_version}}</span></p>
+  <div class="search">
+    <label class="sr-only" for="gsearch">Search the guide</label>
+    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+    <input id="gsearch" type="search" placeholder="Search the guide" autocomplete="off">
+    <kbd aria-hidden="true">/</kbd>
+  </div>
+</div>
+
+<div class="wrap glay">
+  <aside class="gside" aria-label="Guide topics">
+    <nav><a class="side-start" href="#start">Overview</a><details class="side-sec" open><summary>Start here<span>4</span></summary><ul><li><a href="#install">Install Ferrotensor</a></li><li><a href="#check-gpu">Check your GPU</a></li><li><a href="#first-program">Run your first program</a></li><li><a href="#python">Train a model from Python</a></li></ul></details><details class="side-sec"><summary>Fine-tune a language model<span>5</span></summary><ul><li><a href="#lora-data">Download a model and prepare data</a></li><li><a href="#lora-train">Fine-tune a model with LoRA</a></li><li><a href="#lora-eval-generate">Evaluate and chat with your adapter</a></li><li><a href="#lora-resume">Resume or extend a run</a></li><li><a href="#lora-one-command">Run the whole recipe with one script</a></li></ul></details><details class="side-sec"><summary>Train your own models<span>3</span></summary><ul><li><a href="#mlp">Train an MLP with a DataLoader</a></li><li><a href="#transformer">Train a small transformer from scratch</a></li><li><a href="#save-load">Save, load and seed a model</a></li></ul></details><details class="side-sec"><summary>Performance<span>3</span></summary><ul><li><a href="#backend">Choose a GPU and backend</a></li><li><a href="#fusion">Turn on op fusion</a></li><li><a href="#benchmark">Benchmark your machine</a></li></ul></details><details class="side-sec"><summary>Contribute<span>2</span></summary><ul><li><a href="#gpu-tests">Run the GPU tests</a></li><li><a href="#report-gpu">Report results from your GPU</a></li></ul></details><details class="side-sec"><summary>Troubleshooting<span>2</span></summary><ul><li><a href="#no-gpu">No GPU found, or the wrong one</a></li><li><a href="#slow-memory">Training is slow or uses too much memory</a></li></ul></details></nav>
+  </aside>
+
+  <main id="main" class="gmain">
+    <section class="hub" id="start" aria-labelledby="hub-t">
+      <p class="hub-k">The Ferrotensor handbook</p>
+      <h1 id="hub-t">Use Ferrotensor,<br>step by step.</h1>
+      <p class="hub-lede">From installing it to fine-tuning a language model on your own GPU. Every guide shows the real output you should see, from the machine named under it.</p>
+      <div class="gcards"><a class="gcard" href="#check-gpu">
+  <div class="shot mini" aria-hidden="true"><div class="shot-bar"><i></i><i></i><i></i><span>ferrotensor info --check</span></div><pre><span class="ln p">$ ferrotensor info --check</span><span class="ln">ferrotensor 0.5.0 on linux x86_64</span><span class="ln"></span><span class="ln">* llvmpipe (LLVM 20.1.2, 256 bits) (Mesa, Cpu, Vulkan)</span><span class="ln">    driver            llvmpipe Mesa 25.2.8-0ubuntu0.24.04.4 (LLVM 20.1.2)</span></pre></div>
+  <span class="gcard-n">01</span>
+  <span class="gcard-t">Check your GPU</span>
+  <span class="gcard-s">See which GPU Ferrotensor will use and test its kernels against a CPU reference.</span>
+  <span class="gcard-go">Check your GPU<span aria-hidden="true">&#8599;</span></span>
+</a><a class="gcard" href="#lora-train">
+  <div class="shot mini" aria-hidden="true"><div class="shot-bar"><i></i><i></i><i></i><span>ferrotensor train</span></div><pre><span class="ln">device: NVIDIA A10G (Vulkan)</span><span class="ln">model:  data/models/SmolLM2-135M (30 layers, hidden 576, vocab 49152)</span><span class="ln">data:   2000 examples (sft task), 66890 supervised tokens, seq-len 256</span><span class="ln">train:  lora (921600 trainable params), lr 0.0005 warmup 20 cosine, 250 steps x 8 sequences</span><span class="ln">eval before: loss 2.4250 ppl 11.302 (2744 tokens)</span></pre></div>
+  <span class="gcard-n">02</span>
+  <span class="gcard-t">Fine-tune a model with LoRA</span>
+  <span class="gcard-s">Train a LoRA adapter with a response-only loss and check the held-out loss before and after.</span>
+  <span class="gcard-go">Fine-tune a model<span aria-hidden="true">&#8599;</span></span>
+</a><a class="gcard" href="#python">
+  <div class="shot mini" aria-hidden="true"><div class="shot-bar"><i></i><i></i><i></i><span>python xor.py</span></div><pre><span class="ln">[0.0, 1.0, 1.0, 0.0]</span></pre></div>
+  <span class="gcard-n">03</span>
+  <span class="gcard-t">Train a model from Python</span>
+  <span class="gcard-s">PyTorch-style tensors, autograd, nn and optim from Python, on the CPU or a GPU. No NumPy needed.</span>
+  <span class="gcard-go">Train from Python<span aria-hidden="true">&#8599;</span></span>
+</a></div>
+      <a class="callout" href="../docs/">
+        <span class="callout-i" aria-hidden="true">&gt;_</span>
+        <span><strong>Want the reference?</strong><br>The full documentation, the architecture and the API on docs.rs.</span>
+        <span class="callout-go" aria-hidden="true">&#8599;</span>
+      </a>
+      <div class="browse">
+        <h2 class="browse-t">Browse all guides <span>19 topics</span></h2>
+        <div class="chips" role="group" aria-label="Filter guides"><button type="button" class="chip" data-filter="all" aria-pressed="true">All topics</button><button type="button" class="chip" data-filter="rust" aria-pressed="false">Rust</button><button type="button" class="chip" data-filter="python" aria-pressed="false">Python</button><button type="button" class="chip" data-filter="cli" aria-pressed="false">Command line</button><button type="button" class="chip" data-filter="contrib" aria-pressed="false">Contributing</button></div>
+        <p class="no-hits" hidden>No guide matches that search.</p>
+        <details class="acc" data-section="start"><summary><span>Start here</span><span class="acc-n">4 guides</span></summary><ul><li data-tags="rust python cli" data-text="install ferrotensor add the rust crate, install the ferrotensor command, or install the python package."><a href="#install"><span class="r-t">Install Ferrotensor</span><span class="r-s">Add the Rust crate, install the ferrotensor command, or install the Python package.</span><span class="r-m">2 min</span></a></li><li data-tags="cli" data-text="check your gpu see which gpu ferrotensor will use and test its kernels against a cpu reference."><a href="#check-gpu"><span class="r-t">Check your GPU</span><span class="r-s">See which GPU Ferrotensor will use and test its kernels against a CPU reference.</span><span class="r-m">2 min</span></a></li><li data-tags="rust" data-text="run your first program a matmul and its gradient on the best available device, then the same idea in your own code."><a href="#first-program"><span class="r-t">Run your first program</span><span class="r-s">A matmul and its gradient on the best available device, then the same idea in your own code.</span><span class="r-m">3 min</span></a></li><li data-tags="python" data-text="train a model from python pytorch-style tensors, autograd, nn and optim from python, on the cpu or a gpu. no numpy needed."><a href="#python"><span class="r-t">Train a model from Python</span><span class="r-s">PyTorch-style tensors, autograd, nn and optim from Python, on the CPU or a GPU. No NumPy needed.</span><span class="r-m">3 min</span></a></li></ul></details><details class="acc" data-section="lora"><summary><span>Fine-tune a language model</span><span class="acc-n">5 guides</span></summary><ul><li data-tags="cli" data-text="download a model and prepare data fetch a llama-style checkpoint from hugging face and turn an instruction dataset into jsonl."><a href="#lora-data"><span class="r-t">Download a model and prepare data</span><span class="r-s">Fetch a Llama-style checkpoint from Hugging Face and turn an instruction dataset into JSONL.</span><span class="r-m">4 min</span></a></li><li data-tags="cli" data-text="fine-tune a model with lora train a lora adapter with a response-only loss and check the held-out loss before and after."><a href="#lora-train"><span class="r-t">Fine-tune a model with LoRA</span><span class="r-s">Train a LoRA adapter with a response-only loss and check the held-out loss before and after.</span><span class="r-m">5 min</span></a></li><li data-tags="cli" data-text="evaluate and chat with your adapter reload the adapter, measure the held-out loss, and generate text with or without it."><a href="#lora-eval-generate"><span class="r-t">Evaluate and chat with your adapter</span><span class="r-s">Reload the adapter, measure the held-out loss, and generate text with or without it.</span><span class="r-m">3 min</span></a></li><li data-tags="cli" data-text="resume or extend a run continue training from a saved adapter with its optimizer state and step counter."><a href="#lora-resume"><span class="r-t">Resume or extend a run</span><span class="r-s">Continue training from a saved adapter with its optimizer state and step counter.</span><span class="r-m">2 min</span></a></li><li data-tags="cli" data-text="run the whole recipe with one script download, train, evaluate and generate on any llama-style model, and get one json summary."><a href="#lora-one-command"><span class="r-t">Run the whole recipe with one script</span><span class="r-s">Download, train, evaluate and generate on any Llama-style model, and get one JSON summary.</span><span class="r-m">3 min</span></a></li></ul></details><details class="acc" data-section="train"><summary><span>Train your own models</span><span class="acc-n">3 guides</span></summary><ul><li data-tags="rust" data-text="train an mlp with a dataloader classic small-model training: dataset, dataloader, nn::sequential, adamw and a warmup-cosine schedule."><a href="#mlp"><span class="r-t">Train an MLP with a DataLoader</span><span class="r-s">Classic small-model training: Dataset, DataLoader, nn::Sequential, AdamW and a warmup-cosine schedule.</span><span class="r-m">2 min</span></a></li><li data-tags="rust" data-text="train a small transformer from scratch a two-layer gpt-style model built from nn layers, trained on shakespeare sonnets and sampled."><a href="#transformer"><span class="r-t">Train a small transformer from scratch</span><span class="r-s">A two-layer GPT-style model built from nn layers, trained on Shakespeare sonnets and sampled.</span><span class="r-m">3 min</span></a></li><li data-tags="rust python" data-text="save, load and seed a model store parameters as safetensors and make random initialisation reproducible."><a href="#save-load"><span class="r-t">Save, load and seed a model</span><span class="r-s">Store parameters as safetensors and make random initialisation reproducible.</span><span class="r-m">2 min</span></a></li></ul></details><details class="acc" data-section="perf"><summary><span>Performance</span><span class="acc-n">3 guides</span></summary><ul><li data-tags="rust cli" data-text="choose a gpu and backend pick between the gpu and cpu, and between metal, vulkan, dx12 and gl."><a href="#backend"><span class="r-t">Choose a GPU and backend</span><span class="r-s">Pick between the GPU and CPU, and between Metal, Vulkan, DX12 and GL.</span><span class="r-m">2 min</span></a></li><li data-tags="rust python" data-text="turn on op fusion run chains of element-wise ops as one gpu dispatch. results are bit-identical."><a href="#fusion"><span class="r-t">Turn on op fusion</span><span class="r-s">Run chains of element-wise ops as one GPU dispatch. Results are bit-identical.</span><span class="r-m">2 min</span></a></li><li data-tags="cli contrib" data-text="benchmark your machine run the kernel and tensor api benchmarks and get one json report."><a href="#benchmark"><span class="r-t">Benchmark your machine</span><span class="r-s">Run the kernel and Tensor API benchmarks and get one JSON report.</span><span class="r-m">3 min</span></a></li></ul></details><details class="acc" data-section="contrib"><summary><span>Contribute</span><span class="acc-n">2 guides</span></summary><ul><li data-tags="contrib" data-text="run the gpu tests check every kernel and gradient on your gpu against the cpu."><a href="#gpu-tests"><span class="r-t">Run the GPU tests</span><span class="r-s">Check every kernel and gradient on your GPU against the CPU.</span><span class="r-m">3 min</span></a></li><li data-tags="contrib" data-text="report results from your gpu amd, intel and dx12 results are the most useful thing you can contribute."><a href="#report-gpu"><span class="r-t">Report results from your GPU</span><span class="r-s">AMD, Intel and DX12 results are the most useful thing you can contribute.</span><span class="r-m">2 min</span></a></li></ul></details><details class="acc" data-section="trouble"><summary><span>Troubleshooting</span><span class="acc-n">2 guides</span></summary><ul><li data-tags="cli rust python" data-text="no gpu found, or the wrong one what to do when ferrotensor runs on the cpu or picks an unexpected adapter."><a href="#no-gpu"><span class="r-t">No GPU found, or the wrong one</span><span class="r-s">What to do when Ferrotensor runs on the CPU or picks an unexpected adapter.</span><span class="r-m">2 min</span></a></li><li data-tags="cli rust" data-text="training is slow or uses too much memory why tiny models are faster on the cpu, and what the gpu memory limits are."><a href="#slow-memory"><span class="r-t">Training is slow or uses too much memory</span><span class="r-s">Why tiny models are faster on the CPU, and what the GPU memory limits are.</span><span class="r-m">3 min</span></a></li></ul></details>
+      </div>
+      <p class="fine">Checked against Ferrotensor {{ft_version}}. Outputs are real runs on an Apple M2 (Metal), an NVIDIA A10G (Vulkan) or Ferrotensor's CI (software Vulkan), as noted under each one; on your machine the device lines and timings will differ.</p>
+      <p class="help">Need a hand? <a href="https://github.com/puranikyashaswin/ferrotensor/issues/new/choose">Open an issue</a> or read the <a href="../docs/">documentation</a>.</p>
+    </section>
+    
+<article class="g" id="install" aria-labelledby="install-t" data-tags="rust python cli">
+  <p class="crumb"><a href="#start">How-to guide</a><span aria-hidden="true">/</span>Start here</p>
+  <h2 id="install-t">Install Ferrotensor</h2>
+  <p class="sum">Add the Rust crate, install the ferrotensor command, or install the Python package.</p>
+  <p class="meta"><span>2 min read</span><span>Ferrotensor {{ft_version}}</span><button class="copy link" type="button" data-copy="https://puranikyashaswin.github.io/ferrotensor/guide/#install">Copy link</button></p>
+  <div class="fig">
+    <figure class="shot"><div class="shot-bar"><i></i><i></i><i></i><span>Three ways in</span></div><pre tabindex="0"><span class="ln"><b class="mk" aria-label="note 1">1</b>cargo add ferrotensor</span><span class="ln"><b class="mk" aria-label="note 2">2</b>cargo install ferrotensor-cli</span><span class="ln"><b class="mk" aria-label="note 3">3</b>pip install ferrotensor</span></pre><figcaption>Commands</figcaption></figure>
+    <ol class="legend"><li>The tensor API, autograd, <code>nn</code> and optimizers, as a library in your Rust project.</li><li>The <code>ferrotensor</code> command: LoRA <code>train</code>, <code>eval</code>, <code>generate</code> and <code>info</code>.</li><li>The Python bindings. Wheels exist for macOS arm64 and Linux x86_64.</li></ol>
+  </div>
+  <h3>Follow the steps</h3>
+  <ol class="steps"><li><p>Install Rust 1.88 or newer with <a href="https://rustup.rs">rustup</a>. On macOS nothing else is needed: Ferrotensor uses Metal.</p></li><li><p>On Linux, make sure a Vulkan driver is installed. NVIDIA's driver includes one; for AMD and Intel GPUs install Mesa (<code>mesa-vulkan-drivers</code> on Ubuntu).</p></li><li><p>To use the tensor API in a Rust project, add the crate:</p><div class="gcmd"><pre><code>cargo add ferrotensor</code></pre><button class="copy" type="button" data-copy="cargo add ferrotensor">Copy</button></div></li><li><p>To fine-tune and run language models from the terminal, install the command line tool. The binary is called <code>ferrotensor</code>:</p><div class="gcmd"><pre><code>cargo install ferrotensor-cli</code></pre><button class="copy" type="button" data-copy="cargo install ferrotensor-cli">Copy</button></div></li><li><p>For Python 3.10 or newer:</p><div class="gcmd"><pre><code>pip install ferrotensor</code></pre><button class="copy" type="button" data-copy="pip install ferrotensor">Copy</button></div></li></ol>
+  
+  <details class="gmore"><summary>More detail and options</summary><div><p>On platforms without a wheel, <code>pip</code> builds the package from its source distribution, which needs Rust.</p>
+<p>To work from a checkout instead:</p>
+<div class="gcmd"><pre><code>git clone https://github.com/puranikyashaswin/ferrotensor.git
+cd ferrotensor
+cargo build --release -p ferrotensor-cli   # ./target/release/ferrotensor
+pip install ./ferrotensor-py</code></pre></div></div></details>
+  <aside class="glimits" aria-label="Limits"><strong>Limits</strong><p>DX12 on Windows and AMD and Intel GPUs have not been tested yet. If you try one, <a href="#report-gpu">report what you find</a>.</p></aside>
+  <nav class="pn" aria-label="Previous and next guide"><span></span><a class="next" href="#check-gpu"><small>Next</small>Check your GPU</a></nav>
+</article>
+<article class="g" id="check-gpu" aria-labelledby="check-gpu-t" data-tags="cli">
+  <p class="crumb"><a href="#start">How-to guide</a><span aria-hidden="true">/</span>Start here</p>
+  <h2 id="check-gpu-t">Check your GPU</h2>
+  <p class="sum">See which GPU Ferrotensor will use and test its kernels against a CPU reference.</p>
+  <p class="meta"><span>2 min read</span><span>Ferrotensor {{ft_version}}</span><button class="copy link" type="button" data-copy="https://puranikyashaswin.github.io/ferrotensor/guide/#check-gpu">Copy link</button></p>
+  <div class="fig">
+    <figure class="shot"><div class="shot-bar"><i></i><i></i><i></i><span>ferrotensor info --check</span></div><pre tabindex="0"><span class="ln p">$ ferrotensor info --check</span><span class="ln"><b class="mk" aria-label="note 1">1</b>ferrotensor 0.5.0 on linux x86_64</span><span class="ln"></span><span class="ln"><b class="mk" aria-label="note 2">2</b>* llvmpipe (LLVM 20.1.2, 256 bits) (Mesa, Cpu, Vulkan)</span><span class="ln">    driver            llvmpipe Mesa 25.2.8-0ubuntu0.24.04.4 (LLVM 20.1.2)</span><span class="ln"><b class="mk" aria-label="note 3">3</b>    max buffer        2047 MiB</span><span class="ln">    max storage bind  128 MiB</span><span class="ln">    workgroup         1024 threads, 32 KiB shared</span><span class="ln">    shader f16        yes</span><span class="ln"></span><span class="ln">* = the adapter Ferrotensor uses</span><span class="ln"></span><span class="ln">Kernel check against a CPU reference:</span><span class="ln"><b class="mk" aria-label="note 4">4</b>  ok     matmul 37x53 @ 53x29     max error 3.6e-7 (tolerance 1e-4)</span><span class="ln">  ok     softmax 7x1031           max error 4.7e-10 (tolerance 1e-6)</span><span class="ln">  ok     rms_norm 5x777           max error 2.4e-7 (tolerance 1e-4)</span></pre><figcaption>Real output from Ferrotensor&#x27;s CI on Mesa lavapipe (software Vulkan). Your adapter lines show your GPU.</figcaption></figure>
+    <ol class="legend"><li>The version and platform you are running.</li><li>Every adapter wgpu can open. The one marked <code>*</code> is the one Ferrotensor uses: name, vendor, device type and backend.</li><li>The limits the kernels depend on. Large models need a large max buffer and storage binding.</li><li>Each kernel is run on the GPU and compared with an f64 CPU reference. A line says <code>ok</code> or <code>FAIL</code>.</li></ol>
+  </div>
+  <h3>Follow the steps</h3>
+  <ol class="steps"><li><p>List the adapters:</p><div class="gcmd"><pre><code>ferrotensor info</code></pre><button class="copy" type="button" data-copy="ferrotensor info">Copy</button></div></li><li><p>Run the kernel check. Odd sizes are used on purpose, so tiling bugs show up:</p><div class="gcmd"><pre><code>ferrotensor info --check</code></pre><button class="copy" type="button" data-copy="ferrotensor info --check">Copy</button></div></li><li><p>If every line says <code>ok</code>, your GPU computes correctly with Ferrotensor. The command exits with an error when a kernel fails.</p></li></ol>
+  
+  <details class="gmore"><summary>More detail and options</summary><div><p>To try one backend only, set <code>WGPU_BACKEND</code>: <code>vulkan</code>, <code>metal</code>, <code>dx12</code> or <code>gl</code>.</p>
+<div class="gcmd"><pre><code>WGPU_BACKEND=vulkan ferrotensor info --check</code></pre></div>
+<p>For a bug report, <code>ferrotensor info --check --json</code> prints the same information as JSON. See <a href="#report-gpu">Report results from your GPU</a>.</p></div></details>
+  <aside class="glimits" aria-label="Limits"><strong>Limits</strong><p>The check covers matmul, softmax and RMSNorm, the kernels most likely to break on a new driver. The full GPU test suite is in <a href="#gpu-tests">Run the GPU tests</a>.</p></aside>
+  <nav class="pn" aria-label="Previous and next guide"><a class="prev" href="#install"><small>Previous</small>Install Ferrotensor</a><a class="next" href="#first-program"><small>Next</small>Run your first program</a></nav>
+</article>
+<article class="g" id="first-program" aria-labelledby="first-program-t" data-tags="rust">
+  <p class="crumb"><a href="#start">How-to guide</a><span aria-hidden="true">/</span>Start here</p>
+  <h2 id="first-program-t">Run your first program</h2>
+  <p class="sum">A matmul and its gradient on the best available device, then the same idea in your own code.</p>
+  <p class="meta"><span>3 min read</span><span>Ferrotensor {{ft_version}}</span><button class="copy link" type="button" data-copy="https://puranikyashaswin.github.io/ferrotensor/guide/#first-program">Copy link</button></p>
+  <div class="fig">
+    <figure class="shot"><div class="shot-bar"><i></i><i></i><i></i><span>cargo run --release -p ferrotensor --example quickstart</span></div><pre tabindex="0"><span class="ln"><b class="mk" aria-label="note 1">1</b>device: Apple M2 (Metal)</span><span class="ln"><b class="mk" aria-label="note 2">2</b>x @ w = [7.5, 2.0, 18.0, 2.0] (shape [2, 2])</span><span class="ln"><b class="mk" aria-label="note 3">3</b>dL/dw = [5.0, 5.0, 7.0, 7.0, 9.0, 9.0]</span></pre><figcaption>Real output on a MacBook Air (Apple M2, 8 GB).</figcaption></figure>
+    <ol class="legend"><li><code>Device::best()</code> picked the GPU. Without one, the same code runs on the CPU.</li><li>The forward result of the matmul.</li><li>The gradient of the loss with respect to <code>w</code>, from <code>loss.backward()</code>.</li></ol>
+  </div>
+  <h3>Follow the steps</h3>
+  <ol class="steps"><li><p>Clone the repository and run the example:</p><div class="gcmd"><pre><code>git clone https://github.com/puranikyashaswin/ferrotensor.git
+cd ferrotensor
+cargo run --release -p ferrotensor --example quickstart</code></pre><button class="copy" type="button" data-copy="git clone https://github.com/puranikyashaswin/ferrotensor.git
+cd ferrotensor
+cargo run --release -p ferrotensor --example quickstart">Copy</button></div></li><li><p>In your own project (after <code>cargo add ferrotensor</code>), this trains a small network on XOR:</p></li></ol>
+  <div class="gcmd code-rust"><pre><code>use ferrotensor::prelude::*;
+
+let device = Device::cpu(); // or Device::best() for a GPU when present
+let model = nn::Sequential::new(&amp;device)
+    .add(nn::Linear::new(2, 16, &amp;device))
+    .add(nn::Tanh)
+    .add(nn::Linear::new(16, 2, &amp;device));
+let mut opt = optim::AdamW::new(model.parameters(), 0.05).weight_decay(0.0);
+
+// XOR
+let x = Tensor::from_data(&amp;[0., 0., 0., 1., 1., 0., 1., 1.], &amp;[4, 2], &amp;device);
+let y = Tensor::from_data(&amp;[0., 1., 1., 0.], &amp;[4], &amp;device);
+for _ in 0..200 {
+    opt.zero_grad();
+    let loss = F::cross_entropy(&amp;model.forward(&amp;x), &amp;y);
+    loss.backward();
+    opt.step();
+}</code></pre><button class="copy" type="button" data-copy="use ferrotensor::prelude::*;
+
+let device = Device::cpu(); // or Device::best() for a GPU when present
+let model = nn::Sequential::new(&amp;device)
+    .add(nn::Linear::new(2, 16, &amp;device))
+    .add(nn::Tanh)
+    .add(nn::Linear::new(16, 2, &amp;device));
+let mut opt = optim::AdamW::new(model.parameters(), 0.05).weight_decay(0.0);
+
+// XOR
+let x = Tensor::from_data(&amp;[0., 0., 0., 1., 1., 0., 1., 1.], &amp;[4, 2], &amp;device);
+let y = Tensor::from_data(&amp;[0., 1., 1., 0.], &amp;[4], &amp;device);
+for _ in 0..200 {
+    opt.zero_grad();
+    let loss = F::cross_entropy(&amp;model.forward(&amp;x), &amp;y);
+    loss.backward();
+    opt.step();
+}">Copy</button></div>
+  <details class="gmore"><summary>More detail and options</summary><div><p>The example's source is <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/ferrotensor/examples/quickstart.rs"><code>ferrotensor/examples/quickstart.rs</code></a>. The API reference is on <a href="https://docs.rs/ferrotensor">docs.rs</a>.</p></div></details>
+  <aside class="glimits" aria-label="Limits"><strong>Limits</strong><p>Tensors are f32 only. Very small models like this one run faster on the CPU than on a GPU; see <a href="#slow-memory">Training is slow or uses too much memory</a>.</p></aside>
+  <nav class="pn" aria-label="Previous and next guide"><a class="prev" href="#check-gpu"><small>Previous</small>Check your GPU</a><a class="next" href="#python"><small>Next</small>Train a model from Python</a></nav>
+</article>
+<article class="g" id="python" aria-labelledby="python-t" data-tags="python">
+  <p class="crumb"><a href="#start">How-to guide</a><span aria-hidden="true">/</span>Start here</p>
+  <h2 id="python-t">Train a model from Python</h2>
+  <p class="sum">PyTorch-style tensors, autograd, nn and optim from Python, on the CPU or a GPU. No NumPy needed.</p>
+  <p class="meta"><span>3 min read</span><span>Ferrotensor {{ft_version}}</span><button class="copy link" type="button" data-copy="https://puranikyashaswin.github.io/ferrotensor/guide/#python">Copy link</button></p>
+  <div class="fig">
+    <figure class="shot"><div class="shot-bar"><i></i><i></i><i></i><span>python xor.py</span></div><pre tabindex="0"><span class="ln"><b class="mk" aria-label="note 1">1</b>[0.0, 1.0, 1.0, 0.0]</span></pre><figcaption>Output of the script below.</figcaption></figure>
+    <ol class="legend"><li>The network's predictions for the four XOR inputs: all four are right.</li></ol>
+  </div>
+  <h3>Follow the steps</h3>
+  <ol class="steps"><li><p>Install the package:</p><div class="gcmd"><pre><code>pip install ferrotensor</code></pre><button class="copy" type="button" data-copy="pip install ferrotensor">Copy</button></div></li><li><p>Save this as <code>xor.py</code> and run <code>python xor.py</code>:</p></li></ol>
+  <div class="gcmd code-python"><pre><code>import ferrotensor as ft
+from ferrotensor import nn, optim
+import ferrotensor.nn.functional as F
+
+model = nn.Sequential(nn.Linear(2, 16), nn.Tanh(), nn.Linear(16, 2))
+opt = optim.AdamW(model.parameters(), lr=0.05, weight_decay=0.0)
+x = ft.tensor([[0, 0], [0, 1], [1, 0], [1, 1]])
+for _ in range(200):
+    opt.zero_grad()
+    loss = F.cross_entropy(model(x), [0, 1, 1, 0])  # XOR
+    loss.backward()
+    opt.step()
+print(model(x).argmax(dim=1).tolist())</code></pre><button class="copy" type="button" data-copy="import ferrotensor as ft
+from ferrotensor import nn, optim
+import ferrotensor.nn.functional as F
+
+model = nn.Sequential(nn.Linear(2, 16), nn.Tanh(), nn.Linear(16, 2))
+opt = optim.AdamW(model.parameters(), lr=0.05, weight_decay=0.0)
+x = ft.tensor([[0, 0], [0, 1], [1, 0], [1, 1]])
+for _ in range(200):
+    opt.zero_grad()
+    loss = F.cross_entropy(model(x), [0, 1, 1, 0])  # XOR
+    loss.backward()
+    opt.step()
+print(model(x).argmax(dim=1).tolist())">Copy</button></div>
+  <details class="gmore"><summary>More detail and options</summary><div><p>Tensors and layers take a <code>device=</code> argument. <code>ft.Device("best")</code> picks a GPU when there is one; <code>ft.Device.gpu_available()</code> tells you whether there is.</p>
+<div class="gcmd"><pre><code>dev = ft.Device("best")
+a = ft.randn(256, 256, device=dev)</code></pre></div>
+<p><code>ft.Device("gpu")</code> raises <code>RuntimeError</code> when no adapter is found. Tensors on different devices cannot be mixed in one op; move them with <code>.to(device)</code>.</p>
+<p>Everything that is covered, and how it differs from PyTorch, is in the <a href="../docs/python-reference.html">Python reference</a>.</p></div></details>
+  <aside class="glimits" aria-label="Limits"><strong>Limits</strong><p>The Python API covers tensors, autograd, <code>nn</code>, <code>optim</code> and safetensors, not all of PyTorch. The LoRA fine-tuning tool is the command line, not Python.</p></aside>
+  <nav class="pn" aria-label="Previous and next guide"><a class="prev" href="#first-program"><small>Previous</small>Run your first program</a><a class="next" href="#lora-data"><small>Next</small>Download a model and prepare data</a></nav>
+</article>
+<article class="g" id="lora-data" aria-labelledby="lora-data-t" data-tags="cli">
+  <p class="crumb"><a href="#start">How-to guide</a><span aria-hidden="true">/</span>Fine-tune a language model</p>
+  <h2 id="lora-data-t">Download a model and prepare data</h2>
+  <p class="sum">Fetch a Llama-style checkpoint from Hugging Face and turn an instruction dataset into JSONL.</p>
+  <p class="meta"><span>4 min read</span><span>Ferrotensor {{ft_version}}</span><button class="copy link" type="button" data-copy="https://puranikyashaswin.github.io/ferrotensor/guide/#lora-data">Copy link</button></p>
+  <div class="fig">
+    <figure class="shot"><div class="shot-bar"><i></i><i></i><i></i><span>data/alpaca/train.jsonl</span></div><pre tabindex="0"><span class="ln"><b class="mk" aria-label="note 1">1</b>{&quot;prompt&quot;: &quot;&lt;instruction and input&gt;&quot;, &quot;response&quot;: &quot;&lt;the answer&gt;&quot;}</span><span class="ln"><b class="mk" aria-label="note 2">2</b>{&quot;prompt&quot;: &quot;...&quot;, &quot;response&quot;: &quot;...&quot;, &quot;system&quot;: &quot;&lt;optional&gt;&quot;}</span></pre><figcaption>The format ferrotensor train --task sft reads: one JSON object per line.</figcaption></figure>
+    <ol class="legend"><li>Each line is one example. Only the response tokens count toward the loss.</li><li>An optional <code>system</code> message is used too. Prompts are wrapped in the ChatML template unless you pass <code>--no-chat-template</code>.</li></ol>
+  </div>
+  <h3>Follow the steps</h3>
+  <ol class="steps"><li><p>Install the Hugging Face command line tool:</p><div class="gcmd"><pre><code>pip install huggingface_hub</code></pre><button class="copy" type="button" data-copy="pip install huggingface_hub">Copy</button></div></li><li><p>Download the model's weights, config and tokenizer:</p><div class="gcmd"><pre><code>hf download HuggingFaceTB/SmolLM2-135M \
+  model.safetensors config.json tokenizer.json tokenizer_config.json \
+  --local-dir data/models/SmolLM2-135M</code></pre><button class="copy" type="button" data-copy="hf download HuggingFaceTB/SmolLM2-135M \
+  model.safetensors config.json tokenizer.json tokenizer_config.json \
+  --local-dir data/models/SmolLM2-135M">Copy</button></div></li><li><p>Download the dataset:</p><div class="gcmd"><pre><code>hf download yahma/alpaca-cleaned alpaca_data_cleaned.json \
+  --repo-type dataset --local-dir data/alpaca-cleaned</code></pre><button class="copy" type="button" data-copy="hf download yahma/alpaca-cleaned alpaca_data_cleaned.json \
+  --repo-type dataset --local-dir data/alpaca-cleaned">Copy</button></div></li><li><p>Convert it to <code>{prompt, response}</code> JSONL: keep short examples, shuffle with seed 0, and hold out 64 for evaluation.</p><div class="gcmd"><pre><code>mkdir -p data/alpaca
+python3 - &lt;&lt;&#x27;EOF&#x27;
+import json, random
+rows = json.load(open(&quot;data/alpaca-cleaned/alpaca_data_cleaned.json&quot;))
+out = []
+for r in rows:
+    p = r[&quot;instruction&quot;].strip()
+    if r.get(&quot;input&quot;, &quot;&quot;).strip():
+        p += &quot;\n\n&quot; + r[&quot;input&quot;].strip()
+    resp = r[&quot;output&quot;].strip()
+    if len(p) + len(resp) &lt;= 500 and resp:
+        out.append({&quot;prompt&quot;: p, &quot;response&quot;: resp})
+random.Random(0).shuffle(out)
+for name, rs in ((&quot;val&quot;, out[:64]), (&quot;train&quot;, out[64:2064])):
+    with open(f&quot;data/alpaca/{name}.jsonl&quot;, &quot;w&quot;) as f:
+        for x in rs:
+            f.write(json.dumps(x) + &quot;\n&quot;)
+EOF</code></pre><button class="copy" type="button" data-copy="mkdir -p data/alpaca
+python3 - &lt;&lt;&#x27;EOF&#x27;
+import json, random
+rows = json.load(open(&quot;data/alpaca-cleaned/alpaca_data_cleaned.json&quot;))
+out = []
+for r in rows:
+    p = r[&quot;instruction&quot;].strip()
+    if r.get(&quot;input&quot;, &quot;&quot;).strip():
+        p += &quot;\n\n&quot; + r[&quot;input&quot;].strip()
+    resp = r[&quot;output&quot;].strip()
+    if len(p) + len(resp) &lt;= 500 and resp:
+        out.append({&quot;prompt&quot;: p, &quot;response&quot;: resp})
+random.Random(0).shuffle(out)
+for name, rs in ((&quot;val&quot;, out[:64]), (&quot;train&quot;, out[64:2064])):
+    with open(f&quot;data/alpaca/{name}.jsonl&quot;, &quot;w&quot;) as f:
+        for x in rs:
+            f.write(json.dumps(x) + &quot;\n&quot;)
+EOF">Copy</button></div></li></ol>
+  
+  <details class="gmore"><summary>More detail and options</summary><div><p>For plain next-token training, use <code>--task pretrain</code> with <code>.txt</code> lines, JSON text or token arrays, or packed little-endian <code>u32</code> <code>.bin</code> tokens.</p>
+<p>Llama-architecture checkpoints have been measured: SmolLM2-135M, 360M and 1.7B. Sharded checkpoints load through <code>model.safetensors.index.json</code>.</p></div></details>
+  <aside class="glimits" aria-label="Limits"><strong>Limits</strong><p>Released LFM2 checkpoints are rejected because per-head q/k layernorm is not implemented yet.</p></aside>
+  <nav class="pn" aria-label="Previous and next guide"><a class="prev" href="#python"><small>Previous</small>Train a model from Python</a><a class="next" href="#lora-train"><small>Next</small>Fine-tune a model with LoRA</a></nav>
+</article>
+<article class="g" id="lora-train" aria-labelledby="lora-train-t" data-tags="cli">
+  <p class="crumb"><a href="#start">How-to guide</a><span aria-hidden="true">/</span>Fine-tune a language model</p>
+  <h2 id="lora-train-t">Fine-tune a model with LoRA</h2>
+  <p class="sum">Train a LoRA adapter with a response-only loss and check the held-out loss before and after.</p>
+  <p class="meta"><span>5 min read</span><span>Ferrotensor {{ft_version}}</span><button class="copy link" type="button" data-copy="https://puranikyashaswin.github.io/ferrotensor/guide/#lora-train">Copy link</button></p>
+  <div class="fig">
+    <figure class="shot"><div class="shot-bar"><i></i><i></i><i></i><span>ferrotensor train</span></div><pre tabindex="0"><span class="ln"><b class="mk" aria-label="note 1">1</b>device: NVIDIA A10G (Vulkan)</span><span class="ln">model:  data/models/SmolLM2-135M (30 layers, hidden 576, vocab 49152)</span><span class="ln">data:   2000 examples (sft task), 66890 supervised tokens, seq-len 256</span><span class="ln"><b class="mk" aria-label="note 2">2</b>train:  lora (921600 trainable params), lr 0.0005 warmup 20 cosine, 250 steps x 8 sequences</span><span class="ln"><b class="mk" aria-label="note 3">3</b>eval before: loss 2.4250 ppl 11.302 (2744 tokens)</span><span class="ln">  step |   loss | grad norm |       lr | tok/s | s/step</span><span class="ln"><b class="mk" aria-label="note 4">4</b>    10 | 2.6204 |     0.834 |  2.50e-4 |   182 |   1.27</span><span class="ln">    50 | 2.0939 |     1.927 |  4.81e-4 |   176 |   1.31</span><span class="ln">eval @ 50: loss 1.8146 ppl 6.139</span><span class="ln">   250 | 1.6318 |     0.907 |  5.00e-5 |   193 |   1.32</span><span class="ln">done:   250 steps in 351.3s; train loss 2.6204 -&gt; 1.6318</span><span class="ln"><b class="mk" aria-label="note 5">5</b>saved:  data/runs/SmolLM2-135M/lora_adapters.safetensors (+ ...state.json)</span><span class="ln"><b class="mk" aria-label="note 6">6</b>eval after: loss 1.6521 ppl 5.218 (2744 tokens)</span></pre><figcaption>Real output of the command below on an NVIDIA A10G through Vulkan, Ferrotensor 0.5 (rows 70 to 240 omitted).</figcaption></figure>
+    <ol class="legend"><li>The GPU in use. On a Mac this says <code>Apple M2 (Metal)</code>.</li><li>Only the LoRA adapters train: 921,600 parameters, rank 8 on q/k/v/o of every layer.</li><li>Held-out loss of the base model, before any training.</li><li>Seconds per optimizer step (8 sequences). <code>tok/s</code> counts response tokens only.</li><li>The adapter, with its rank, alpha and targets in the file metadata, plus optimizer state for resuming.</li><li>Held-out loss after 250 steps: 2.43 to 1.65.</li></ol>
+  </div>
+  <h3>Follow the steps</h3>
+  <ol class="steps"><li><p>Prepare a model and data as in <a href="#lora-data">Download a model and prepare data</a>.</p></li><li><p>Train. These are the settings of the measured run:</p><div class="gcmd"><pre><code>ferrotensor train \
+  --model data/models/SmolLM2-135M \
+  --data data/alpaca/train.jsonl --eval-data data/alpaca/val.jsonl \
+  --out data/runs/sft --seq-len 256 \
+  --lr 5e-4 --warmup-steps 20 --grad-accum 8 --max-steps 250 \
+  --log-every 10 --eval-every 50 --save-every 50 \
+  --sample-prompt &quot;Give three tips for staying healthy.&quot;</code></pre><button class="copy" type="button" data-copy="ferrotensor train \
+  --model data/models/SmolLM2-135M \
+  --data data/alpaca/train.jsonl --eval-data data/alpaca/val.jsonl \
+  --out data/runs/sft --seq-len 256 \
+  --lr 5e-4 --warmup-steps 20 --grad-accum 8 --max-steps 250 \
+  --log-every 10 --eval-every 50 --save-every 50 \
+  --sample-prompt &quot;Give three tips for staying healthy.&quot;">Copy</button></div></li><li><p>Watch <code>eval before</code> and <code>eval after</code>. The run writes <code>lora_adapters.safetensors</code>, its <code>.state.json</code>, <code>metrics.jsonl</code> and <code>training_state.json</code> to <code>--out</code>.</p></li></ol>
+  
+  <details class="gmore"><summary>More detail and options</summary><div><p>Defaults that apply: batch size 1 (so <code>--grad-accum 8</code> means 8 sequences per step), LoRA rank 8 and alpha 16 on <code>q_proj,k_proj,v_proj,o_proj</code>, gradient clipping at a global norm of 1.0, AdamW without weight decay, and warmup then cosine decay to lr/10.</p>
+<ul>
+<li><code>--lora-rank</code>, <code>--lora-alpha</code> and <code>--lora-targets</code> change the adapter.</li>
+<li><code>--lite</code> is a preset for small machines: sequence length 128, rank 4 and grad-accum 8, unless you set them.</li>
+<li><code>--train-modules all|attn|mlp|norm|lm_head</code> trains base weights instead of LoRA.</li>
+<li><code>ferrotensor monitor</code> follows a run's <code>training_state.json</code> in a terminal dashboard.</li>
+</ul>
+<p>The same recipe on three model sizes on an NVIDIA A10G:</p>
+<table class="gt"><thead><tr><th>Model</th><th>Held-out loss</th><th>Per step</th><th>Adapter</th></tr></thead><tbody>
+<tr><td>SmolLM2-135M</td><td>2.4250 &rarr; 1.6521</td><td>1.33 s</td><td>3.7 MB</td></tr>
+<tr><td>SmolLM2-360M</td><td>2.0852 &rarr; 1.3228</td><td>1.69 s</td><td>6.6 MB</td></tr>
+<tr><td>SmolLM2-1.7B</td><td>2.6474 &rarr; 1.0667</td><td>2.47 s</td><td>12.6 MB</td></tr>
+</tbody></table>
+<p>Every number, with the M2 run, is in the <a href="../docs/examples/lora-sft.html">LoRA walkthrough</a>.</p></div></details>
+  <aside class="glimits" aria-label="Limits"><strong>Limits</strong><p>Each step trains one sequence at a time (<code>--batch-size</code> only changes how many share an optimizer step). Tensors are f32. Models above 1.7B have not been tested.</p></aside>
+  <nav class="pn" aria-label="Previous and next guide"><a class="prev" href="#lora-data"><small>Previous</small>Download a model and prepare data</a><a class="next" href="#lora-eval-generate"><small>Next</small>Evaluate and chat with your adapter</a></nav>
+</article>
+<article class="g" id="lora-eval-generate" aria-labelledby="lora-eval-generate-t" data-tags="cli">
+  <p class="crumb"><a href="#start">How-to guide</a><span aria-hidden="true">/</span>Fine-tune a language model</p>
+  <h2 id="lora-eval-generate-t">Evaluate and chat with your adapter</h2>
+  <p class="sum">Reload the adapter, measure the held-out loss, and generate text with or without it.</p>
+  <p class="meta"><span>3 min read</span><span>Ferrotensor {{ft_version}}</span><button class="copy link" type="button" data-copy="https://puranikyashaswin.github.io/ferrotensor/guide/#lora-eval-generate">Copy link</button></p>
+  <div class="fig">
+    <figure class="shot"><div class="shot-bar"><i></i><i></i><i></i><span>ferrotensor eval / generate</span></div><pre tabindex="0"><span class="ln p">$ ferrotensor eval ... --lora data/runs/sft/lora_adapters.safetensors</span><span class="ln"><b class="mk" aria-label="note 1">1</b>lora:   data/runs/SmolLM2-135M/lora_adapters.safetensors (240 tensors)</span><span class="ln"><b class="mk" aria-label="note 2">2</b>eval: 64 examples, 2744 tokens, loss 1.6521, perplexity 5.218 (4.5s)</span><span class="ln"></span><span class="ln p">$ ferrotensor generate ... --prompt &quot;Translate &#x27;good morning&#x27; into French.&quot; --temperature 0</span><span class="ln"><b class="mk" aria-label="note 3">3</b>Bonjour, bonne journe!</span><span class="ln"><b class="mk" aria-label="note 4">4</b>[18 prompt + 8 new tokens, 14.3 tok/s, kv cache on]</span></pre><figcaption>Real output on an NVIDIA A10G through Vulkan, Ferrotensor 0.5.</figcaption></figure>
+    <ol class="legend"><li>The adapter is applied on top of the frozen base model: 240 LoRA tensors.</li><li>Reloading the adapter reproduces the held-out loss from training.</li><li>Greedy output with the adapter. The base model repeats the prompt instead.</li><li>Generation speed, with the KV cache.</li></ol>
+  </div>
+  <h3>Follow the steps</h3>
+  <ol class="steps"><li><p>Measure the held-out loss with the adapter:</p><div class="gcmd"><pre><code>ferrotensor eval --model data/models/SmolLM2-135M \
+  --data data/alpaca/val.jsonl \
+  --lora data/runs/sft/lora_adapters.safetensors</code></pre><button class="copy" type="button" data-copy="ferrotensor eval --model data/models/SmolLM2-135M \
+  --data data/alpaca/val.jsonl \
+  --lora data/runs/sft/lora_adapters.safetensors">Copy</button></div></li><li><p>Generate, greedily:</p><div class="gcmd"><pre><code>ferrotensor generate --model data/models/SmolLM2-135M \
+  --lora data/runs/sft/lora_adapters.safetensors \
+  --prompt &quot;Translate &#x27;good morning&#x27; into French.&quot; --temperature 0</code></pre><button class="copy" type="button" data-copy="ferrotensor generate --model data/models/SmolLM2-135M \
+  --lora data/runs/sft/lora_adapters.safetensors \
+  --prompt &quot;Translate &#x27;good morning&#x27; into French.&quot; --temperature 0">Copy</button></div></li><li><p>Run both again without <code>--lora</code> to compare with the base model.</p></li></ol>
+  
+  <details class="gmore"><summary>More detail and options</summary><div><p><code>generate</code> takes <code>--temperature</code> (0 is greedy, default 0.7), <code>--top-k</code> (default 50), <code>--top-p</code> (default 0.9), <code>--seed</code>, <code>--system</code>, <code>--max-new-tokens</code> (default 128), <code>--raw</code> to skip the chat template, and <code>--no-kv-cache</code>. Greedy output is identical with and without the cache.</p>
+<table class="gt"><thead><tr><th>Prompt</th><th>Base SmolLM2-1.7B</th><th>With the adapter</th></tr></thead><tbody>
+<tr><td>Translate 'good morning' into French.</td><td>Repeats the prompt until the 60-token limit</td><td>Bonjour</td></tr>
+<tr><td>Give three tips for staying healthy.</td><td>Rambles on about a "Healthy Diet"</td><td>A numbered list of three tips</td></tr>
+</tbody></table></div></details>
+  <aside class="glimits" aria-label="Limits"><strong>Limits</strong><p>Small models stay small: answers are fluent but shallow, and sampled output can wander.</p></aside>
+  <nav class="pn" aria-label="Previous and next guide"><a class="prev" href="#lora-train"><small>Previous</small>Fine-tune a model with LoRA</a><a class="next" href="#lora-resume"><small>Next</small>Resume or extend a run</a></nav>
+</article>
+<article class="g" id="lora-resume" aria-labelledby="lora-resume-t" data-tags="cli">
+  <p class="crumb"><a href="#start">How-to guide</a><span aria-hidden="true">/</span>Fine-tune a language model</p>
+  <h2 id="lora-resume-t">Resume or extend a run</h2>
+  <p class="sum">Continue training from a saved adapter with its optimizer state and step counter.</p>
+  <p class="meta"><span>2 min read</span><span>Ferrotensor {{ft_version}}</span><button class="copy link" type="button" data-copy="https://puranikyashaswin.github.io/ferrotensor/guide/#lora-resume">Copy link</button></p>
+  <div class="fig">
+    <figure class="shot"><div class="shot-bar"><i></i><i></i><i></i><span>ferrotensor train --resume</span></div><pre tabindex="0"><span class="ln p"><b class="mk" aria-label="note 1">1</b>$ ferrotensor train ... --max-steps 300 --resume data/runs/sft/lora_adapters.safetensors</span><span class="ln"><b class="mk" aria-label="note 2">2</b>continuing at step 250</span></pre><figcaption>From the measured walkthrough run.</figcaption></figure>
+    <ol class="legend"><li>Point <code>--resume</code> at an adapter a previous run saved; raise <code>--max-steps</code> to train further.</li><li>The adapter, the AdamW moments and the step counter are restored. Batches already seen are skipped, in the same seeded order.</li></ol>
+  </div>
+  <h3>Follow the steps</h3>
+  <ol class="steps"><li><p>Keep the <code>.state.json</code> file next to the adapter. It holds the step and the optimizer state.</p></li><li><p>Run the same command with a higher <code>--max-steps</code> and <code>--resume</code>:</p><div class="gcmd"><pre><code>ferrotensor train --model data/models/SmolLM2-135M \
+  --data data/alpaca/train.jsonl --out data/runs/sft --seq-len 256 \
+  --lr 5e-4 --warmup-steps 20 --grad-accum 8 --max-steps 300 \
+  --resume data/runs/sft/lora_adapters.safetensors</code></pre><button class="copy" type="button" data-copy="ferrotensor train --model data/models/SmolLM2-135M \
+  --data data/alpaca/train.jsonl --out data/runs/sft --seq-len 256 \
+  --lr 5e-4 --warmup-steps 20 --grad-accum 8 --max-steps 300 \
+  --resume data/runs/sft/lora_adapters.safetensors">Copy</button></div></li></ol>
+  
+  <details class="gmore"><summary>More detail and options</summary><div><p>Use <code>--save-every N</code> during long runs so there is always a recent adapter to resume from.</p></div></details>
+  <aside class="glimits" aria-label="Limits"><strong>Limits</strong><p>The state file stores the AdamW moments as JSON, so it is large: 50 MB for SmolLM2-135M.</p></aside>
+  <nav class="pn" aria-label="Previous and next guide"><a class="prev" href="#lora-eval-generate"><small>Previous</small>Evaluate and chat with your adapter</a><a class="next" href="#lora-one-command"><small>Next</small>Run the whole recipe with one script</a></nav>
+</article>
+<article class="g" id="lora-one-command" aria-labelledby="lora-one-command-t" data-tags="cli">
+  <p class="crumb"><a href="#start">How-to guide</a><span aria-hidden="true">/</span>Fine-tune a language model</p>
+  <h2 id="lora-one-command-t">Run the whole recipe with one script</h2>
+  <p class="sum">Download, train, evaluate and generate on any Llama-style model, and get one JSON summary.</p>
+  <p class="meta"><span>3 min read</span><span>Ferrotensor {{ft_version}}</span><button class="copy link" type="button" data-copy="https://puranikyashaswin.github.io/ferrotensor/guide/#lora-one-command">Copy link</button></p>
+  <div class="fig">
+    <figure class="shot"><div class="shot-bar"><i></i><i></i><i></i><span>data/runs/SmolLM2-135M/summary.json</span></div><pre tabindex="0"><span class="ln">&quot;model&quot;: &quot;HuggingFaceTB/SmolLM2-135M&quot;,</span><span class="ln"><b class="mk" aria-label="note 1">1</b>&quot;device&quot;: &quot;NVIDIA A10G (Vulkan)&quot;,</span><span class="ln"><b class="mk" aria-label="note 2">2</b>&quot;heldout_loss_before&quot;: 2.425,</span><span class="ln">&quot;heldout_loss_after&quot;: 1.6521,</span><span class="ln">&quot;heldout_ppl_after&quot;: 5.218,</span><span class="ln"><b class="mk" aria-label="note 3">3</b>&quot;seconds_per_step_median&quot;: 1.328196144104004,</span><span class="ln"><b class="mk" aria-label="note 4">4</b>&quot;peak_memory_gb&quot;: 2.06,</span><span class="ln">&quot;adapter_mb&quot;: 3.7,</span></pre><figcaption>Real summary from an NVIDIA A10G run, Ferrotensor 0.5 (loss curve and generations omitted).</figcaption></figure>
+    <ol class="legend"><li>Where it ran.</li><li>Held-out loss before and after, on the same 64 examples as the walkthrough.</li><li>Median seconds per optimizer step.</li><li>Peak host memory of the training process.</li></ol>
+  </div>
+  <h3>Follow the steps</h3>
+  <ol class="steps"><li><p>From a checkout of the repository, install the Hugging Face tool:</p><div class="gcmd"><pre><code>pip install huggingface_hub</code></pre><button class="copy" type="button" data-copy="pip install huggingface_hub">Copy</button></div></li><li><p>Run the script with any Llama-style model:</p><div class="gcmd"><pre><code>scripts/lora-run.sh HuggingFaceTB/SmolLM2-360M</code></pre><button class="copy" type="button" data-copy="scripts/lora-run.sh HuggingFaceTB/SmolLM2-360M">Copy</button></div></li><li><p>Read <code>data/runs/&lt;model&gt;/summary.json</code>. It also has the loss curve and greedy generations from the base model and the adapter.</p></li></ol>
+  
+  <details class="gmore"><summary>More detail and options</summary><div><p>Options: <code>--steps N</code> (default 250) and <code>--seq-len L</code> (default 256). Everything else matches the walkthrough: 2,000 Alpaca examples, 64 held out, rank 8 on q/k/v/o, lr 5e-4.</p></div></details>
+  <aside class="glimits" aria-label="Limits"><strong>Limits</strong><p>The script needs bash, Python 3 and the <code>hf</code> command. It builds the CLI in release mode the first time.</p></aside>
+  <nav class="pn" aria-label="Previous and next guide"><a class="prev" href="#lora-resume"><small>Previous</small>Resume or extend a run</a><a class="next" href="#mlp"><small>Next</small>Train an MLP with a DataLoader</a></nav>
+</article>
+<article class="g" id="mlp" aria-labelledby="mlp-t" data-tags="rust">
+  <p class="crumb"><a href="#start">How-to guide</a><span aria-hidden="true">/</span>Train your own models</p>
+  <h2 id="mlp-t">Train an MLP with a DataLoader</h2>
+  <p class="sum">Classic small-model training: Dataset, DataLoader, nn::Sequential, AdamW and a warmup-cosine schedule.</p>
+  <p class="meta"><span>2 min read</span><span>Ferrotensor {{ft_version}}</span><button class="copy link" type="button" data-copy="https://puranikyashaswin.github.io/ferrotensor/guide/#mlp">Copy link</button></p>
+  <div class="fig">
+    <figure class="shot"><div class="shot-bar"><i></i><i></i><i></i><span>cargo run --release -p ferrotensor --example mlp_two_moons</span></div><pre tabindex="0"><span class="ln"><b class="mk" aria-label="note 1">1</b>device: CPU (Cpu)</span><span class="ln">train: 800 points, test: 400 points</span><span class="ln">model: 2-32-32-2 MLP, 1218 parameters</span><span class="ln">epoch  0  train loss 0.4292  test accuracy 85.8%</span><span class="ln">epoch 10  train loss 0.0319  test accuracy 98.5%</span><span class="ln"><b class="mk" aria-label="note 2">2</b>epoch 59  train loss 0.0081  test accuracy 99.5%</span></pre><figcaption>Real output on the CPU.</figcaption></figure>
+    <ol class="legend"><li>The examples default to the CPU. Set <code>FERROTENSOR_DEVICE=gpu</code> to use the GPU.</li><li>99.5% test accuracy on two noisy interleaved half-circles.</li></ol>
+  </div>
+  <h3>Follow the steps</h3>
+  <ol class="steps"><li><p>From a checkout:</p><div class="gcmd"><pre><code>cargo run --release -p ferrotensor --example mlp_two_moons</code></pre><button class="copy" type="button" data-copy="cargo run --release -p ferrotensor --example mlp_two_moons">Copy</button></div></li><li><p>Try the GPU:</p><div class="gcmd"><pre><code>FERROTENSOR_DEVICE=gpu cargo run --release -p ferrotensor --example mlp_two_moons</code></pre><button class="copy" type="button" data-copy="FERROTENSOR_DEVICE=gpu cargo run --release -p ferrotensor --example mlp_two_moons">Copy</button></div></li></ol>
+  
+  <details class="gmore"><summary>More detail and options</summary><div><p>The GPU run reaches the same accuracy but takes about 2 s against 0.2 s on the CPU: a 1,218-parameter model gives a GPU too little work. Source: <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/ferrotensor/examples/mlp_two_moons.rs"><code>mlp_two_moons.rs</code></a>.</p></div></details>
+  
+  <nav class="pn" aria-label="Previous and next guide"><a class="prev" href="#lora-one-command"><small>Previous</small>Run the whole recipe with one script</a><a class="next" href="#transformer"><small>Next</small>Train a small transformer from scratch</a></nav>
+</article>
+<article class="g" id="transformer" aria-labelledby="transformer-t" data-tags="rust">
+  <p class="crumb"><a href="#start">How-to guide</a><span aria-hidden="true">/</span>Train your own models</p>
+  <h2 id="transformer-t">Train a small transformer from scratch</h2>
+  <p class="sum">A two-layer GPT-style model built from nn layers, trained on Shakespeare sonnets and sampled.</p>
+  <p class="meta"><span>3 min read</span><span>Ferrotensor {{ft_version}}</span><button class="copy link" type="button" data-copy="https://puranikyashaswin.github.io/ferrotensor/guide/#transformer">Copy link</button></p>
+  <div class="fig">
+    <figure class="shot"><div class="shot-bar"><i></i><i></i><i></i><span>cargo run --release -p ferrotensor --example char_transformer</span></div><pre tabindex="0"><span class="ln">corpus: 3700 characters, vocabulary 54</span><span class="ln"><b class="mk" aria-label="note 1">1</b>model: 2 layers, dim 64, 4 heads, 109622 parameters</span><span class="ln">step   0  loss 4.577</span><span class="ln">step 300  loss 1.588</span><span class="ln"><b class="mk" aria-label="note 2">2</b>step 599  loss 0.603</span><span class="ln"><b class="mk" aria-label="note 3">3</b>trained 600 steps in 47.6s</span><span class="ln">--- sample (prompt: &quot;Shall I compare&quot;) ---</span><span class="ln"><b class="mk" aria-label="note 4">4</b>Shall I comparestemaf look con.</span></pre><figcaption>Real output on the CPU of a MacBook Air M2.</figcaption></figure>
+    <ol class="legend"><li><code>nn::Embedding</code>, <code>nn::LayerNorm</code>, causal <code>nn::MultiHeadAttention</code> and <code>nn::Linear</code>.</li><li>The loss falls from 4.6 to 0.6 on training windows.</li><li>With <code>FERROTENSOR_DEVICE=gpu</code> the same 600 steps took 31.9 s on the M2's GPU.</li><li>Partly English-shaped, partly not: a working training loop on 3.7 KB of text, not a language model.</li></ol>
+  </div>
+  <h3>Follow the steps</h3>
+  <ol class="steps"><li><p>From a checkout:</p><div class="gcmd"><pre><code>cargo run --release -p ferrotensor --example char_transformer</code></pre><button class="copy" type="button" data-copy="cargo run --release -p ferrotensor --example char_transformer">Copy</button></div></li></ol>
+  
+  <details class="gmore"><summary>More detail and options</summary><div><p>It uses AdamW, gradient clipping and a warmup+cosine schedule. Source: <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/ferrotensor/examples/char_transformer.rs"><code>char_transformer.rs</code></a>. More examples, with output, are in <a href="../docs/use-cases.html">Use cases</a>.</p></div></details>
+  <aside class="glimits" aria-label="Limits"><strong>Limits</strong><p>There is no held-out set, so the loss says nothing about generalisation.</p></aside>
+  <nav class="pn" aria-label="Previous and next guide"><a class="prev" href="#mlp"><small>Previous</small>Train an MLP with a DataLoader</a><a class="next" href="#save-load"><small>Next</small>Save, load and seed a model</a></nav>
+</article>
+<article class="g" id="save-load" aria-labelledby="save-load-t" data-tags="rust python">
+  <p class="crumb"><a href="#start">How-to guide</a><span aria-hidden="true">/</span>Train your own models</p>
+  <h2 id="save-load-t">Save, load and seed a model</h2>
+  <p class="sum">Store parameters as safetensors and make random initialisation reproducible.</p>
+  <p class="meta"><span>2 min read</span><span>Ferrotensor {{ft_version}}</span><button class="copy link" type="button" data-copy="https://puranikyashaswin.github.io/ferrotensor/guide/#save-load">Copy link</button></p>
+  <div class="fig">
+    <figure class="shot"><div class="shot-bar"><i></i><i></i><i></i><span>Rust</span></div><pre tabindex="0"><span class="ln"><b class="mk" aria-label="note 1">1</b>ferrotensor::manual_seed(42);</span><span class="ln"><b class="mk" aria-label="note 2">2</b>ferrotensor::serialize::save_module(&amp;model, &quot;model.safetensors&quot;)?;</span><span class="ln"><b class="mk" aria-label="note 3">3</b>ferrotensor::serialize::load_module(&amp;model, &quot;model.safetensors&quot;)?;</span></pre><figcaption>Save and load a module&#x27;s parameters; seed every random source.</figcaption></figure>
+    <ol class="legend"><li>Seeds random tensors, layer initialisation and dropout, so a program gives the same numbers on every run.</li><li>Writes every named parameter to a safetensors file.</li><li>Loads them back in place. Loading is strict: missing or extra names are errors.</li></ol>
+  </div>
+  <h3>Follow the steps</h3>
+  <ol class="steps"><li><p>In Rust, use the three calls above. <code>serialize::state_dict</code> and <code>load_state_dict</code> give you the named tensors directly.</p></li><li><p>In Python:</p></li></ol>
+  <div class="gcmd code-python"><pre><code>import ferrotensor as ft
+ft.manual_seed(42)
+model.save(&quot;xor.safetensors&quot;)
+model.load(&quot;xor.safetensors&quot;)</code></pre><button class="copy" type="button" data-copy="import ferrotensor as ft
+ft.manual_seed(42)
+model.save(&quot;xor.safetensors&quot;)
+model.load(&quot;xor.safetensors&quot;)">Copy</button></div>
+  <details class="gmore"><summary>More detail and options</summary><div><p>Safetensors files load as F32, F16, BF16 or F64 (F32, F16 or BF16 in Python) and are converted to f32.</p></div></details>
+  
+  <nav class="pn" aria-label="Previous and next guide"><a class="prev" href="#transformer"><small>Previous</small>Train a small transformer from scratch</a><a class="next" href="#backend"><small>Next</small>Choose a GPU and backend</a></nav>
+</article>
+<article class="g" id="backend" aria-labelledby="backend-t" data-tags="rust cli">
+  <p class="crumb"><a href="#start">How-to guide</a><span aria-hidden="true">/</span>Performance</p>
+  <h2 id="backend-t">Choose a GPU and backend</h2>
+  <p class="sum">Pick between the GPU and CPU, and between Metal, Vulkan, DX12 and GL.</p>
+  <p class="meta"><span>2 min read</span><span>Ferrotensor {{ft_version}}</span><button class="copy link" type="button" data-copy="https://puranikyashaswin.github.io/ferrotensor/guide/#backend">Copy link</button></p>
+  <div class="fig">
+    <figure class="shot"><div class="shot-bar"><i></i><i></i><i></i><span>Choosing a device</span></div><pre tabindex="0"><span class="ln"><b class="mk" aria-label="note 1">1</b>WGPU_BACKEND=vulkan ferrotensor info --check</span><span class="ln"><b class="mk" aria-label="note 2">2</b>ferrotensor train --device cpu ...</span><span class="ln"><b class="mk" aria-label="note 3">3</b>let device = Device::best();   // or Device::gpu(), Device::cpu()</span><span class="ln"><b class="mk" aria-label="note 4">4</b>FERROTENSOR_DEVICE=gpu cargo run --release -p ferrotensor --example mlp_two_moons</span></pre><figcaption>The switches Ferrotensor reads.</figcaption></figure>
+    <ol class="legend"><li>Restricts which backends are tried: <code>vulkan</code>, <code>metal</code>, <code>dx12</code>, <code>gl</code> or a comma list. Applies to the library, the CLI and the tests.</li><li>The CLI's <code>--device</code>: <code>auto</code> and <code>gpu</code> use the high-performance GPU; <code>cpu</code> uses wgpu's software adapter, which is slow.</li><li>In Rust, <code>Device::best()</code> falls back to the CPU device; <code>Device::gpu()</code> returns <code>None</code> without a GPU.</li><li>The examples read <code>FERROTENSOR_DEVICE</code> and default to the CPU.</li></ol>
+  </div>
+  <h3>Follow the steps</h3>
+  <ol class="steps"><li><p>Check what is available with <a href="#check-gpu"><code>ferrotensor info</code></a>.</p></li><li><p>On Windows, compare backends on the same GPU:</p><div class="gcmd"><pre><code>WGPU_BACKEND=vulkan ferrotensor info --check
+WGPU_BACKEND=dx12 ferrotensor info --check</code></pre><button class="copy" type="button" data-copy="WGPU_BACKEND=vulkan ferrotensor info --check
+WGPU_BACKEND=dx12 ferrotensor info --check">Copy</button></div></li></ol>
+  
+  
+  <aside class="glimits" aria-label="Limits"><strong>Limits</strong><p>One GPU per process. Multi-GPU training is not supported.</p></aside>
+  <nav class="pn" aria-label="Previous and next guide"><a class="prev" href="#save-load"><small>Previous</small>Save, load and seed a model</a><a class="next" href="#fusion"><small>Next</small>Turn on op fusion</a></nav>
+</article>
+<article class="g" id="fusion" aria-labelledby="fusion-t" data-tags="rust python">
+  <p class="crumb"><a href="#start">How-to guide</a><span aria-hidden="true">/</span>Performance</p>
+  <h2 id="fusion-t">Turn on op fusion</h2>
+  <p class="sum">Run chains of element-wise ops as one GPU dispatch. Results are bit-identical.</p>
+  <p class="meta"><span>2 min read</span><span>Ferrotensor {{ft_version}}</span><button class="copy link" type="button" data-copy="https://puranikyashaswin.github.io/ferrotensor/guide/#fusion">Copy link</button></p>
+  <div class="fig">
+    <figure class="shot"><div class="shot-bar"><i></i><i></i><i></i><span>FERROTENSOR_FUSION=1</span></div><pre tabindex="0"><span class="ln">case                          GPU          off        on</span><span class="ln"><b class="mk" aria-label="note 1">1</b>100 element-wise ops, [64]    A10G     0.676 ms  0.322 ms</span><span class="ln">100 element-wise ops, [64]    T4       0.668 ms  0.305 ms</span><span class="ln"><b class="mk" aria-label="note 2">2</b>MLP 784-256-10 AdamW step     A10G     0.855 ms  0.673 ms</span><span class="ln"><b class="mk" aria-label="note 3">3</b>matmul 512x512x512            A10G     0.528 ms  0.532 ms</span></pre><figcaption>Real medians from benchmarks/RESULTS.md, Tensor API, fusion off and on.</figcaption></figure>
+    <ol class="legend"><li>A chain of small ops takes half the time.</li><li>A training step gets 21% faster.</li><li>Ops that are not element-wise chains are unchanged.</li></ol>
+  </div>
+  <h3>Follow the steps</h3>
+  <ol class="steps"><li><p>Set the variable for any program that uses the <code>ferrotensor</code> Tensor API, Rust or Python:</p><div class="gcmd"><pre><code>FERROTENSOR_DEVICE=gpu FERROTENSOR_FUSION=1 \
+  cargo run --release -p ferrotensor --example char_transformer</code></pre><button class="copy" type="button" data-copy="FERROTENSOR_DEVICE=gpu FERROTENSOR_FUSION=1 \
+  cargo run --release -p ferrotensor --example char_transformer">Copy</button></div></li><li><p>Results do not change: every intermediate is still written, and CI checks fused and unfused runs bit for bit.</p></li></ol>
+  
+  <details class="gmore"><summary>More detail and options</summary><div><p>Up to six consecutive same-size element-wise steps run as one <code>fused</code> dispatch. The design and its decision tree are in <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/docs/design/op-fusion.md">op fusion</a>.</p></div></details>
+  <aside class="glimits" aria-label="Limits"><strong>Limits</strong><p>Off by default. It applies to the Tensor API, not to the LoRA command line, which uses its own kernels.</p></aside>
+  <nav class="pn" aria-label="Previous and next guide"><a class="prev" href="#backend"><small>Previous</small>Choose a GPU and backend</a><a class="next" href="#benchmark"><small>Next</small>Benchmark your machine</a></nav>
+</article>
+<article class="g" id="benchmark" aria-labelledby="benchmark-t" data-tags="cli contrib">
+  <p class="crumb"><a href="#start">How-to guide</a><span aria-hidden="true">/</span>Performance</p>
+  <h2 id="benchmark-t">Benchmark your machine</h2>
+  <p class="sum">Run the kernel and Tensor API benchmarks and get one JSON report.</p>
+  <p class="meta"><span>3 min read</span><span>Ferrotensor {{ft_version}}</span><button class="copy link" type="button" data-copy="https://puranikyashaswin.github.io/ferrotensor/guide/#benchmark">Copy link</button></p>
+  <div class="fig">
+    <figure class="shot"><div class="shot-bar"><i></i><i></i><i></i><span>scripts/hardware-report.sh --quick</span></div><pre tabindex="0"><span class="ln"><b class="mk" aria-label="note 1">1</b>report: reports/runnervm48cm3-vulkan-403a069.json</span><span class="ln"><b class="mk" aria-label="note 2">2</b>GPU: llvmpipe (LLVM 20.1.2, 256 bits) (vulkan), kernel check passed, 12 kernel and 4 Tensor API results</span></pre><figcaption>Real output from Ferrotensor&#x27;s CI (software Vulkan).</figcaption></figure>
+    <ol class="legend"><li>One JSON file per machine, backend and commit, under <code>reports/</code>.</li><li>A summary line: the GPU, whether the kernel check passed and how many results were recorded.</li></ol>
+  </div>
+  <h3>Follow the steps</h3>
+  <ol class="steps"><li><p>From a checkout, run the full report (or add <code>--quick</code> for a short one):</p><div class="gcmd"><pre><code>scripts/hardware-report.sh</code></pre><button class="copy" type="button" data-copy="scripts/hardware-report.sh">Copy</button></div></li><li><p>Or run the parts on their own:</p><div class="gcmd"><pre><code>cargo run -p ferrotensor-benchmarks --release --bin bench
+cargo run -p ferrotensor-benchmarks --release --bin tensor-api</code></pre><button class="copy" type="button" data-copy="cargo run -p ferrotensor-benchmarks --release --bin bench
+cargo run -p ferrotensor-benchmarks --release --bin tensor-api">Copy</button></div></li></ol>
+  
+  <details class="gmore"><summary>More detail and options</summary><div><p>The report runs <code>ferrotensor info --check</code>, the kernel benchmarks and the Tensor API benchmarks, and keeps the raw tables. Published results for an Apple M2, an NVIDIA A10G and a Tesla T4 are on the <a href="../docs/benchmarks.html">benchmarks page</a>.</p></div></details>
+  <aside class="glimits" aria-label="Limits"><strong>Limits</strong><p>Close other GPU-heavy programs first; timings are medians but still noisy.</p></aside>
+  <nav class="pn" aria-label="Previous and next guide"><a class="prev" href="#fusion"><small>Previous</small>Turn on op fusion</a><a class="next" href="#gpu-tests"><small>Next</small>Run the GPU tests</a></nav>
+</article>
+<article class="g" id="gpu-tests" aria-labelledby="gpu-tests-t" data-tags="contrib">
+  <p class="crumb"><a href="#start">How-to guide</a><span aria-hidden="true">/</span>Contribute</p>
+  <h2 id="gpu-tests-t">Run the GPU tests</h2>
+  <p class="sum">Check every kernel and gradient on your GPU against the CPU.</p>
+  <p class="meta"><span>3 min read</span><span>Ferrotensor {{ft_version}}</span><button class="copy link" type="button" data-copy="https://puranikyashaswin.github.io/ferrotensor/guide/#gpu-tests">Copy link</button></p>
+  <div class="fig">
+    <figure class="shot"><div class="shot-bar"><i></i><i></i><i></i><span>FERROTENSOR_RUN_GPU_TESTS=1</span></div><pre tabindex="0"><span class="ln"><b class="mk" aria-label="note 1">1</b>FERROTENSOR_RUN_GPU_TESTS=1 cargo test --workspace -- --ignored --test-threads=1</span><span class="ln"><b class="mk" aria-label="note 2">2</b>FERROTENSOR_RUN_GPU_TESTS=1 cargo test -p ferrotensor --lib</span><span class="ln"><b class="mk" aria-label="note 3">3</b>FERROTENSOR_RUN_GPU_TESTS=1 cargo test -p ferrotensor-autograd --test grad_check</span></pre><figcaption>What the GPU suites cover.</figcaption></figure>
+    <ol class="legend"><li>Every <code>ferrotensor-backend</code> kernel against a CPU reference. 229 GPU tests pass on an NVIDIA A10G and a Tesla T4.</li><li>The Tensor API: forward values and gradients on the GPU must match the CPU.</li><li>Finite-difference gradient checks of every autograd op on the GPU.</li></ol>
+  </div>
+  <h3>Follow the steps</h3>
+  <ol class="steps"><li><p>Clone the repository, then run the suites above. Without the variable, GPU tests skip themselves.</p></li><li><p>Add <code>FERROTENSOR_FUSION=1</code> to the second command to test op fusion too.</p></li></ol>
+  
+  <details class="gmore"><summary>More detail and options</summary><div><p>Every pull request runs these suites in CI on Mesa lavapipe, a Vulkan driver that runs on the CPU, so the Vulkan path is checked without a GPU. Behaviour on real hardware still needs a local run. Adding a kernel is covered in <a href="../docs/writing-a-kernel.html">Writing a kernel</a>.</p></div></details>
+  <aside class="glimits" aria-label="Limits"><strong>Limits</strong><p>Use <code>--test-threads=1</code>: creating several GPU devices at once is unreliable on some drivers.</p></aside>
+  <nav class="pn" aria-label="Previous and next guide"><a class="prev" href="#benchmark"><small>Previous</small>Benchmark your machine</a><a class="next" href="#report-gpu"><small>Next</small>Report results from your GPU</a></nav>
+</article>
+<article class="g" id="report-gpu" aria-labelledby="report-gpu-t" data-tags="contrib">
+  <p class="crumb"><a href="#start">How-to guide</a><span aria-hidden="true">/</span>Contribute</p>
+  <h2 id="report-gpu-t">Report results from your GPU</h2>
+  <p class="sum">AMD, Intel and DX12 results are the most useful thing you can contribute.</p>
+  <p class="meta"><span>2 min read</span><span>Ferrotensor {{ft_version}}</span><button class="copy link" type="button" data-copy="https://puranikyashaswin.github.io/ferrotensor/guide/#report-gpu">Copy link</button></p>
+  <div class="fig">
+    <figure class="shot"><div class="shot-bar"><i></i><i></i><i></i><span>ferrotensor info --check --json</span></div><pre tabindex="0"><span class="ln"><b class="mk" aria-label="note 1">1</b>ferrotensor info --check --json</span><span class="ln"><b class="mk" aria-label="note 2">2</b>scripts/hardware-report.sh</span></pre><figcaption>What to attach to the issue.</figcaption></figure>
+    <ol class="legend"><li>Adapters, limits and the kernel check, as JSON. Paste it into the bug report's field for it.</li><li>Optional: the full benchmark report, the same measurement every published number comes from.</li></ol>
+  </div>
+  <h3>Follow the steps</h3>
+  <ol class="steps"><li><p>Run the commands above.</p></li><li><p>Open an issue on <a href="https://github.com/puranikyashaswin/ferrotensor/issues/new/choose">GitHub</a> and attach the output, whether everything passed or something failed.</p></li></ol>
+  
+  <details class="gmore"><summary>More detail and options</summary><div><p>The full checklist is in <a href="../docs/testing-on-your-gpu.html">Testing on your GPU</a>.</p></div></details>
+  
+  <nav class="pn" aria-label="Previous and next guide"><a class="prev" href="#gpu-tests"><small>Previous</small>Run the GPU tests</a><a class="next" href="#no-gpu"><small>Next</small>No GPU found, or the wrong one</a></nav>
+</article>
+<article class="g" id="no-gpu" aria-labelledby="no-gpu-t" data-tags="cli rust python">
+  <p class="crumb"><a href="#start">How-to guide</a><span aria-hidden="true">/</span>Troubleshooting</p>
+  <h2 id="no-gpu-t">No GPU found, or the wrong one</h2>
+  <p class="sum">What to do when Ferrotensor runs on the CPU or picks an unexpected adapter.</p>
+  <p class="meta"><span>2 min read</span><span>Ferrotensor {{ft_version}}</span><button class="copy link" type="button" data-copy="https://puranikyashaswin.github.io/ferrotensor/guide/#no-gpu">Copy link</button></p>
+  <div class="fig">
+    <figure class="shot"><div class="shot-bar"><i></i><i></i><i></i><span>ferrotensor info</span></div><pre tabindex="0"><span class="ln"><b class="mk" aria-label="note 1">1</b>No GPU adapter found. Ferrotensor&#x27;s CPU device still works.</span></pre><figcaption>The message when wgpu finds no adapter.</figcaption></figure>
+    <ol class="legend"><li>wgpu could not open a GPU. Programs that use <code>Device::best()</code> or <code>ft.Device("best")</code> keep working on the CPU.</li></ol>
+  </div>
+  <h3>Follow the steps</h3>
+  <ol class="steps"><li><p>On Linux, install a Vulkan driver (NVIDIA's driver, or Mesa for AMD and Intel) and check with <code>vulkaninfo --summary</code>.</p></li><li><p>If several adapters are listed, restrict the backend with <code>WGPU_BACKEND</code>, for example <code>WGPU_BACKEND=vulkan</code>.</p></li><li><p>In a container or VM without GPU access, use the CPU device: <code>Device::cpu()</code>, <code>ft.Device("cpu")</code>, or <code>--device cpu</code> for the CLI.</p></li></ol>
+  
+  
+  
+  <nav class="pn" aria-label="Previous and next guide"><a class="prev" href="#report-gpu"><small>Previous</small>Report results from your GPU</a><a class="next" href="#slow-memory"><small>Next</small>Training is slow or uses too much memory</a></nav>
+</article>
+<article class="g" id="slow-memory" aria-labelledby="slow-memory-t" data-tags="cli rust">
+  <p class="crumb"><a href="#start">How-to guide</a><span aria-hidden="true">/</span>Troubleshooting</p>
+  <h2 id="slow-memory-t">Training is slow or uses too much memory</h2>
+  <p class="sum">Why tiny models are faster on the CPU, and what the GPU memory limits are.</p>
+  <p class="meta"><span>3 min read</span><span>Ferrotensor {{ft_version}}</span><button class="copy link" type="button" data-copy="https://puranikyashaswin.github.io/ferrotensor/guide/#slow-memory">Copy link</button></p>
+  <div class="fig">
+    <figure class="shot"><div class="shot-bar"><i></i><i></i><i></i><span>Seconds per LoRA step, SmolLM2-135M</span></div><pre tabindex="0"><span class="ln"><b class="mk" aria-label="note 1">1</b>NVIDIA A10G, 0.4          20.2 s</span><span class="ln">MacBook Air M2, 0.4        8.8 s</span><span class="ln"><b class="mk" aria-label="note 2">2</b>NVIDIA A10G, 0.5          1.33 s</span></pre><figcaption>Real measurements: the same run before and after Ferrotensor 0.5.</figcaption></figure>
+    <ol class="legend"><li>Before 0.5, parts of the backward pass and the loss copied tensors to the CPU and back: about 2,000 blocking reads per step.</li><li>0.5 keeps them on the GPU and batches dispatches. Update if you are on an older version.</li></ol>
+  </div>
+  <h3>Follow the steps</h3>
+  <ol class="steps"><li><p>Use the latest release: <code>cargo install ferrotensor-cli --force</code>.</p></li><li><p>For very small models, use the CPU. Every GPU dispatch has a fixed cost, so a 1,218-parameter MLP trains about 10x faster on the CPU.</p></li><li><p>Out of memory while loading a large model? SmolLM2-1.7B needed about 20 GB of host memory in 0.5. A fix that stops uploads from keeping a staging copy of every weight is on <code>main</code> and will be in the next release.</p></li></ol>
+  
+  <details class="gmore"><summary>More detail and options</summary><div><p>Try <a href="#fusion">op fusion</a> for Tensor API programs with long element-wise chains, and <code>--lite</code> for LoRA on small machines.</p></div></details>
+  <aside class="glimits" aria-label="Limits"><strong>Limits</strong><p>Tensors are f32 only, so memory is twice that of bf16 frameworks.</p></aside>
+  <nav class="pn" aria-label="Previous and next guide"><a class="prev" href="#no-gpu"><small>Previous</small>No GPU found, or the wrong one</a><span></span></nav>
+</article>
+  </main>
+</div>
+
+<footer class="foot">
+  <div class="wrap foot-in">
+    <div class="foot-brand">
+      <svg class="tile" viewBox="0 0 32 32" aria-hidden="true"><rect x="1" y="1" width="30" height="30" rx="4"/><text x="5" y="10">26</text><text class="tile-sym" x="5.5" y="26">Ft</text></svg>
+      <p>Ferrotensor {{ft_version}} · Licensed under <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/LICENSE-MIT">MIT</a> or <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/LICENSE-APACHE">Apache-2.0</a>, at your option.</p>
+    </div>
+    <nav aria-label="Project links">
+      <ul>
+        <li><a href="https://github.com/puranikyashaswin/ferrotensor">GitHub</a></li>
+        <li><a href="https://crates.io/crates/ferrotensor">crates.io</a></li>
+        <li><a href="https://pypi.org/project/ferrotensor/">PyPI</a></li>
+        <li><a href="https://docs.rs/ferrotensor">docs.rs</a></li>
+        <li><a href="../docs/">Docs</a></li>
+        <li><a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/CHANGELOG.md">Changelog</a></li>
+      </ul>
+    </nav>
+  </div>
+</footer>
+</body>
+</html>
