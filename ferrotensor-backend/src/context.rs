@@ -1,7 +1,7 @@
 //! GPU device setup.
 
 use crate::pool::BufferPool;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use wgpu::{Adapter, CommandEncoder, Device, Instance, Queue};
@@ -9,6 +9,10 @@ use wgpu::{Adapter, CommandEncoder, Device, Instance, Queue};
 /// Recorded GPU work is submitted once this many ops are pending, so the GPU
 /// starts on long sequences without waiting for a sync point.
 const MAX_PENDING_OPS: u32 = 128;
+
+/// Uploaded bytes after which [`WgpuContext::note_upload`] waits for the
+/// staging copies to finish so wgpu can free them.
+pub const UPLOAD_RELEASE_BYTES: u64 = 256 << 20;
 
 /// A GPU device, its queue and a buffer pool shared by tensors.
 ///
@@ -20,6 +24,12 @@ const MAX_PENDING_OPS: u32 = 128;
 /// Call [`flush`](Self::flush) before submitting work of your own on
 /// `queue`, so it runs after the recorded ops, and
 /// [`synchronize`](Self::synchronize) to wait for the GPU.
+///
+/// Uploads (creating a tensor from host data, or writing one) go through a
+/// host-side staging buffer that wgpu frees only after a later submission
+/// completes. The context counts uploaded bytes and, every
+/// [`UPLOAD_RELEASE_BYTES`], submits and waits so those buffers are freed;
+/// without that, loading a model would hold a staging copy of every weight.
 #[derive(Debug)]
 pub struct WgpuContext {
     /// The wgpu instance the adapter came from.
@@ -33,6 +43,8 @@ pub struct WgpuContext {
     /// Pool that [`UnifiedTensor::empty`](crate::UnifiedTensor::empty) draws from.
     pub pool: Arc<BufferPool>,
     pending: Mutex<Pending>,
+    /// Bytes uploaded since staging buffers were last released.
+    staged: AtomicU64,
 }
 
 /// Recorded work not yet submitted.
@@ -106,6 +118,7 @@ impl WgpuContext {
             queue: Arc::new(queue),
             pool,
             pending: Mutex::new(Pending::default()),
+            staged: AtomicU64::new(0),
         }
     }
 
@@ -131,15 +144,31 @@ impl WgpuContext {
         self.submit(&mut pending);
     }
 
-    /// Submits all recorded work and blocks until the GPU has finished
-    /// everything submitted so far.
+    /// Submits all recorded work and pending uploads and blocks until the
+    /// GPU has finished them. Staging buffers of finished uploads are freed.
     pub fn synchronize(&self) {
+        self.staged.store(0, Ordering::Relaxed);
         self.flush();
+        // An empty submission carries wgpu's pending buffer writes.
+        self.queue.submit(std::iter::empty());
         let done = Arc::new(AtomicBool::new(false));
         let flag = done.clone();
         self.queue
             .on_submitted_work_done(move || flag.store(true, Ordering::Release));
         self.poll_until(|| done.load(Ordering::Acquire));
+    }
+
+    /// Records that `bytes` were uploaded through a staging buffer (by
+    /// `create_buffer_init` or `queue.write_buffer`). Once
+    /// [`UPLOAD_RELEASE_BYTES`] have accumulated it
+    /// [`synchronize`](Self::synchronize)s, so host memory held by staging
+    /// stays bounded. [`UnifiedTensor`](crate::UnifiedTensor) calls this for
+    /// its uploads; call it after uploading through `queue` yourself.
+    pub fn note_upload(&self, bytes: u64) {
+        let total = self.staged.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        if total >= UPLOAD_RELEASE_BYTES {
+            self.synchronize();
+        }
     }
 
     /// Polls the device until `done` returns true.

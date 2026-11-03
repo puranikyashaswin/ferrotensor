@@ -71,6 +71,7 @@ impl UnifiedTensor {
         // them first: ops recorded earlier must see the old contents.
         context.flush();
         context.queue.write_buffer(self.buffer(), 0, data);
+        context.note_upload(data.len() as u64);
     }
 }
 
@@ -87,6 +88,7 @@ impl UnifiedTensor {
                     | wgpu::BufferUsages::COPY_DST
                     | wgpu::BufferUsages::COPY_SRC,
             });
+        context.note_upload(size_in_bytes);
         Self {
             data: Arc::new(TensorData {
                 buffer: Arc::new(buffer),
@@ -147,6 +149,7 @@ impl UnifiedTensor {
                     | wgpu::BufferUsages::COPY_DST
                     | wgpu::BufferUsages::COPY_SRC,
             });
+        context.note_upload(size_in_bytes);
         Self {
             data: Arc::new(TensorData {
                 buffer: Arc::new(buffer),

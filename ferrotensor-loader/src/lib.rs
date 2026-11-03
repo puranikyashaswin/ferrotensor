@@ -423,6 +423,7 @@ impl WeightsContext {
                 mapped_at_creation: false,
             });
         ctx.queue.write_buffer(&q_buf, 0, &q_data);
+        ctx.note_upload(q_data.len() as u64);
 
         // 3. Output Tensor (FP32)
         let out_tensor = UnifiedTensor::empty(ctx, &q_shape);
