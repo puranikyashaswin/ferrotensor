@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- `ferrotensor-backend`: uploading tensors no longer keeps a host-side staging copy of every upload until the next GPU submission. `WgpuContext::note_upload` counts uploaded bytes and every 256 MiB (`UPLOAD_RELEASE_BYTES`) waits for the copies so wgpu frees them; `synchronize` now also submits pending uploads. Loading a model held a staging copy of all its weights (6.8 GB for SmolLM2-1.7B in fp32); in the CI test, uploading 768 MiB grew peak memory by 1536 MiB before and is bounded at under 1.6x now.
 - The README, CONTRIBUTING, the GPU testing guide, the architecture notes and the website's benchmarks and LoRA pages describe the NVIDIA results, the software-Vulkan CI job and op fusion; the README no longer says the Python package is missing from PyPI.
 
 ## [0.5.0] - 2026-11-02
