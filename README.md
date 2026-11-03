@@ -270,7 +270,7 @@ against them; kernel-level numbers for Ferrotensor alone are in
 - [x] Tested on NVIDIA GPUs through Vulkan, and the GPU suites run in CI on software Vulkan ([results](benchmarks/RESULTS.md))
 - [x] LoRA measured up to SmolLM2-1.7B, with the backward passes and the loss on the GPU ([walkthrough](docs/examples/lora-sft.md#on-an-nvidia-gpu-three-model-sizes))
 - [ ] Op fusion on by default (needs a measurement on more GPUs)
-- [ ] Lower host memory when loading models (SmolLM2-1.7B needs about 20 GB)
+- [ ] Lower host memory when loading models (SmolLM2-1.7B needed about 20 GB; uploads no longer keep staging copies, re-measuring is next)
 - [ ] Results from AMD and Intel GPUs, and from DX12
 - [ ] Parallel-reduction softmax and layer norm kernels
 - [ ] `f16`/`bf16` tensors, convolutions, sort/top-k
