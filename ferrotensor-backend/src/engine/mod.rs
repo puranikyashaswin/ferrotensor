@@ -21,7 +21,30 @@ fn shader_source() -> String {
     let matmul_src = include_str!("../shaders/matmul.wgsl");
     let flash_v2_src = include_str!("../shaders/flash_attention_v2.wgsl");
     let flash_v2_bw_src = include_str!("../shaders/flash_attention_v2_backward.wgsl");
-    format!("{kernels_src}\n{matmul_src}\n{flash_v2_src}\n{flash_v2_bw_src}")
+    let matmul_h_src = half_b_matmul(matmul_src);
+    format!("{kernels_src}\n{matmul_src}\n{matmul_h_src}\n{flash_v2_src}\n{flash_v2_bw_src}")
+}
+
+/// `matmul_blocked_h`: the matmul kernel with `b` stored as f16 pairs packed
+/// into `u32` words (element `i` in the low half of word `i / 2` when `i` is
+/// even, the high half when odd). Generated from matmul.wgsl so the two
+/// kernels cannot drift apart; only the `b` binding and its loader differ.
+fn half_b_matmul(src: &str) -> String {
+    const B_DECL: &str = "var<storage, read> mmb_b: array<f32>;";
+    const B_LOAD: &str =
+        "    if (mode == 1u) { return mmb_b[gn * k + gk]; }\n    return mmb_b[gk * n + gn];";
+    assert!(
+        src.contains(B_DECL) && src.contains(B_LOAD),
+        "matmul.wgsl changed"
+    );
+    src.replace(
+        B_LOAD,
+        "    var i = gk * n + gn;\n    if (mode == 1u) { i = gn * k + gk; }\n    return unpack2x16float(mmb_b[i >> 1u])[i & 1u];",
+    )
+    .replace(B_DECL, "var<storage, read> mmb_b: array<u32>;")
+    .replace("matmul_blocked", "matmul_blocked_h")
+    .replace("mmb_", "mmh_")
+    .replace("MMB_", "MMH_")
 }
 
 /// A compiled compute pipeline together with its bind group layout.
@@ -81,6 +104,7 @@ fn uniform(ctx: &WgpuContext, bytes: &[u8]) -> Buffer {
 /// Tensors are dense, row-major `f32` unless stated otherwise.
 pub struct ComputeEngine {
     matmul: Kernel,
+    matmul_h: Kernel,
     rope: Kernel,
     rms_norm: Kernel,
     rms_norm_bw: Kernel,
@@ -135,6 +159,7 @@ impl ComputeEngine {
 
         Self {
             matmul: k("matmul_blocked"),
+            matmul_h: k("matmul_blocked_h"),
             rope: k("rope"),
             rms_norm: k("rms_norm"),
             rms_norm_bw: k("rms_norm_backward"),

@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `ferrotensor-backend`: `UnifiedTensor::from_f32_as_f16` stores a tensor as f16 (two values per 32-bit word, half the memory), and `ComputeEngine::matmul_f16b` and `matmul_bt_f16b` multiply by such a weight matrix with f32 products and sums. The kernel unpacks with WGSL's `unpack2x16float`, so it needs no f16 shader extension and runs on every adapter.
 - `ferrotensor-trainer`: `TrainingCheckpoint::save` writes the optimizer moments to an F32 safetensors file next to the JSON (`moments_path`), with the step in its header, instead of as JSON numbers. A SmolLM2-135M LoRA resume state goes from 50 MB to about 7.4 MB. `load` reads both layouts, and rejects a moments file from a different step (a crash between the two writes).
 - A how-to guide on the website (`/guide/`): 19 step-by-step guides, from installing and checking your GPU to LoRA fine-tuning, training in Rust or Python, performance and troubleshooting. Each has the real output to expect, annotated, with the machine it came from.
 
