@@ -262,6 +262,53 @@ fn matmul_matches_cpu() {
     }
 }
 
+/// `x` rounded to f16 and back, as the `*_f16b` matmuls see it.
+fn f16_round(x: &[f32]) -> Vec<f32> {
+    x.iter().map(|&v| half::f16::from_f32(v).to_f32()).collect()
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn matmul_with_f16_b_matches_cpu() {
+    // Odd k * n exercises the padded last word; shapes off the 64x64 tile
+    // exercise the edges.
+    let g = gpu();
+    for (seed, &(m, k, n)) in MATMUL_SHAPES
+        .iter()
+        .chain(&[(3, 5, 7), (65, 33, 129)])
+        .enumerate()
+    {
+        let a = rand_vec(m * k, 300 + seed as u64);
+        let b = rand_vec(k * n, 400 + seed as u64);
+        let b_h = UnifiedTensor::from_f32_as_f16(&g.ctx, &b, &[k, n]);
+        assert!(b_h.size_in_bytes() <= ((k * n * 2).div_ceil(4) * 4).max(4) as u64);
+        let out = zeros(&[m, n]);
+        g.engine
+            .matmul_f16b(&g.ctx, &upload(&a, &[m, k]), &b_h, &out);
+        let want = cpu_matmul(&a, &f16_round(&b), m, k, n);
+        assert_close(
+            &format!("matmul_f16b {m}x{k}x{n}"),
+            &read(&out),
+            &want,
+            1e-4,
+            1e-4,
+        );
+
+        let bt = transpose(&b, k, n); // [n, k]
+        let bt_h = UnifiedTensor::from_f32_as_f16(&g.ctx, &bt, &[n, k]);
+        let out = zeros(&[m, n]);
+        g.engine
+            .matmul_bt_f16b(&g.ctx, &upload(&a, &[m, k]), &bt_h, &out);
+        assert_close(
+            &format!("matmul_bt_f16b {m}x{k}x{n}"),
+            &read(&out),
+            &want,
+            1e-4,
+            1e-4,
+        );
+    }
+}
+
 #[test]
 #[ignore = "needs a GPU; run with --ignored --test-threads=1"]
 fn matmul_bt_matches_cpu() {

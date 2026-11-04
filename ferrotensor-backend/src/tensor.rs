@@ -161,6 +161,20 @@ impl UnifiedTensor {
         }
     }
 
+    /// Uploads `data` rounded to f16, two values packed per 32-bit word
+    /// (the first in the low half), as an [`DType::FP16`] tensor of `shape`.
+    /// Half the memory of [`new`](Self::new); read it with the `*_f16b`
+    /// matmuls, not [`to_vec`](Self::to_vec), which reads f32.
+    pub fn from_f32_as_f16(context: &WgpuContext, data: &[f32], shape: &[usize]) -> Self {
+        let mut bytes: Vec<u8> = data
+            .iter()
+            .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
+            .collect();
+        // Storage bindings are whole 32-bit words.
+        bytes.resize(bytes.len().next_multiple_of(4).max(4), 0);
+        Self::from_bytes_with_dtype(context, &bytes, shape, DType::FP16)
+    }
+
     /// Create an FP16 tensor (half precision for memory savings)
     pub fn empty_fp16(context: &WgpuContext, shape: &[usize]) -> Self {
         Self::empty_with_dtype(context, shape, DType::FP16)
