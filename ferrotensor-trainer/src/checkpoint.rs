@@ -2,14 +2,15 @@
 //!
 //! Adapters are written as safetensors (F32) with their LoRA settings in
 //! the file's metadata, so `ferrotensor-cli generate --lora` can rebuild the same
-//! adapter shapes. [`TrainingCheckpoint`] (JSON) holds the step counter,
-//! optimizer moments and loss-scaler state for resuming.
+//! adapter shapes. [`TrainingCheckpoint`] holds the step counter, optimizer
+//! moments and loss-scaler state for resuming: settings as JSON, the moments
+//! as F32 safetensors next to it.
 
-use ferrotensor_autograd::{OptimizerCheckpoint, Tensor};
+use ferrotensor_autograd::{AdamWCheckpoint, OptimizerCheckpoint, OptimizerTensorState, Tensor};
 use ferrotensor_backend::WgpuContext;
 use ferrotensor_loader::{LoaderError, WeightsContext};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::scaler::GradScalerCheckpoint;
@@ -325,31 +326,182 @@ pub struct TrainingCheckpoint {
 }
 
 impl TrainingCheckpoint {
-    /// Write as JSON (via a temporary file, so a crash never leaves a
-    /// truncated checkpoint).
+    /// Write the checkpoint to `path` as JSON, with the optimizer moments in
+    /// a separate F32 safetensors file ([`moments_path`]). Each file goes
+    /// through a temporary name, so a crash never leaves a truncated one.
+    ///
+    /// The moments file is written first and records the step; if a crash
+    /// falls between the two writes, [`load`](Self::load) reports the
+    /// mismatch instead of resuming with the wrong moments.
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<(), Box<dyn std::error::Error>> {
         let path = path.as_ref();
-        let json = serde_json::to_string_pretty(self)?;
+        let mut light = TrainingCheckpoint {
+            training_state: self.training_state.clone(),
+            optimizer_state: None,
+            grad_scaler_state: self.grad_scaler_state.clone(),
+        };
+        if let Some(OptimizerCheckpoint::AdamW(adam)) = &self.optimizer_state {
+            if moment_count(adam) > 0 {
+                write_moments(&moments_path(path), adam, self.training_state.step)?;
+            }
+            light.optimizer_state = Some(OptimizerCheckpoint::AdamW(AdamWCheckpoint {
+                lr: adam.lr,
+                beta1: adam.beta1,
+                beta2: adam.beta2,
+                eps: adam.eps,
+                weight_decay: adam.weight_decay,
+                t: adam.t,
+                m_states: shapes_only(&adam.m_states),
+                v_states: shapes_only(&adam.v_states),
+            }));
+        }
+        let json = serde_json::to_string_pretty(&light)?;
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, json)?;
         std::fs::rename(&tmp, path)?;
         Ok(())
     }
 
-    /// Read a checkpoint written by [`save`](Self::save).
+    /// Read a checkpoint written by [`save`](Self::save). Checkpoints that
+    /// keep the moments inline in the JSON (written by older versions) load too.
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
+        let path = path.as_ref();
         let json = std::fs::read_to_string(path)?;
-        let state: Self = serde_json::from_str(&json)?;
+        let mut state: Self = serde_json::from_str(&json)?;
+        let step = state.training_state.step;
+        if let Some(OptimizerCheckpoint::AdamW(adam)) = &mut state.optimizer_state {
+            let missing = adam
+                .m_states
+                .values()
+                .chain(adam.v_states.values())
+                .any(|t| t.data.is_empty() && t.shape.iter().product::<usize>() > 0);
+            if missing {
+                read_moments(&moments_path(path), adam, step)?;
+            }
+        }
         Ok(state)
     }
 }
 
+/// Where [`TrainingCheckpoint::save`] puts the optimizer moments for a
+/// checkpoint at `path`: the same name with a `.safetensors` extension
+/// (`x.state.json` -> `x.state.safetensors`).
+pub fn moments_path(path: &Path) -> PathBuf {
+    path.with_extension("safetensors")
+}
+
+const MOMENTS_FORMAT: &str = "ferrotensor-adamw-moments";
+
+fn moment_count(adam: &AdamWCheckpoint) -> usize {
+    adam.m_states.len() + adam.v_states.len()
+}
+
+fn shapes_only(
+    states: &HashMap<String, OptimizerTensorState>,
+) -> HashMap<String, OptimizerTensorState> {
+    states
+        .iter()
+        .map(|(name, t)| {
+            let state = OptimizerTensorState {
+                shape: t.shape.clone(),
+                data: Vec::new(),
+            };
+            (name.clone(), state)
+        })
+        .collect()
+}
+
+fn write_moments(
+    path: &Path,
+    adam: &AdamWCheckpoint,
+    step: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut entries = Vec::with_capacity(moment_count(adam));
+    for (prefix, states) in [("m/", &adam.m_states), ("v/", &adam.v_states)] {
+        for (name, t) in states {
+            let bytes: Vec<u8> = t.data.iter().flat_map(|v| v.to_le_bytes()).collect();
+            entries.push((format!("{prefix}{name}"), t.shape.clone(), bytes));
+        }
+    }
+    let mut views = HashMap::new();
+    for (name, shape, bytes) in &entries {
+        views.insert(
+            name.clone(),
+            safetensors::tensor::TensorView::new(safetensors::Dtype::F32, shape.clone(), bytes)?,
+        );
+    }
+    let metadata = HashMap::from([
+        ("format".to_string(), MOMENTS_FORMAT.to_string()),
+        ("step".to_string(), step.to_string()),
+        ("t".to_string(), adam.t.to_string()),
+    ]);
+    let data = safetensors::tensor::serialize(views, &Some(metadata))?;
+    let tmp = path.with_extension("safetensors.tmp");
+    std::fs::write(&tmp, data)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+fn read_moments(
+    path: &Path,
+    adam: &mut AdamWCheckpoint,
+    step: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let data = std::fs::read(path)
+        .map_err(|e| format!("cannot read optimizer moments {}: {e}", path.display()))?;
+    let (_, header) = safetensors::tensor::SafeTensors::read_metadata(&data)?;
+    let meta = header.metadata().clone().unwrap_or_default();
+    if meta.get("format").map(String::as_str) != Some(MOMENTS_FORMAT) {
+        return Err(format!("{} is not an optimizer moments file", path.display()).into());
+    }
+    let saved_step: usize = meta
+        .get("step")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(usize::MAX);
+    let saved_t: f32 = meta
+        .get("t")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(f32::NAN);
+    if saved_step != step || saved_t != adam.t {
+        return Err(format!(
+            "optimizer moments in {} are from step {saved_step}, but the checkpoint is at step {step};              the run was probably interrupted while saving",
+            path.display()
+        )
+        .into());
+    }
+    let tensors = safetensors::tensor::SafeTensors::deserialize(&data)?;
+    for (prefix, states) in [("m/", &mut adam.m_states), ("v/", &mut adam.v_states)] {
+        for (name, t) in states.iter_mut() {
+            let key = format!("{prefix}{name}");
+            let view = tensors
+                .tensor(&key)
+                .map_err(|_| format!("{} has no tensor {key}", path.display()))?;
+            if view.dtype() != safetensors::Dtype::F32 || view.shape() != t.shape.as_slice() {
+                return Err(format!(
+                    "{key} in {} has shape {:?}, expected {:?}",
+                    path.display(),
+                    view.shape(),
+                    t.shape
+                )
+                .into());
+            }
+            t.data = view
+                .data()
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{TrainingCheckpoint, TrainingState};
+    use super::{moments_path, TrainingCheckpoint, TrainingState};
     use crate::scaler::GradScalerCheckpoint;
-    use ferrotensor_autograd::{AdamWCheckpoint, OptimizerCheckpoint};
+    use ferrotensor_autograd::{AdamWCheckpoint, OptimizerCheckpoint, OptimizerTensorState};
     use std::collections::HashMap;
+    use std::path::PathBuf;
 
     #[test]
     fn resume_validation_rejects_task_mismatch() {
@@ -447,6 +599,115 @@ mod tests {
             OptimizerCheckpoint::AdamW(state) => assert_eq!(state.t, 42.0),
         }
         assert_eq!(loaded.grad_scaler_state.as_ref().unwrap().scale, 1024.0);
+    }
+
+    fn checkpoint_at(step: usize, values: usize) -> TrainingCheckpoint {
+        let mut training_state = TrainingState::new(100);
+        training_state.step = step;
+        let state = |seed: f32| OptimizerTensorState {
+            shape: vec![values / 4, 4],
+            data: (0..values).map(|i| seed + i as f32 * 1e-3).collect(),
+        };
+        TrainingCheckpoint {
+            training_state,
+            optimizer_state: Some(OptimizerCheckpoint::AdamW(AdamWCheckpoint {
+                lr: 5e-4,
+                beta1: 0.9,
+                beta2: 0.999,
+                eps: 1e-8,
+                weight_decay: 0.0,
+                t: step as f32,
+                m_states: HashMap::from([
+                    ("layers.0.q_proj.lora_a".to_string(), state(0.25)),
+                    ("layers.0.q_proj.lora_b".to_string(), state(-0.5)),
+                ]),
+                v_states: HashMap::from([
+                    ("layers.0.q_proj.lora_a".to_string(), state(1e-6)),
+                    ("layers.0.q_proj.lora_b".to_string(), state(2e-6)),
+                ]),
+            })),
+            grad_scaler_state: None,
+        }
+    }
+
+    fn temp_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "ferrotensor_{}_{name}.state.json",
+            std::process::id()
+        ))
+    }
+
+    fn adam(ckpt: &TrainingCheckpoint) -> &AdamWCheckpoint {
+        match ckpt.optimizer_state.as_ref().expect("optimizer state") {
+            OptimizerCheckpoint::AdamW(a) => a,
+        }
+    }
+
+    #[test]
+    fn moments_round_trip_through_safetensors_bit_for_bit() {
+        let path = temp_path("moments_round_trip");
+        let ckpt = checkpoint_at(7, 40_000);
+        ckpt.save(&path).expect("save");
+
+        let json = std::fs::read_to_string(&path).expect("read json");
+        let moments = std::fs::metadata(moments_path(&path))
+            .expect("moments file")
+            .len();
+        let loaded = TrainingCheckpoint::load(&path).expect("load");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(moments_path(&path));
+
+        // 4 tensors of 40,000 f32: the values live in the safetensors file,
+        // not in the JSON.
+        assert!(json.len() < 4_000, "JSON is {} bytes", json.len());
+        assert!(moments >= 4 * 40_000 * 4, "moments file is {moments} bytes");
+        let (a, b) = (adam(&ckpt), adam(&loaded));
+        assert_eq!(b.t, 7.0);
+        for (orig, back) in [(&a.m_states, &b.m_states), (&a.v_states, &b.v_states)] {
+            assert_eq!(orig.len(), back.len());
+            for (name, t) in orig {
+                let r = &back[name];
+                assert_eq!(r.shape, t.shape);
+                let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(&r.data), bits(&t.data), "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn moments_from_another_step_are_rejected() {
+        let path = temp_path("moments_mismatch");
+        let stale = std::env::temp_dir().join(format!(
+            "ferrotensor_{}_stale.safetensors",
+            std::process::id()
+        ));
+        checkpoint_at(5, 400).save(&path).expect("save step 5");
+        std::fs::copy(moments_path(&path), &stale).expect("keep step 5 moments");
+        checkpoint_at(6, 400).save(&path).expect("save step 6");
+        // A crash after the moments of step 5 but before the JSON of step 6
+        // would look like this, the other way round.
+        std::fs::copy(&stale, moments_path(&path)).expect("put back step 5 moments");
+        let err = TrainingCheckpoint::load(&path).unwrap_err().to_string();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(moments_path(&path));
+        let _ = std::fs::remove_file(&stale);
+        assert!(err.contains("step 5") && err.contains("step 6"), "{err}");
+    }
+
+    #[test]
+    fn inline_json_checkpoints_still_load() {
+        // The format written before the moments moved to safetensors.
+        let path = temp_path("inline_json");
+        let ckpt = checkpoint_at(3, 8);
+        std::fs::write(&path, serde_json::to_string(&ckpt).unwrap()).expect("write");
+        let loaded = TrainingCheckpoint::load(&path).expect("load");
+        let _ = std::fs::remove_file(&path);
+        assert!(!moments_path(&path).exists());
+        let name = "layers.0.q_proj.lora_b";
+        assert_eq!(
+            adam(&loaded).m_states[name].data,
+            adam(&ckpt).m_states[name].data
+        );
     }
 
     /// Simulated continuous vs resume-to-end: remaining steps after resume

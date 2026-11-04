@@ -274,7 +274,7 @@ EOF</pre></figure></div></li></ol>
   --out data/runs/sft --seq-len 256 \
   --lr 5e-4 --warmup-steps 20 --grad-accum 8 --max-steps 250 \
   --log-every 10 --eval-every 50 --save-every 50 \
-  --sample-prompt &quot;Give three tips for staying healthy.&quot;</pre></figure></div></li><li><div><p>Watch <code>eval before</code> and <code>eval after</code>. The run writes <code>lora_adapters.safetensors</code>, its <code>.state.json</code>, <code>metrics.jsonl</code> and <code>training_state.json</code> to <code>--out</code>.</p></div></li></ol>
+  --sample-prompt &quot;Give three tips for staying healthy.&quot;</pre></figure></div></li><li><div><p>Watch <code>eval before</code> and <code>eval after</code>. The run writes <code>lora_adapters.safetensors</code>, its <code>.state.json</code> and <code>.state.safetensors</code>, <code>metrics.jsonl</code> and <code>training_state.json</code> to <code>--out</code>.</p></div></li></ol>
   
   <h3>Details</h3><div class="gprose"><p>Defaults that apply: batch size 1 (so <code>--grad-accum 8</code> means 8 sequences per step), LoRA rank 8 and alpha 16 on <code>q_proj,k_proj,v_proj,o_proj</code>, gradient clipping at a global norm of 1.0, AdamW without weight decay, and warmup then cosine decay to lr/10.</p>
 <ul>
@@ -329,7 +329,7 @@ EOF</pre></figure></div></li></ol>
   <figure class="sample gpanel"><figcaption><span class="lang">Output</span><code>ferrotensor train --resume</code></figcaption><pre tabindex="0"><span class="ln p"><span class="mk" aria-label="note 1">1</span>$ ferrotensor train ... --max-steps 300 --resume data/runs/sft/lora_adapters.safetensors</span><span class="ln"><span class="mk" aria-label="note 2">2</span>continuing at step 250</span></pre><p class="gnote">From the measured walkthrough run.</p></figure>
   <ol class="notes"><li><span>Point <code>--resume</code> at an adapter a previous run saved; raise <code>--max-steps</code> to train further.</span></li><li><span>The adapter, the AdamW moments and the step counter are restored. Batches already seen are skipped, in the same seeded order.</span></li></ol>
   <h3>Steps</h3>
-  <ol class="steps"><li><div><p>Keep the <code>.state.json</code> file next to the adapter. It holds the step and the optimizer state.</p></div></li><li><div><p>Run the same command with a higher <code>--max-steps</code> and <code>--resume</code>:</p><figure class="sample gpanel"><figcaption><span class="lang">Shell</span><button class="gcopy" type="button" data-copy="ferrotensor train --model data/models/SmolLM2-135M \
+  <ol class="steps"><li><div><p>Keep the <code>.state.json</code> and <code>.state.safetensors</code> files next to the adapter. They hold the step and the optimizer state.</p></div></li><li><div><p>Run the same command with a higher <code>--max-steps</code> and <code>--resume</code>:</p><figure class="sample gpanel"><figcaption><span class="lang">Shell</span><button class="gcopy" type="button" data-copy="ferrotensor train --model data/models/SmolLM2-135M \
   --data data/alpaca/train.jsonl --out data/runs/sft --seq-len 256 \
   --lr 5e-4 --warmup-steps 20 --grad-accum 8 --max-steps 300 \
   --resume data/runs/sft/lora_adapters.safetensors">Copy</button></figcaption><pre tabindex="0">ferrotensor train --model data/models/SmolLM2-135M \
@@ -338,7 +338,7 @@ EOF</pre></figure></div></li></ol>
   --resume data/runs/sft/lora_adapters.safetensors</pre></figure></div></li></ol>
   
   <h3>Details</h3><div class="gprose"><p>Use <code>--save-every N</code> during long runs so there is always a recent adapter to resume from.</p></div>
-  <h3>Limits</h3><p class="gprose">The state file stores the AdamW moments as JSON, so it is large: 50 MB for SmolLM2-135M.</p>
+  <h3>Limits</h3><p class="gprose">The optimizer state takes 8 bytes per trainable parameter (7.4 MB for SmolLM2-135M). Versions before the next release stored it as JSON, 50 MB for the same run; those files still resume.</p>
   <nav class="pn" aria-label="Previous and next guide"><a class="prev" href="#lora-eval-generate"><span>Previous</span>Evaluate and chat with your adapter</a><a class="next" href="#lora-one-command"><span>Next</span>Run the whole recipe with one script</a></nav>
 </article>
 <article class="g" id="lora-one-command" aria-labelledby="lora-one-command-t">
