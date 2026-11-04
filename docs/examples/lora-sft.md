@@ -200,8 +200,10 @@ Defaults that apply here:
 The run writes the following to `data/runs/sft/`:
 - `lora_adapters.safetensors`, the adapter with its rank, alpha and
   targets in the file metadata;
-- `lora_adapters.safetensors.state.json`, the step and AdamW moments for
-  `--resume` (50 MB, because the moments are stored as JSON);
+- `lora_adapters.safetensors.state.json` and `.state.safetensors`, the
+  step and the AdamW moments for `--resume`. The moments are F32, 8 bytes
+  per trainable parameter: 7.4 MB here. (Older versions stored them in
+  the JSON, which took 50 MB; those files still resume.)
 - `metrics.jsonl`, one line per logged step and evaluation;
 - `training_state.json`.
 

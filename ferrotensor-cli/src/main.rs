@@ -144,8 +144,9 @@ struct TrainArgs {
     /// Where to write the adapter [default: OUT/lora_adapters.safetensors].
     #[arg(long, value_name = "FILE")]
     save_lora: Option<PathBuf>,
-    /// Resume from an adapter written by a previous run (its .state.json
-    /// next to it restores optimizer state and the step counter).
+    /// Resume from an adapter written by a previous run (its .state.json and
+    /// .state.safetensors next to it restore the step counter and optimizer
+    /// state).
     #[arg(long, value_name = "FILE")]
     resume: Option<PathBuf>,
     /// Peak learning rate.
