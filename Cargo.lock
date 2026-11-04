@@ -632,6 +632,7 @@ version = "0.5.0"
 dependencies = [
  "bytemuck",
  "env_logger",
+ "half",
  "log",
  "naga",
  "pollster",
