@@ -11,6 +11,7 @@ mod common;
 
 use common::*;
 use ferrotensor_autograd::{AdamW, Optimizer};
+use ferrotensor_backend::DType;
 use ferrotensor_trainer::checkpoint::{
     apply_checkpoint, load_lora_checkpoint, save_lora_checkpoint, LoraMetadata, TrainingCheckpoint,
     TrainingState,
@@ -45,6 +46,47 @@ fn lora_training_reduces_loss_on_a_tiny_model() {
     assert!(
         last < 0.5 * first,
         "loss should at least halve on a memorisable sequence: {losses:?}"
+    );
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn f16_base_weights_halve_memory_and_train_like_f32() {
+    let dir = TempDir::new("f16");
+    write_tiny_llama(dir.path());
+    let gpu = gpu();
+    let full = build_model(&gpu, dir.path());
+    let half = build_model_with(&gpu, dir.path(), true);
+
+    let w = &half.lm_head.weight.data;
+    let numel: usize = w.shape.iter().product();
+    assert_eq!(full.lm_head.weight.data.dtype, DType::FP32);
+    assert_eq!(w.dtype, DType::FP16);
+    assert_eq!(w.size_in_bytes(), ((numel * 2).div_ceil(4) * 4) as u64);
+
+    let seq = pattern_sequence();
+    let (input, target) = (&seq[..seq.len() - 1], &seq[1..]);
+    let mut losses = [Vec::new(), Vec::new()];
+    for (i, model) in [full, half].into_iter().enumerate() {
+        let (_, params) = sorted_lora_params(&model);
+        let mut trainer = trainer(&gpu, model, 1e-2);
+        for _ in 0..40 {
+            let stats = trainer.train_step(input, target, &params).expect("step");
+            assert!(stats.loss.is_finite());
+            losses[i].push(stats.loss);
+        }
+    }
+    let (f32_losses, f16_losses) = (&losses[0], &losses[1]);
+    // Same adapters and data; only the base weights are rounded to f16.
+    assert!(
+        (f16_losses[0] - f32_losses[0]).abs() <= 1e-2 * f32_losses[0],
+        "first loss: f32 {} vs f16 {}",
+        f32_losses[0],
+        f16_losses[0]
+    );
+    assert!(
+        f16_losses[39] < 0.5 * f16_losses[0],
+        "f16 weights should still learn the sequence: {f16_losses:?}"
     );
 }
 

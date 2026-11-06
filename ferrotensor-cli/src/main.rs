@@ -105,6 +105,10 @@ struct ModelArgs {
     /// Compute device.
     #[arg(long, value_enum, default_value_t = Device::Auto)]
     device: Device,
+    /// Store frozen base weights as f16 (half the memory; computation stays
+    /// f32). No effect when base weights train (--train-modules other than lora).
+    #[arg(long)]
+    f16_weights: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -307,6 +311,7 @@ struct Loaded {
     tokenizer: Tokenizer,
     config: Lfm2Config,
     weights: WeightsContext,
+    f16_weights: bool,
 }
 
 async fn load_base(args: &ModelArgs) -> Result<Loaded> {
@@ -348,6 +353,7 @@ async fn load_base(args: &ModelArgs) -> Result<Loaded> {
         tokenizer,
         config,
         weights,
+        f16_weights: args.f16_weights,
     })
 }
 
@@ -362,7 +368,8 @@ fn build_model(
         &base.weights,
         base.config.clone(),
     )
-    .with_trainable_base(trainable_base);
+    .with_trainable_base(trainable_base)
+    .with_f16_weights(base.f16_weights);
     if let Some(meta) = lora {
         builder = builder.with_lora(LoRaConfig {
             rank: meta.rank,
