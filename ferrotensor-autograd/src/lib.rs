@@ -15,7 +15,7 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
 use ferrotensor_backend::{
-    AdamParams, AttentionOptions, ComputeEngine, UnifiedTensor, WgpuContext,
+    AdamParams, AttentionOptions, ComputeEngine, DType, UnifiedTensor, WgpuContext,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -215,7 +215,11 @@ impl AutogradNode for MatMulNode {
         // never reads, which skips a matmul per frozen weight.
         let grad_a = if self.a.requires_grad {
             let g = UnifiedTensor::empty(&self.a.ctx, &self.a.data.shape);
-            engine.matmul_bt(&self.a.ctx, grad, &self.b.data, &g);
+            if self.b.data.dtype == DType::FP16 {
+                engine.matmul_bt_f16b(&self.a.ctx, grad, &self.b.data, &g);
+            } else {
+                engine.matmul_bt(&self.a.ctx, grad, &self.b.data, &g);
+            }
             g
         } else {
             UnifiedTensor::empty(&self.a.ctx, &[1])
@@ -770,10 +774,22 @@ impl Tensor {
     }
 
     /// Matrix product of `[M, K]` and `[K, N]`.
+    ///
+    /// `b` may be stored as f16 ([`UnifiedTensor::from_f32_as_f16`]) when it
+    /// does not require a gradient, as for frozen base weights; the product
+    /// is still computed in f32.
     pub fn matmul(a: &Tensor, b: &Tensor, engine: &ComputeEngine) -> Tensor {
         let out_shape = vec![a.data.shape[0], b.data.shape[1]];
         let out_data = UnifiedTensor::empty(&a.ctx, &out_shape);
-        engine.matmul(&a.ctx, &a.data, &b.data, &out_data);
+        if b.data.dtype == DType::FP16 {
+            assert!(
+                !b.requires_grad,
+                "matmul: an f16 right operand must not require a gradient"
+            );
+            engine.matmul_f16b(&a.ctx, &a.data, &b.data, &out_data);
+        } else {
+            engine.matmul(&a.ctx, &a.data, &b.data, &out_data);
+        }
         let node = Arc::new(MatMulNode {
             a: a.clone(),
             b: b.clone(),

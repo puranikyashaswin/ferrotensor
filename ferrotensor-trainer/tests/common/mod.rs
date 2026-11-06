@@ -172,11 +172,17 @@ pub fn lora_config() -> LoRaConfig {
 
 /// Build the tiny model in `dir` with LoRA adapters.
 pub fn build_model(gpu: &Gpu, dir: &Path) -> Lfm2Model {
+    build_model_with(gpu, dir, false)
+}
+
+/// [`build_model`], optionally with frozen weights stored as f16.
+pub fn build_model_with(gpu: &Gpu, dir: &Path, f16_weights: bool) -> Lfm2Model {
     let config = ModelLoader::load_config(dir.join("config.json")).expect("config");
     let mut weights = WeightsContext::new();
     weights.load_model_dir(dir).expect("weights");
     Lfm2ModelBuilder::new(gpu.ctx.clone(), gpu.engine.clone(), &weights, config)
         .with_lora(lora_config())
+        .with_f16_weights(f16_weights)
         .build()
         .expect("build")
 }

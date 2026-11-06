@@ -96,6 +96,7 @@ pub struct Lfm2ModelBuilder<'a> {
     config: Lfm2Config,
     lora_config: Option<LoRaConfig>,
     trainable_base: bool,
+    f16_weights: bool,
 }
 
 impl<'a> Lfm2ModelBuilder<'a> {
@@ -123,6 +124,7 @@ impl<'a> Lfm2ModelBuilder<'a> {
             config,
             lora_config: None,
             trainable_base: false,
+            f16_weights: false,
         }
     }
 
@@ -130,6 +132,25 @@ impl<'a> Lfm2ModelBuilder<'a> {
     pub fn with_lora(mut self, lora_config: LoRaConfig) -> Self {
         self.lora_config = Some(lora_config);
         self
+    }
+
+    /// Store frozen linear-layer weights (attention, MLP and `lm_head`) as
+    /// f16, half the memory; activations, products and LoRA adapters stay
+    /// f32. Ignored when the base weights are trainable. Embeddings and norms
+    /// stay f32.
+    pub fn with_f16_weights(mut self, f16: bool) -> Self {
+        self.f16_weights = f16;
+        self
+    }
+
+    /// Uploads a linear-layer weight, as f16 when
+    /// [`with_f16_weights`](Self::with_f16_weights) applies.
+    fn upload_linear(&self, data: &[f32], shape: &[usize]) -> UnifiedTensor {
+        if self.f16_weights && !self.trainable_base {
+            UnifiedTensor::from_f32_as_f16(&self.ctx, data, shape)
+        } else {
+            UnifiedTensor::new(&self.ctx, data, shape)
+        }
     }
 
     /// Let the base weights receive gradients (full or partial fine-tuning).
@@ -183,7 +204,7 @@ impl<'a> Lfm2ModelBuilder<'a> {
         } else {
             (data, shape)
         };
-        Ok(self.wrap(UnifiedTensor::new(&self.ctx, &data, &shape)))
+        Ok(self.wrap(self.upload_linear(&data, &shape)))
     }
 
     fn maybe_add_lora(&self, linear: Linear, module_name: &str, seed: u64) -> Linear {
@@ -372,7 +393,7 @@ impl<'a> Lfm2ModelBuilder<'a> {
                 )));
             };
             let weight = Self::transpose_2d(&data, vocab, hidden);
-            let weight = self.wrap(UnifiedTensor::new(&self.ctx, &weight, &[hidden, vocab]));
+            let weight = self.wrap(self.upload_linear(&weight, &[hidden, vocab]));
             self.maybe_add_lora(Linear::new(weight), "lm_head", 0)
         };
 
