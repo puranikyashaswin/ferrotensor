@@ -9,8 +9,8 @@ abstract: >-
   language models from 135M to 1.7B parameters, with every kernel checked
   against a CPU reference.
 authors:
-  - given-names: Yashaswin
-    family-names: Puranik
+  - given-names: Puranik Yashaswin
+    family-names: Sharma
     email: puranikyashaswinsharma@gmail.com
 repository-code: "https://github.com/puranikyashaswin/ferrotensor"
 url: "https://github.com/puranikyashaswin/ferrotensor"
@@ -18,7 +18,7 @@ license:
   - MIT
   - Apache-2.0
 version: 0.6.0
-date-released: 2026-11-08
+date-released: 2026-11-10
 keywords:
   - rust
   - webgpu

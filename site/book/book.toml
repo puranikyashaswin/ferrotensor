@@ -1,7 +1,7 @@
 [book]
 title = "Ferrotensor"
 description = "Guide to Ferrotensor, a pure-Rust GPU ML framework on wgpu and WGSL."
-authors = ["Yashaswin Puranik"]
+authors = ["Puranik Yashaswin Sharma"]
 language = "en"
 src = "src"
 
