@@ -113,6 +113,28 @@ sequence length 256) on any Llama-style checkpoint. Run on an NVIDIA A10G
 - Greedy generation with the KV cache runs at 35.9, 21.8 and 10.1 tokens/s
   for the base models.
 
+### Batching, f16 base weights and lower host memory (0.6)
+
+The same recipe on the same A10G at commit `b319ce7`, with the changes in 0.6:
+uploads that no longer keep staging copies, `--batch-size`, and frozen base
+weights stored as f16 (`--f16-weights`, the default since 0.6):
+
+| Model | Run | Held-out loss after | Time per step | GPU memory | Peak host memory |
+|---|---|---|---:|---:|---:|
+| SmolLM2-135M | f32 weights, `--batch-size 1 --grad-accum 8` | **1.6521** | 1.28 s | 3.9 GB | 1.35 GB |
+| SmolLM2-135M | f32 weights, `--batch-size 8 --grad-accum 1` | **1.6521** | **0.57 s** | 16.7 GB | 1.30 GB |
+| SmolLM2-1.7B | f32 weights, batch 1 | **1.0657** | 2.49 s | 15.0 GB | 5.57 GB |
+| SmolLM2-1.7B | f16 weights, batch 1 | **1.0640** | **2.38 s** | **12.2 GB** | **5.33 GB** |
+
+- Batching eight sequences into one GPU pass trains SmolLM2-135M 2.2x
+  faster per optimizer step with the identical held-out loss.
+- f16 base weights cut SmolLM2-1.7B's GPU memory by 2.8 GB and run slightly
+  faster; the held-out loss moves by 0.0017.
+- Peak host memory for SmolLM2-1.7B dropped from 20.01 GB to 5.33 GB.
+- GPU memory is the peak reported by `nvidia-smi` during training.
+- SmolLM2-1.7B with `--batch-size 8` needs more than the A10G's 24 GB
+  (the run stopped at 22.6 GB); use batch 1 to 4 for it on a 24 GB card.
+
 ## Correctness checks
 
 Two checks were run against PyTorch with `transformers` before trusting the
@@ -261,14 +283,12 @@ training normally (losses 1.4960 and 1.6540).
 - The M2 run above predates moving the RMSNorm and RoPE backward passes and
   the loss to the GPU and batching kernel submissions; its 8.8 s per step is
   not current.
-- Peak host memory grows with the model: 20 GB for SmolLM2-1.7B, about three
-  times its fp32 weights. Models above 1.7B are untested.
-- The run above trains one sequence at a time (`--batch-size 1`, the
-  default). Since the release after 0.5, `--batch-size N` runs N sequences
-  through a Llama-style model in one pass, padded to the longest, with the
-  same result as one at a time; the logits and their gradient grow with N
-  (about 50 MB each per SmolLM2 sequence of 256 tokens). Its speed has not
-  been measured yet.
+- Peak host memory for SmolLM2-1.7B is 5.3 GB in 0.6 (20 GB in 0.5).
+  Models above 1.7B are untested.
+- `--batch-size 1` is the default. `--batch-size N` runs N sequences through
+  a Llama-style model in one pass, padded to the longest, with the same
+  result as one at a time; the logits and their gradient grow with N (about
+  50 MB each per SmolLM2 sequence of 256 tokens), so GPU memory grows with N.
 - The tested architecture is Llama-style. Released LFM2 checkpoints are
   rejected because per-head q/k layernorm is not implemented. LFM2 conv
   blocks also lack the B/C gating and a backward pass.

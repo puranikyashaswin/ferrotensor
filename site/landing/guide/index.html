@@ -285,12 +285,14 @@ EOF</pre></figure></div></li></ol>
 </ul>
 <p>The same recipe on three model sizes on an NVIDIA A10G:</p>
 <table class="gt"><thead><tr><th>Model</th><th>Held-out loss</th><th>Per step</th><th>Adapter</th></tr></thead><tbody>
-<tr><td>SmolLM2-135M</td><td>2.4250 &rarr; 1.6521</td><td>1.33 s</td><td>3.7 MB</td></tr>
+<tr><td>SmolLM2-135M</td><td>2.4250 &rarr; 1.6521</td><td>1.28 s</td><td>3.7 MB</td></tr>
+<tr><td>SmolLM2-135M, <code>--batch-size 8 --grad-accum 1</code></td><td>2.4250 &rarr; 1.6521</td><td>0.57 s</td><td>3.7 MB</td></tr>
 <tr><td>SmolLM2-360M</td><td>2.0852 &rarr; 1.3228</td><td>1.69 s</td><td>6.6 MB</td></tr>
-<tr><td>SmolLM2-1.7B</td><td>2.6474 &rarr; 1.0667</td><td>2.47 s</td><td>12.6 MB</td></tr>
+<tr><td>SmolLM2-1.7B, f16 base weights</td><td>2.6474 &rarr; 1.0640</td><td>2.38 s</td><td>12.6 MB</td></tr>
 </tbody></table>
+<p>Frozen base weights are stored as f16 by default, which saves GPU memory (12.2 GB instead of 15.0 GB for SmolLM2-1.7B) at the same loss; <code>--f32-weights</code> keeps them f32. <code>--batch-size N</code> trains N sequences in one GPU pass with the same result, faster but with more GPU memory.</p>
 <p>Every number, with the M2 run, is in the <a href="../docs/examples/lora-sft.html">LoRA walkthrough</a>.</p></div>
-  <h3>Limits</h3><p class="gprose">The measured run trains one sequence at a time (<code>--batch-size 1</code>). Larger batches run in one pass on the main branch and give the same result, but their speed is not measured yet. Tensors are f32. Models above 1.7B have not been tested.</p>
+  <h3>Limits</h3><p class="gprose">Larger batches need more GPU memory: SmolLM2-1.7B with <code>--batch-size 8</code> does not fit in 24 GB. Activations and LoRA adapters are f32. Models above 1.7B have not been tested.</p>
   <nav class="pn" aria-label="Previous and next guide"><a class="prev" href="#lora-data"><span>Previous</span>Download a model and prepare data</a><a class="next" href="#lora-eval-generate"><span>Next</span>Evaluate and chat with your adapter</a></nav>
 </article>
 <article class="g" id="lora-eval-generate" aria-labelledby="lora-eval-generate-t">
@@ -517,13 +519,13 @@ scripts/hardware-report.sh">Copy</button></figcaption><pre tabindex="0"><span cl
   <h2 id="slow-memory-t">Training is slow or uses too much memory</h2>
   <p class="glede">Why tiny models are faster on the CPU, and what the GPU memory limits are.</p>
   <p class="gmeta">Ferrotensor {{ft_version}} · 3 min</p>
-  <figure class="sample gpanel"><figcaption><span class="lang">Results</span><code>Seconds per LoRA step, SmolLM2-135M</code></figcaption><pre tabindex="0"><span class="ln"><span class="mk" aria-label="note 1">1</span>NVIDIA A10G, 0.4          20.2 s</span><span class="ln">MacBook Air M2, 0.4        8.8 s</span><span class="ln"><span class="mk" aria-label="note 2">2</span>NVIDIA A10G, 0.5          1.33 s</span></pre><p class="gnote">Real measurements: the same run before and after Ferrotensor 0.5.</p></figure>
-  <ol class="notes"><li><span>Before 0.5, parts of the backward pass and the loss copied tensors to the CPU and back: about 2,000 blocking reads per step.</span></li><li><span>0.5 keeps them on the GPU and batches dispatches. Update if you are on an older version.</span></li></ol>
+  <figure class="sample gpanel"><figcaption><span class="lang">Results</span><code>Seconds per LoRA step, SmolLM2-135M</code></figcaption><pre tabindex="0"><span class="ln"><span class="mk" aria-label="note 1">1</span>NVIDIA A10G, 0.4          20.2 s</span><span class="ln">MacBook Air M2, 0.4        8.8 s</span><span class="ln"><span class="mk" aria-label="note 2">2</span>NVIDIA A10G, 0.5          1.33 s</span><span class="ln"><span class="mk" aria-label="note 3">3</span>NVIDIA A10G, 0.6, batch 8 0.57 s</span></pre><p class="gnote">Real measurements: the same run in Ferrotensor 0.4, 0.5 and 0.6.</p></figure>
+  <ol class="notes"><li><span>Before 0.5, parts of the backward pass and the loss copied tensors to the CPU and back: about 2,000 blocking reads per step.</span></li><li><span>0.5 keeps them on the GPU and batches dispatches. Update if you are on an older version.</span></li><li><span>0.6 adds <code>--batch-size</code>: eight sequences in one GPU pass, same held-out loss.</span></li></ol>
   <h3>Steps</h3>
-  <ol class="steps"><li><div><p>Use the latest release: <code>cargo install ferrotensor-cli --force</code>.</p></div></li><li><div><p>For very small models, use the CPU. Every GPU dispatch has a fixed cost, so a 1,218-parameter MLP trains about 10x faster on the CPU.</p></div></li><li><div><p>Out of memory while loading a large model? SmolLM2-1.7B needed about 20 GB of host memory in 0.5. A fix that stops uploads from keeping a staging copy of every weight is on <code>main</code> and will be in the next release.</p></div></li></ol>
+  <ol class="steps"><li><div><p>Use the latest release: <code>cargo install ferrotensor-cli --force</code>.</p></div></li><li><div><p>For very small models, use the CPU. Every GPU dispatch has a fixed cost, so a 1,218-parameter MLP trains about 10x faster on the CPU.</p></div></li><li><div><p>If GPU memory allows, train several sequences per pass: <code>--batch-size 8 --grad-accum 1</code> gives the same result as the default 8 steps of accumulation, 2.2x faster for SmolLM2-135M on an A10G.</p></div></li><li><div><p>Out of GPU memory? Lower <code>--batch-size</code>, and keep the default f16 base weights. SmolLM2-1.7B trains in 12.2 GB of GPU memory and 5.3 GB of host memory (20 GB in 0.5).</p></div></li></ol>
   
   <h3>Details</h3><div class="gprose"><p>Try <a href="#fusion">op fusion</a> for Tensor API programs with long element-wise chains, and <code>--lite</code> for LoRA on small machines.</p></div>
-  <h3>Limits</h3><p class="gprose">Tensors are f32 only, so memory is twice that of bf16 frameworks.</p>
+  <h3>Limits</h3><p class="gprose">Activations, gradients and LoRA adapters are f32; only frozen base weights are f16.</p>
   <nav class="pn" aria-label="Previous and next guide"><a class="prev" href="#no-gpu"><span>Previous</span>No GPU found, or the wrong one</a><span></span></nav>
 </article>
   </main>

@@ -48,9 +48,11 @@ Measured on a MacBook Air (Apple M2, 8 GB unified memory) through Metal:
   differences on the CPU, and every GPU kernel against a CPU reference.
 
 On an NVIDIA A10G through Vulkan, the same walkthrough fine-tunes
-**SmolLM2-1.7B**: held-out loss 2.65 → **1.07** in 250 steps at 2.5 s/step
-(SmolLM2-135M: 1.33 s/step, held-out loss 1.65 as on the M2).
-[Three model sizes](docs/examples/lora-sft.md#on-an-nvidia-gpu-three-model-sizes).
+**SmolLM2-1.7B**: held-out loss 2.65 → **1.06** in 250 steps at 2.4 s/step,
+with f16 base weights in 12.2 GB of GPU memory and 5.3 GB of host memory.
+SmolLM2-135M trains at **0.57 s/step** with `--batch-size 8`, held-out loss
+1.65 as on the M2.
+[Results](docs/examples/lora-sft.md#on-an-nvidia-gpu-three-model-sizes).
 
 ## Install
 
@@ -270,10 +272,11 @@ against them; kernel-level numbers for Ferrotensor alone are in
 - [x] Tested on NVIDIA GPUs through Vulkan, and the GPU suites run in CI on software Vulkan ([results](benchmarks/RESULTS.md))
 - [x] LoRA measured up to SmolLM2-1.7B, with the backward passes and the loss on the GPU ([walkthrough](docs/examples/lora-sft.md#on-an-nvidia-gpu-three-model-sizes))
 - [ ] Op fusion on by default (needs a measurement on more GPUs)
-- [ ] Lower host memory when loading models (SmolLM2-1.7B needed about 20 GB; uploads no longer keep staging copies, re-measuring is next)
+- [x] Lower host memory when loading models (SmolLM2-1.7B: 20 GB → 5.3 GB)
+- [x] Batched LoRA training and f16 base weights ([measured](docs/examples/lora-sft.md#batching-f16-base-weights-and-lower-host-memory-06))
 - [ ] Results from AMD and Intel GPUs, and from DX12
 - [ ] Parallel-reduction softmax and layer norm kernels
-- [ ] `f16`/`bf16` tensors, convolutions, sort/top-k
+- [ ] `f16`/`bf16` tensors in the `ferrotensor` API, convolutions, sort/top-k
 - [ ] Unify the `ferrotensor` tensor API with the LLM stack
 
 ## Contributing
