@@ -9,7 +9,8 @@
 # Same data, split and hyperparameters as the walkthrough unless overridden:
 # 2,000 Alpaca examples for training, 64 held out, LoRA rank 8 on q/k/v/o,
 # lr 5e-4, 20 warmup steps, 8 sequences per step (--batch-size 1
-# --grad-accum 8). --f16-weights stores the frozen base weights as f16.
+# --grad-accum 8). Frozen base weights are f16 (the CLI default);
+# --f32-weights keeps them f32.
 # Everything goes under data/ (gitignored); the summary is
 # data/runs/<model>[-<name>]/summary.json. Needs the `hf` CLI
 # (pip install huggingface_hub). Respects WGPU_BACKEND.
@@ -26,7 +27,7 @@ steps=250
 seq_len=256
 batch_size=1
 grad_accum=8
-f16_weights=0
+f16_weights=1
 suffix=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -35,6 +36,7 @@ while [ $# -gt 0 ]; do
     --batch-size) batch_size="$2"; shift 2 ;;
     --grad-accum) grad_accum="$2"; shift 2 ;;
     --f16-weights) f16_weights=1; shift ;;
+    --f32-weights) f16_weights=0; shift ;;
     --name) suffix="-$2"; shift 2 ;;
     -h|--help) usage 0 ;;
     *) echo "unknown option: $1" >&2; usage 2 ;;
@@ -47,7 +49,7 @@ name="${repo##*/}"
 model_dir="data/models/$name"
 run_dir="data/runs/$name$suffix"
 model_flags=()
-[ "$f16_weights" = 1 ] && model_flags=(--f16-weights)
+[ "$f16_weights" = 0 ] && model_flags=(--f32-weights)
 mkdir -p "$run_dir" data/alpaca
 
 command -v hf >/dev/null || { echo "needs the hf CLI: pip install huggingface_hub" >&2; exit 1; }
