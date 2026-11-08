@@ -49,7 +49,7 @@ Measured on a MacBook Air (Apple M2, 8 GB unified memory) through Metal:
 
 On an NVIDIA A10G through Vulkan, the same walkthrough fine-tunes
 **SmolLM2-1.7B**: held-out loss 2.65 → **1.06** in 250 steps at 2.4 s/step,
-with f16 base weights in 12.2 GB of GPU memory and 5.3 GB of host memory.
+with f16 base weights in 11.9 GiB of GPU memory and 5.3 GB of host memory.
 SmolLM2-135M trains at **0.57 s/step** with `--batch-size 8`, held-out loss
 1.65 as on the M2.
 [Results](docs/examples/lora-sft.md#on-an-nvidia-gpu-three-model-sizes).

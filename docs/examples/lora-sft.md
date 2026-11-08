@@ -119,21 +119,23 @@ The same recipe on the same A10G at commit `b319ce7`, with the changes in 0.6:
 uploads that no longer keep staging copies, `--batch-size`, and frozen base
 weights stored as f16 (`--f16-weights`, the default since 0.6):
 
-| Model | Run | Held-out loss after | Time per step | GPU memory | Peak host memory |
+| Model | Run | Held-out loss after | Time per step | GPU memory (GiB) | Peak host memory |
 |---|---|---|---:|---:|---:|
-| SmolLM2-135M | f32 weights, `--batch-size 1 --grad-accum 8` | **1.6521** | 1.28 s | 3.9 GB | 1.35 GB |
-| SmolLM2-135M | f32 weights, `--batch-size 8 --grad-accum 1` | **1.6521** | **0.57 s** | 16.7 GB | 1.30 GB |
-| SmolLM2-1.7B | f32 weights, batch 1 | **1.0657** | 2.49 s | 15.0 GB | 5.57 GB |
-| SmolLM2-1.7B | f16 weights, batch 1 | **1.0640** | **2.38 s** | **12.2 GB** | **5.33 GB** |
+| SmolLM2-135M | f32 weights, `--batch-size 1 --grad-accum 8` | **1.6521** | 1.28 s | 3.8 | 1.35 GB |
+| SmolLM2-135M | f32 weights, `--batch-size 8 --grad-accum 1` | **1.6521** | **0.57 s** | 16.3 | 1.30 GB |
+| SmolLM2-1.7B | f32 weights, batch 1 | **1.0657** | 2.49 s | 14.7 | 5.57 GB |
+| SmolLM2-1.7B | f16 weights, batch 1 | **1.0640** | **2.38 s** | **11.9** | **5.33 GB** |
 
 - Batching eight sequences into one GPU pass trains SmolLM2-135M 2.2x
   faster per optimizer step with the identical held-out loss.
-- f16 base weights cut SmolLM2-1.7B's GPU memory by 2.8 GB and run slightly
+- f16 base weights cut SmolLM2-1.7B's GPU memory by 2.8 GiB and run slightly
   faster; the held-out loss moves by 0.0017.
 - Peak host memory for SmolLM2-1.7B dropped from 20.01 GB to 5.33 GB.
-- GPU memory is the peak reported by `nvidia-smi` during training.
-- SmolLM2-1.7B with `--batch-size 8` needs more than the A10G's 24 GB
-  (the run stopped at 22.6 GB); use batch 1 to 4 for it on a 24 GB card.
+- GPU memory is the peak reported by `nvidia-smi` during training
+  (3,861, 16,708, 15,028 and 12,199 MiB).
+- SmolLM2-1.7B with `--batch-size 8` does not fit on the 24 GB A10G (22.5 GiB
+  usable): it stopped at 22,590 MiB. Batch 1 fits in 11.9 GiB; batch sizes
+  between 1 and 8 are not measured yet.
 
 ## Correctness checks
 
