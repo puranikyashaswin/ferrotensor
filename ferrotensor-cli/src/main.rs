@@ -278,8 +278,39 @@ struct GenerateArgs {
     no_kv_cache: bool,
 }
 
+/// Hint printed after a panic that looks like the GPU running out of memory.
+/// wgpu reports an out-of-memory GPU as a lost device on the next submission,
+/// which panics inside wgpu with no mention of memory.
+const GPU_MEMORY_HINT: &str =
+    "\nhint: the GPU device was lost, most often because it ran out of memory. \
+Try a smaller --batch-size (with a larger --grad-accum for the same sequences per step), \
+a shorter --seq-len, or --lite; keep the default f16 base weights (no --f32-weights).";
+
+/// Whether a panic message means the GPU device was lost or ran out of memory.
+fn looks_like_gpu_memory_loss(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("device is lost") || m.contains("out of memory") || m.contains("outofmemory")
+}
+
+fn install_gpu_memory_hint() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        let payload = info.payload();
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        if looks_like_gpu_memory_loss(message) {
+            eprintln!("{GPU_MEMORY_HINT}");
+        }
+    }));
+}
+
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    install_gpu_memory_hint();
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Train(args) => pollster::block_on(train(*args)),
@@ -1098,6 +1129,17 @@ mod tests {
 
     fn parse(args: &[&str]) -> std::result::Result<Cli, clap::Error> {
         Cli::try_parse_from(std::iter::once("ferrotensor-cli").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn gpu_memory_loss_is_recognised() {
+        assert!(looks_like_gpu_memory_loss(
+            "Error in Queue::submit: Validation Error\n\nCaused by:\n    Parent device is lost"
+        ));
+        assert!(looks_like_gpu_memory_loss(
+            "Not enough memory left: OutOfMemory"
+        ));
+        assert!(!looks_like_gpu_memory_loss("expected train"));
     }
 
     #[test]
