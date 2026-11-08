@@ -165,7 +165,9 @@ struct TrainArgs {
     /// Stop after this many optimizer steps.
     #[arg(long)]
     max_steps: Option<usize>,
-    /// Sequences per batch.
+    /// Sequences per batch. Llama-style models run a batch through the GPU
+    /// together (padded to the longest); the result matches training them
+    /// one at a time.
     #[arg(long, default_value_t = 1)]
     batch_size: usize,
     /// Batches per optimizer step.

@@ -290,7 +290,7 @@ EOF</pre></figure></div></li></ol>
 <tr><td>SmolLM2-1.7B</td><td>2.6474 &rarr; 1.0667</td><td>2.47 s</td><td>12.6 MB</td></tr>
 </tbody></table>
 <p>Every number, with the M2 run, is in the <a href="../docs/examples/lora-sft.html">LoRA walkthrough</a>.</p></div>
-  <h3>Limits</h3><p class="gprose">Each step trains one sequence at a time (<code>--batch-size</code> only changes how many share an optimizer step). Tensors are f32. Models above 1.7B have not been tested.</p>
+  <h3>Limits</h3><p class="gprose">The measured run trains one sequence at a time (<code>--batch-size 1</code>). Larger batches run in one pass on the main branch and give the same result, but their speed is not measured yet. Tensors are f32. Models above 1.7B have not been tested.</p>
   <nav class="pn" aria-label="Previous and next guide"><a class="prev" href="#lora-data"><span>Previous</span>Download a model and prepare data</a><a class="next" href="#lora-eval-generate"><span>Next</span>Evaluate and chat with your adapter</a></nav>
 </article>
 <article class="g" id="lora-eval-generate" aria-labelledby="lora-eval-generate-t">
