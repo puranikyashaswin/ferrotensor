@@ -16,6 +16,7 @@ use ferrotensor_trainer::checkpoint::{
     apply_checkpoint, load_lora_checkpoint, save_lora_checkpoint, LoraMetadata, TrainingCheckpoint,
     TrainingState,
 };
+use ferrotensor_trainer::Batch;
 
 #[test]
 #[ignore = "needs a GPU"]
@@ -88,6 +89,97 @@ fn f16_base_weights_halve_memory_and_train_like_f32() {
         f16_losses[39] < 0.5 * f16_losses[0],
         "f16 weights should still learn the sequence: {f16_losses:?}"
     );
+}
+
+/// A `Batch` of `(inputs, targets, loss mask)` sequences, right-padded.
+fn make_batch(seqs: &[(Vec<u32>, Vec<u32>, Vec<u8>)]) -> Batch {
+    let max = seqs.iter().map(|s| s.0.len()).max().unwrap_or(0);
+    let pad = |v: &Vec<u32>| {
+        let mut p = v.clone();
+        p.resize(max, 0);
+        p
+    };
+    Batch {
+        input_ids: seqs.iter().map(|s| s.0.clone()).collect(),
+        target_ids: seqs.iter().map(|s| s.1.clone()).collect(),
+        padded_input_ids: seqs.iter().map(|s| pad(&s.0)).collect(),
+        padded_target_ids: seqs.iter().map(|s| pad(&s.1)).collect(),
+        attention_mask: seqs
+            .iter()
+            .map(|s| (0..max).map(|i| u8::from(i < s.0.len())).collect())
+            .collect(),
+        loss_masks: seqs
+            .iter()
+            .map(|s| {
+                let mut m = s.2.clone();
+                m.resize(max, 0);
+                m
+            })
+            .collect(),
+        batch_size: seqs.len(),
+        max_seq_len: max,
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn batched_training_matches_one_sequence_at_a_time() {
+    let dir = TempDir::new("batched");
+    write_tiny_llama(dir.path());
+    let gpu = gpu();
+    let seq = pattern_sequence();
+    // Three lengths, one with a prompt that is not supervised.
+    let seqs: Vec<(Vec<u32>, Vec<u32>, Vec<u8>)> =
+        [(0usize, 10usize, 0usize), (2, 17, 3), (5, 12, 0)]
+            .iter()
+            .map(|&(start, end, unsupervised)| {
+                let input = seq[start..end - 1].to_vec();
+                let target = seq[start + 1..end].to_vec();
+                let mask = (0..input.len())
+                    .map(|i| u8::from(i >= unsupervised))
+                    .collect();
+                (input, target, mask)
+            })
+            .collect();
+
+    let model = build_model(&gpu, dir.path());
+    assert!(model.supports_batching());
+    let (_, params) = sorted_lora_params(&model);
+    let mut batched = trainer(&gpu, model, 1e-2).with_grad_accum_steps(3);
+    let batched_stats = batched
+        .train_batch(&make_batch(&seqs), &params)
+        .expect("batched step");
+
+    let model = build_model(&gpu, dir.path());
+    let (_, params) = sorted_lora_params(&model);
+    let mut sequential = trainer(&gpu, model, 1e-2).with_grad_accum_steps(3);
+    let sequential_stats: Vec<_> = seqs
+        .iter()
+        .map(|(i, t, m)| {
+            sequential
+                .train_step_masked(i, t, Some(m), &params)
+                .expect("sequential step")
+        })
+        .collect();
+
+    assert_eq!(batched_stats.len(), 3);
+    for (b, s) in batched_stats.iter().zip(&sequential_stats) {
+        assert_eq!(b.tokens, s.tokens);
+        assert!(
+            (b.loss - s.loss).abs() <= 1e-4 * s.loss.abs().max(1.0),
+            "loss {} vs {}",
+            b.loss,
+            s.loss
+        );
+        assert_eq!(b.optimizer_step, s.optimizer_step);
+    }
+    // The optimizer steps after the third sequence in both, on the same
+    // accumulated gradient.
+    let (bn, sn) = (
+        batched_stats[2].grad_norm.expect("batched stepped"),
+        sequential_stats[2].grad_norm.expect("sequential stepped"),
+    );
+    assert!((bn - sn).abs() <= 1e-4 * sn, "grad norm {bn} vs {sn}");
 }
 
 #[test]

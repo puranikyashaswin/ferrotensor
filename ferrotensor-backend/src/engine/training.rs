@@ -215,12 +215,32 @@ impl ComputeEngine {
     ) {
         let vocab = *logits.shape.last().unwrap_or(&1);
         let rows = logits.shape.iter().product::<usize>() / vocab.max(1);
+        let weights = UnifiedTensor::new(ctx, &vec![inv; rows.max(1)], &[rows.max(1)]);
+        self.masked_cross_entropy_weighted(ctx, logits, targets, &weights, grad, row_loss);
+    }
+
+    /// [`masked_cross_entropy`](Self::masked_cross_entropy) with a weight per
+    /// row instead of one `inv`: row `r`'s gradient is
+    /// `(softmax - onehot) * weights[r]`. Giving each row `1 / supervised
+    /// rows of its own sequence` makes a batch of sequences produce the sum
+    /// of their per-sequence mean-loss gradients.
+    pub fn masked_cross_entropy_weighted(
+        &self,
+        ctx: &WgpuContext,
+        logits: &UnifiedTensor,
+        targets: &UnifiedTensor,
+        weights: &UnifiedTensor,
+        grad: &UnifiedTensor,
+        row_loss: &UnifiedTensor,
+    ) {
+        let vocab = *logits.shape.last().unwrap_or(&1);
+        let rows = logits.shape.iter().product::<usize>() / vocab.max(1);
         if rows == 0 || vocab == 0 {
             return;
         }
         let params = uniform(
             ctx,
-            bytemuck::cast_slice(&[vocab as u32, rows as u32, inv.to_bits(), 0]),
+            bytemuck::cast_slice(&[vocab as u32, rows as u32, 0, 0]),
         );
         self.run(
             ctx,
@@ -231,6 +251,7 @@ impl ComputeEngine {
                 (2, grad.buffer()),
                 (3, row_loss.buffer()),
                 (4, &params),
+                (5, weights.buffer()),
             ],
             grid(rows as u32),
         );

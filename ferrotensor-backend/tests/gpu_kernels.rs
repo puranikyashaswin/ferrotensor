@@ -707,6 +707,46 @@ fn masked_cross_entropy_matches_cpu() {
 
 #[test]
 #[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn masked_cross_entropy_weighted_scales_each_row() {
+    let g = gpu();
+    let (rows, vocab) = (6, 97);
+    let logits = rand_vec(rows * vocab, 500)
+        .iter()
+        .map(|v| v * 4.0)
+        .collect::<Vec<_>>();
+    let targets: Vec<u32> = vec![3, MASKED_CE_SKIP, 50, 96, 0, MASKED_CE_SKIP];
+    let weights: Vec<f32> = vec![0.5, 0.5, 0.25, 0.25, 0.25, 1.0];
+    let target_buf = UnifiedTensor::from_bytes(&g.ctx, bytemuck::cast_slice(&targets), &[rows]);
+    let grad = zeros(&[rows, vocab]);
+    let loss = zeros(&[rows]);
+    g.engine.masked_cross_entropy_weighted(
+        &g.ctx,
+        &upload(&logits, &[rows, vocab]),
+        &target_buf,
+        &upload(&weights, &[rows]),
+        &grad,
+        &loss,
+    );
+    let probs = cpu_softmax_rows(&logits, vocab);
+    let mut want_grad = vec![0.0f32; rows * vocab];
+    let mut want_loss = vec![0.0f32; rows];
+    for (r, &t) in targets.iter().enumerate() {
+        if t == MASKED_CE_SKIP {
+            continue;
+        }
+        let t = t as usize;
+        want_loss[r] = -probs[r * vocab + t].ln();
+        for i in 0..vocab {
+            want_grad[r * vocab + i] = probs[r * vocab + i] * weights[r];
+        }
+        want_grad[r * vocab + t] -= weights[r];
+    }
+    assert_close("weighted loss", &read(&loss), &want_loss, 1e-4, 1e-4);
+    assert_close("weighted grad", &read(&grad), &want_grad, 1e-6, 1e-3);
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
 fn sum_squares_partial_adds_up_to_the_squared_norm() {
     let g = gpu();
     let sizes = [

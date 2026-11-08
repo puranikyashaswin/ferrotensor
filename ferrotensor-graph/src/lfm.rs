@@ -268,7 +268,7 @@ impl Lfm2Model {
 
         // 1. Embedding
         // Note: Generic Embedding.forward usually handles this, manual here for LFM specific
-        let mut x = self.lookup_embeddings(&ctx, engine, input_ids);
+        let mut x = self.lookup_embeddings(&ctx, &[input_ids]);
         if let Some(norm) = &self.embedding_norm {
             x = norm.forward(engine, &x);
         }
@@ -284,22 +284,57 @@ impl Lfm2Model {
         self.lm_head.forward(engine, &x)
     }
 
+    /// Whether [`forward_batch`](Self::forward_batch) can run: every block is
+    /// attention (conv blocks would mix the sequences of a batch).
+    pub fn supports_batching(&self) -> bool {
+        self.supports_kv_cache()
+    }
+
+    /// Logits `[batch, seq, vocab]` for equally long `rows` of token ids,
+    /// each starting at position 0, in one pass. Pad shorter sequences on
+    /// the right: attention is causal, so real tokens never see the padding.
+    ///
+    /// # Panics
+    /// If the rows differ in length, or if
+    /// [`supports_batching`](Self::supports_batching) is false.
+    pub fn forward_batch(&self, engine: &ComputeEngine, rows: &[&[u32]]) -> Tensor {
+        assert!(
+            self.supports_batching(),
+            "forward_batch needs an all-attention model"
+        );
+        let seq_len = rows.first().map_or(0, |r| r.len());
+        assert!(
+            rows.iter().all(|r| r.len() == seq_len),
+            "forward_batch: rows must have the same length"
+        );
+        let ctx = self.embed_tokens.ctx.clone();
+        let mut x = self.lookup_embeddings(&ctx, rows);
+        if let Some(norm) = &self.embedding_norm {
+            x = norm.forward(engine, &x);
+        }
+        for layer in &self.layers {
+            x = layer.forward(engine, &x, 0, None, None);
+        }
+        x = self.norm_f.forward(engine, &x);
+        self.lm_head.forward(engine, &x)
+    }
+
+    /// Embeddings `[rows, seq, hidden]` for equally long rows of ids.
     fn lookup_embeddings(
         &self,
         ctx: &Arc<ferrotensor_backend::WgpuContext>,
-        _engine: &ComputeEngine,
-        ids: &[u32],
+        rows: &[&[u32]],
     ) -> Tensor {
         let hidden_dim = self.embed_tokens.data.shape[1];
-        let seq_len = ids.len();
-        let mut data = Vec::with_capacity(seq_len * hidden_dim);
+        let seq_len = rows.first().map_or(0, |r| r.len());
+        let mut data = Vec::with_capacity(rows.len() * seq_len * hidden_dim);
 
         // Host-side lookup against a cached copy of the table (there is no
         // GPU gather kernel yet). Out-of-range ids map to zeros.
         let w = self
             .embed_host
             .get_or_init(|| pollster::block_on(self.embed_tokens.data.to_vec(ctx)));
-        for &id in ids {
+        for &id in rows.iter().flat_map(|r| r.iter()) {
             let start = (id as usize) * hidden_dim;
             match w.get(start..start + hidden_dim) {
                 Some(row) => data.extend_from_slice(row),
@@ -309,7 +344,7 @@ impl Lfm2Model {
         // The lookup is not differentiable, so its output is a constant.
         Tensor::frozen(
             ctx.clone(),
-            UnifiedTensor::new(ctx, &data, &[1, seq_len, hidden_dim]),
+            UnifiedTensor::new(ctx, &data, &[rows.len(), seq_len, hidden_dim]),
         )
     }
 

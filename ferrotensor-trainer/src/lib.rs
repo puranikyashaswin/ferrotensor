@@ -301,14 +301,20 @@ impl Trainer {
         Ok(())
     }
 
-    /// Train on every sequence of `batch` (one micro-batch per sequence,
-    /// padding stripped). Sequences without supervised tokens are skipped.
+    /// Train on every sequence of `batch`. Sequences without supervised
+    /// tokens are skipped. Returns one [`StepStats`] per trained sequence.
+    ///
+    /// With an all-attention model ([`Lfm2Model::supports_batching`]) the
+    /// sequences run through the model together, one forward and backward
+    /// per accumulation chunk; otherwise one at a time. Both give the same
+    /// result: each sequence contributes its own mean-loss gradient, and
+    /// optimizer steps fall after the same sequences.
     pub fn train_batch(
         &mut self,
         batch: &Batch,
         train_params: &[Tensor],
     ) -> Result<Vec<StepStats>, TrainError> {
-        let mut out = Vec::with_capacity(batch.batch_size);
+        let mut seqs: Vec<(&[u32], &[u32], &[u8])> = Vec::with_capacity(batch.batch_size);
         for (((input_ids, target_ids), attn), loss_mask) in batch
             .padded_input_ids
             .iter()
@@ -326,12 +332,101 @@ impl Trainer {
             if loss_mask.iter().all(|&m| m == 0) {
                 continue;
             }
-            out.push(self.train_step_masked(
-                input_ids,
-                target_ids,
-                Some(loss_mask),
-                train_params,
-            )?);
+            seqs.push((input_ids, target_ids, loss_mask));
+        }
+
+        let mut out = Vec::with_capacity(seqs.len());
+        if !self.model.supports_batching() || seqs.len() < 2 {
+            for (input_ids, target_ids, loss_mask) in seqs {
+                out.push(self.train_step_masked(
+                    input_ids,
+                    target_ids,
+                    Some(loss_mask),
+                    train_params,
+                )?);
+            }
+            return Ok(out);
+        }
+        let mut rest = seqs.as_slice();
+        while !rest.is_empty() {
+            // Stop each chunk at the accumulation boundary, so the optimizer
+            // steps after the same sequence as in the one-at-a-time path.
+            let room = self
+                .grad_accum_steps
+                .saturating_sub(self.step_in_accum)
+                .max(1);
+            let (chunk, tail) = rest.split_at(room.min(rest.len()));
+            out.extend(self.train_chunk(chunk, train_params)?);
+            rest = tail;
+        }
+        Ok(out)
+    }
+
+    /// One forward and backward over `chunk`, padded on the right to a
+    /// common length; then an optimizer step if accumulation is complete.
+    fn train_chunk(
+        &mut self,
+        chunk: &[(&[u32], &[u32], &[u8])],
+        train_params: &[Tensor],
+    ) -> Result<Vec<StepStats>, TrainError> {
+        let longest = chunk
+            .iter()
+            .map(|s| s.0.len().min(s.1.len()))
+            .max()
+            .unwrap_or(0);
+        let padded_len = longest.div_ceil(self.length_bucket) * self.length_bucket;
+        let mut inputs = Vec::with_capacity(chunk.len());
+        let mut targets = Vec::with_capacity(chunk.len() * padded_len);
+        let mut masks = Vec::with_capacity(chunk.len() * padded_len);
+        for &(input_ids, target_ids, loss_mask) in chunk {
+            let len = input_ids.len().min(target_ids.len());
+            let pad = input_ids[..len].last().copied().unwrap_or(0);
+            let mut row = input_ids[..len].to_vec();
+            row.resize(padded_len, pad);
+            inputs.push(row);
+            targets.extend_from_slice(&target_ids[..len]);
+            targets.resize(targets.len() + padded_len - len, pad);
+            masks.extend((0..len).map(|i| loss_mask.get(i).copied().unwrap_or(0)));
+            masks.resize(masks.len() + padded_len - len, 0);
+        }
+        let rows: Vec<&[u32]> = inputs.iter().map(Vec::as_slice).collect();
+        let logits = self.model.forward_batch(&self.engine, &rows);
+
+        let mut out: Vec<StepStats> = Vec::with_capacity(chunk.len());
+        if let Some(loss) =
+            masked_cross_entropy_batch(&logits, &targets, &masks, chunk.len(), &self.engine)
+        {
+            for &(value, tokens) in &loss.per_sequence {
+                out.push(StepStats {
+                    loss: value,
+                    tokens,
+                    optimizer_step: false,
+                    grad_norm: None,
+                    lr: None,
+                });
+            }
+            let mut seed = 1.0 / self.grad_accum_steps as f32;
+            if let Some(scaler) = self.scaler.as_ref() {
+                seed *= scaler.scale_factor();
+            }
+            *loss.tensor.grad.borrow_mut() = Some(UnifiedTensor::new(&self.ctx, &[seed], &[1]));
+            loss.tensor.backward(&self.engine);
+        }
+
+        self.step_in_accum += chunk.len();
+        if self.step_in_accum >= self.grad_accum_steps {
+            self.step_in_accum = 0;
+            let mut stats = out.pop().unwrap_or(StepStats {
+                loss: 0.0,
+                tokens: 0,
+                optimizer_step: false,
+                grad_norm: None,
+                lr: None,
+            });
+            let applied = self.apply_gradients(train_params, &mut stats);
+            self.optimizer.zero_grad(train_params);
+            applied?;
+            out.push(stats);
         }
         Ok(out)
     }
@@ -461,6 +556,102 @@ pub fn masked_cross_entropy(
         tensor,
         value,
         tokens,
+    })
+}
+
+/// The loss of a batch of sequences, see [`masked_cross_entropy_batch`].
+pub struct BatchLoss {
+    /// Sum of the per-sequence mean losses `[1]`; call `backward` on it.
+    pub tensor: Tensor,
+    /// `(mean loss, supervised tokens)` of each sequence, in order.
+    pub per_sequence: Vec<(f32, usize)>,
+}
+
+/// Cross-entropy of `logits` (`[sequences, seq, vocab]`, flattened rows)
+/// against `target_ids` where `loss_mask` is 1, for a batch of sequences.
+///
+/// Each sequence is averaged over its own supervised tokens and the result
+/// is the sum of those means, so its gradient equals the sum of
+/// [`masked_cross_entropy`] gradients of the sequences taken one at a time.
+/// `target_ids` and `loss_mask` hold one entry per row. Returns `None` when
+/// no position is supervised.
+// Autograd nodes are shared through `Arc` but used on one thread.
+#[allow(clippy::arc_with_non_send_sync)]
+pub fn masked_cross_entropy_batch(
+    logits: &Tensor,
+    target_ids: &[u32],
+    loss_mask: &[u8],
+    sequences: usize,
+    engine: &ComputeEngine,
+) -> Option<BatchLoss> {
+    let vocab = *logits.data.shape.last()?;
+    let rows = logits.data.shape.iter().product::<usize>() / vocab.max(1);
+    if vocab == 0 || sequences == 0 || !rows.is_multiple_of(sequences) {
+        return None;
+    }
+    let seq_len = rows / sequences;
+    let supervised = |r: usize| {
+        r < target_ids.len()
+            && r < loss_mask.len()
+            && loss_mask[r] != 0
+            && (target_ids[r] as usize) < vocab
+    };
+    let tokens: Vec<usize> = (0..sequences)
+        .map(|s| {
+            (s * seq_len..(s + 1) * seq_len)
+                .filter(|&r| supervised(r))
+                .count()
+        })
+        .collect();
+    if tokens.iter().all(|&t| t == 0) {
+        return None;
+    }
+    let mut targets = Vec::with_capacity(rows);
+    let mut weights = Vec::with_capacity(rows);
+    for r in 0..rows {
+        let t = tokens[r / seq_len];
+        if supervised(r) {
+            targets.push(target_ids[r]);
+            weights.push(1.0 / t as f32);
+        } else {
+            targets.push(MASKED_CE_SKIP);
+            weights.push(0.0);
+        }
+    }
+    let ctx = logits.ctx.clone();
+    let target_buf = UnifiedTensor::from_bytes(&ctx, bytemuck::cast_slice(&targets), &[rows]);
+    let weight_buf = UnifiedTensor::new(&ctx, &weights, &[rows]);
+    let grad = UnifiedTensor::empty(&ctx, &logits.data.shape);
+    let row_loss = UnifiedTensor::empty(&ctx, &[rows]);
+    engine.masked_cross_entropy_weighted(
+        &ctx,
+        &logits.data,
+        &target_buf,
+        &weight_buf,
+        &grad,
+        &row_loss,
+    );
+    let losses = pollster::block_on(row_loss.to_vec(&ctx));
+    let per_sequence: Vec<(f32, usize)> = tokens
+        .iter()
+        .enumerate()
+        .map(|(s, &t)| {
+            let sum: f64 = losses[s * seq_len..(s + 1) * seq_len]
+                .iter()
+                .map(|&l| l as f64)
+                .sum();
+            ((sum / t.max(1) as f64) as f32, t)
+        })
+        .collect();
+    let total: f32 = per_sequence.iter().map(|&(l, _)| l).sum();
+    let node = Arc::new(MaskedCrossEntropyNode {
+        logits: logits.clone(),
+        grad_logits: grad,
+    });
+    let tensor = Tensor::with_creator(ctx.clone(), UnifiedTensor::new(&ctx, &[total], &[1]), node);
+    Some(BatchLoss {
+        tensor,
+        per_sequence,
     })
 }
 

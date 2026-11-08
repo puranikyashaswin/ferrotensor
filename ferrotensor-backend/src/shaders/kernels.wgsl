@@ -573,13 +573,14 @@ fn clip_grad_by_norm(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num
 // Masked cross-entropy over [rows, vocab] logits, one workgroup per row.
 // mce_targets[row] is the target id, or MCE_SKIP for a row outside the loss.
 // Writes the row's loss (log-sum-exp minus the target logit; 0 when skipped)
-// and its gradient (softmax - onehot) * inv, where inv = 1 / supervised rows.
+// and its gradient (softmax - onehot) * mce_weights[row].
 const MCE_SKIP: u32 = 0xffffffffu;
 @group(0) @binding(0) var<storage, read> mce_logits: array<f32>;
 @group(0) @binding(1) var<storage, read> mce_targets: array<u32>;
 @group(0) @binding(2) var<storage, read_write> mce_grad: array<f32>;
 @group(0) @binding(3) var<storage, read_write> mce_loss: array<f32>;
-@group(0) @binding(4) var<uniform> mce_params: vec4<u32>; // vocab, rows, inv bits, 0
+@group(0) @binding(4) var<uniform> mce_params: vec4<u32>; // vocab, rows, 0, 0
+@group(0) @binding(5) var<storage, read> mce_weights: array<f32>;
 
 @compute @workgroup_size(256)
 fn masked_cross_entropy(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wg: vec3<u32>,
@@ -601,7 +602,7 @@ fn masked_cross_entropy(@builtin(local_invocation_index) lid: u32, @builtin(work
     for (var i = lid; i < vocab; i += ROW_WG) { se += exp(mce_logits[off + i] - m); }
     se = row_sum(lid, se);
     let log_z = m + log(se);
-    let inv = bitcast<f32>(mce_params.z);
+    let inv = mce_weights[row];
     for (var i = lid; i < vocab; i += ROW_WG) {
         var gv = exp(mce_logits[off + i] - log_z) * inv;
         if (i == tgt) { gv -= inv; }
