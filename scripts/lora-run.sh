@@ -4,23 +4,38 @@
 #
 #   scripts/lora-run.sh HuggingFaceTB/SmolLM2-360M
 #   scripts/lora-run.sh HuggingFaceTB/SmolLM2-1.7B --steps 250 --seq-len 256
+#   scripts/lora-run.sh HuggingFaceTB/SmolLM2-135M --batch-size 8 --grad-accum 1 --name b8
 #
 # Same data, split and hyperparameters as the walkthrough unless overridden:
 # 2,000 Alpaca examples for training, 64 held out, LoRA rank 8 on q/k/v/o,
-# lr 5e-4, 20 warmup steps, 8 sequences per step. Everything goes under data/
-# (gitignored); the summary is data/runs/<model>/summary.json. Needs the `hf`
-# CLI (pip install huggingface_hub). Respects WGPU_BACKEND.
+# lr 5e-4, 20 warmup steps, 8 sequences per step (--batch-size 1
+# --grad-accum 8). --f16-weights stores the frozen base weights as f16.
+# Everything goes under data/ (gitignored); the summary is
+# data/runs/<model>[-<name>]/summary.json. Needs the `hf` CLI
+# (pip install huggingface_hub). Respects WGPU_BACKEND.
 set -euo pipefail
 
-usage() { sed -n '2,13p' "$0"; exit "${1:-0}"; }
+usage() { sed -n '2,16p' "$0"; exit "${1:-0}"; }
 [ $# -ge 1 ] || usage 2
+case "$1" in
+  -h|--help) usage 0 ;;
+  -*) echo "the first argument is the model, e.g. HuggingFaceTB/SmolLM2-135M" >&2; usage 2 ;;
+esac
 repo="$1"; shift
 steps=250
 seq_len=256
+batch_size=1
+grad_accum=8
+f16_weights=0
+suffix=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --steps) steps="$2"; shift 2 ;;
     --seq-len) seq_len="$2"; shift 2 ;;
+    --batch-size) batch_size="$2"; shift 2 ;;
+    --grad-accum) grad_accum="$2"; shift 2 ;;
+    --f16-weights) f16_weights=1; shift ;;
+    --name) suffix="-$2"; shift 2 ;;
     -h|--help) usage 0 ;;
     *) echo "unknown option: $1" >&2; usage 2 ;;
   esac
@@ -30,7 +45,9 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 name="${repo##*/}"
 model_dir="data/models/$name"
-run_dir="data/runs/$name"
+run_dir="data/runs/$name$suffix"
+model_flags=()
+[ "$f16_weights" = 1 ] && model_flags=(--f16-weights)
 mkdir -p "$run_dir" data/alpaca
 
 command -v hf >/dev/null || { echo "needs the hf CLI: pip install huggingface_hub" >&2; exit 1; }
@@ -68,19 +85,21 @@ bin=./target/release/ferrotensor
 # Peak memory: BSD time on macOS, GNU time on Linux.
 if [ "$(uname)" = Darwin ]; then time_args=(-l); else time_args=(-v); fi
 
-echo "== train ($steps steps, seq-len $seq_len)"
+echo "== train ($steps steps, seq-len $seq_len, batch $batch_size x accum $grad_accum)"
 /usr/bin/time "${time_args[@]}" "$bin" train \
-  --model "$model_dir" \
+  --model "$model_dir" ${model_flags[@]+"${model_flags[@]}"} \
   --data data/alpaca/train.jsonl --eval-data data/alpaca/val.jsonl \
   --out "$run_dir" --seq-len "$seq_len" \
-  --lr 5e-4 --warmup-steps 20 --grad-accum 8 --max-steps "$steps" \
+  --lr 5e-4 --warmup-steps 20 --batch-size "$batch_size" --grad-accum "$grad_accum" \
+  --max-steps "$steps" \
   --log-every 10 --eval-every 50 --save-every 50 \
   --sample-prompt "Give three tips for staying healthy." \
   2>&1 | tee "$run_dir/train.log"
 
 adapter="$run_dir/lora_adapters.safetensors"
 echo "== eval with the adapter"
-"$bin" eval --model "$model_dir" --data data/alpaca/val.jsonl --lora "$adapter" \
+"$bin" eval --model "$model_dir" ${model_flags[@]+"${model_flags[@]}"} \
+  --data data/alpaca/val.jsonl --lora "$adapter" \
   2>&1 | tee "$run_dir/eval.log"
 
 echo "== generate (greedy), base and adapter"
@@ -91,16 +110,18 @@ for p in "${prompts[@]}"; do
     lora=()
     [ "$mode" = adapter ] && lora=(--lora "$adapter")
     printf '### %s | %s\n' "$mode" "$p" >> "$run_dir/generate.log"
-    "$bin" generate --model "$model_dir" ${lora[@]+"${lora[@]}"} \
+    "$bin" generate --model "$model_dir" ${model_flags[@]+"${model_flags[@]}"} ${lora[@]+"${lora[@]}"} \
       --prompt "$p" --temperature 0 --max-new-tokens 60 >> "$run_dir/generate.log" 2>&1
   done
 done
 
-python3 - "$run_dir" "$repo" "$steps" "$seq_len" "$(git rev-parse --short HEAD)" <<'PY'
+python3 - "$run_dir" "$repo" "$steps" "$seq_len" "$(git rev-parse --short HEAD)" \
+  "$batch_size" "$grad_accum" "$f16_weights" <<'PY'
 import json, re, sys
 from pathlib import Path
 
 run, repo, steps, seq_len, commit = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
+batch_size, grad_accum, f16_weights = int(sys.argv[6]), int(sys.argv[7]), sys.argv[8] == "1"
 train = (run / "train.log").read_text()
 evals = (run / "eval.log").read_text()
 
@@ -135,6 +156,9 @@ summary = {
     "trainable_params": find(r"lora \((\d+) trainable params\)", train, int),
     "steps": steps,
     "seq_len": seq_len,
+    "batch_size": batch_size,
+    "grad_accum": grad_accum,
+    "f16_weights": f16_weights,
     "heldout_loss_before": find(r"eval before: loss ([\d.]+)", train, float),
     "heldout_loss_after": find(r"loss ([\d.]+), perplexity", evals, float),
     "heldout_ppl_after": find(r"perplexity ([\d.]+)", evals, float),
