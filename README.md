@@ -51,7 +51,9 @@ On an NVIDIA A10G through Vulkan, the same walkthrough fine-tunes
 **SmolLM2-1.7B**: held-out loss 2.65 → **1.06** in 250 steps at 2.4 s/step,
 with f16 base weights in 11.9 GiB of GPU memory and 5.3 GB of host memory.
 SmolLM2-135M trains at **0.57 s/step** with `--batch-size 8`, held-out loss
-1.65 as on the M2.
+1.65 as on the M2. Against PyTorch + PEFT on CUDA on the same GPU and recipe,
+the held-out loss agrees within 0.005
+([comparison](docs/examples/lora-sft.md#against-pytorch--peft-on-cuda-same-gpu)).
 [Results](docs/examples/lora-sft.md#on-an-nvidia-gpu-three-model-sizes).
 
 ## Install
