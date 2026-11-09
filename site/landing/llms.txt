@@ -12,25 +12,25 @@ Measured on a MacBook Air (Apple M2, 8 GB): LoRA fine-tuning of SmolLM2-135M too
 
 ## Docs
 
-- [Introduction](https://puranikyashaswin.github.io/ferrotensor/docs/): what Ferrotensor is and where to start
-- [Installation](https://puranikyashaswin.github.io/ferrotensor/docs/installation.html): crate, CLI and Python package
-- [Python quickstart](https://puranikyashaswin.github.io/ferrotensor/docs/python.html): train a model from Python, CPU or GPU
-- [Use cases](https://puranikyashaswin.github.io/ferrotensor/docs/use-cases.html): runnable Rust examples with their real output
-- [How-to guide](https://puranikyashaswin.github.io/ferrotensor/guide/): 19 step-by-step guides with real output, from installing and checking your GPU to LoRA fine-tuning, training in Rust or Python, and troubleshooting
-- [LoRA fine-tuning on a laptop](https://puranikyashaswin.github.io/ferrotensor/docs/examples/lora-sft.html): end-to-end walkthrough with every command
-- [Architecture](https://puranikyashaswin.github.io/ferrotensor/docs/architecture.html): how a tensor op reaches a WGSL kernel
-- [Writing a kernel](https://puranikyashaswin.github.io/ferrotensor/docs/writing-a-kernel.html): adding a GPU op
-- [Benchmarks](https://puranikyashaswin.github.io/ferrotensor/docs/benchmarks.html): kernel and tensor-API timings with method
+- [Introduction](https://ferrotensor.dev/docs/): what Ferrotensor is and where to start
+- [Installation](https://ferrotensor.dev/docs/installation.html): crate, CLI and Python package
+- [Python quickstart](https://ferrotensor.dev/docs/python.html): train a model from Python, CPU or GPU
+- [Use cases](https://ferrotensor.dev/docs/use-cases.html): runnable Rust examples with their real output
+- [How-to guide](https://ferrotensor.dev/guide/): 19 step-by-step guides with real output, from installing and checking your GPU to LoRA fine-tuning, training in Rust or Python, and troubleshooting
+- [LoRA fine-tuning on a laptop](https://ferrotensor.dev/docs/examples/lora-sft.html): end-to-end walkthrough with every command
+- [Architecture](https://ferrotensor.dev/docs/architecture.html): how a tensor op reaches a WGSL kernel
+- [Writing a kernel](https://ferrotensor.dev/docs/writing-a-kernel.html): adding a GPU op
+- [Benchmarks](https://ferrotensor.dev/docs/benchmarks.html): kernel and tensor-API timings with method
 
 ## Reference
 
 - [Rust API on docs.rs](https://docs.rs/ferrotensor)
-- [Python API](https://puranikyashaswin.github.io/ferrotensor/docs/python-reference.html): what the bindings cover and how they differ from PyTorch
-- [Changelog](https://puranikyashaswin.github.io/ferrotensor/docs/changelog.html)
+- [Python API](https://ferrotensor.dev/docs/python-reference.html): what the bindings cover and how they differ from PyTorch
+- [Changelog](https://ferrotensor.dev/docs/changelog.html)
 - [Source on GitHub](https://github.com/puranikyashaswin/ferrotensor)
 
 ## Optional
 
 - [Comparison with candle, burn and tch-rs](https://github.com/puranikyashaswin/ferrotensor/blob/main/README.md#compared-with-candle-burn-and-tch)
-- [Good first issues](https://puranikyashaswin.github.io/ferrotensor/docs/good-first-issues.html)
+- [Good first issues](https://ferrotensor.dev/docs/good-first-issues.html)
 - [crates.io](https://crates.io/crates/ferrotensor) · [PyPI](https://pypi.org/project/ferrotensor/)
