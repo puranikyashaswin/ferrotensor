@@ -291,7 +291,8 @@ EOF</pre></figure></div></li></ol>
 <tr><td>SmolLM2-1.7B, f16 base weights</td><td>2.6474 &rarr; 1.0640</td><td>2.38 s</td><td>12.6 MB</td></tr>
 </tbody></table>
 <p>Frozen base weights are stored as f16 by default, which saves GPU memory (11.9 GiB instead of 14.7 GiB for SmolLM2-1.7B) at the same loss; <code>--f32-weights</code> keeps them f32. <code>--batch-size N</code> trains N sequences in one GPU pass with the same result, faster but with more GPU memory.</p>
-<p>Every number, with the M2 run, is in the <a href="../docs/examples/lora-sft.html">LoRA walkthrough</a>.</p></div>
+<p>On the same GPU, PyTorch + PEFT on CUDA with the same recipe reaches the same held-out loss within 0.005, starting from the identical loss before training.</p>
+<p>Every number, with the M2 run and the full PyTorch comparison, is in the <a href="../docs/examples/lora-sft.html">LoRA walkthrough</a>.</p></div>
   <h3>Limits</h3><p class="gprose">Larger batches need more GPU memory: SmolLM2-1.7B with <code>--batch-size 8</code> does not fit in 24 GB. Activations and LoRA adapters are f32. Models above 1.7B have not been tested.</p>
   <nav class="pn" aria-label="Previous and next guide"><a class="prev" href="#lora-data"><span>Previous</span>Download a model and prepare data</a><a class="next" href="#lora-eval-generate"><span>Next</span>Evaluate and chat with your adapter</a></nav>
 </article>

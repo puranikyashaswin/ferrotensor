@@ -137,10 +137,43 @@ weights stored as f16 (`--f16-weights`, the default since 0.6):
   usable): it stopped at 22,590 MiB. Batch 1 fits in 11.9 GiB; batch sizes
   between 1 and 8 are not measured yet.
 
+### Against PyTorch + PEFT on CUDA, same GPU
+
+[`benchmarks/baselines/pytorch_lora.py`](../../benchmarks/baselines/pytorch_lora.py)
+runs the same recipe in PyTorch 2.15 + PEFT (CUDA 13.2): the same split,
+ChatML formatting, response-only loss, LoRA initialization, optimizer,
+schedule and clipping. Both ran on the same NVIDIA A10G; GPU memory is the
+`nvidia-smi` peak for both.
+
+| Model | Run | Held-out loss | Time per step | GPU memory (MiB) |
+|---|---|---|---:|---:|
+| SmolLM2-135M | Ferrotensor, batch 1 | 2.4250 → **1.6521** | 1.28 s | 3,861 |
+| | PyTorch, batch 1 | 2.4250 → **1.6494** | 1.08 s | 1,541 |
+| | Ferrotensor, batch 8 | 2.4250 → **1.6521** | 0.57 s | 16,708 |
+| | PyTorch, batch 8 | 2.4250 → **1.6493** | 0.19 s | 6,843 |
+| SmolLM2-1.7B | Ferrotensor, f16 base weights, batch 1 | 2.6474 → **1.0640** | 2.38 s | 12,199 |
+| | Ferrotensor, f32 base weights, batch 1 | 2.6474 → **1.0657** | 2.49 s | 15,028 |
+| | PyTorch, f32, batch 1 | 2.6474 → **1.0608** | 0.93 s | 8,175 |
+| | PyTorch, f32, batch 8 | 2.6474 → **1.0596** | 0.52 s | 21,103 |
+
+- The held-out loss before training is identical to four decimals for both
+  models, so the forward passes and the loss agree.
+- After 250 steps Ferrotensor is within 0.005 of PyTorch (0.0027 for 135M,
+  0.0032 for 1.7B with f16 base weights). Each framework shuffles the data
+  with its own generator, so this number can only match approximately;
+  PyTorch's own batch-1 and batch-8 runs differ by 0.0012 on 1.7B.
+- Speed: Ferrotensor runs at 84% of PyTorch's speed for SmolLM2-135M at
+  batch 1, and 37% for SmolLM2-1.7B. The gap grows with the size of the
+  matrix multiplications, where PyTorch uses cuBLAS and Ferrotensor one
+  portable WGSL kernel for every GPU; tuning that kernel is the next step.
+- PyTorch needs less GPU memory and fits SmolLM2-1.7B at batch 8, which
+  Ferrotensor does not yet on a 24 GB card.
+
 ## Correctness checks
 
-Two checks were run against PyTorch with `transformers` before trusting the
-loss numbers above. The scripts are not part of the repository.
+Besides the full PyTorch run above, two checks were run against PyTorch with
+`transformers` before trusting the loss numbers. These two scripts are not
+part of the repository.
 
 - Forward pass: logits for a 20-token input matched
   `AutoModelForCausalLM` (float32) to about 1e-5 at every position, with the
