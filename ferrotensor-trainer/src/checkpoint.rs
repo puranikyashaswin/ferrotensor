@@ -604,7 +604,7 @@ fn read_moments(
 
 #[cfg(test)]
 mod tests {
-    use super::{moments_path, TrainingCheckpoint, TrainingState};
+    use super::{moments_path, LoraMetadata, TrainingCheckpoint, TrainingState};
     use crate::scaler::GradScalerCheckpoint;
     use ferrotensor_autograd::{AdamWCheckpoint, OptimizerCheckpoint, OptimizerTensorState};
     use std::collections::HashMap;
