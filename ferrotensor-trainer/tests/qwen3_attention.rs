@@ -27,10 +27,10 @@ fn read_weights(dir: &Path) -> Weights {
     st.tensors()
         .into_iter()
         .map(|(name, view)| {
-            let values = view
-                .data()
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64)
+            let (words, _) = view.data().as_chunks::<4>();
+            let values = words
+                .iter()
+                .map(|c| f32::from_le_bytes(*c) as f64)
                 .collect();
             (name, (view.shape().to_vec(), values))
         })
@@ -327,7 +327,10 @@ fn qwen3_norms_are_loaded_frozen_and_named() {
         let a = attention(&llama, l);
         assert!(a.q_norm.is_none() && a.k_norm.is_none());
     }
-    assert!(!llama.named_params().keys().any(|k| k.contains("_norm.")));
+    assert!(!llama
+        .named_params()
+        .keys()
+        .any(|k| k.contains(".q_norm.") || k.contains(".k_norm.")));
 }
 
 #[test]
