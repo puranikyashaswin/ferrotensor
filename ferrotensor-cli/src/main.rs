@@ -12,7 +12,7 @@
 mod info;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use ferrotensor_autograd::{AdamW, WarmupCosineScheduler};
+use ferrotensor_autograd::{AdamW, OptimizerLoad, WarmupCosineScheduler};
 use ferrotensor_backend::{ComputeEngine, WgpuContext};
 use ferrotensor_graph::lfm::{legacy_llama_name, Lfm2Model};
 use ferrotensor_graph::model_builder::{Lfm2ModelBuilder, LoRaConfig};
@@ -465,6 +465,29 @@ fn restore_adapter(base: &Loaded, model: &Lfm2Model, path: &Path) -> Result<usiz
     let n = apply_checkpoint(&base.ctx, &ckpt, &model.named_lora_params())
         .map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(n)
+}
+
+/// What `--resume` makes of the optimizer state it loaded at `step`: an error
+/// when no saved moment fits a parameter, a warning when only some do.
+fn check_optimizer_load(load: OptimizerLoad, step: usize) -> Result<Option<String>> {
+    if load.matched == 0 {
+        if step == 0 && load.unused == 0 {
+            // Saved before the first optimizer step: there is nothing to restore.
+            return Ok(None);
+        }
+        return Err(format!(
+            "none of the {} saved optimizer entries belongs to one of the {} trainable parameters; the state was saved for a different model or --train-modules",
+            load.unused, load.missing
+        )
+        .into());
+    }
+    if load.is_complete() {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "optimizer state matched {} parameters; {} start with empty moments and {} saved entries were not used",
+        load.matched, load.missing, load.unused
+    )))
 }
 
 /// The LoRA settings stored in an adapter file.
@@ -972,11 +995,14 @@ async fn train(mut args: TrainArgs) -> Result<()> {
             )?;
             if let Some(mut opt) = ckpt.optimizer_state.clone() {
                 upgrade_optimizer_names(&mut opt, &named_params);
-                if !trainer.optimizer.load_state(&base.ctx, &named_params, &opt) {
-                    log::warn!(
-                        "optimizer state in {} did not apply",
-                        resume_state.display()
-                    );
+                let load = trainer
+                    .optimizer
+                    .load_state(&base.ctx, &named_params, &opt)
+                    .map_err(|e| format!("optimizer state in {}: {e}", resume_state.display()))?;
+                let verdict = check_optimizer_load(load, ckpt.training_state.step)
+                    .map_err(|e| format!("optimizer state in {}: {e}", resume_state.display()))?;
+                if let Some(warning) = verdict {
+                    log::warn!("{}: {warning}", resume_state.display());
                 }
             }
             start_step = ckpt.training_state.step;
@@ -1332,5 +1358,38 @@ mod tests {
             state_path_for(Path::new("out/a.safetensors")),
             PathBuf::from("out/a.safetensors.state.json")
         );
+    }
+
+    #[test]
+    fn optimizer_state_that_fits_nothing_is_an_error() {
+        let load = |matched, missing, unused| OptimizerLoad {
+            matched,
+            missing,
+            unused,
+        };
+        assert_eq!(check_optimizer_load(load(4, 0, 0), 10).unwrap(), None);
+
+        let err = check_optimizer_load(load(0, 4, 8), 10)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("none") && err.contains('8') && err.contains('4'),
+            "{err}"
+        );
+
+        let warning = check_optimizer_load(load(3, 1, 2), 10)
+            .unwrap()
+            .expect("warning");
+        assert!(
+            warning.contains("matched 3")
+                && warning.contains("1 start")
+                && warning.contains("2 saved"),
+            "{warning}"
+        );
+
+        // Saved before the first optimizer step: no moments to restore.
+        assert_eq!(check_optimizer_load(load(0, 4, 0), 0).unwrap(), None);
+        assert!(check_optimizer_load(load(0, 4, 0), 5).is_err());
+        assert!(check_optimizer_load(load(0, 4, 2), 0).is_err());
     }
 }
