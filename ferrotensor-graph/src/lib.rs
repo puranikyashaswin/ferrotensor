@@ -257,7 +257,8 @@ impl RMSNorm {
     }
 }
 
-/// Causal grouped-query self-attention with RoPE (Llama style).
+/// Causal grouped-query self-attention with RoPE (Llama style), with the
+/// optional per-head query/key norms of Qwen3.
 pub struct Attention {
     /// Query projection `[hidden, n_heads * head_dim]`.
     pub q_proj: Linear,
@@ -277,6 +278,35 @@ pub struct Attention {
     pub dropout_prob: f32,
     /// RoPE base frequency (`rope_theta` in Hugging Face configs).
     pub rope_theta: f32,
+    /// RMSNorm over `head_dim` applied to every query head before RoPE, one
+    /// weight vector `[head_dim]` shared by all heads (Qwen3 `q_norm`).
+    /// `None` for Llama-style attention.
+    pub q_norm: Option<RMSNorm>,
+    /// The same for every key head (Qwen3 `k_norm`).
+    pub k_norm: Option<RMSNorm>,
+}
+
+/// Applies `norm` to each `head_dim`-wide head vector of `x`
+/// (`[.., heads * head_dim]`), or returns `x` unchanged without a norm.
+///
+/// Heads are contiguous in the last dimension, so viewing `x` as
+/// `[tokens * heads, head_dim]` turns the per-head norm into the row-wise
+/// [`Tensor::rms_norm`]. Both reshapes are views whose backward reshapes the
+/// gradient back, so the projection (and its LoRA adapter) upstream gets
+/// the gradient in its own layout.
+fn per_head_norm(
+    norm: Option<&RMSNorm>,
+    engine: &ComputeEngine,
+    x: Tensor,
+    head_dim: usize,
+) -> Tensor {
+    let Some(norm) = norm else {
+        return x;
+    };
+    let shape = x.data.shape.clone();
+    let rows = shape.iter().product::<usize>() / head_dim;
+    let heads = Tensor::reshape(&x, &[rows, head_dim]);
+    Tensor::reshape(&norm.forward(engine, &heads), &shape)
 }
 
 impl Attention {
@@ -294,6 +324,11 @@ impl Attention {
         let q = self.q_proj.forward(engine, x);
         let k = self.k_proj.forward(engine, x);
         let v = self.v_proj.forward(engine, x);
+
+        // Before RoPE, as in Hugging Face Qwen3; every path below (training,
+        // batched, KV-cache decoding) starts from these q and k.
+        let q = per_head_norm(self.q_norm.as_ref(), engine, q, self.head_dim);
+        let k = per_head_norm(self.k_norm.as_ref(), engine, k, self.head_dim);
 
         let q = Tensor::rope_theta(&q, self.head_dim, pos, self.rope_theta, engine);
         let k = Tensor::rope_theta(&k, self.head_dim, pos, self.rope_theta, engine);
@@ -364,6 +399,9 @@ impl Attention {
         p.extend(self.k_proj.params());
         p.extend(self.v_proj.params());
         p.extend(self.o_proj.params());
+        for norm in [&self.q_norm, &self.k_norm].into_iter().flatten() {
+            p.extend(norm.params());
+        }
         p
     }
 
@@ -374,6 +412,12 @@ impl Attention {
         map.extend(self.k_proj.named_params(&format!("{}.k_proj", prefix)));
         map.extend(self.v_proj.named_params(&format!("{}.v_proj", prefix)));
         map.extend(self.o_proj.named_params(&format!("{}.o_proj", prefix)));
+        if let Some(norm) = &self.q_norm {
+            map.extend(norm.named_params(&format!("{}.q_norm", prefix)));
+        }
+        if let Some(norm) = &self.k_norm {
+            map.extend(norm.named_params(&format!("{}.k_norm", prefix)));
+        }
         map
     }
 
