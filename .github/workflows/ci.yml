@@ -102,7 +102,11 @@ jobs:
       - uses: actions/checkout@v4.2.2
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2.9.2
-      - run: cargo doc --workspace --no-deps
+      # The CLI's binary is also named `ferrotensor`; documented in the same
+      # cargo call as the library, both write target/doc/ferrotensor and the
+      # job fails now and then with a missing file. Document it afterwards.
+      - run: cargo doc --workspace --no-deps --exclude ferrotensor-cli
+      - run: cargo doc -p ferrotensor-cli --no-deps
 
   msrv:
     name: MSRV
