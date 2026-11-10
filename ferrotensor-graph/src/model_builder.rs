@@ -397,7 +397,7 @@ impl<'a> Lfm2ModelBuilder<'a> {
             self.maybe_add_lora(Linear::new(weight), "lm_head", 0)
         };
 
-        Ok(Lfm2Model::new(embed_tokens, None, layers, norm_f, lm_head))
+        Ok(Lfm2Model::new(embed_tokens, None, layers, norm_f, lm_head).with_architecture(arch))
     }
 }
 

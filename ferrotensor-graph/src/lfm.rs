@@ -1,3 +1,4 @@
+use crate::model_builder::Architecture;
 use crate::{Attention, KVCacheLayer, Linear, RMSNorm, Tensor, MLP};
 use ferrotensor_backend::{ComputeEngine, UnifiedTensor};
 use std::cell::OnceCell;
@@ -146,12 +147,21 @@ impl Lfm2Block {
         p
     }
 
-    /// Parameters keyed by Hugging Face-style names under `prefix`.
+    /// Parameters keyed by LFM2 names under `prefix` (`operator_norm`,
+    /// `ffn_norm`, `feed_forward`); see [`named_params_as`](Self::named_params_as).
     pub fn named_params(&self, prefix: &str) -> HashMap<String, Tensor> {
+        self.named_params_as(prefix, Architecture::Lfm2)
+    }
+
+    /// Parameters keyed by the names of `arch` under `prefix`. For
+    /// [`Architecture::Llama`] these are the Hugging Face Llama names
+    /// (`input_layernorm`, `post_attention_layernorm`, `mlp.*`).
+    pub fn named_params_as(&self, prefix: &str, arch: Architecture) -> HashMap<String, Tensor> {
+        let [op_norm, mlp_norm, mlp] = block_names(arch);
         let mut map = HashMap::new();
         map.extend(
             self.operator_norm
-                .named_params(&format!("{}.operator_norm", prefix)),
+                .named_params(&format!("{}.{op_norm}", prefix)),
         );
         match &self.op {
             Lfm2LayerOp::Conv(c) => map.extend(c.named_params(&format!("{}.conv", prefix))),
@@ -159,13 +169,27 @@ impl Lfm2Block {
                 map.extend(a.named_params(&format!("{}.self_attn", prefix)))
             }
         }
-        map.extend(self.ffn_norm.named_params(&format!("{}.ffn_norm", prefix)));
-        map.extend(self.mlp.named_params(&format!("{}.feed_forward", prefix)));
+        map.extend(
+            self.ffn_norm
+                .named_params(&format!("{}.{mlp_norm}", prefix)),
+        );
+        map.extend(self.mlp.named_params(&format!("{}.{mlp}", prefix)));
         map
     }
 
-    /// LoRA tensors keyed by name under `prefix`.
+    /// LoRA tensors keyed by LFM2 names under `prefix`; see
+    /// [`named_lora_params_as`](Self::named_lora_params_as).
     pub fn named_lora_params(&self, prefix: &str) -> HashMap<String, Tensor> {
+        self.named_lora_params_as(prefix, Architecture::Lfm2)
+    }
+
+    /// LoRA tensors keyed by the names of `arch` under `prefix`.
+    pub fn named_lora_params_as(
+        &self,
+        prefix: &str,
+        arch: Architecture,
+    ) -> HashMap<String, Tensor> {
+        let [_, _, mlp] = block_names(arch);
         let mut map = match &self.op {
             Lfm2LayerOp::Conv(c) => c.named_lora_params(&format!("{}.conv", prefix)),
             Lfm2LayerOp::Attention(a) => a
@@ -176,12 +200,58 @@ impl Lfm2Block {
         };
         map.extend(
             self.mlp
-                .named_params(&format!("{}.feed_forward", prefix))
+                .named_params(&format!("{}.{mlp}", prefix))
                 .into_iter()
                 .filter(|(name, _)| name.contains("lora_")),
         );
         map
     }
+}
+
+/// Block-level module names of `arch`: operator norm, MLP norm, MLP.
+fn block_names(arch: Architecture) -> [&'static str; 3] {
+    match arch {
+        Architecture::Llama => ["input_layernorm", "post_attention_layernorm", "mlp"],
+        Architecture::Lfm2 => ["operator_norm", "ffn_norm", "feed_forward"],
+    }
+}
+
+/// Pairs of (Hugging Face Llama name, name earlier releases used) for the
+/// block modules whose names changed for Llama-style models.
+const LLAMA_RENAMES: [(&str, &str); 3] = [
+    (".input_layernorm.", ".operator_norm."),
+    (".post_attention_layernorm.", ".ffn_norm."),
+    (".mlp.", ".feed_forward."),
+];
+
+/// The name a Llama-style parameter had before Ferrotensor used Hugging
+/// Face names for Llama blocks, or `None` when the name did not change
+/// (attention projections, `lm_head`, embeddings, the final norm, and every
+/// LFM2 name).
+///
+/// `model.layers.0.mlp.gate_proj.lora_A.weight` was
+/// `model.layers.0.feed_forward.gate_proj.lora_A.weight`.
+pub fn legacy_llama_name(name: &str) -> Option<String> {
+    if !name.starts_with("model.layers.") {
+        return None;
+    }
+    LLAMA_RENAMES
+        .iter()
+        .find(|(new, _)| name.contains(new))
+        .map(|(new, old)| name.replacen(new, old, 1))
+}
+
+/// The inverse of [`legacy_llama_name`]: the Hugging Face Llama name of a
+/// parameter named the old way, or `None` when `name` is not an old
+/// Llama-block name.
+pub fn llama_name_from_legacy(name: &str) -> Option<String> {
+    if !name.starts_with("model.layers.") {
+        return None;
+    }
+    LLAMA_RENAMES
+        .iter()
+        .find(|(_, old)| name.contains(old))
+        .map(|(new, old)| name.replacen(old, new, 1))
 }
 
 /// A decoder-only language model: LFM2 (mixed conv/attention blocks) or
@@ -202,10 +272,13 @@ pub struct Lfm2Model {
     /// Host copy of `embed_tokens`, read once on first use (the embedding
     /// lookup runs on the CPU).
     embed_host: OnceCell<Vec<f32>>,
+    /// Naming family of [`named_params`](Self::named_params).
+    architecture: Architecture,
 }
 
 impl Lfm2Model {
-    /// Assemble a model from its parts.
+    /// Assemble a model from its parts. Parameters get LFM2 names until
+    /// [`with_architecture`](Self::with_architecture) says otherwise.
     pub fn new(
         embed_tokens: Tensor,
         embedding_norm: Option<RMSNorm>,
@@ -220,7 +293,23 @@ impl Lfm2Model {
             norm_f,
             lm_head,
             embed_host: OnceCell::new(),
+            architecture: Architecture::Lfm2,
         }
+    }
+
+    /// Set the family whose parameter names [`named_params`](Self::named_params)
+    /// and [`named_lora_params`](Self::named_lora_params) use: Hugging Face
+    /// Llama names for [`Architecture::Llama`], LFM2 names otherwise.
+    /// [`Lfm2ModelBuilder`](crate::model_builder::Lfm2ModelBuilder) sets it
+    /// from the checkpoint's config.
+    pub fn with_architecture(mut self, architecture: Architecture) -> Self {
+        self.architecture = architecture;
+        self
+    }
+
+    /// The naming family set by [`with_architecture`](Self::with_architecture).
+    pub fn architecture(&self) -> Architecture {
+        self.architecture
     }
 
     /// Whether every block is attention, so incremental decoding with a
@@ -383,7 +472,7 @@ impl Lfm2Model {
             map.extend(norm.named_params("model.embedding_norm"));
         }
         for (idx, layer) in self.layers.iter().enumerate() {
-            map.extend(layer.named_params(&format!("model.layers.{}", idx)));
+            map.extend(layer.named_params_as(&format!("model.layers.{}", idx), self.architecture));
         }
         map.extend(self.norm_f.named_params("model.norm"));
         map.extend(self.lm_head.named_params("lm_head"));
@@ -394,7 +483,9 @@ impl Lfm2Model {
     pub fn named_lora_params(&self) -> HashMap<String, Tensor> {
         let mut map = HashMap::new();
         for (idx, layer) in self.layers.iter().enumerate() {
-            map.extend(layer.named_lora_params(&format!("model.layers.{}", idx)));
+            map.extend(
+                layer.named_lora_params_as(&format!("model.layers.{}", idx), self.architecture),
+            );
         }
         map.extend(
             self.lm_head
@@ -403,5 +494,50 @@ impl Lfm2Model {
                 .filter(|(name, _)| name.contains("lora_")),
         );
         map
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{legacy_llama_name, llama_name_from_legacy};
+
+    #[test]
+    fn llama_block_names_map_to_and_from_the_old_names() {
+        let pairs = [
+            (
+                "model.layers.3.input_layernorm.weight",
+                "model.layers.3.operator_norm.weight",
+            ),
+            (
+                "model.layers.3.post_attention_layernorm.weight",
+                "model.layers.3.ffn_norm.weight",
+            ),
+            (
+                "model.layers.0.mlp.gate_proj.lora_A.weight",
+                "model.layers.0.feed_forward.gate_proj.lora_A.weight",
+            ),
+            (
+                "model.layers.11.mlp.down_proj.weight",
+                "model.layers.11.feed_forward.down_proj.weight",
+            ),
+        ];
+        for (new, old) in pairs {
+            assert_eq!(legacy_llama_name(new).as_deref(), Some(old));
+            assert_eq!(llama_name_from_legacy(old).as_deref(), Some(new));
+        }
+    }
+
+    #[test]
+    fn unchanged_names_have_no_legacy_form() {
+        for name in [
+            "model.layers.0.self_attn.q_proj.lora_A.weight",
+            "model.layers.0.self_attn.o_proj.weight",
+            "lm_head.lora_B.weight",
+            "model.norm.weight",
+            "model.embed_tokens.weight",
+        ] {
+            assert_eq!(legacy_llama_name(name), None, "{name}");
+            assert_eq!(llama_name_from_legacy(name), None, "{name}");
+        }
     }
 }

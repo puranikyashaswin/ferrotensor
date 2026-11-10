@@ -6,7 +6,8 @@
 //! gradient-norm clipping, an optional learning-rate schedule, a loss scaler
 //! and file-based multi-process gradient averaging. [`data`] builds SFT and
 //! pretraining datasets, [`checkpoint`] saves and restores LoRA adapters and
-//! optimizer state.
+//! optimizer state, and [`peft`] converts adapters to and from the Hugging
+//! Face PEFT format.
 
 #![warn(missing_docs)]
 
@@ -21,6 +22,7 @@ pub mod checkpoint;
 pub mod data;
 pub mod demo;
 pub mod distributed;
+pub mod peft;
 pub mod scaler;
 
 pub use data::{build_sft_example, Batch, DataLoader, Dataset, TextDataset, TrainingExample};
