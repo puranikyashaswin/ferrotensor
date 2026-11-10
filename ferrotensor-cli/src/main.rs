@@ -5,9 +5,12 @@
 //! ferrotensor-cli train    --model DIR --data train.jsonl --out runs/sft
 //! ferrotensor-cli eval     --model DIR --data val.jsonl --lora runs/sft/lora_adapters.safetensors
 //! ferrotensor-cli generate --model DIR --lora runs/sft/lora_adapters.safetensors --prompt "Hi"
+//! ferrotensor-cli classify-train   --model DIR --data train.jsonl --output runs/cls
+//! ferrotensor-cli classify-predict --model DIR --classifier runs/cls --data test.jsonl --output probs.jsonl
 //! ferrotensor-cli info --check
 //! ```
 
+mod classify;
 mod info;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -55,6 +58,11 @@ enum Command {
     /// Generate text from a prompt (top-k / top-p / temperature sampling).
     #[command(visible_alias = "infer")]
     Generate(GenerateArgs),
+    /// LoRA fine-tuning of a decoder as a text classifier, from JSONL
+    /// {"text", "label"} lines.
+    ClassifyTrain(Box<classify::ClassifyTrainArgs>),
+    /// Class probabilities for every JSONL line, from a classify-train output.
+    ClassifyPredict(classify::ClassifyPredictArgs),
     /// Simulated training UI (does not train anything).
     #[command(long_flag = "demo")]
     Demo,
@@ -320,6 +328,8 @@ fn main() {
         Command::Train(args) => pollster::block_on(train(*args)),
         Command::Eval(args) => pollster::block_on(eval(args)),
         Command::Generate(args) => pollster::block_on(generate(args)),
+        Command::ClassifyTrain(args) => pollster::block_on(classify::classify_train(*args)),
+        Command::ClassifyPredict(args) => pollster::block_on(classify::classify_predict(args)),
         Command::Demo => {
             ferrotensor_trainer::run_demo(ferrotensor_trainer::DemoConfig::default());
             Ok(())
@@ -1224,6 +1234,158 @@ mod tests {
             parse(&["--demo"]).expect("parse").command,
             Command::Demo
         ));
+    }
+
+    #[test]
+    fn classify_train_has_the_documented_defaults() {
+        let cli = parse(&[
+            "classify-train",
+            "--model",
+            "m",
+            "--data",
+            "d.jsonl",
+            "--output",
+            "out",
+        ])
+        .expect("parse");
+        let Command::ClassifyTrain(t) = cli.command else {
+            panic!("expected classify-train");
+        };
+        assert_eq!(t.taps, None);
+        assert_eq!(t.max_len, 384);
+        assert_eq!((t.rank, t.alpha), (16, 32.0));
+        assert_eq!(
+            t.lora_targets,
+            vec![
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj"
+            ]
+        );
+        assert!((t.lr - 1e-4).abs() < 1e-12 && (t.head_lr - 1e-3).abs() < 1e-12);
+        assert_eq!((t.epochs, t.batch_size, t.grad_accum), (2, 8, 2));
+        assert_eq!((t.clip_grad_norm, t.warmup_steps, t.seed), (1.0, 0, 0));
+        assert_eq!(t.log_every, 10);
+        assert!(
+            !t.no_skip_first_token,
+            "the first token is skipped by default"
+        );
+        assert!(t.batches.is_none() && t.eval.is_none());
+        assert!(!t.model.f32_weights, "f16 base weights by default");
+    }
+
+    #[test]
+    fn classify_train_parses_flags() {
+        let cli = parse(&[
+            "classify-train",
+            "--model",
+            "m",
+            "--data",
+            "d.jsonl",
+            "--output",
+            "out",
+            "--taps",
+            "4,8",
+            "--lora-targets",
+            "q_proj,v_proj",
+            "--no-skip-first-token",
+            "--batches",
+            "plan.jsonl",
+            "--eval",
+            "val.jsonl",
+            "--f32-weights",
+        ])
+        .expect("parse");
+        let Command::ClassifyTrain(t) = cli.command else {
+            panic!("expected classify-train");
+        };
+        assert_eq!(t.taps, Some(vec![4, 8]));
+        assert_eq!(t.lora_targets, vec!["q_proj", "v_proj"]);
+        assert!(t.no_skip_first_token);
+        assert_eq!(t.batches, Some(PathBuf::from("plan.jsonl")));
+        assert_eq!(t.eval, Some(PathBuf::from("val.jsonl")));
+        assert!(t.model.f32_weights);
+
+        // The last of the two skip flags wins.
+        let base = [
+            "classify-train",
+            "--model",
+            "m",
+            "--data",
+            "d",
+            "--output",
+            "o",
+        ];
+        let last = |flags: &[&str]| {
+            let args: Vec<&str> = base.iter().chain(flags).copied().collect();
+            match parse(&args).expect("parse").command {
+                Command::ClassifyTrain(t) => !t.no_skip_first_token,
+                _ => panic!("expected classify-train"),
+            }
+        };
+        assert!(last(&["--no-skip-first-token", "--skip-first-token"]));
+        assert!(!last(&["--skip-first-token", "--no-skip-first-token"]));
+
+        assert!(parse(&["classify-train", "--model", "m", "--data", "d"]).is_err());
+        assert!(parse(&[
+            "classify-train",
+            "--model",
+            "m",
+            "--data",
+            "d",
+            "--output",
+            "o",
+            "--taps",
+            "x"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn classify_predict_parses_flags() {
+        let cli = parse(&[
+            "classify-predict",
+            "--model",
+            "m",
+            "--classifier",
+            "runs/cls",
+            "--data",
+            "test.jsonl",
+            "--output",
+            "probs.jsonl",
+        ])
+        .expect("parse");
+        let Command::ClassifyPredict(p) = cli.command else {
+            panic!("expected classify-predict");
+        };
+        assert_eq!(p.classifier, PathBuf::from("runs/cls"));
+        assert_eq!(p.output, PathBuf::from("probs.jsonl"));
+        assert_eq!(p.batch_size, 8);
+        assert!(parse(&[
+            "classify-predict",
+            "--model",
+            "m",
+            "--data",
+            "d",
+            "--output",
+            "o"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn taps_must_be_distinct_blocks_of_the_model() {
+        assert!(classify::check_taps(&[2, 4], 4).is_ok());
+        assert!(classify::check_taps(&[], 4).is_err());
+        assert!(classify::check_taps(&[0], 4).is_err());
+        assert!(classify::check_taps(&[5], 4).is_err());
+        assert!(classify::check_taps(&[3, 3], 4)
+            .expect_err("duplicate")
+            .contains("twice"));
     }
 
     #[test]
