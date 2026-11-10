@@ -154,12 +154,15 @@ fn transpose(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     out
 }
 
+/// Shape and values of each tensor, by slot.
+type Slots<'a> = BTreeMap<LoraSlot, (&'a Vec<usize>, &'a Vec<f32>)>;
+
 /// Check that `tensors` (Ferrotensor names, old or new, and layout) form an
 /// adapter PEFT can represent, and return them keyed by slot plus the rank.
 fn collect_slots(
     tensors: &HashMap<String, (Vec<usize>, Vec<f32>)>,
     n_layers: usize,
-) -> Result<(BTreeMap<LoraSlot, (&Vec<usize>, &Vec<f32>)>, usize)> {
+) -> Result<(Slots<'_>, usize)> {
     if tensors.is_empty() {
         return Err("the adapter has no LoRA tensors".into());
     }
