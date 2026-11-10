@@ -324,6 +324,10 @@ training normally (losses 1.4960 and 1.6540).
   a Llama-style model in one pass, padded to the longest, with the same
   result as one at a time; the logits and their gradient grow with N (about
   50 MB each per SmolLM2 sequence of 256 tokens), so GPU memory grows with N.
-- The tested architecture is Llama-style. Released LFM2 checkpoints are
-  rejected because per-head q/k layernorm is not implemented. LFM2 conv
-  blocks also lack the B/C gating and a backward pass.
+- The tested architecture is Llama-style. Qwen3-style attention (per-head
+  RMSNorm of queries and keys before RoPE, `q_norm`/`k_norm`) is implemented
+  and checked on a small synthetic model against a CPU reference of the
+  forward pass; real Qwen3 checkpoints are not measured yet. Released LFM2
+  checkpoints are rejected because their per-head q/k layernorm
+  (`q_layernorm`) is not wired up, and LFM2 conv blocks also lack the B/C
+  gating and a backward pass.

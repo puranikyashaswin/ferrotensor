@@ -166,7 +166,7 @@ tested, incomplete, or only checked on one machine.
 | `DataLoader` | **Stable** | Batching, seeded shuffling, optional prefetching on a background thread (`epoch_prefetched`) |
 | Reproducible randomness | **Stable** | `manual_seed` (Rust and Python) seeds random tensors, layer initialisation and dropout |
 | LoRA fine-tuning of Llama-style models (`ferrotensor-cli`) | **Experimental** | Measured with SmolLM2-135M on an 8 GB Apple M2, and SmolLM2-135M, 360M and 1.7B on an NVIDIA A10G; see the [LoRA walkthrough](docs/examples/lora-sft.md). Larger models are untested |
-| Llama / LFM2-style blocks (`ferrotensor-graph`) | **Experimental** | Attention with RoPE, SwiGLU MLP, RMSNorm, KV cache |
+| Llama / LFM2-style blocks (`ferrotensor-graph`) | **Experimental** | Attention with RoPE, SwiGLU MLP, RMSNorm, KV cache. Qwen3-style per-head q/k norms are implemented and checked on a small synthetic model against a CPU reference; real Qwen3 checkpoints are not measured yet |
 | Flash attention kernels (`ferrotensor-backend`) | **Experimental** | Forward v2 and a backward kernel; see `tests/flash_grad_check.rs` |
 | FP16 loss scaling, checkpoint/resume (`ferrotensor-trainer`) | **Experimental** | |
 | Terminal monitor, Hub download helpers | **Experimental** | `ferrotensor-monitor`, `ferrotensor-hub` |
