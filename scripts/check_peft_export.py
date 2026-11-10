@@ -62,7 +62,9 @@ def main() -> None:
     # Every tensor of the file reached the model, and the model has no
     # adapter tensor the file lacks.
     saved = load_file(str(Path(args.adapter) / "adapter_model.safetensors"))
-    loaded = get_peft_model_state_dict(model)
+    # save_embedding_layers=False: with lm_head among the targets PEFT would
+    # otherwise add the base lm_head weight, which is not part of an adapter.
+    loaded = get_peft_model_state_dict(model, save_embedding_layers=False)
     if set(saved) != set(loaded):
         fail(
             "adapter keys differ: only in file "
