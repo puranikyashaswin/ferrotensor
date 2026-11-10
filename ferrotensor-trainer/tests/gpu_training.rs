@@ -262,6 +262,7 @@ fn checkpoint_resume_round_trip_continues_identically() {
         rank: 4,
         alpha: 8.0,
         target_modules: lora_config().target_modules,
+        trained_modules: None,
     };
 
     // Run A: 5 steps, checkpoint, 3 more steps.

@@ -153,12 +153,14 @@ struct TrainArgs {
         default_value = "outputs/run"
     )]
     out: PathBuf,
-    /// Where to write the adapter [default: OUT/lora_adapters.safetensors].
+    /// Where to write the adapter, or the trained weights when --train-modules
+    /// is not lora [default: OUT/lora_adapters.safetensors, or
+    /// OUT/trained_weights.safetensors].
     #[arg(long, value_name = "FILE")]
     save_lora: Option<PathBuf>,
-    /// Resume from an adapter written by a previous run (its .state.json and
-    /// .state.safetensors next to it restore the step counter and optimizer
-    /// state).
+    /// Resume from the adapter (or trained weights) written by a previous run
+    /// with the same --train-modules (its .state.json and .state.safetensors
+    /// next to it restore the step counter and optimizer state).
     #[arg(long, value_name = "FILE")]
     resume: Option<PathBuf>,
     /// Peak learning rate.
@@ -200,7 +202,9 @@ struct TrainArgs {
         default_value = "q_proj,k_proj,v_proj,o_proj"
     )]
     lora_targets: Vec<String>,
-    /// What to train: lora, or base weights by group (all, attn, mlp, norm, lm_head).
+    /// What to train: lora, or base weights by group (all, attn, mlp, norm,
+    /// lm_head). Trained base weights are saved in f32, only the tensors that
+    /// trained, and load with --lora in eval and generate or with --resume.
     #[arg(long, default_value = "lora")]
     train_modules: String,
     /// Log every N optimizer steps.
@@ -246,6 +250,8 @@ struct EvalArgs {
     #[command(flatten)]
     data: DataArgs,
     /// LoRA adapter to apply: a Ferrotensor file or a PEFT adapter directory.
+    /// A file of trained base weights (from --train-modules other than lora)
+    /// also works; the model then loads in f32.
     #[arg(long, value_name = "FILE")]
     lora: Option<PathBuf>,
 }
@@ -282,7 +288,9 @@ struct GenerateArgs {
     #[command(flatten)]
     model: ModelArgs,
     /// LoRA adapter to apply: a Ferrotensor file (rank, alpha and targets are
-    /// read from it) or a PEFT adapter directory.
+    /// read from it) or a PEFT adapter directory. A file of trained base
+    /// weights (from --train-modules other than lora) also works; the model
+    /// then loads in f32.
     #[arg(long, value_name = "FILE")]
     lora: Option<PathBuf>,
     /// The user message (wrapped in the ChatML template unless --raw).
@@ -427,11 +435,16 @@ async fn load_base(args: &ModelArgs) -> Result<Loaded> {
     })
 }
 
+/// Build the model. `saved` is the metadata of the file the model will load,
+/// if any: LoRA settings give the model adapters of that shape; trained base
+/// weights give it none and store every weight as f32 (what the file holds,
+/// and what training used), whatever `--f32-weights` says.
 fn build_model(
     base: &Loaded,
-    lora: Option<&LoraMetadata>,
+    saved: Option<&LoraMetadata>,
     trainable_base: bool,
 ) -> Result<Lfm2Model> {
+    let weights_file = saved.is_some_and(|m| m.trained_modules.is_some());
     let mut builder = Lfm2ModelBuilder::new(
         base.ctx.clone(),
         base.engine.clone(),
@@ -439,8 +452,8 @@ fn build_model(
         base.config.clone(),
     )
     .with_trainable_base(trainable_base)
-    .with_f16_weights(base.f16_weights);
-    if let Some(meta) = lora {
+    .with_f16_weights(base.f16_weights && !weights_file);
+    if let Some(meta) = saved.filter(|m| m.trained_modules.is_none()) {
         builder = builder.with_lora(LoRaConfig {
             rank: meta.rank,
             alpha: meta.alpha,
@@ -459,12 +472,84 @@ fn read_adapter(path: &Path) -> Result<LoraCheckpoint> {
     }
 }
 
-/// Load `path` and copy it into the model's LoRA tensors.
+/// The tensors of `model` that a file with this metadata holds: the base
+/// weights selected by `trained_modules` for a file of trained weights, the
+/// LoRA adapters otherwise.
+fn restorable_params(
+    model: &Lfm2Model,
+    meta: Option<&LoraMetadata>,
+) -> Result<HashMap<String, ferrotensor_autograd::Tensor>> {
+    match meta.and_then(|m| m.trained_modules.as_deref()) {
+        Some(modules) => select_train_params(model, modules),
+        None => Ok(model.named_lora_params()),
+    }
+}
+
+/// Load `path` and copy it into the model: its LoRA tensors, or the trained
+/// base weights the file holds.
 fn restore_adapter(base: &Loaded, model: &Lfm2Model, path: &Path) -> Result<usize> {
-    let ckpt = read_adapter(path)?;
-    let n = apply_checkpoint(&base.ctx, &ckpt, &model.named_lora_params())
-        .map_err(|e| format!("{}: {e}", path.display()))?;
-    Ok(n)
+    restore_checkpoint(base, model, &read_adapter(path)?, path)
+}
+
+/// Copy the tensors of `ckpt` (read from `path`) into the model.
+fn restore_checkpoint(
+    base: &Loaded,
+    model: &Lfm2Model,
+    ckpt: &LoraCheckpoint,
+    path: &Path,
+) -> Result<usize> {
+    ensure_not_empty(ckpt, path)?;
+    let params = restorable_params(model, ckpt.metadata.as_ref())?;
+    apply_checkpoint(&base.ctx, ckpt, &params)
+        .map_err(|e| format!("{}: {e}", path.display()).into())
+}
+
+/// Reject a file without tensors. Versions before trained base weights were
+/// saved wrote such a file when training with `--train-modules` other than
+/// `lora`; nothing in it can be loaded.
+fn ensure_not_empty(ckpt: &LoraCheckpoint, path: &Path) -> Result<()> {
+    if ckpt.is_empty() {
+        return Err(format!(
+            "{} holds no tensors (older versions wrote an empty file when training base weights with --train-modules; that run's weights were not saved)",
+            path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// The line `eval` and `generate` print after loading `path`.
+fn loaded_line(path: &Path, tensors: usize, meta: Option<&LoraMetadata>) -> String {
+    match meta.and_then(|m| m.trained_modules.as_deref()) {
+        Some(modules) => format!(
+            "weights: {} ({tensors} tensors trained with --train-modules {modules})",
+            path.display()
+        ),
+        None => format!("lora:   {} ({tensors} tensors)", path.display()),
+    }
+}
+
+/// Whether `--resume` can continue a run of `train_modules` from a file with
+/// this metadata: a LoRA run needs an adapter file, a run that trains base
+/// weights needs the weights of the same modules.
+fn check_resume_file(meta: Option<&LoraMetadata>, train_modules: &str) -> Result<()> {
+    let lora_run = train_modules.eq_ignore_ascii_case("lora");
+    match (meta.and_then(|m| m.trained_modules.as_deref()), lora_run) {
+        (None, true) => Ok(()),
+        (Some(saved), false) if saved.eq_ignore_ascii_case(train_modules) => Ok(()),
+        (Some(saved), true) => Err(format!(
+            "it holds base weights trained with --train-modules {saved}, not a LoRA adapter; resume with --train-modules {saved}"
+        )
+        .into()),
+        (Some(saved), false) => Err(format!(
+            "it holds base weights trained with --train-modules {saved}, but this run trains {train_modules}"
+        )
+        .into()),
+        (None, false) => Err(format!(
+            "it is a LoRA adapter, but --train-modules {train_modules} trains base weights; resume with --train-modules lora"
+        )
+        .into()),
+    }
 }
 
 /// What `--resume` makes of the optimizer state it loaded at `step`: an error
@@ -490,7 +575,17 @@ fn check_optimizer_load(load: OptimizerLoad, step: usize) -> Result<Option<Strin
     )))
 }
 
-/// The LoRA settings stored in an adapter file.
+/// The metadata `train` writes next to the tensors it saves: the LoRA
+/// settings, or, when base weights train, the modules that trained.
+fn saved_metadata(lora: &LoraMetadata, train_modules: &str) -> LoraMetadata {
+    if train_modules.eq_ignore_ascii_case("lora") {
+        lora.clone()
+    } else {
+        LoraMetadata::trained_weights(&train_modules.to_ascii_lowercase())
+    }
+}
+
+/// The settings stored in an adapter or trained-weights file.
 fn adapter_metadata(path: &Path) -> Result<LoraMetadata> {
     read_adapter(path)?.metadata.ok_or_else(|| {
         format!(
@@ -510,6 +605,17 @@ fn export_adapter(args: ExportAdapterArgs) -> Result<()> {
     let config = ModelLoader::load_config(&config_path)
         .map_err(|e| format!("cannot read {}: {e}", config_path.display()))?;
     let ckpt = load_lora_checkpoint(&args.lora)?;
+    if let Some(modules) = ckpt
+        .metadata
+        .as_ref()
+        .and_then(|m| m.trained_modules.as_deref())
+    {
+        return Err(format!(
+            "{} holds base weights trained with --train-modules {modules}, not a LoRA adapter; there is nothing to export to PEFT",
+            args.lora.display()
+        )
+        .into());
+    }
     let base_model = args
         .base_model
         .unwrap_or_else(|| args.model.display().to_string());
@@ -688,7 +794,7 @@ async fn eval(args: EvalArgs) -> Result<()> {
     let model = build_model(&base, meta.as_ref(), false)?;
     if let Some(path) = &args.lora {
         let n = restore_adapter(&base, &model, path)?;
-        eprintln!("lora:   {} ({n} tensors)", path.display());
+        eprintln!("{}", loaded_line(path, n, meta.as_ref()));
     }
     let t = Instant::now();
     let (loss, tokens) = evaluate(&base, &model, &ds, usize::MAX).await;
@@ -710,7 +816,7 @@ async fn generate(args: GenerateArgs) -> Result<()> {
     let model = build_model(&base, meta.as_ref(), false)?;
     if let Some(path) = &args.lora {
         let n = restore_adapter(&base, &model, path)?;
-        eprintln!("lora:   {} ({n} tensors)", path.display());
+        eprintln!("{}", loaded_line(path, n, meta.as_ref()));
     }
     if !(0.0..=1.0).contains(&args.top_p) || args.temperature < 0.0 {
         return Err("--top-p must be in [0, 1] and --temperature >= 0".into());
@@ -916,6 +1022,7 @@ async fn train(mut args: TrainArgs) -> Result<()> {
         rank: args.lora_rank,
         alpha: args.lora_alpha,
         target_modules: args.lora_targets.clone(),
+        trained_modules: None,
     };
     let model = build_model(&base, lora_on.then_some(&meta), !lora_on)?;
     let named_params = select_train_params(&model, &args.train_modules)?;
@@ -930,10 +1037,14 @@ async fn train(mut args: TrainArgs) -> Result<()> {
 
     fs::create_dir_all(&args.out)
         .map_err(|e| format!("cannot create {}: {e}", args.out.display()))?;
-    let adapter_path = args
-        .save_lora
-        .clone()
-        .unwrap_or_else(|| args.out.join("lora_adapters.safetensors"));
+    let adapter_path = args.save_lora.clone().unwrap_or_else(|| {
+        args.out.join(if lora_on {
+            "lora_adapters.safetensors"
+        } else {
+            "trained_weights.safetensors"
+        })
+    });
+    let saved_meta = saved_metadata(&meta, &args.train_modules);
     let state_path = state_path_for(&adapter_path);
 
     // Data-parallel sharding: each rank trains on a disjoint slice.
@@ -980,10 +1091,14 @@ async fn train(mut args: TrainArgs) -> Result<()> {
         trainer = trainer.with_file_grad_sync(cfg);
     }
 
-    // Resume: adapter weights, optimizer moments, step counter.
+    // Resume: adapter or trained base weights, optimizer moments, step counter.
     let mut start_step = 0usize;
     if let Some(resume) = &args.resume {
-        let n = restore_adapter(&base, &trainer.model, resume)?;
+        let file = read_adapter(resume)?;
+        ensure_not_empty(&file, resume)?;
+        check_resume_file(file.metadata.as_ref(), &args.train_modules)
+            .map_err(|e| format!("{}: {e}", resume.display()))?;
+        let n = restore_checkpoint(&base, &trainer.model, &file, resume)?;
         let resume_state = state_path_for(resume);
         if resume_state.is_file() {
             let ckpt = TrainingCheckpoint::load(&resume_state)?;
@@ -1056,11 +1171,18 @@ async fn train(mut args: TrainArgs) -> Result<()> {
         if !is_root {
             return Ok(());
         }
+        // LoRA runs save the adapters; runs that train base weights save
+        // exactly the tensors that train.
+        let saved_params = if lora_on {
+            trainer.model.named_lora_params()
+        } else {
+            named_params.clone()
+        };
         pollster::block_on(save_lora_checkpoint(
             &base.ctx,
             &adapter_path,
-            &trainer.model.named_lora_params(),
-            Some(&meta),
+            &saved_params,
+            Some(&saved_meta),
         ))?;
         let state = TrainingState {
             step,
@@ -1360,6 +1482,49 @@ mod tests {
         );
     }
 
+    fn lora_meta() -> LoraMetadata {
+        LoraMetadata {
+            rank: 8,
+            alpha: 16.0,
+            target_modules: vec!["q_proj".into()],
+            trained_modules: None,
+        }
+    }
+
+    #[test]
+    fn lora_runs_save_their_lora_settings_and_base_runs_the_trained_modules() {
+        assert_eq!(saved_metadata(&lora_meta(), "lora"), lora_meta());
+        assert_eq!(saved_metadata(&lora_meta(), "LoRA"), lora_meta());
+        let weights = saved_metadata(&lora_meta(), "Attn");
+        assert_eq!(weights, LoraMetadata::trained_weights("attn"));
+        assert_eq!(weights.trained_modules.as_deref(), Some("attn"));
+        assert!(weights.target_modules.is_empty());
+    }
+
+    #[test]
+    fn resume_needs_a_file_of_the_same_kind() {
+        let weights = LoraMetadata::trained_weights("attn");
+        let ok = |meta: Option<&LoraMetadata>, modules: &str| check_resume_file(meta, modules);
+        assert!(ok(Some(&lora_meta()), "lora").is_ok());
+        assert!(ok(None, "lora").is_ok());
+        assert!(ok(Some(&weights), "attn").is_ok());
+        assert!(ok(Some(&weights), "ATTN").is_ok());
+
+        let err = ok(Some(&weights), "lora").unwrap_err().to_string();
+        assert!(
+            err.contains("not a LoRA adapter") && err.contains("attn"),
+            "{err}"
+        );
+        let err = ok(Some(&weights), "mlp").unwrap_err().to_string();
+        assert!(err.contains("attn") && err.contains("mlp"), "{err}");
+        let err = ok(Some(&lora_meta()), "all").unwrap_err().to_string();
+        assert!(
+            err.contains("LoRA adapter") && err.contains("--train-modules lora"),
+            "{err}"
+        );
+        assert!(ok(None, "all").is_err());
+    }
+
     #[test]
     fn optimizer_state_that_fits_nothing_is_an_error() {
         let load = |matched, missing, unused| OptimizerLoad {
@@ -1391,5 +1556,19 @@ mod tests {
         assert_eq!(check_optimizer_load(load(0, 4, 0), 0).unwrap(), None);
         assert!(check_optimizer_load(load(0, 4, 0), 5).is_err());
         assert!(check_optimizer_load(load(0, 4, 2), 0).is_err());
+    }
+
+    #[test]
+    fn loaded_line_names_what_was_loaded() {
+        let p = Path::new("out/x.safetensors");
+        let line = loaded_line(p, 8, Some(&LoraMetadata::trained_weights("mlp")));
+        assert!(
+            line.starts_with("weights:") && line.contains("--train-modules mlp"),
+            "{line}"
+        );
+        assert_eq!(
+            loaded_line(p, 8, Some(&lora_meta())),
+            "lora:   out/x.safetensors (8 tensors)"
+        );
     }
 }

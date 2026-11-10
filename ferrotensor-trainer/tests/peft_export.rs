@@ -277,6 +277,7 @@ fn adapter_with_old_llama_names_still_loads_with_identical_logits() {
         rank: RANK,
         alpha: ALPHA,
         target_modules: targets.iter().map(|t| t.to_string()).collect(),
+        trained_modules: None,
     };
     let path = dir.path().join("old.safetensors");
     pollster::block_on(save_lora_checkpoint(&gpu.ctx, &path, &old, Some(&meta))).expect("save");

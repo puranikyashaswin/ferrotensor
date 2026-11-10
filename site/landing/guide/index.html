@@ -280,7 +280,7 @@ EOF</pre></figure></div></li></ol>
 <ul>
 <li><code>--lora-rank</code>, <code>--lora-alpha</code> and <code>--lora-targets</code> change the adapter.</li>
 <li><code>--lite</code> is a preset for small machines: sequence length 128, rank 4 and grad-accum 8, unless you set them.</li>
-<li><code>--train-modules all|attn|mlp|norm|lm_head</code> trains base weights instead of LoRA.</li>
+<li><code>--train-modules all|attn|mlp|norm|lm_head</code> trains base weights instead of LoRA and saves the trained tensors, in f32, to <code>trained_weights.safetensors</code>. Pass that file to <code>--lora</code> in <code>eval</code> and <code>generate</code>, or to <code>--resume</code> with the same <code>--train-modules</code>.</li>
 <li><code>ferrotensor monitor</code> follows a run's <code>training_state.json</code> in a terminal dashboard.</li>
 </ul>
 <p>The same recipe on three model sizes on an NVIDIA A10G:</p>
