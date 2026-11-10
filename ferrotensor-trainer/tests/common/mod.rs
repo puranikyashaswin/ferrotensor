@@ -187,6 +187,17 @@ pub fn build_model_with(gpu: &Gpu, dir: &Path, f16_weights: bool) -> Lfm2Model {
         .expect("build")
 }
 
+/// [`build_model`] with the adapters described by `lora`.
+pub fn build_model_with_lora(gpu: &Gpu, dir: &Path, lora: LoRaConfig) -> Lfm2Model {
+    let config = ModelLoader::load_config(dir.join("config.json")).expect("config");
+    let mut weights = WeightsContext::new();
+    weights.load_model_dir(dir).expect("weights");
+    Lfm2ModelBuilder::new(gpu.ctx.clone(), gpu.engine.clone(), &weights, config)
+        .with_lora(lora)
+        .build()
+        .expect("build")
+}
+
 /// LoRA parameters in a stable (name-sorted) order.
 pub fn sorted_lora_params(model: &Lfm2Model) -> (Vec<String>, Vec<Tensor>) {
     let named = model.named_lora_params();
