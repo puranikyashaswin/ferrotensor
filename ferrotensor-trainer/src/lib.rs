@@ -559,6 +559,27 @@ pub fn masked_cross_entropy(
     })
 }
 
+/// Mean cross-entropy of class `logits` (`[batch, classes]`, e.g. from
+/// `ferrotensor_graph::ClassifierHead`) against one label per row, as a
+/// differentiable scalar computed on the GPU.
+///
+/// Returns `None` when the number of labels differs from the batch size or
+/// a label is not below `classes`, so a bad label cannot be skipped silently.
+pub fn classification_loss(
+    logits: &Tensor,
+    labels: &[u32],
+    engine: &ComputeEngine,
+) -> Option<MaskedLoss> {
+    let (batch, classes) = match logits.data.shape.as_slice() {
+        [batch, classes] => (*batch, *classes),
+        _ => return None,
+    };
+    if labels.len() != batch || labels.iter().any(|&l| l as usize >= classes) {
+        return None;
+    }
+    masked_cross_entropy(logits, labels, &vec![1u8; batch], engine)
+}
+
 /// The loss of a batch of sequences, see [`masked_cross_entropy_batch`].
 pub struct BatchLoss {
     /// Sum of the per-sequence mean losses `[1]`; call `backward` on it.
