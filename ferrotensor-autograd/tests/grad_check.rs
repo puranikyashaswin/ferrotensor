@@ -56,6 +56,16 @@ fn cases() -> Vec<Case> {
         case("add", vec![input(&[6], 1), input(&[6], 2)], |x, e| {
             Tensor::add(&x[0], &x[1], e)
         }),
+        // One leaf used twice: its first gradient is kept, the second is added.
+        case("shared_input", vec![input(&[6], 1)], |x, e| {
+            Tensor::add(&x[0], &x[0], e)
+        }),
+        // A leaf reached once directly and once through a reshape.
+        case("reshape_and_direct", vec![input(&[2, 3], 1)], |x, e| {
+            let flat = Tensor::reshape(&x[0], &[6]);
+            let back = Tensor::reshape(&flat, &[2, 3]);
+            Tensor::mul(&x[0], &back, e)
+        }),
         case("sub", vec![input(&[6], 1), input(&[6], 2)], |x, e| {
             Tensor::sub(&x[0], &x[1], e)
         }),
@@ -228,4 +238,47 @@ fn gpu_gradients_match_finite_differences() {
         "gradient mismatches:\n{}",
         failures.join("\n")
     );
+}
+
+#[test]
+fn scaling_one_gradient_in_place_leaves_others_alone() {
+    if std::env::var("FERROTENSOR_RUN_GPU_TESTS").as_deref() != Ok("1") {
+        eprintln!("skipping GPU in-place gradient test; set FERROTENSOR_RUN_GPU_TESTS=1 to enable");
+        return;
+    }
+    let ctx = Arc::new(pollster::block_on(WgpuContext::new()));
+    let engine = ComputeEngine::new(&ctx);
+    let p = Tensor::new(
+        ctx.clone(),
+        UnifiedTensor::new(&ctx, &values(6, 1, true), &[2, 3]),
+    );
+    let q = Tensor::new(
+        ctx.clone(),
+        UnifiedTensor::new(&ctx, &values(6, 2, true), &[6]),
+    );
+    let out = Tensor::add(&Tensor::reshape(&p, &[6]), &q, &engine);
+    out.backward(&engine);
+
+    let grad_of = |t: &Tensor| read(&ctx, t.grad.borrow().as_ref().expect("grad"));
+    for g in grad_of(&p).iter().chain(grad_of(&q).iter()) {
+        assert!(
+            (g - 1.0).abs() < 1e-6,
+            "expected a gradient of ones, got {g}"
+        );
+    }
+
+    engine.gradient_scale(&ctx, p.grad.borrow().as_ref().expect("grad"), 0.5);
+
+    for g in grad_of(&p) {
+        assert!(
+            (g - 0.5).abs() < 1e-6,
+            "p's gradient should be scaled to 0.5, got {g}"
+        );
+    }
+    for g in grad_of(&q) {
+        assert!(
+            (g - 1.0).abs() < 1e-6,
+            "q's gradient should stay 1.0, got {g}"
+        );
+    }
 }
