@@ -688,7 +688,7 @@ fn broken_index_files_are_an_error_that_names_the_index() {
     std::fs::create_dir_all(&model).expect("mkdir");
     let index = model.join("model.safetensors.index.json");
     let long_name = "x".repeat(10_000);
-    let bad_shard_name = format!(r#"{{"weight_map":{{"a":"{long_name}"}}}}"#);
+    let bad_shard_name = format!(r#"{{"weight_map":{{"a":"{long_name}.safetensors"}}}}"#);
     for text in [
         "",
         "{not json",

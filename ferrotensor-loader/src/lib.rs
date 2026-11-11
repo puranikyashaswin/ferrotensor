@@ -199,6 +199,11 @@ fn check_range(
     Ok(())
 }
 
+/// Whether `divisor` divides `n` exactly (false for a zero divisor).
+fn divides(divisor: usize, n: usize) -> bool {
+    n.checked_rem(divisor) == Some(0)
+}
+
 /// Rejects configs whose sizes are zero, absurdly large, or inconsistent.
 fn validate_config(path: &Path, c: &Lfm2Config) -> Result<(), LoaderError> {
     check_range(path, "hidden_size", c.hidden_size, 1, MAX_HIDDEN_SIZE)?;
@@ -233,7 +238,7 @@ fn validate_config(path: &Path, c: &Lfm2Config) -> Result<(), LoaderError> {
             check_range(path, field, v, 1, max)?;
         }
     }
-    if c.head_dim.is_none() && c.hidden_size % c.num_attention_heads != 0 {
+    if c.head_dim.is_none() && !divides(c.num_attention_heads, c.hidden_size) {
         return Err(json_error(
             path,
             format!(
@@ -244,7 +249,7 @@ fn validate_config(path: &Path, c: &Lfm2Config) -> Result<(), LoaderError> {
     }
     if let Some(kv) = c.num_key_value_heads {
         check_range(path, "num_key_value_heads", kv, 1, c.num_attention_heads)?;
-        if c.num_attention_heads % kv != 0 {
+        if !divides(kv, c.num_attention_heads) {
             return Err(json_error(
                 path,
                 format!(
