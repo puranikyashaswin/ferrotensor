@@ -47,3 +47,48 @@ A full walkthrough with measured numbers is in
   `training_state.json` (read by `ferrotensor-cli monitor`).
 - `ferrotensor-cli demo` (or `--demo`) plays a simulated training UI; it does not
   train anything.
+
+## Where GPU memory goes: `--memory-report`
+
+`train --memory-report` prints a table of GPU memory by category after the
+model loads and after each of the first 3 optimizer steps
+(`--memory-report=N` for N steps), and writes the same numbers in bytes to
+`OUT/memory_report.json`. Without the flag nothing is printed and training
+is unchanged.
+
+```bash
+cargo run -p ferrotensor-cli --release -- train \
+  --model ./data/models/SmolLM2-135M --data ./data/alpaca/train.jsonl \
+  --out ./data/runs/mem --max-steps 3 --memory-report
+```
+
+Each table has two columns: the bytes at the highest point of that phase
+(the model load, or one optimizer step of `--batch-size` x `--grad-accum`
+sequences) and at the highest point seen so far in the run. The rows:
+
+| Row | What it holds |
+|---|---|
+| base weights (frozen) | Model weights uploaded when the model is built, split into f16 (linear layers with the default f16 weights) and f32 (embedding, norms, or every weight with `--f32-weights`) |
+| trainable parameters | The LoRA adapters, or the base weights `--train-modules` selects |
+| optimizer state | The AdamW moments, two f32 tensors per trainable tensor |
+| activations | Forward outputs and intermediates, kept by the autograd graph until the step's backward is done |
+| parameter gradients | Gradients of the trainable parameters |
+| backward scratch | Everything else created during backward: gradients of activations and kernel temporaries |
+| loss (vocab-sized) | The logits, `d loss / d logits` and the logits' gradient |
+| readback staging | Buffers that copy results to the host |
+| other | Buffers created outside these phases (e.g. gradient-norm partial sums) |
+| pool idle | Freed buffers the pool keeps for reuse; still allocated on the GPU |
+
+Below the table: how much of the live bytes the tensors' shapes need
+(wgpu rounds every buffer up to 4 bytes), the highest live plus pool-idle
+total of the phase, and the 10 largest live buffers at the phase peak with
+their category, dtype and shape.
+
+The report counts only buffers Ferrotensor allocated through wgpu, so it is
+lower than `nvidia-smi` or Activity Monitor. Not counted: driver and
+allocator overhead and alignment, compiled pipelines and shaders, uniform
+buffers, the staging copies wgpu makes for uploads (released every 256 MiB
+of uploads), and buffers of the `ferrotensor` tensor API. A buffer is
+counted under the phase that created it; the logits, the loss gradient and
+the parameter gradients are moved to their own rows when the trainer knows
+what they are, and the phase peak is corrected for that move.

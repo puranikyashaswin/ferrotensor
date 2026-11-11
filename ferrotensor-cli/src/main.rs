@@ -9,10 +9,11 @@
 //! ```
 
 mod info;
+mod memory_report;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use ferrotensor_autograd::{AdamW, WarmupCosineScheduler};
-use ferrotensor_backend::{ComputeEngine, WgpuContext};
+use ferrotensor_backend::{ComputeEngine, MemoryCategory, WgpuContext};
 use ferrotensor_graph::lfm::Lfm2Model;
 use ferrotensor_graph::model_builder::{Lfm2ModelBuilder, LoRaConfig};
 use ferrotensor_loader::{Lfm2Config, ModelLoader, Sampler, Tokenizer, WeightsContext};
@@ -233,6 +234,16 @@ struct TrainArgs {
     /// Shared directory for gradient exchange [default: OUT/grad_sync].
     #[arg(long, value_name = "DIR")]
     sync_dir: Option<PathBuf>,
+    /// Print GPU memory by category after the model loads and after each of
+    /// the first STEPS optimizer steps, and write OUT/memory_report.json.
+    #[arg(
+        long,
+        value_name = "STEPS",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "3"
+    )]
+    memory_report: Option<usize>,
 }
 
 #[derive(Args, Debug)]
@@ -822,16 +833,27 @@ async fn train(mut args: TrainArgs) -> Result<()> {
         alpha: args.lora_alpha,
         target_modules: args.lora_targets.clone(),
     };
-    let model = build_model(&base, lora_on.then_some(&meta), !lora_on)?;
+    let mut memory = args.memory_report.map(|steps| {
+        let json = is_root.then(|| args.out.join(memory_report::FILE_NAME));
+        memory_report::MemoryReportRun::start(&base.ctx, steps, json)
+    });
+    let model = {
+        let _tag = base.ctx.memory().scope(MemoryCategory::BaseWeights);
+        build_model(&base, lora_on.then_some(&meta), !lora_on)?
+    };
     let named_params = select_train_params(&model, &args.train_modules)?;
     let train_params: Vec<_> = {
         let mut names: Vec<&String> = named_params.keys().collect();
         names.sort();
         names.into_iter().map(|n| named_params[n].clone()).collect()
     };
+    ferrotensor_trainer::memory::tag_trainable(&train_params);
 
     fs::create_dir_all(&args.out)
         .map_err(|e| format!("cannot create {}: {e}", args.out.display()))?;
+    if let Some(m) = memory.as_mut() {
+        m.after_load()?;
+    }
     let adapter_path = args
         .save_lora
         .clone()
@@ -896,6 +918,7 @@ async fn train(mut args: TrainArgs) -> Result<()> {
                 &args.model.model.display().to_string(),
             )?;
             if let Some(opt) = &ckpt.optimizer_state {
+                let _tag = base.ctx.memory().scope(MemoryCategory::OptimizerState);
                 if !trainer.optimizer.load_state(&base.ctx, &named_params, opt) {
                     log::warn!(
                         "optimizer state in {} did not apply",
@@ -1005,6 +1028,9 @@ async fn train(mut args: TrainArgs) -> Result<()> {
     let mut last_loss = f32::NAN;
     let mut last_norm = 0.0f32;
     let mut last_lr = 0.0f32;
+    if let Some(m) = &memory {
+        m.begin_steps();
+    }
 
     'outer: for epoch in 0.. {
         loader.set_epoch(epoch as u64);
@@ -1031,6 +1057,9 @@ async fn train(mut args: TrainArgs) -> Result<()> {
                     continue;
                 }
                 step += 1;
+                if let Some(m) = memory.as_mut() {
+                    m.after_step(step, step - start_step)?;
+                }
                 if step.is_multiple_of(args.log_every.max(1)) || step == total_steps {
                     let loss = (win_loss / win_tok.max(1) as f64) as f32;
                     let secs = win_start.elapsed().as_secs_f32();
@@ -1177,6 +1206,23 @@ mod tests {
         assert_eq!(t.lora_targets, vec!["q_proj", "v_proj"]);
         assert_eq!(t.max_steps, Some(5));
         assert!((t.lr - 1e-3).abs() < 1e-9);
+        assert_eq!(t.memory_report, None);
+    }
+
+    #[test]
+    fn memory_report_takes_an_optional_step_count() {
+        let steps = |extra: &[&str]| {
+            let mut args = vec!["train", "--model", "m", "--data", "d.jsonl"];
+            args.extend_from_slice(extra);
+            match parse(&args).expect("parse").command {
+                Command::Train(t) => t.memory_report,
+                _ => panic!("expected train"),
+            }
+        };
+        assert_eq!(steps(&["--memory-report"]), Some(3));
+        assert_eq!(steps(&["--memory-report=5"]), Some(5));
+        assert_eq!(steps(&["--memory-report", "--lite"]), Some(3));
+        assert_eq!(steps(&[]), None);
     }
 
     #[test]
