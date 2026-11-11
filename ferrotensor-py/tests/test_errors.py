@@ -206,7 +206,8 @@ def lr_setter(value):
     ],
 )
 def test_more_errors_are_python_exceptions(fn, exc, match):
-    with pytest.raises(exc, match=match):
+    # An empty match means only the exception type is checked (Python's own message).
+    with pytest.raises(exc, match=match or None):
         fn()
 
 
