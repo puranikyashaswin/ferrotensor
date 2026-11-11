@@ -170,7 +170,9 @@ tested, incomplete, or only checked on one machine.
 | LoRA fine-tuning of Llama-style models (`ferrotensor-cli`) | **Experimental** | Measured with SmolLM2-135M on an 8 GB Apple M2, and SmolLM2-135M, 360M and 1.7B on an NVIDIA A10G; see the [LoRA walkthrough](docs/examples/lora-sft.md). Larger models are untested |
 | Llama / LFM2-style blocks (`ferrotensor-graph`) | **Experimental** | Attention with RoPE, SwiGLU MLP, RMSNorm, KV cache |
 | Flash attention kernels (`ferrotensor-backend`) | **Experimental** | Forward v2 and a backward kernel; see `tests/flash_grad_check.rs` |
-| FP16 loss scaling, checkpoint/resume (`ferrotensor-trainer`) | **Experimental** | |
+| Checkpoint/resume (`ferrotensor-trainer`) | **Experimental** | |
+| Loss scaler (`GradScaler` in `ferrotensor-trainer`) | **Experimental** | A library type: `Trainer::with_grad_scaler` attaches it, the CLI does not use it, and `ferrotensor demo` only constructs one. Gradients are f32, so there is no f16 underflow for it to guard against |
+| Mixed-precision (f16 activations and gradients) training | Planned | Today only frozen LoRA base weights are f16; arithmetic, activations, gradients and adapters are f32 |
 | Terminal monitor, Hub download helpers | **Experimental** | `ferrotensor-monitor`, `ferrotensor-hub` |
 | `f16` / `bf16` tensors in the `ferrotensor` API | Planned | |
 | Convolutions, sort/top-k, cumsum in the `ferrotensor` API | Planned | |
@@ -215,7 +217,7 @@ tensor op reaches a WGSL kernel, are in [docs/architecture.md](docs/architecture
 | [`ferrotensor-autograd`](ferrotensor-autograd) | Gradient tape for the backend tensors |
 | [`ferrotensor-graph`](ferrotensor-graph) | Transformer building blocks and the Llama/LFM2-style model builder |
 | [`ferrotensor-loader`](ferrotensor-loader) | Safetensors (single and sharded) and tokenizer loading |
-| [`ferrotensor-trainer`](ferrotensor-trainer) | Training loops, LoRA, loss scaling, checkpoints |
+| [`ferrotensor-trainer`](ferrotensor-trainer) | Training loops, LoRA, checkpoints, an optional `GradScaler` |
 | [`ferrotensor-cli`](ferrotensor-cli) | `train`, `eval` and `infer` commands |
 | [`ferrotensor-monitor`](ferrotensor-monitor) | Terminal dashboard |
 | [`ferrotensor-hub`](ferrotensor-hub) | Hugging Face Hub download helpers |

@@ -37,7 +37,8 @@ pub struct StepStats {
     /// Number of supervised (unmasked) target tokens.
     pub tokens: usize,
     /// Whether this call completed an accumulation window and updated the
-    /// parameters (`false` while accumulating or after an fp16 overflow).
+    /// parameters (`false` while accumulating or when a loss scaler found
+    /// non-finite gradients).
     pub optimizer_step: bool,
     /// Global L2 norm of the gradients before clipping, when the optimizer
     /// stepped.
@@ -74,7 +75,7 @@ pub struct Trainer {
     pub grad_accum_steps: usize,
     /// Micro-batches accumulated so far in the current window.
     pub step_in_accum: usize,
-    /// Dynamic loss scaler (fp16-style overflow protection).
+    /// Optional dynamic loss scaler. Not set by the CLI.
     pub scaler: Option<GradScaler>,
     /// Multi-process gradient averaging through a shared directory.
     pub distributed_grad_sync: Option<FileGradSyncConfig>,
@@ -135,6 +136,7 @@ impl Trainer {
     }
 
     /// Scale the loss before backward and skip steps whose gradients overflow.
+    /// The CLI does not call this.
     pub fn with_grad_scaler(mut self, scaler: GradScaler) -> Self {
         self.scaler = Some(scaler);
         self
