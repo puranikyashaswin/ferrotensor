@@ -76,6 +76,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.2
       - name: Adapter and kernel self-check
         run: cargo run --release -p ferrotensor-cli -- info --check
+      - name: Trainer examples (tiny model, no download)
+        run: |
+          cargo run --release -p ferrotensor-trainer --example lora_finetune_tiny
+          cargo run --release -p ferrotensor-trainer --example resume_training
+          cargo run --release -p ferrotensor-trainer --example generate_with_kv_cache
       - name: GPU suites (ignored tests)
         run: cargo test --release --workspace -- --ignored --test-threads=1
       - name: Autograd finite-difference checks
