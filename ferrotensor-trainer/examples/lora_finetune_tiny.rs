@@ -12,7 +12,20 @@
 //! Output from the CI job "GPU tests (software Vulkan)" (Mesa lavapipe):
 //!
 //! ```text
-//! (filled in from the CI log)
+//! device: llvmpipe (LLVM 20.1.2, 256 bits) (Vulkan)
+//! task: continue the pattern [3, 10, 17, 24, 31, 38, 45, 52, 59, 2, 9, 16, 23, 30, 37, 44]
+//! model: 2 layers, vocabulary 64; LoRA rank 4 on q/k/v/o, 1792 trainable values
+//! loss before training: 5.9385
+//! step  0  loss 5.9385
+//! step 10  loss 2.5799
+//! step 20  loss 0.9200
+//! step 30  loss 0.4844
+//! step 39  loss 0.2989
+//! loss after 40 steps: 0.2841
+//! saved 16 adapter tensors (8984 bytes)
+//! fresh copy, no adapter: loss 5.9385
+//! fresh copy, adapter loaded (16 tensors): loss 0.2841
+//! |reloaded - trained| = 0.00e0
 //! ```
 
 #[path = "common/mod.rs"]

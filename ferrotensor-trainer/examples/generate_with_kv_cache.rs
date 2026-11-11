@@ -16,7 +16,14 @@
 //! Output from the CI job "GPU tests (software Vulkan)" (Mesa lavapipe):
 //!
 //! ```text
-//! (filled in from the CI log)
+//! device: llvmpipe (LLVM 20.1.2, 256 bits) (Vulkan)
+//! trained LoRA for 30 steps, final loss 0.5063
+//! prompt:            [3, 10, 17, 24]
+//! without KV cache:  [31, 38, 45, 52, 59, 2, 9, 16, 23, 30, 37, 44]
+//! with KV cache:     [31, 38, 45, 52, 59, 2, 9, 16, 23, 30, 37, 44]
+//! training pattern:  [31, 38, 45, 52, 59, 2, 9, 16, 23, 30, 37, 44]
+//! largest logit difference between the two: 0.00e0
+//! tokens that continue the pattern: 12 of 12
 //! ```
 
 #[path = "common/mod.rs"]

@@ -17,7 +17,13 @@
 //! Output from the CI job "GPU tests (software Vulkan)" (Mesa lavapipe):
 //!
 //! ```text
-//! (filled in from the CI log)
+//! device: llvmpipe (LLVM 20.1.2, 256 bits) (Vulkan)
+//! 12 steps straight:           5.9385 5.7171 5.4485 5.1535 4.8705 4.6353 4.4604 4.3264 4.2083 4.0905 3.9635 3.8199
+//! saved adapter and optimizer state after 6 steps
+//! 6 + 6 steps, resumed:        5.9385 5.7171 5.4485 5.1535 4.8705 4.6353 4.4604 4.3264 4.2083 4.0905 3.9635 3.8199
+//! 6 + 6, new optimizer:        5.9385 5.7171 5.4485 5.1535 4.8705 4.6353 4.4604 4.2503 4.0582 3.8699 3.6729 3.4597
+//! largest relative difference, resumed vs straight: 0.00e0 (allowed 1e-5)
+//! final loss without the optimizer state differs by 0.3602
 //! ```
 
 #[path = "common/mod.rs"]
