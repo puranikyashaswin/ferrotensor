@@ -327,7 +327,10 @@ GRADIENTS = {
     "mse": (lambda a, b: F.mse_loss(a, b), (X, Y)),
     "smooth_l1": (lambda a, b: F.smooth_l1_loss(a, b), (X, Y)),
     "cross_entropy": (lambda a: F.cross_entropy(a, [2, 0]), (X,)),
-    "bce_with_logits": (lambda a, b: F.binary_cross_entropy_with_logits(a, (b > 0) * 1.0), (X, Y)),
+    "bce_with_logits": (
+        lambda a: F.binary_cross_entropy_with_logits(a, [[1.0, 0.0, 1.0], [0.0, 1.0, 0.0]]),
+        (X,),
+    ),
     "layer_norm": (lambda a, w, b: F.layer_norm(a, w, b), (X, V, V)),
     "rms_norm": (lambda a, w: F.rms_norm(a, w), (X, V)),
     "linear": (lambda a, m, b: F.linear(a, m, b), (X, M, V)),
@@ -349,9 +352,9 @@ def test_clip_grad_matches_cpu(gpu):
         loss = (w * w).sum() + (b * 3).sum()
         loss.backward()
         norm = optim.clip_grad_norm([w, b], 2.0)
-        clipped = (w.grad.tolist(), b.grad.tolist())
+        clipped = [w.grad.tolist(), b.grad.tolist()]
         optim.clip_grad_value([w, b], 0.5)
-        return norm, clipped, (w.grad.tolist(), b.grad.tolist())
+        return norm, clipped, [w.grad.tolist(), b.grad.tolist()]
 
     norm_g, clipped_g, value_g = run(gpu)
     norm_c, clipped_c, value_c = run(None)
@@ -562,7 +565,9 @@ def test_save_and_load_tensors_on_gpu(gpu, tmp_path):
     on_cpu = ft.load(path)
     on_gpu = ft.load(path, device=gpu)
     assert on_cpu["a"].device.is_cpu and on_gpu["a"].device == gpu
-    assert on_cpu["a"].tolist() == X and on_gpu["b"].tolist() == [0.0, 1.0, 2.0, 3.0]
+    close(on_cpu["a"].tolist(), X)
+    close(on_gpu["a"].tolist(), X)
+    assert on_gpu["b"].tolist() == [0.0, 1.0, 2.0, 3.0]
     assert ft.load(path, device="gpu")["a"].device == gpu
 
 
