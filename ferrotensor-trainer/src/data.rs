@@ -232,29 +232,10 @@ impl TextDataset {
         Self { samples }
     }
 
-    /// Greedily pack short sequences into longer windows up to `max_len`.
+    /// Greedily pack sequences into windows of at most `max_len` tokens.
+    /// A sequence longer than `max_len` is split across windows.
     pub fn pack_sequences(sequences: Vec<Vec<u32>>, max_len: usize) -> Self {
-        if max_len < 2 {
-            return Self::new();
-        }
-
-        let mut packed = Vec::new();
-        let mut current = Vec::new();
-        for seq in sequences {
-            if seq.is_empty() {
-                continue;
-            }
-            if current.len() + seq.len() > max_len && current.len() >= 2 {
-                packed.push(current);
-                current = Vec::new();
-            }
-            current.extend(seq);
-        }
-        if current.len() >= 2 {
-            packed.push(current);
-        }
-
-        Self::from_sequences(packed)
+        Self::from_sequences(pack_windows(sequences, max_len))
     }
 
     /// All examples, in insertion order.
@@ -540,6 +521,36 @@ impl SimpleRng {
     }
 }
 
+/// Greedily packs `sequences` into windows of at most `max_len` tokens.
+///
+/// A sequence longer than `max_len` is cut into `max_len`-sized pieces. A
+/// window is closed when the next piece would not fit. Windows need at least
+/// two tokens (one input, one target): a single leftover token that cannot be
+/// joined with what follows is dropped.
+fn pack_windows(sequences: Vec<Vec<u32>>, max_len: usize) -> Vec<Vec<u32>> {
+    let mut packed = Vec::new();
+    if max_len < 2 {
+        return packed;
+    }
+    let mut current: Vec<u32> = Vec::new();
+    for seq in sequences {
+        for piece in seq.chunks(max_len) {
+            if current.len() + piece.len() > max_len {
+                if current.len() >= 2 {
+                    packed.push(std::mem::take(&mut current));
+                } else {
+                    current.clear();
+                }
+            }
+            current.extend_from_slice(piece);
+        }
+    }
+    if current.len() >= 2 {
+        packed.push(current);
+    }
+    packed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -632,5 +643,51 @@ mod tests {
         // Second example response-only positions stay marked.
         assert!(batch.loss_masks[1].contains(&1));
         assert!(batch.loss_masks[1].contains(&0));
+    }
+
+    #[test]
+    fn pack_windows_never_exceeds_max_len() {
+        let tokens: Vec<u32> = (0..5000u32).collect();
+        let windows = pack_windows(vec![tokens.clone()], 256);
+        assert_eq!(windows.len(), 20);
+        assert!(windows.iter().all(|w| w.len() <= 256));
+        let flat: Vec<u32> = windows.into_iter().flatten().collect();
+        assert_eq!(flat, tokens);
+    }
+
+    #[test]
+    fn pack_windows_joins_short_sequences() {
+        let windows = pack_windows(vec![vec![1, 2], vec![3, 4], vec![5, 6, 7]], 4);
+        assert_eq!(windows, vec![vec![1, 2, 3, 4], vec![5, 6, 7]]);
+    }
+
+    #[test]
+    fn pack_windows_splits_a_long_sequence_after_a_short_one() {
+        let windows = pack_windows(vec![vec![1, 2], vec![3, 4, 5, 6, 7, 8, 9]], 3);
+        assert_eq!(windows, vec![vec![1, 2], vec![3, 4, 5], vec![6, 7, 8]]);
+    }
+
+    #[test]
+    fn pack_windows_drops_a_single_token_that_cannot_be_joined() {
+        let windows = pack_windows(vec![vec![1], vec![2, 3, 4]], 3);
+        assert_eq!(windows, vec![vec![2, 3, 4]]);
+    }
+
+    #[test]
+    fn pack_windows_handles_empty_and_tiny_limits() {
+        let windows = pack_windows(vec![vec![], vec![1, 2]], 4);
+        assert_eq!(windows, vec![vec![1, 2]]);
+        assert!(pack_windows(vec![vec![1, 2, 3], vec![4, 5]], 1).is_empty());
+    }
+
+    #[test]
+    fn pack_sequences_builds_one_example_per_window() {
+        let tokens: Vec<u32> = (0..10u32).collect();
+        let dataset = TextDataset::pack_sequences(vec![tokens.clone()], 4);
+        assert_eq!(
+            dataset.examples().len(),
+            pack_windows(vec![tokens], 4).len()
+        );
+        assert_eq!(dataset.examples().len(), 3);
     }
 }
