@@ -1,5 +1,6 @@
 //! GPU-resident tensors.
 
+use crate::memory::{Allocation, MemoryCategory};
 use crate::pool::BufferPool;
 use crate::WgpuContext;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,10 +45,37 @@ struct TensorData {
     buffer: Arc<Buffer>,
     size_in_bytes: u64,
     pool: Option<Arc<BufferPool>>,
+    /// Counted in the context's memory tracker; `None` only while dropping.
+    memory: Option<Allocation>,
+}
+
+impl TensorData {
+    fn new(
+        context: &WgpuContext,
+        buffer: Arc<Buffer>,
+        size_in_bytes: u64,
+        pool: Option<Arc<BufferPool>>,
+        shape: &[usize],
+        dtype: DType,
+    ) -> Self {
+        let numel = shape.iter().product::<usize>() as u64;
+        let logical = (numel * dtype.size_bytes() as u64).min(size_in_bytes);
+        let memory = context
+            .memory()
+            .allocate(dtype, shape, logical, size_in_bytes);
+        Self {
+            buffer,
+            size_in_bytes,
+            pool,
+            memory: Some(memory),
+        }
+    }
 }
 
 impl Drop for TensorData {
     fn drop(&mut self) {
+        // Stop counting the bytes as live before the pool counts them idle.
+        drop(self.memory.take());
         if let Some(pool) = &self.pool {
             pool.return_buffer(self.size_in_bytes, self.buffer.clone());
         }
@@ -63,6 +91,23 @@ impl UnifiedTensor {
     /// Size of the tensor's data in bytes.
     pub fn size_in_bytes(&self) -> u64 {
         self.data.size_in_bytes
+    }
+
+    /// What the buffer is counted as in the context's
+    /// [`MemoryTracker`](crate::MemoryTracker).
+    pub fn memory_category(&self) -> MemoryCategory {
+        self.data
+            .memory
+            .as_ref()
+            .map_or(MemoryCategory::Other, Allocation::category)
+    }
+
+    /// Count the buffer (shared by clones and reshaped views) as `category`
+    /// from now on. Changes no data.
+    pub fn set_memory_category(&self, category: MemoryCategory) {
+        if let Some(memory) = &self.data.memory {
+            memory.set_category(category);
+        }
     }
 
     /// Uploads `data` to the start of the buffer, after all recorded work.
@@ -90,11 +135,14 @@ impl UnifiedTensor {
             });
         context.note_upload(size_in_bytes);
         Self {
-            data: Arc::new(TensorData {
-                buffer: Arc::new(buffer),
+            data: Arc::new(TensorData::new(
+                context,
+                Arc::new(buffer),
                 size_in_bytes,
-                pool: None,
-            }),
+                None,
+                shape,
+                DType::FP32,
+            )),
             shape: shape.to_vec(),
             dtype: DType::FP32,
         }
@@ -110,11 +158,14 @@ impl UnifiedTensor {
         let size_in_bytes = (shape.iter().product::<usize>() * dtype.size_bytes()) as u64;
         let buffer = context.pool.get(&context.device, size_in_bytes);
         Self {
-            data: Arc::new(TensorData {
+            data: Arc::new(TensorData::new(
+                context,
                 buffer,
                 size_in_bytes,
-                pool: Some(context.pool.clone()),
-            }),
+                Some(context.pool.clone()),
+                shape,
+                dtype,
+            )),
             shape: shape.to_vec(),
             dtype,
         }
@@ -151,11 +202,14 @@ impl UnifiedTensor {
             });
         context.note_upload(size_in_bytes);
         Self {
-            data: Arc::new(TensorData {
-                buffer: Arc::new(buffer),
+            data: Arc::new(TensorData::new(
+                context,
+                Arc::new(buffer),
                 size_in_bytes,
-                pool: None,
-            }),
+                None,
+                shape,
+                dtype,
+            )),
             shape: shape.to_vec(),
             dtype,
         }
@@ -207,6 +261,9 @@ impl UnifiedTensor {
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let _counted = context
+            .memory()
+            .allocate_raw(Some(MemoryCategory::Staging), size);
         context.record(|encoder| {
             encoder.copy_buffer_to_buffer(&self.data.buffer, 0, &staging, 0, size);
         });

@@ -200,6 +200,12 @@ impl WgpuContext {
         }
     }
 
+    /// Byte counters of this context's tensors: live, peak, idle in the
+    /// pool, and by [`MemoryCategory`](crate::MemoryCategory).
+    pub fn memory(&self) -> &Arc<crate::MemoryTracker> {
+        self.pool.tracker()
+    }
+
     /// Adapter name and backend, e.g. `"Apple M2 (Metal)"`.
     pub fn adapter_info(&self) -> String {
         let info = self.adapter.get_info();
