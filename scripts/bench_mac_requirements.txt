@@ -1,0 +1,9 @@
+# Pinned for scripts/bench_mac.sh. mlx-lm 0.32.2 is the version the harness
+# was written against (docs/benchmarks-mac.md); the others are the releases
+# current when it was written. Packages not listed (mlx, tokenizers,
+# huggingface_hub, ...) are resolved by pip and recorded in results.json.
+mlx-lm[train]==0.32.2
+torch==2.15.0
+peft==0.21.2
+transformers==5.22.2
+datasets==5.2.0

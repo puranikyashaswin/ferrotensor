@@ -20,6 +20,7 @@ after = ["links"]
 "architecture.md" = "docs/architecture.md"
 "writing-a-kernel.md" = "docs/writing-a-kernel.md"
 "testing-on-your-gpu.md" = "docs/testing-on-your-gpu.md"
+"benchmarks-mac.md" = "docs/benchmarks-mac.md"
 "benchmarks.md" = "benchmarks/RESULTS.md"
 "python-reference.md" = "ferrotensor-py/README.md"
 "good-first-issues.md" = "docs/good-first-issues.md"

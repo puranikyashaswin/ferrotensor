@@ -14,6 +14,7 @@
 - [Architecture](architecture.md)
 - [Writing a kernel](writing-a-kernel.md)
 - [Testing on your GPU](testing-on-your-gpu.md)
+- [Comparing stacks on a Mac](benchmarks-mac.md)
 
 # Reference
 
