@@ -64,6 +64,7 @@ impl BufferPool {
         for (size, list) in &state.free {
             for _ in list {
                 self.tracker.pool_take(*size);
+                self.tracker.gpu_dropped(*size);
             }
         }
         state.free.clear();
@@ -78,6 +79,12 @@ impl BufferPool {
         if state.pooled_bytes > max {
             self.release_all(&mut state);
         }
+    }
+
+    /// The most bytes of freed buffers the pool keeps
+    /// ([`DEFAULT_MAX_POOLED_BYTES`] unless changed).
+    pub fn max_pooled_bytes(&self) -> u64 {
+        self.buffers.lock().unwrap().max_pooled_bytes
     }
 
     /// Bytes currently held for reuse.
@@ -107,7 +114,9 @@ impl BufferPool {
     pub fn return_buffer(&self, size: u64, buffer: Arc<Buffer>) {
         let mut state = self.buffers.lock().unwrap();
         if state.pooled_bytes + size > state.max_pooled_bytes {
-            // Dropping the last reference releases the GPU memory.
+            // Dropping the last reference releases the GPU memory once the
+            // work using it has finished and the device is polled.
+            self.tracker.gpu_dropped(size);
             return;
         }
         state.pooled_bytes += size;

@@ -60,9 +60,12 @@ impl TensorData {
     ) -> Self {
         let numel = shape.iter().product::<usize>() as u64;
         let logical = (numel * dtype.size_bytes() as u64).min(size_in_bytes);
-        let memory = context
-            .memory()
-            .allocate(dtype, shape, logical, size_in_bytes);
+        // A buffer without a pool is dropped with the tensor; a pooled one
+        // is kept or dropped by the pool, which counts it either way.
+        let memory =
+            context
+                .memory()
+                .allocate(dtype, shape, logical, size_in_bytes, pool.is_none());
         Self {
             buffer,
             size_in_bytes,
@@ -74,7 +77,8 @@ impl TensorData {
 
 impl Drop for TensorData {
     fn drop(&mut self) {
-        // Stop counting the bytes as live before the pool counts them idle.
+        // Stop counting the bytes as live before the pool counts them idle
+        // (or, past its cap, as awaiting GPU).
         drop(self.memory.take());
         if let Some(pool) = &self.pool {
             pool.return_buffer(self.size_in_bytes, self.buffer.clone());
@@ -261,9 +265,9 @@ impl UnifiedTensor {
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let _counted = context
-            .memory()
-            .allocate_raw(Some(MemoryCategory::Staging), size);
+        // Counted as staging while the copy runs, then as awaiting GPU until
+        // the next wait polls the device and wgpu destroys it.
+        let _counted = context.memory().allocate_raw(MemoryCategory::Staging, size);
         context.record(|encoder| {
             encoder.copy_buffer_to_buffer(&self.data.buffer, 0, &staging, 0, size);
         });

@@ -1,6 +1,7 @@
 //! GPU memory accounting on the tiny model: the report's categories add up,
-//! the frozen weights come out at their exact size, and turning the report
-//! on changes nothing about training.
+//! the frozen weights come out at their exact size, turning the report on
+//! changes nothing about training, and dropped buffers are counted as
+//! awaiting the GPU until the context waits for it.
 //!
 //! Needs a GPU, so `#[ignore]`d by default:
 //!
@@ -12,7 +13,8 @@ mod common;
 
 use common::*;
 use ferrotensor_backend::memory::{wgpu_buffer_size, MemorySnapshot};
-use ferrotensor_backend::MemoryCategory;
+use ferrotensor_backend::pool::DEFAULT_MAX_POOLED_BYTES;
+use ferrotensor_backend::{MemoryCategory, UnifiedTensor};
 use ferrotensor_trainer::memory::{tag_trainable, MemoryRecorder};
 use std::io::Write as _;
 
@@ -123,6 +125,22 @@ fn memory_report_adds_up_and_does_not_change_training() {
         assert!(r.peak.live_bytes >= r.live.live_bytes);
         assert!(r.overall_peak.live_bytes >= r.peak.live_bytes);
         assert!(r.peak_held_bytes >= r.peak.live_bytes);
+        assert!(r.overall_peak_held_bytes >= r.peak_held_bytes);
+        assert!(r.overall_peak_held_bytes >= r.overall_peak.live_bytes);
+        // Every dispatch drops a uniform buffer before the GPU runs it.
+        assert!(
+            r.peak_awaiting_gpu_bytes > 0,
+            "dispatch buffers not counted"
+        );
+        assert!(r.overall_peak_awaiting_gpu_bytes >= r.peak_awaiting_gpu_bytes);
+        assert!(r.peak_total_bytes >= r.peak_held_bytes);
+        assert!(
+            r.peak_total_bytes
+                >= r.peak.live_bytes + r.peak.pool_idle_bytes + r.peak.awaiting_gpu_bytes
+        );
+        assert!(r.overall_peak_total_bytes >= r.peak_total_bytes);
+        assert_eq!(r.live.awaiting_gpu_bytes, 0, "record waits for the GPU");
+        assert_eq!(r.pool_cap_bytes, DEFAULT_MAX_POOLED_BYTES);
         for c in [
             MemoryCategory::Activations,
             MemoryCategory::Loss,
@@ -185,4 +203,69 @@ fn memory_report_adds_up_and_does_not_change_training() {
         bits(&losses_off),
         "the memory report changed the loss"
     );
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn dropped_buffers_await_the_gpu_until_synchronize() {
+    let gpu = gpu();
+    let ctx = &gpu.ctx;
+    let mem = ctx.memory();
+    let shape = [1024];
+    let bytes = f32_bytes(1024);
+    // Room in the pool for exactly one buffer of this size.
+    ctx.pool.clear();
+    ctx.pool.set_max_pooled_bytes(bytes);
+    ctx.synchronize();
+    assert_eq!(mem.awaiting_gpu_bytes(), 0);
+    mem.reset_peak();
+
+    let src = UnifiedTensor::new(ctx, &[1.0; 1024], &shape);
+    let kept = UnifiedTensor::empty(ctx, &shape);
+    let past_cap = UnifiedTensor::empty(ctx, &shape);
+    // Work in flight that reads both buffers.
+    gpu.engine.copy_tensor(ctx, &src, &kept, 0);
+    gpu.engine.copy_tensor(ctx, &src, &past_cap, 0);
+    let (live, idle) = (mem.live_bytes(), mem.pool_idle_bytes());
+
+    drop(kept);
+    assert_eq!(mem.pool_idle_bytes(), idle + bytes, "kept by the pool");
+    assert_eq!(mem.awaiting_gpu_bytes(), 0);
+    drop(past_cap);
+    assert_eq!(mem.pool_idle_bytes(), idle + bytes);
+    assert_eq!(mem.awaiting_gpu_bytes(), bytes, "dropped past the cap");
+    assert_eq!(mem.live_bytes(), live - 2 * bytes);
+
+    // A dispatch's uniform buffer is counted from the start.
+    gpu.engine.gradient_scale(ctx, &src, 1.0);
+    assert_eq!(mem.awaiting_gpu_bytes(), bytes + 4);
+
+    ctx.flush();
+    assert_eq!(mem.awaiting_gpu_bytes(), bytes + 4, "flush does not poll");
+    ctx.synchronize();
+    assert_eq!(
+        mem.awaiting_gpu_bytes(),
+        0,
+        "synchronize lets wgpu free them"
+    );
+    assert_eq!(mem.peak_awaiting_gpu_bytes(), bytes + 4);
+    // Live + idle + awaiting stayed at `live + idle` through the drops,
+    // then the uniform added 4 bytes.
+    assert_eq!(mem.peak_total_bytes(), live + idle + 4);
+
+    // The readback copy is staging while it runs, then awaits the GPU.
+    let staging_before = mem.current().category(MemoryCategory::Staging).buffers;
+    let values = pollster::block_on(src.to_vec(ctx));
+    assert_eq!(values.len(), 1024);
+    assert_eq!(
+        mem.current().category(MemoryCategory::Staging).buffers,
+        staging_before
+    );
+    assert_eq!(mem.awaiting_gpu_bytes(), bytes);
+    ctx.synchronize();
+    assert_eq!(mem.awaiting_gpu_bytes(), 0);
+
+    let s = mem.current();
+    assert_consistent(&s);
+    assert_eq!(s.live_bytes, mem.live_bytes());
 }

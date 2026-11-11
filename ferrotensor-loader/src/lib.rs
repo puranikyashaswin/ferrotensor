@@ -424,6 +424,8 @@ impl WeightsContext {
             });
         ctx.queue.write_buffer(&q_buf, 0, &q_data);
         ctx.note_upload(q_data.len() as u64);
+        // Dropped once the dequantize dispatch below is recorded.
+        ctx.memory().count_dispatch_buffer(q_buf.size());
 
         // 3. Output Tensor (FP32)
         let out_tensor = UnifiedTensor::empty(ctx, &q_shape);

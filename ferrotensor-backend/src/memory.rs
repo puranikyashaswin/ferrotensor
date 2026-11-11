@@ -8,6 +8,20 @@
 //! Buffers returned to the [`BufferPool`](crate::pool::BufferPool) and kept
 //! for reuse are counted separately as idle pool bytes.
 //!
+//! A buffer Ferrotensor drops is not freed on the GPU at once: wgpu destroys
+//! it only once the work that uses it has finished and the device is polled,
+//! which happens when the context waits for the GPU
+//! ([`WgpuContext::synchronize`](crate::WgpuContext::synchronize) or a read
+//! back to the host). Recorded work is submitted in batches and
+//! [`flush`](crate::WgpuContext::flush) does not poll, so dropped buffers
+//! (tensors the pool does not keep, e.g. beyond its cap, and the uniform and
+//! scratch buffers each kernel dispatch creates) are counted as *awaiting
+//! GPU* from the drop until the next such wait.
+//!
+//! The current category is one value per tracker, not per thread: tag
+//! from one thread at a time and drop scopes in reverse order (checked in
+//! debug builds).
+//!
 //! The counters are relaxed atomics and always on. The breakdown at the
 //! peak and the list of the largest buffers need a lock per allocation, so
 //! they are only kept after [`MemoryTracker::set_detailed`]`(true)`.
@@ -15,8 +29,8 @@
 //! Sizes are what Ferrotensor asked wgpu for, after wgpu rounds every buffer
 //! up to a multiple of 4 bytes (see [`memory::wgpu_buffer_size`](crate::memory::wgpu_buffer_size)).
 //! The driver and its allocator add their own alignment and block overhead,
-//! and pipelines, shaders, uniform buffers and upload staging copies are not
-//! tensors, so the totals are lower than what `nvidia-smi` or Activity
+//! and pipelines, bind groups and wgpu's own upload staging copies are not
+//! counted, so the totals are lower than what `nvidia-smi` or Activity
 //! Monitor show.
 
 use crate::DType;
@@ -146,6 +160,9 @@ pub struct MemorySnapshot {
     pub logical_bytes: u64,
     /// Bytes of freed buffers the pool keeps for reuse.
     pub pool_idle_bytes: u64,
+    /// Bytes of buffers dropped but possibly not yet destroyed by wgpu
+    /// (see the [module docs](self)).
+    pub awaiting_gpu_bytes: u64,
     /// Per category, indexed by `MemoryCategory as usize`.
     pub categories: [CategoryBytes; MemoryCategory::COUNT],
     /// The largest live buffers, largest first (at most
@@ -191,6 +208,9 @@ pub struct MemoryTracker {
     peak_live: AtomicU64,
     pool_idle: AtomicU64,
     peak_held: AtomicU64,
+    awaiting_gpu: AtomicU64,
+    peak_awaiting_gpu: AtomicU64,
+    peak_total: AtomicU64,
     detailed: AtomicBool,
     registry: Mutex<Registry>,
 }
@@ -204,6 +224,9 @@ impl Default for MemoryTracker {
             peak_live: AtomicU64::new(0),
             pool_idle: AtomicU64::new(0),
             peak_held: AtomicU64::new(0),
+            awaiting_gpu: AtomicU64::new(0),
+            peak_awaiting_gpu: AtomicU64::new(0),
+            peak_total: AtomicU64::new(0),
             detailed: AtomicBool::new(false),
             registry: Mutex::new(Registry::default()),
         }
@@ -216,6 +239,7 @@ impl std::fmt::Debug for MemoryTracker {
             .field("live_bytes", &self.live_bytes())
             .field("peak_live_bytes", &self.peak_live_bytes())
             .field("pool_idle_bytes", &self.pool_idle_bytes())
+            .field("awaiting_gpu_bytes", &self.awaiting_gpu_bytes())
             .finish()
     }
 }
@@ -225,11 +249,16 @@ impl std::fmt::Debug for MemoryTracker {
 pub struct MemoryScope<'a> {
     tracker: &'a MemoryTracker,
     previous: u8,
+    set: u8,
 }
 
 impl Drop for MemoryScope<'_> {
     fn drop(&mut self) {
-        self.tracker.current.store(self.previous, Relaxed);
+        let current = self.tracker.current.swap(self.previous, Relaxed);
+        debug_assert!(
+            current == self.set || std::thread::panicking(),
+            "memory scopes must be dropped in reverse order, from one thread"
+        );
     }
 }
 
@@ -241,6 +270,9 @@ pub(crate) struct Allocation {
     f16: bool,
     logical: u64,
     allocated: u64,
+    /// Count the bytes as awaiting GPU once released (the buffer is
+    /// dropped rather than kept by the pool).
+    awaits_gpu: bool,
 }
 
 impl std::fmt::Debug for Allocation {
@@ -275,11 +307,16 @@ impl MemoryTracker {
     }
 
     /// Tag tensors created until the guard drops with `category`.
+    ///
+    /// Single-threaded use only: the category is one value per tracker,
+    /// shared by every thread, so tag from one thread at a time and drop
+    /// nested scopes in reverse order (debug builds assert this).
     pub fn scope(&self, category: MemoryCategory) -> MemoryScope<'_> {
         let previous = self.current.swap(category as u8, Relaxed);
         MemoryScope {
             tracker: self,
             previous,
+            set: category as u8,
         }
     }
 
@@ -326,11 +363,33 @@ impl MemoryTracker {
         self.peak_held.load(Relaxed)
     }
 
+    /// Bytes of buffers dropped since the context last waited for the GPU;
+    /// wgpu may not have destroyed them yet (see the [module docs](self)).
+    pub fn awaiting_gpu_bytes(&self) -> u64 {
+        self.awaiting_gpu.load(Relaxed)
+    }
+
+    /// Highest [`awaiting_gpu_bytes`](Self::awaiting_gpu_bytes) since the
+    /// last [`reset_peak`](Self::reset_peak).
+    pub fn peak_awaiting_gpu_bytes(&self) -> u64 {
+        self.peak_awaiting_gpu.load(Relaxed)
+    }
+
+    /// Highest live plus idle pool plus awaiting-GPU bytes since the last
+    /// [`reset_peak`](Self::reset_peak).
+    pub fn peak_total_bytes(&self) -> u64 {
+        self.peak_total.load(Relaxed)
+    }
+
     /// Start a new peak from the current state.
     pub fn reset_peak(&self) {
         let live = self.live_bytes();
+        let held = live + self.pool_idle_bytes();
+        let awaiting = self.awaiting_gpu_bytes();
         self.peak_live.store(live, Relaxed);
-        self.peak_held.store(live + self.pool_idle_bytes(), Relaxed);
+        self.peak_held.store(held, Relaxed);
+        self.peak_awaiting_gpu.store(awaiting, Relaxed);
+        self.peak_total.store(held + awaiting, Relaxed);
         if self.is_detailed() {
             let mut reg = self.registry.lock().unwrap();
             let snap = self.snapshot(&reg);
@@ -358,6 +417,7 @@ impl MemoryTracker {
     fn snapshot(&self, reg: &Registry) -> MemorySnapshot {
         let mut snap = MemorySnapshot {
             pool_idle_bytes: self.pool_idle_bytes(),
+            awaiting_gpu_bytes: self.awaiting_gpu_bytes(),
             ..MemorySnapshot::default()
         };
         for (out, c) in snap.categories.iter_mut().zip(&self.categories) {
@@ -402,22 +462,43 @@ impl MemoryTracker {
         op(&c.buffers, 1);
     }
 
+    /// Raise the held and total peaks to the current counters.
+    fn note_peaks(&self, live: u64) {
+        let held = live + self.pool_idle_bytes();
+        self.peak_held.fetch_max(held, Relaxed);
+        self.peak_total
+            .fetch_max(held + self.awaiting_gpu_bytes(), Relaxed);
+    }
+
     /// Count a new buffer of `requested` bytes (before wgpu's rounding)
     /// holding a tensor of `shape` and `dtype` that needs `logical` bytes.
+    /// If `awaits_gpu`, its bytes move to awaiting GPU when it is released.
     pub(crate) fn allocate(
         self: &Arc<Self>,
         dtype: DType,
         shape: &[usize],
         logical: u64,
         requested: u64,
+        awaits_gpu: bool,
+    ) -> Allocation {
+        let category = self.current.load(Relaxed);
+        self.allocate_in(category, dtype, shape, logical, requested, awaits_gpu)
+    }
+
+    fn allocate_in(
+        self: &Arc<Self>,
+        category: u8,
+        dtype: DType,
+        shape: &[usize],
+        logical: u64,
+        requested: u64,
+        awaits_gpu: bool,
     ) -> Allocation {
         let allocated = wgpu_buffer_size(requested);
-        let category = self.current.load(Relaxed);
         let f16 = dtype == DType::FP16;
         self.adjust(category, f16, logical, allocated, true);
         let live = self.live.fetch_add(allocated, Relaxed) + allocated;
-        self.peak_held
-            .fetch_max(live + self.pool_idle_bytes(), Relaxed);
+        self.note_peaks(live);
         let previous_peak = self.peak_live.fetch_max(live, Relaxed);
         let mut id = 0;
         if self.is_detailed() {
@@ -447,19 +528,50 @@ impl MemoryTracker {
             f16,
             logical,
             allocated,
+            awaits_gpu,
         }
     }
 
     /// Count a buffer of `requested` bytes that is not a tensor (e.g. a
-    /// readback copy) until the returned value drops, under `category` or
-    /// the current one.
+    /// readback copy) under `category` until the returned value drops, and
+    /// then as awaiting GPU until the context next waits for the GPU.
     pub(crate) fn allocate_raw(
         self: &Arc<Self>,
-        category: Option<MemoryCategory>,
+        category: MemoryCategory,
         requested: u64,
     ) -> Allocation {
-        let _scope = self.scope(category.unwrap_or_else(|| self.category()));
-        self.allocate(DType::FP32, &[requested as usize], requested, requested)
+        self.allocate_in(
+            category as u8,
+            DType::FP32,
+            &[requested as usize],
+            requested,
+            requested,
+            true,
+        )
+    }
+
+    /// Count a buffer of `requested` bytes that is dropped as soon as the
+    /// work using it is recorded: a kernel's uniform or scratch buffer, or
+    /// an upload read by one dispatch. wgpu can destroy it only after that
+    /// work has run, so it is counted as awaiting GPU from now until the
+    /// context next waits for the GPU.
+    pub fn count_dispatch_buffer(&self, requested: u64) {
+        self.gpu_dropped(requested);
+    }
+
+    /// A buffer of `requested` bytes was dropped; wgpu destroys it once the
+    /// work using it has finished and the device is polled.
+    pub(crate) fn gpu_dropped(&self, requested: u64) {
+        let size = wgpu_buffer_size(requested);
+        let awaiting = self.awaiting_gpu.fetch_add(size, Relaxed) + size;
+        self.peak_awaiting_gpu.fetch_max(awaiting, Relaxed);
+        self.note_peaks(self.live_bytes());
+    }
+
+    /// The context waited for all submitted work and polled the device, so
+    /// wgpu has destroyed the buffers dropped before.
+    pub(crate) fn gpu_reclaimed(&self) {
+        self.awaiting_gpu.store(0, Relaxed);
     }
 
     fn release(&self, a: &Allocation) {
@@ -473,6 +585,9 @@ impl MemoryTracker {
         self.live.fetch_sub(a.allocated, Relaxed);
         if a.id != 0 {
             self.registry.lock().unwrap().live.remove(&a.id);
+        }
+        if a.awaits_gpu {
+            self.gpu_dropped(a.allocated);
         }
     }
 
@@ -525,11 +640,9 @@ impl MemoryTracker {
 
     /// A buffer of `requested` bytes was kept in the pool for reuse.
     pub(crate) fn pool_put(&self, requested: u64) {
-        let idle = self
-            .pool_idle
-            .fetch_add(wgpu_buffer_size(requested), Relaxed)
-            + wgpu_buffer_size(requested);
-        self.peak_held.fetch_max(self.live_bytes() + idle, Relaxed);
+        self.pool_idle
+            .fetch_add(wgpu_buffer_size(requested), Relaxed);
+        self.note_peaks(self.live_bytes());
     }
 }
 
@@ -557,8 +670,8 @@ mod tests {
     #[test]
     fn allocate_and_release_update_live_and_peak() {
         let t = tracker();
-        let a = t.allocate(DType::FP32, &[4], 16, 16);
-        let b = t.allocate(DType::FP16, &[3], 6, 6);
+        let a = t.allocate(DType::FP32, &[4], 16, 16, false);
+        let b = t.allocate(DType::FP16, &[3], 6, 6, false);
         assert_eq!(t.live_bytes(), 16 + 8);
         assert_eq!(t.peak_live_bytes(), 24);
         drop(a);
@@ -576,7 +689,7 @@ mod tests {
     #[test]
     fn pool_reuse_moves_bytes_between_live_and_idle() {
         let t = tracker();
-        let a = t.allocate(DType::FP32, &[256], 1024, 1024);
+        let a = t.allocate(DType::FP32, &[256], 1024, 1024, false);
         // A tensor drop releases the allocation, then the pool keeps it.
         drop(a);
         t.pool_put(1024);
@@ -584,7 +697,7 @@ mod tests {
         assert_eq!(t.peak_held_bytes(), 1024);
         // Reuse: taken from the pool, counted live again.
         t.pool_take(1024);
-        let b = t.allocate(DType::FP32, &[256], 1024, 1024);
+        let b = t.allocate(DType::FP32, &[256], 1024, 1024, false);
         assert_eq!((t.live_bytes(), t.pool_idle_bytes()), (1024, 0));
         assert_eq!(t.peak_held_bytes(), 1024, "reuse holds no extra bytes");
         drop(b);
@@ -596,7 +709,7 @@ mod tests {
         t.set_detailed(true);
         let w = {
             let _s = t.scope(MemoryCategory::BaseWeights);
-            let w = t.allocate(DType::FP16, &[10], 20, 20);
+            let w = t.allocate(DType::FP16, &[10], 20, 20, false);
             {
                 let _inner = t.scope(MemoryCategory::Trainable);
                 assert_eq!(t.category(), MemoryCategory::Trainable);
@@ -607,7 +720,7 @@ mod tests {
         assert_eq!(t.category(), MemoryCategory::Other);
         let act = {
             let _s = t.scope(MemoryCategory::Activations);
-            t.allocate(DType::FP32, &[100], 400, 400)
+            t.allocate(DType::FP32, &[100], 400, 400, false)
         };
         let snap = t.current();
         assert_eq!(
@@ -630,8 +743,8 @@ mod tests {
     fn peak_snapshot_is_kept_and_follows_retags() {
         let t = tracker();
         t.set_detailed(true);
-        let logits = t.allocate(DType::FP32, &[2, 8], 64, 64);
-        let tmp = t.allocate(DType::FP32, &[32], 128, 128);
+        let logits = t.allocate(DType::FP32, &[2, 8], 64, 64, false);
+        let tmp = t.allocate(DType::FP32, &[32], 128, 128, false);
         drop(tmp);
         let peak = t.peak().expect("peak");
         assert_eq!(peak.live_bytes, 192);
@@ -664,7 +777,7 @@ mod tests {
         let t = tracker();
         t.set_detailed(true);
         let held: Vec<_> = (1..=15u64)
-            .map(|i| t.allocate(DType::FP32, &[i as usize], i * 4, i * 4))
+            .map(|i| t.allocate(DType::FP32, &[i as usize], i * 4, i * 4, false))
             .collect();
         let snap = t.current();
         assert_eq!(snap.largest.len(), LARGEST_BUFFERS);
@@ -675,5 +788,57 @@ mod tests {
             .all(|w| w[0].allocated_bytes >= w[1].allocated_bytes));
         drop(held);
         assert!(t.current().largest.is_empty());
+    }
+
+    #[test]
+    fn dropped_buffers_await_the_gpu_until_reclaimed() {
+        let t = tracker();
+        t.set_detailed(true);
+        // Dropped outside the pool: counted until the context next waits.
+        let a = t.allocate(DType::FP32, &[256], 1024, 1024, true);
+        drop(a);
+        assert_eq!((t.live_bytes(), t.awaiting_gpu_bytes()), (0, 1024));
+        // Per-dispatch buffers and readback copies are counted the same way.
+        t.count_dispatch_buffer(6);
+        let staging = t.allocate_raw(MemoryCategory::Staging, 64);
+        assert_eq!(
+            t.current()
+                .category(MemoryCategory::Staging)
+                .allocated_bytes,
+            64
+        );
+        assert_eq!(t.awaiting_gpu_bytes(), 1024 + 8);
+        drop(staging);
+        assert_eq!(t.awaiting_gpu_bytes(), 1024 + 8 + 64);
+        assert_eq!(t.current().awaiting_gpu_bytes, 1024 + 8 + 64);
+        assert_eq!(t.peak_awaiting_gpu_bytes(), 1024 + 8 + 64);
+        assert_eq!(t.peak_total_bytes(), 1024 + 8 + 64);
+        // A kept buffer moves to the pool instead.
+        let b = t.allocate(DType::FP32, &[4], 16, 16, false);
+        drop(b);
+        t.pool_put(16);
+        assert_eq!(t.awaiting_gpu_bytes(), 1024 + 8 + 64);
+        assert_eq!(t.peak_total_bytes(), 1024 + 8 + 64 + 16);
+        assert_eq!(t.peak_held_bytes(), 1024, "a was live once");
+
+        t.gpu_reclaimed();
+        assert_eq!(t.awaiting_gpu_bytes(), 0);
+        assert_eq!(t.peak_awaiting_gpu_bytes(), 1024 + 8 + 64, "peak kept");
+        t.reset_peak();
+        assert_eq!(t.peak_awaiting_gpu_bytes(), 0);
+        assert_eq!(t.peak_total_bytes(), 16);
+        let snap = t.current();
+        assert_eq!(sum(&snap), snap.live_bytes);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "reverse order")]
+    fn scopes_dropped_out_of_order_panic_in_debug() {
+        let t = tracker();
+        let outer = t.scope(MemoryCategory::Activations);
+        let inner = t.scope(MemoryCategory::Loss);
+        drop(outer);
+        drop(inner);
     }
 }

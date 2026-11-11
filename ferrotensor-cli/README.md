@@ -77,18 +77,43 @@ sequences) and at the highest point seen so far in the run. The rows:
 | loss (vocab-sized) | The logits, `d loss / d logits` and the logits' gradient |
 | readback staging | Buffers that copy results to the host |
 | other | Buffers created outside these phases (e.g. gradient-norm partial sums) |
-| pool idle | Freed buffers the pool keeps for reuse; still allocated on the GPU |
+| total (live tensors) | The sum of the rows above |
+| pool idle (cap 512 MiB) | Freed buffers the pool keeps for reuse; still allocated on the GPU. The pool keeps at most the cap shown, so this row often sits at the cap |
+| total held (live + pool idle) | The highest live plus pool-idle bytes of the phase, and of the run so far |
+| freed, awaiting GPU | Buffers Ferrotensor has dropped but wgpu may not have destroyed yet (see below); the highest of the phase and of the run |
+| total incl. awaiting GPU | The highest live plus pool-idle plus awaiting-GPU bytes of the phase and of the run: the closest figure to what the GPU holds |
+
+The rows down to pool idle are taken at the moment the live tensors peaked.
+The last three are the highest each value reached, so they can come from
+other moments and need not add up with the rows above.
+
+A buffer Ferrotensor drops stays on the GPU until wgpu destroys it, which
+it does only after the work using it has run and the device is polled.
+Kernels are recorded and submitted in batches, and the device is polled
+only when Ferrotensor waits for the GPU (a read back to the host, or a
+synchronisation). Between two waits, every tensor the pool does not keep
+(beyond its cap, or created from host data), every per-dispatch uniform,
+dummy and scratch buffer, the readback copy after the read, and the
+temporary buffer of a quantised weight upload are still on the GPU; the
+report counts them as awaiting GPU until the next wait.
+
+With `--memory-report`, every point where the report samples (after the
+model load, before the first step and after each reported step) waits for
+the GPU first, so the numbers are taken with no work in flight. This adds
+waits that a run without the flag does not have: it can change timing,
+never results. Without the flag there is no added wait.
 
 Below the table: how much of the live bytes the tensors' shapes need
-(wgpu rounds every buffer up to 4 bytes), the highest live plus pool-idle
-total of the phase, and the 10 largest live buffers at the phase peak with
-their category, dtype and shape.
+(wgpu rounds every buffer up to 4 bytes), the bytes held right after the
+sample (live, pool idle, awaiting GPU), and the 10 largest live buffers at
+the phase peak with their category, dtype and shape.
 
 The report counts only buffers Ferrotensor allocated through wgpu, so it is
-lower than `nvidia-smi` or Activity Monitor. Not counted: driver and
-allocator overhead and alignment, compiled pipelines and shaders, uniform
-buffers, the staging copies wgpu makes for uploads (released every 256 MiB
-of uploads), and buffers of the `ferrotensor` tensor API. A buffer is
+lower than `nvidia-smi` or Activity Monitor. Not counted: the driver's
+context and its allocator's blocks, alignment and slack, compiled
+pipelines, shaders and bind groups, the staging copies wgpu makes for
+uploads (released every 256 MiB of uploads), and buffers of the
+`ferrotensor` tensor API. A buffer is
 counted under the phase that created it; the logits, the loss gradient and
 the parameter gradients are moved to their own rows when the trainer knows
 what they are, and the phase peak is corrected for that move.

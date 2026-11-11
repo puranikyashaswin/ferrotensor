@@ -182,6 +182,9 @@ impl WgpuContext {
         loop {
             self.device.poll(wgpu::Maintain::Poll);
             if done() {
+                // Callers wait for the last submitted work, so that poll let
+                // wgpu destroy every buffer dropped before it.
+                self.memory().gpu_reclaimed();
                 return;
             }
             if polls < 100 {
