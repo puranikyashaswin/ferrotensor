@@ -102,6 +102,7 @@ pub struct Lfm2Block {
 
 impl Lfm2Block {
     /// Runs the block; `pos`, `cache` and `mask` are used by attention layers.
+    /// No attention dropout (evaluation).
     pub fn forward(
         &self,
         engine: &ComputeEngine,
@@ -110,11 +111,27 @@ impl Lfm2Block {
         cache: Option<&KVCacheLayer>,
         mask: Option<&UnifiedTensor>,
     ) -> Tensor {
+        self.forward_with_dropout(engine, x, pos, cache, mask, None)
+    }
+
+    /// [`forward`](Self::forward) with attention dropout seeded by
+    /// `dropout_seed` (see [`Attention::forward_with_dropout`]).
+    pub fn forward_with_dropout(
+        &self,
+        engine: &ComputeEngine,
+        x: &Tensor,
+        pos: usize,
+        cache: Option<&KVCacheLayer>,
+        mask: Option<&UnifiedTensor>,
+        dropout_seed: Option<u64>,
+    ) -> Tensor {
         // Residual 1: x + Op(Norm(x))
         let h = self.operator_norm.forward(engine, x);
         let h = match &self.op {
             Lfm2LayerOp::Conv(conv) => conv.forward(engine, &h),
-            Lfm2LayerOp::Attention(attn) => attn.forward(engine, &h, pos, cache, mask),
+            Lfm2LayerOp::Attention(attn) => {
+                attn.forward_with_dropout(engine, &h, pos, cache, mask, dropout_seed)
+            }
         };
         let h = Tensor::add(x, &h, engine);
 
@@ -256,6 +273,7 @@ impl Lfm2Model {
     }
 
     /// Logits `[1, seq, vocab]` for `input_ids`, the first of which is at `pos`.
+    /// No attention dropout (evaluation and generation).
     pub fn forward(
         &self,
         engine: &ComputeEngine,
@@ -263,6 +281,22 @@ impl Lfm2Model {
         pos: usize,
         cache: Option<&mut crate::KVCache>,
         mask: Option<&UnifiedTensor>,
+    ) -> Tensor {
+        self.forward_with_dropout(engine, input_ids, pos, cache, mask, None)
+    }
+
+    /// [`forward`](Self::forward) for training: with `Some(step_seed)`, layer
+    /// `i` applies attention dropout with seed
+    /// [`layer_seed`](crate::dropout::layer_seed)`(step_seed, i)`, so the
+    /// masks are a pure function of the step seed and the layer index.
+    pub fn forward_with_dropout(
+        &self,
+        engine: &ComputeEngine,
+        input_ids: &[u32],
+        pos: usize,
+        cache: Option<&mut crate::KVCache>,
+        mask: Option<&UnifiedTensor>,
+        dropout_seed: Option<u64>,
     ) -> Tensor {
         let ctx = self.embed_tokens.ctx.clone();
 
@@ -276,7 +310,8 @@ impl Lfm2Model {
         // 2. Layers
         for (i, layer) in self.layers.iter().enumerate() {
             let layer_cache = cache.as_ref().map(|c| &c.layers[i]);
-            x = layer.forward(engine, &x, pos, layer_cache, mask);
+            let seed = dropout_seed.map(|s| crate::dropout::layer_seed(s, i));
+            x = layer.forward_with_dropout(engine, &x, pos, layer_cache, mask, seed);
         }
 
         // 3. Final Norm & Head
@@ -298,6 +333,18 @@ impl Lfm2Model {
     /// If the rows differ in length, or if
     /// [`supports_batching`](Self::supports_batching) is false.
     pub fn forward_batch(&self, engine: &ComputeEngine, rows: &[&[u32]]) -> Tensor {
+        self.forward_batch_with_dropout(engine, rows, None)
+    }
+
+    /// [`forward_batch`](Self::forward_batch) with attention dropout, seeded
+    /// as in [`forward_with_dropout`](Self::forward_with_dropout). Each row
+    /// of the batch gets its own mask.
+    pub fn forward_batch_with_dropout(
+        &self,
+        engine: &ComputeEngine,
+        rows: &[&[u32]],
+        dropout_seed: Option<u64>,
+    ) -> Tensor {
         assert!(
             self.supports_batching(),
             "forward_batch needs an all-attention model"
@@ -312,8 +359,9 @@ impl Lfm2Model {
         if let Some(norm) = &self.embedding_norm {
             x = norm.forward(engine, &x);
         }
-        for layer in &self.layers {
-            x = layer.forward(engine, &x, 0, None, None);
+        for (i, layer) in self.layers.iter().enumerate() {
+            let seed = dropout_seed.map(|s| crate::dropout::layer_seed(s, i));
+            x = layer.forward_with_dropout(engine, &x, 0, None, None, seed);
         }
         x = self.norm_f.forward(engine, &x);
         self.lm_head.forward(engine, &x)

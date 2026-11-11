@@ -7,6 +7,7 @@ use ferrotensor_backend::{ComputeEngine, UnifiedTensor, WgpuContext};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+pub mod dropout;
 pub mod flash_attention;
 /// LFM2 (Liquid foundation model) blocks.
 pub mod lfm;
@@ -283,6 +284,9 @@ impl Attention {
     /// Attends over `x` (`[batch, seq, hidden]`) whose first token is at
     /// position `pos`. With `cache`, the new keys/values are written at `pos`
     /// and the queries attend to the whole cache up to their own position.
+    ///
+    /// Evaluation: no attention dropout is applied. Training goes through
+    /// [`forward_with_dropout`](Self::forward_with_dropout).
     pub fn forward(
         &self,
         engine: &ComputeEngine,
@@ -290,6 +294,23 @@ impl Attention {
         pos: usize,
         cache: Option<&KVCacheLayer>,
         mask: Option<&UnifiedTensor>,
+    ) -> Tensor {
+        self.forward_with_dropout(engine, x, pos, cache, mask, None)
+    }
+
+    /// [`forward`](Self::forward) with attention dropout at
+    /// [`dropout_prob`](Self::dropout_prob) when `dropout_seed` is `Some`
+    /// (training). The mask is a pure function of the seed, so the same seed
+    /// gives the same mask, including in the backward pass. `None`, and the
+    /// KV-cache path (inference only), apply no dropout.
+    pub fn forward_with_dropout(
+        &self,
+        engine: &ComputeEngine,
+        x: &Tensor,
+        pos: usize,
+        cache: Option<&KVCacheLayer>,
+        mask: Option<&UnifiedTensor>,
+        dropout_seed: Option<u64>,
     ) -> Tensor {
         let q = self.q_proj.forward(engine, x);
         let k = self.k_proj.forward(engine, x);
@@ -308,14 +329,18 @@ impl Attention {
             let k_4d = Tensor::reshape(&k, &[batch, seq_len, self.num_kv_heads, self.head_dim]);
             let v_4d = Tensor::reshape(&v, &[batch, seq_len, self.num_kv_heads, self.head_dim]);
             let mask = mask.map(|m| Tensor::frozen(x.ctx.clone(), m.clone()));
+            let (dropout_prob, seed) = match dropout_seed {
+                Some(seed) => (self.dropout_prob, seed),
+                None => (0.0, 0),
+            };
             let out = Tensor::flash_attention(
                 &q_4d,
                 &k_4d,
                 &v_4d,
                 mask.as_ref(),
                 true,
-                self.dropout_prob,
-                0,
+                dropout_prob,
+                seed,
                 engine,
             );
             let out = Tensor::reshape(&out, &[batch, seq_len, self.n_heads * self.head_dim]);
@@ -331,7 +356,7 @@ impl Attention {
             self.n_heads,
             self.num_kv_heads,
             true, // causal
-            self.dropout_prob,
+            0.0,  // no dropout at inference
         );
 
         // Write the new keys/values at `pos` (cache is `[1, max_seq, kv * head_dim]`).

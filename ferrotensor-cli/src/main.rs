@@ -912,6 +912,8 @@ async fn train(mut args: TrainArgs) -> Result<()> {
             resume.display()
         );
     }
+    // Attention-dropout masks follow the run seed (restored on resume).
+    trainer.dropout_seed = args.seed;
 
     let sup = supervised_tokens(&dataset);
     eprintln!(

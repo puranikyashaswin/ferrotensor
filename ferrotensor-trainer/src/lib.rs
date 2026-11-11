@@ -86,6 +86,15 @@ pub struct Trainer {
     /// tokens from seeing the padding, so results are unchanged, but GPU
     /// buffer sizes repeat and can be reused. 1 disables padding.
     pub length_bucket: usize,
+    /// Run seed for attention dropout. Each forward pass draws its masks
+    /// from this seed, the rank, the optimizer step and the position in the
+    /// accumulation window (see
+    /// [`attention_dropout_seed`](Self::attention_dropout_seed)), so a run is
+    /// reproducible and a resumed run (with
+    /// [`set_optimizer_steps`](Self::set_optimizer_steps)) draws the same
+    /// masks as an uninterrupted one. Has no effect when the model's
+    /// attention dropout is 0.
+    pub dropout_seed: u64,
     optimizer_step_count: usize,
 }
 
@@ -109,6 +118,7 @@ impl Trainer {
             distributed_grad_sync: None,
             lr_scheduler: None,
             length_bucket: 32,
+            dropout_seed: 0,
             optimizer_step_count: 0,
         }
     }
@@ -150,6 +160,27 @@ impl Trainer {
     pub fn with_lr_scheduler(mut self, scheduler: Box<dyn LRScheduler>) -> Self {
         self.lr_scheduler = Some(scheduler);
         self
+    }
+
+    /// Seed the attention-dropout masks with `seed` (see
+    /// [`dropout_seed`](Self::dropout_seed)).
+    pub fn with_dropout_seed(mut self, seed: u64) -> Self {
+        self.dropout_seed = seed;
+        self
+    }
+
+    /// The attention-dropout step seed for the next forward pass:
+    /// [`derive_seed`](ferrotensor_graph::dropout::derive_seed) of the run
+    /// seed, this process's rank, the optimizer step and the position in the
+    /// accumulation window. Layers derive their own seeds from it.
+    pub fn attention_dropout_seed(&self) -> u64 {
+        let rank = self.distributed_grad_sync.as_ref().map_or(0, |c| c.rank);
+        ferrotensor_graph::dropout::derive_seed(&[
+            self.dropout_seed,
+            rank as u64,
+            self.optimizer_step_count as u64,
+            self.step_in_accum as u64,
+        ])
     }
 
     /// Optimizer steps taken so far.
@@ -205,7 +236,10 @@ impl Trainer {
         targets.resize(padded_len, pad);
         mask.resize(padded_len, 0);
 
-        let logits = self.model.forward(&self.engine, &inputs, 0, None, None);
+        let dropout_seed = Some(self.attention_dropout_seed());
+        let logits =
+            self.model
+                .forward_with_dropout(&self.engine, &inputs, 0, None, None, dropout_seed);
 
         let mut stats = StepStats {
             loss: 0.0,
@@ -308,7 +342,8 @@ impl Trainer {
     /// sequences run through the model together, one forward and backward
     /// per accumulation chunk; otherwise one at a time. Both give the same
     /// result: each sequence contributes its own mean-loss gradient, and
-    /// optimizer steps fall after the same sequences.
+    /// optimizer steps fall after the same sequences. With attention dropout
+    /// on, the two paths draw different (identically distributed) masks.
     pub fn train_batch(
         &mut self,
         batch: &Batch,
@@ -390,7 +425,10 @@ impl Trainer {
             masks.resize(masks.len() + padded_len - len, 0);
         }
         let rows: Vec<&[u32]> = inputs.iter().map(Vec::as_slice).collect();
-        let logits = self.model.forward_batch(&self.engine, &rows);
+        let dropout_seed = Some(self.attention_dropout_seed());
+        let logits = self
+            .model
+            .forward_batch_with_dropout(&self.engine, &rows, dropout_seed);
 
         let mut out: Vec<StepStats> = Vec::with_capacity(chunk.len());
         if let Some(loss) =

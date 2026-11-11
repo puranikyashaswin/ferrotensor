@@ -135,6 +135,28 @@ fn cases() -> Vec<Case> {
             ],
             |x, e| Tensor::flash_attention(&x[0], &x[1], &x[2], None, false, 0.3, 7, e),
         ),
+        case(
+            // A full-width seed, as the trainer derives per step and layer:
+            // forward and backward must regenerate the same mask from it.
+            "flash_attention_dropout_causal_mixed_seed",
+            vec![
+                input(&[2, 4, 2, 8], 25),
+                input(&[2, 4, 1, 8], 26),
+                input(&[2, 4, 1, 8], 27),
+            ],
+            |x, e| {
+                Tensor::flash_attention(
+                    &x[0],
+                    &x[1],
+                    &x[2],
+                    None,
+                    true,
+                    0.4,
+                    0xD1B5_4A32_D192_ED03,
+                    e,
+                )
+            },
+        ),
         case("checkpoint", vec![input(&[6], 15)], |x, e| {
             checkpoint_single(
                 x[0].clone(),
