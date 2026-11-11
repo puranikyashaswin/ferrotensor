@@ -679,6 +679,7 @@ dependencies = [
  "ferrotensor-loader",
  "log",
  "pollster",
+ "safetensors",
  "serde",
  "serde_json",
 ]
