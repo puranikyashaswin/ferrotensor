@@ -1,4 +1,7 @@
-"""GPU parity tests; run with FERROTENSOR_GPU_TESTS=1 on a machine with a GPU."""
+"""GPU parity tests; run with FERROTENSOR_RUN_GPU_TESTS=1 (the old FERROTENSOR_GPU_TESTS=1 also works).
+
+They need a GPU adapter; CI runs them on software Vulkan (Mesa lavapipe).
+"""
 
 import pytest
 

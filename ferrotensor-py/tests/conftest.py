@@ -4,20 +4,25 @@ import pytest
 
 import ferrotensor as ft
 
-RUN_GPU = os.environ.get("FERROTENSOR_GPU_TESTS") == "1"
+# FERROTENSOR_RUN_GPU_TESTS is the repository-wide switch; the older
+# FERROTENSOR_GPU_TESTS still works.
+RUN_GPU = "1" in (
+    os.environ.get("FERROTENSOR_RUN_GPU_TESTS"),
+    os.environ.get("FERROTENSOR_GPU_TESTS"),
+)
 
 
 def pytest_collection_modifyitems(config, items):
     if RUN_GPU:
         return
-    skip = pytest.mark.skip(reason="set FERROTENSOR_GPU_TESTS=1 to run GPU tests")
+    skip = pytest.mark.skip(reason="set FERROTENSOR_RUN_GPU_TESTS=1 to run GPU tests")
     for item in items:
         if "gpu" in item.keywords:
             item.add_marker(skip)
 
 
 def pytest_configure(config):
-    config.addinivalue_line("markers", "gpu: needs a GPU adapter (FERROTENSOR_GPU_TESTS=1)")
+    config.addinivalue_line("markers", "gpu: needs a GPU adapter (FERROTENSOR_RUN_GPU_TESTS=1)")
 
 
 def close(a, b, tol=1e-5):
