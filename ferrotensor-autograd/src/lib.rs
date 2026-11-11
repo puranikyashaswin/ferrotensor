@@ -36,7 +36,9 @@ pub trait AutogradNode {
 pub struct Tensor {
     /// The values (shared between clones).
     pub data: Arc<UnifiedTensor>,
-    /// Accumulated gradient, if backward has reached this tensor.
+    /// Accumulated gradient. After [`Tensor::backward`] only leaves hold one:
+    /// the gradient of a tensor produced by an op is released as soon as it
+    /// has been propagated to that op's inputs.
     pub grad: Arc<RefCell<Option<UnifiedTensor>>>,
     /// GPU context the data lives in.
     pub ctx: Arc<WgpuContext>,
@@ -95,7 +97,11 @@ impl Tensor {
     }
 
     /// Backpropagate from this tensor (seeded with ones unless a gradient is
-    /// already set) and accumulate gradients into every tensor in its graph.
+    /// already set) and accumulate gradients into the leaves of its graph.
+    /// Gradients of intermediate tensors, this one included (when it requires
+    /// a gradient), are released as
+    /// they are used, so calling `backward` again adds one more copy of the
+    /// gradient to each leaf.
     pub fn backward(&self, engine: &ComputeEngine) {
         let mut sorted_tensors = Vec::new();
         let mut visited = std::collections::HashSet::new();
@@ -129,21 +135,26 @@ impl Tensor {
             *self.grad.borrow_mut() = Some(UnifiedTensor::new(&self.ctx, &ones, shape));
         }
 
-        // Iterate backwards
+        // Iterate backwards. A non-leaf's gradient is complete when it is
+        // reached (every consumer came earlier), and is needed only here, so
+        // it is taken out of its slot: its buffer returns to the pool as soon
+        // as this iteration ends instead of living until the graph is dropped.
+        // Leaves keep their gradients for the optimizer.
         for tensor in sorted_tensors.into_iter().rev() {
             if !tensor.requires_grad {
                 continue;
             }
-            let grad_option = tensor.grad.borrow().clone();
-            if let Some(grad) = grad_option {
-                if let Some(creator) = &tensor.creator {
-                    let input_grads = creator.backward(&grad, engine);
-                    let inputs = creator.inputs();
-                    for (input, input_grad) in inputs.iter().zip(input_grads) {
-                        if input.requires_grad {
-                            input.accumulate_grad(engine, &input_grad);
-                        }
-                    }
+            let Some(creator) = &tensor.creator else {
+                continue;
+            };
+            let Some(grad) = tensor.grad.borrow_mut().take() else {
+                continue;
+            };
+            let input_grads = creator.backward(&grad, engine);
+            let inputs = creator.inputs();
+            for (input, input_grad) in inputs.iter().zip(input_grads) {
+                if input.requires_grad {
+                    input.accumulate_grad(engine, &input_grad);
                 }
             }
         }

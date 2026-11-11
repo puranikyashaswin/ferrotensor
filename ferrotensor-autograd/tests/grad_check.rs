@@ -282,3 +282,51 @@ fn scaling_one_gradient_in_place_leaves_others_alone() {
         );
     }
 }
+
+#[test]
+fn backward_releases_intermediate_gradients() {
+    if std::env::var("FERROTENSOR_RUN_GPU_TESTS").as_deref() != Ok("1") {
+        eprintln!("skipping GPU gradient release test; set FERROTENSOR_RUN_GPU_TESTS=1 to enable");
+        return;
+    }
+    let ctx = Arc::new(pollster::block_on(WgpuContext::new()));
+    let engine = ComputeEngine::new(&ctx);
+    let a = Tensor::new(
+        ctx.clone(),
+        UnifiedTensor::new(&ctx, &values(6, 1, true), &[2, 3]),
+    );
+    let b = Tensor::new(
+        ctx.clone(),
+        UnifiedTensor::new(&ctx, &values(6, 2, true), &[3, 2]),
+    );
+    let mid = Tensor::matmul(&a, &b, &engine);
+    let out = Tensor::silu(&mid, &engine);
+    out.backward(&engine);
+
+    assert!(
+        mid.grad.borrow().is_none(),
+        "the intermediate gradient should be released"
+    );
+    assert!(
+        out.grad.borrow().is_none(),
+        "the root gradient should be released"
+    );
+    let grad_of = |t: &Tensor| read(&ctx, t.grad.borrow().as_ref().expect("leaf grad"));
+    let g1a = grad_of(&a);
+    let g1b = grad_of(&b);
+
+    out.backward(&engine);
+    let g2a = grad_of(&a);
+    let g2b = grad_of(&b);
+
+    for (g1, g2) in g1a.iter().zip(&g2a).chain(g1b.iter().zip(&g2b)) {
+        assert!(
+            (g2 - 2.0 * g1).abs() <= 1e-5 + 1e-5 * g1.abs(),
+            "a second backward should add exactly one more gradient: {g1} then {g2}"
+        );
+    }
+    assert!(
+        g1a.iter().any(|g| *g != 0.0),
+        "a's gradient should not be all zeros"
+    );
+}
