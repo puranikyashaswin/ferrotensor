@@ -28,7 +28,6 @@ pub use wgpu; // Re-export wgpu for downstream crates
 pub mod adapters;
 mod context;
 mod engine;
-/// Byte accounting of GPU tensors by category.
 pub mod memory;
 /// Size-keyed reuse of GPU buffers.
 pub mod pool;

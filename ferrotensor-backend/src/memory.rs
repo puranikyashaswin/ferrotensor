@@ -1,10 +1,10 @@
 //! Accounting of the GPU memory held by tensors, split by what it is for.
 //!
-//! Every [`UnifiedTensor`](crate::UnifiedTensor) buffer is counted while it
+//! Every [tensor](crate::UnifiedTensor) buffer is counted while it
 //! is alive, under a [`MemoryCategory`]: the category current on the
 //! context's [`MemoryTracker`] when the tensor was created (see
 //! [`MemoryTracker::scope`]), or the one set later with
-//! [`UnifiedTensor::set_memory_category`](crate::UnifiedTensor::set_memory_category).
+//! [`set_memory_category`](crate::UnifiedTensor::set_memory_category).
 //! Buffers returned to the [`BufferPool`](crate::pool::BufferPool) and kept
 //! for reuse are counted separately as idle pool bytes.
 //!
@@ -12,11 +12,12 @@
 //! peak and the list of the largest buffers need a lock per allocation, so
 //! they are only kept after [`MemoryTracker::set_detailed`]`(true)`.
 //!
-//! Sizes are what Ferrotensor asked wgpu for, after wgpu's rounding of every
-//! buffer to a multiple of 4 bytes ([`wgpu_buffer_size`]). The driver and
-//! its allocator add their own alignment and block overhead, and pipelines,
-//! shaders, uniform buffers and upload staging copies are not tensors, so
-//! the totals are lower than what `nvidia-smi` or Activity Monitor show.
+//! Sizes are what Ferrotensor asked wgpu for, after wgpu rounds every buffer
+//! up to a multiple of 4 bytes (see [`memory::wgpu_buffer_size`](crate::memory::wgpu_buffer_size)).
+//! The driver and its allocator add their own alignment and block overhead,
+//! and pipelines, shaders, uniform buffers and upload staging copies are not
+//! tensors, so the totals are lower than what `nvidia-smi` or Activity
+//! Monitor show.
 
 use crate::DType;
 use std::collections::HashMap;
