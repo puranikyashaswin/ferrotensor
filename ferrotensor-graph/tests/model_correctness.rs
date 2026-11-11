@@ -419,6 +419,132 @@ fn forward_is_deterministic() {
     );
 }
 
+/// `(shape, values)` of every f32 tensor in a safetensors file.
+fn read_safetensors(path: &std::path::Path) -> Weights {
+    let bytes =
+        std::fs::read(path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let file = safetensors::SafeTensors::deserialize(&bytes).expect("safetensors");
+    let mut out = Weights::new();
+    for (name, view) in file.tensors() {
+        assert_eq!(view.dtype(), safetensors::Dtype::F32, "{name} is not f32");
+        let values = view
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect();
+        out.insert(name, (view.shape().to_vec(), values));
+    }
+    out
+}
+
+/// The PyTorch fixture of the gradient-parity tests in ferrotensor-trainer
+/// (`scripts/gen_gradient_fixtures.py`) describes this file's model: same
+/// config, bit-identical weights, and logits (without and with its LoRA
+/// adapters) that equal the CPU reference above. This ties the PyTorch
+/// mirror to an independent forward pass. CPU only, so it always runs.
+#[test]
+fn pytorch_gradient_fixture_matches_the_cpu_reference() {
+    let dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gradient_parity");
+
+    let config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).expect("config"))
+            .expect("config json");
+    for (key, value) in [
+        ("hidden_size", HIDDEN),
+        ("intermediate_size", FFN),
+        ("num_attention_heads", HEADS),
+        ("num_key_value_heads", KV_HEADS),
+        ("num_hidden_layers", LAYERS),
+        ("vocab_size", VOCAB),
+    ] {
+        assert_eq!(config[key].as_u64(), Some(value as u64), "config {key}");
+    }
+    assert_eq!(config["rms_norm_eps"].as_f64().map(|v| v as f32), Some(EPS));
+    assert_eq!(config["rope_theta"].as_f64().map(|v| v as f32), Some(THETA));
+    assert_eq!(config["tie_word_embeddings"].as_bool(), Some(false));
+
+    let weights = tiny_llama_weights();
+    let fixture = read_safetensors(&dir.join("model.safetensors"));
+    let mut names: Vec<&String> = fixture.keys().collect();
+    names.sort();
+    let mut expected_names: Vec<&String> = weights.keys().collect();
+    expected_names.sort();
+    assert_eq!(names, expected_names, "fixture weight names");
+    for (name, (shape, values)) in &weights {
+        let (f_shape, f_values) = &fixture[name];
+        assert_eq!(f_shape, shape, "{name} shape");
+        assert!(
+            f_values
+                .iter()
+                .zip(values)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "{name}: fixture weights differ from tiny_llama_weights()"
+        );
+    }
+
+    let cases: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("cases.json")).expect("cases"))
+            .expect("cases json");
+    let first_row: Vec<u32> = cases["cases"]["single"]["rows"][0]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|v| v.as_u64().expect("id") as u32)
+        .collect();
+    assert_eq!(first_row, IDS, "the fixture's first row is IDS");
+    let config = lora_everywhere();
+    assert_eq!(
+        cases["lora_rank"].as_u64(),
+        Some(config.rank as u64),
+        "LoRA rank"
+    );
+    assert_eq!(
+        cases["lora_alpha"].as_f64().map(|v| v as f32),
+        Some(config.alpha),
+        "LoRA alpha"
+    );
+
+    let raw = read_safetensors(&dir.join("adapters.safetensors"));
+    let adapters: HashMap<String, Adapter> = raw
+        .keys()
+        .filter_map(|k| k.strip_suffix(".lora_a"))
+        .map(|prefix| {
+            let a = raw[&format!("{prefix}.lora_a")].1.clone();
+            let b = raw[&format!("{prefix}.lora_b")].1.clone();
+            (prefix.to_string(), Adapter { a, b })
+        })
+        .collect();
+    assert_eq!(
+        adapters.len(),
+        LAYERS * 7 + 1,
+        "an adapter per linear layer"
+    );
+
+    // Two f32 CPU implementations of the same math: they differ only in
+    // summation order and libm, about 1e-6 on logits of order 1 (both are
+    // within 1.5e-6 of an f64 evaluation).
+    let tol = 1e-4;
+    let expected = read_safetensors(&dir.join("expected.safetensors"));
+    let base = reference_forward(&weights, &IDS);
+    assert_close(
+        &expected["logits.base"].1,
+        &base,
+        tol,
+        "PyTorch base logits",
+    );
+    let merged = merge_adapters(&weights, &adapters, config.rank, config.alpha);
+    let with_lora = reference_forward(&merged, &IDS);
+    assert_close(
+        &expected["logits.single"].1,
+        &with_lora,
+        tol,
+        "PyTorch LoRA logits",
+    );
+}
+
 #[test]
 #[ignore = "needs a GPU"]
 fn f16_base_weights_stay_close_to_f32() {
