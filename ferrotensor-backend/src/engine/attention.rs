@@ -366,7 +366,7 @@ impl AttentionDims {
             s[2],
             s[3],
             opts.window,
-            0,
+            (opts.seed >> 32) as u32,
             0,
             0,
         ];
@@ -399,7 +399,7 @@ impl AttentionDims {
             s[2],
             s[3],
             opts.window,
-            0,
+            (opts.seed >> 32) as u32,
             0,
             0,
         ];
@@ -424,7 +424,7 @@ pub struct AttentionOptions {
     pub window: u32,
     /// Attention dropout probability; 0.0 disables dropout.
     pub dropout_prob: f32,
-    /// Seed for the dropout pattern (only the low 32 bits are used).
+    /// Seed for the dropout pattern (all 64 bits are used).
     pub seed: u64,
 }
 

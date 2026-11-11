@@ -42,7 +42,7 @@ struct FlashBwdParams {
     mask_stride_q: u32,
     mask_stride_k: u32,
     window: u32,
-    _pad0: u32,
+    seed_hi: u32,
     _pad1: u32,
     _pad2: u32,
 };
@@ -253,7 +253,7 @@ fn flash_bwd_dq(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id
             let s = dot4.x + dot4.y + dot4.z + dot4.w + fab2_mask_at(b, h, qi, kj);
             if (s <= FAB_MASKED) { continue; }
             let pij = exp(s - lse);
-            let mij = dropout_scale(p.dropout_prob, p.seed, bh, qi, kj);
+            let mij = dropout_scale(p.dropout_prob, p.seed, p.seed_hi, bh, qi, kj);
             let ds = pij * (mij * (dov4.x + dov4.y + dov4.z + dov4.w) - delta) * p.scale;
             for (var c = 0u; c < d4; c++) {
                 dq_acc[c] = fma(vec4<f32>(ds), fab2_t0[j * FAB_D4 + c], dq_acc[c]);
@@ -353,7 +353,7 @@ fn flash_bwd_dk_dv(@builtin(local_invocation_index) lid: u32, @builtin(workgroup
                 if (s <= FAB_MASKED) { continue; }
                 let stats = fab2_stats[fab2_row(b, h, qi)];
                 let pij = exp(s - stats.y);
-                let mij = dropout_scale(p.dropout_prob, p.seed, bh, qi, kj);
+                let mij = dropout_scale(p.dropout_prob, p.seed, p.seed_hi, bh, qi, kj);
                 let ds = pij * (mij * (dov4.x + dov4.y + dov4.z + dov4.w) - stats.x) * p.scale;
                 let pm = pij * mij;
                 for (var c = 0u; c < d4; c++) {

@@ -1,7 +1,8 @@
 //! Seeds for attention dropout.
 //!
-//! A dropout mask is a pure function of its seed: the attention kernels hash
-//! `(batch * heads + head, query, key + seed)`, and the backward pass (and any
+//! A dropout mask is a pure function of its seed: the attention kernels mix
+//! both 32-bit halves of the seed into one key and hash
+//! `((batch * heads + head) ^ key, query, key_index)`, and the backward pass (and any
 //! recomputation of a forward, such as activation checkpointing) regenerates
 //! the same mask from the same seed. Training therefore derives one seed per
 //! step from the run seed and the step counter
@@ -10,9 +11,8 @@
 //! run that restores its step counter draws the same masks as an
 //! uninterrupted one.
 //!
-//! The kernels add the seed to the key index, so two seeds that differ by a
-//! small amount give masks that are shifted copies of each other. Every seed
-//! is therefore passed through a full 64-bit mix before use.
+//! Every seed is also passed through a full 64-bit mix here, so the step
+//! and layer seeds handed to the kernels are spread over all 64 bits.
 
 /// SplitMix64 finaliser: a bijective mix of all 64 bits.
 fn mix(mut z: u64) -> u64 {
@@ -65,8 +65,8 @@ mod tests {
 
     #[test]
     fn consecutive_steps_are_not_small_offsets() {
-        // The kernels use the low 32 bits as a (wrapping) offset on the key
-        // index; a small difference would make two masks shifted copies.
+        // Neighbouring steps and layers get seeds whose low halves are far
+        // apart (the kernels mix the seed themselves as well).
         let far = |a: u32, b: u32| a.wrapping_sub(b).min(b.wrapping_sub(a)) > 1 << 12;
         for step in 0..64u64 {
             let a = derive_seed(&[0, 0, step, 0]) as u32;
