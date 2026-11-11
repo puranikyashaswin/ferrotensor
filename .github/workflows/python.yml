@@ -58,7 +58,8 @@ jobs:
             3.10
             3.14
       # One abi3 wheel serves every CPython >= 3.10: test the oldest and newest.
-      # Hosted runners have no GPU, so the GPU tests skip themselves.
+      # Hosted runners have no GPU, so the GPU tests skip themselves. The MLP
+      # example runs on the CPU.
       - name: Test the wheel
         shell: bash
         run: |
@@ -69,6 +70,8 @@ jobs:
             "$venv/pip" install --quiet pytest
             "$venv/pip" install --quiet --no-index --find-links ferrotensor-py/dist ferrotensor
             (cd "$RUNNER_TEMP/tests" && "$venv/python" -m pytest -q)
+            # The example checks its own result and exits non-zero when it is wrong.
+            "$venv/python" ferrotensor-py/examples/mlp.py
           done
       - uses: actions/upload-artifact@v4.4.3
         with:

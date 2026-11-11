@@ -2,6 +2,9 @@
 
 python examples/mlp.py            # CPU
 python examples/mlp.py --device gpu
+
+The script exits with an error if the loss does not fall, if the model does not
+learn the spirals, or if the reloaded model gives a different accuracy.
 """
 
 from __future__ import annotations
@@ -60,12 +63,16 @@ def main() -> None:
     sched = optim.WarmupCosineLR(opt, warmup_steps=10, total_steps=args.steps, min_lr=0.002)
     print(f"device={device!r} parameters={model.num_parameters()}")
 
+    first_loss = last_loss = float("nan")
     for step in range(args.steps):
         opt.zero_grad()
         loss = F.cross_entropy(model(x), labels)
         loss.backward()
         opt.step()
         sched.step()
+        last_loss = loss.item()
+        if step == 0:
+            first_loss = last_loss
         if step % 50 == 0 or step == args.steps - 1:
             print(f"step {step:4d}  loss {loss.item():.4f}  lr {opt.lr:.4f}")
 
@@ -73,6 +80,8 @@ def main() -> None:
     with ft.no_grad():
         acc = F.accuracy(model(x), labels)
     print(f"train accuracy {acc:.3f}")
+    assert last_loss < first_loss, f"loss did not fall: {first_loss} -> {last_loss}"
+    assert acc > 0.75, f"train accuracy is only {acc:.3f}"
 
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "mlp.safetensors")
@@ -80,7 +89,9 @@ def main() -> None:
         restored = MLP(32, device)
         restored.load(path)
         with ft.no_grad():
-            print(f"reloaded accuracy {F.accuracy(restored(x), labels):.3f}")
+            reloaded = F.accuracy(restored(x), labels)
+        print(f"reloaded accuracy {reloaded:.3f}")
+        assert reloaded == acc, f"reloaded accuracy {reloaded} != {acc}"
 
 
 if __name__ == "__main__":

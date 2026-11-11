@@ -54,6 +54,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.2
       # Hosted runners have no GPU: GPU tests are #[ignore]d and skipped here.
       - run: cargo test --workspace
+      # Run the examples that need no GPU. They check their own results.
+      - name: Examples (CPU)
+        if: matrix.os == 'ubuntu-latest'
+        run: scripts/run-examples.sh --cpu
 
   gpu-vulkan:
     name: GPU tests (software Vulkan)
@@ -86,6 +90,8 @@ jobs:
         run: cargo test --release -p ferrotensor --lib -- --test-threads=1
         env:
           FERROTENSOR_FUSION: "1"
+      - name: Examples (GPU)
+        run: scripts/run-examples.sh --gpu
       - name: Hardware report (quick)
         run: scripts/hardware-report.sh --quick
       - uses: actions/upload-artifact@v4.4.3
