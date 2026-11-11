@@ -67,10 +67,10 @@ jobs:
       FERROTENSOR_RUN_GPU_TESTS: "1"
     steps:
       - uses: actions/checkout@v4.2.2
+      # The Azure package mirror is down now and then. The script retries, then
+      # falls back to archive.ubuntu.com / security.ubuntu.com.
       - name: Install Mesa lavapipe
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q mesa-vulkan-drivers vulkan-tools
+        run: scripts/ci/apt-install.sh mesa-vulkan-drivers vulkan-tools
       - run: vulkaninfo --summary
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2.9.2
