@@ -11,10 +11,19 @@
 # canonical archive.ubuntu.com / security.ubuntu.com hosts and tries again.
 # It exits non-zero if every attempt fails.
 #
-# Environment overrides (used to test this script off a runner):
-#   APT_DIR       apt configuration directory (default /etc/apt)
-#   ATTEMPTS      attempts per mirror setting (default 3)
-#   WAIT_SECONDS  base wait; attempt n waits n times this (default 15)
+# The fallback only helps when one host or the mirror list is down. It cannot
+# help when the runner resolves no Ubuntu host at all; callers that must survive
+# that cache the .deb files (see install-lavapipe.sh).
+#
+# The source rewrite is a CI-only action: it needs CI=true (GitHub Actions sets
+# it), and the original files are put back when the script exits.
+#
+# Environment:
+#   APT_ARCHIVE_DIR  download the .deb files into this directory and keep them
+#                    (apt option Dir::Cache::archives); default is apt's own
+#   APT_DIR          apt configuration directory (default /etc/apt)
+#   ATTEMPTS         attempts per mirror setting (default 3)
+#   WAIT_SECONDS     base wait; attempt n waits n times this (default 15)
 set -u
 
 APT_DIR="${APT_DIR:-/etc/apt}"
@@ -32,10 +41,39 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 apt_opts=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30)
+if [ -n "${APT_ARCHIVE_DIR:-}" ]; then
+  apt_opts+=(-o "Dir::Cache::archives=$APT_ARCHIVE_DIR" -o APT::Keep-Downloaded-Packages=true)
+fi
+
+# Source files rewritten by use_canonical_mirrors are saved first and put back
+# on exit. backup_list holds "original<TAB>backup" entries.
+backup_dir=""
+backup_list=()
+
+# shellcheck disable=SC2329  # run by the EXIT trap below
+restore_sources() {
+  local entry orig bak
+  for entry in ${backup_list[@]+"${backup_list[@]}"}; do
+    orig="${entry%%$'\t'*}"
+    bak="${entry#*$'\t'}"
+    if ${sudo_cmd[@]+"${sudo_cmd[@]}"} cp -p "$bak" "$orig"; then
+      echo "apt-install: restored $orig"
+    else
+      echo "apt-install: could not restore $orig; the original is in $bak" >&2
+      return 0
+    fi
+  done
+  if [ -n "$backup_dir" ]; then
+    rm -rf "$backup_dir"
+  fi
+}
+trap restore_sources EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 try_install() {
-  "${sudo_cmd[@]}" apt-get update -q "${apt_opts[@]}" &&
-    "${sudo_cmd[@]}" apt-get install -y -q "${apt_opts[@]}" "$@"
+  ${sudo_cmd[@]+"${sudo_cmd[@]}"} apt-get update -q "${apt_opts[@]}" &&
+    ${sudo_cmd[@]+"${sudo_cmd[@]}"} apt-get install -y -q "${apt_opts[@]}" "$@"
 }
 
 # Run try_install up to ATTEMPTS times, waiting 1x, 2x, ... WAIT_SECONDS between tries.
@@ -59,11 +97,17 @@ run_attempts() {
 
 # Rewrite the runner's mirror+file: and azure.archive.ubuntu.com sources to the
 # canonical hosts (security.ubuntu.com for the *-security suites). Returns 1
-# without touching anything when no source file has either.
+# without touching anything when CI is not "true", when no source file has
+# either, or when no file could be backed up and written. Every file it
+# rewrites is saved first and put back by restore_sources on exit.
 use_canonical_mirrors() {
+  if [ "${CI:-}" != "true" ]; then
+    echo "apt-install: CI is not 'true', refusing to rewrite apt sources"
+    return 1
+  fi
   # Bracket classes, not backslashes: awk -v would eat the backslashes.
   local pattern='mirror[+]file:/etc/apt/apt-mirrors[.]txt|https?://azure[.]archive[.]ubuntu[.]com/ubuntu/?'
-  local files=() f changed=0 tmp
+  local files=() f changed=0 tmp bak
   for f in "$APT_DIR/sources.list" "$APT_DIR"/sources.list.d/*.sources "$APT_DIR"/sources.list.d/*.list; do
     if [ -f "$f" ] && grep -Eq "$pattern" "$f"; then
       files+=("$f")
@@ -74,38 +118,65 @@ use_canonical_mirrors() {
     return 1
   fi
 
-  tmp="$(mktemp)"
+  if ! tmp="$(mktemp)"; then
+    echo "apt-install: mktemp failed, leaving apt sources unchanged" >&2
+    return 1
+  fi
+  if [ -z "$backup_dir" ] && ! backup_dir="$(mktemp -d)"; then
+    echo "apt-install: mktemp -d failed, leaving apt sources unchanged" >&2
+    backup_dir=""
+    rm -f "$tmp"
+    return 1
+  fi
+
   for f in "${files[@]}"; do
-    # Paragraph mode: a deb822 stanza is one paragraph; a one-line-style .list
-    # file is one paragraph whose lines are each handled on their own.
-    awk -v pat="$pattern" '
-      BEGIN { RS = "" }
-      {
-        n = split($0, lines, "\n")
-        stanza_sec = ($0 ~ /(^|\n)Suites:[^\n]*-security/)
-        out = ""
+    # Line by line, so blank lines and everything else stay as they were. A
+    # deb822 stanza is the run of lines between blank lines; its Suites: line
+    # decides whether URIs: points at security.ubuntu.com. A one-line-style
+    # .list file is one such run whose deb lines are each handled on their own.
+    if ! awk -v pat="$pattern" \
+      -v main_url="http://archive.ubuntu.com/ubuntu/" \
+      -v sec_url="http://security.ubuntu.com/ubuntu/" '
+      function flush(   i, sec, line) {
+        sec = 0
+        for (i = 1; i <= n; i++) if (buf[i] ~ /^Suites:.*-security/) sec = 1
         for (i = 1; i <= n; i++) {
-          line = lines[i]
+          line = buf[i]
           if (line ~ /^URIs:/) {
-            sub(pat, stanza_sec ? "http://security.ubuntu.com/ubuntu/" : "http://archive.ubuntu.com/ubuntu/", line)
+            sub(pat, sec ? sec_url : main_url, line)
           } else if (line ~ /^deb/) {
-            sub(pat, (line ~ /-security/) ? "http://security.ubuntu.com/ubuntu/" : "http://archive.ubuntu.com/ubuntu/", line)
+            sub(pat, (line ~ /-security/) ? sec_url : main_url, line)
           }
-          out = out (i > 1 ? "\n" : "") line
+          print line
         }
-        printf "%s%s", (NR > 1 ? "\n\n" : ""), out
+        n = 0
       }
-      END { print "" }' "$f" >"$tmp"
-    if ! cmp -s "$f" "$tmp"; then
-      echo "apt-install: rewriting $f"
-      diff -u "$f" "$tmp" | sed 's/^/apt-install:   /'
-      "${sudo_cmd[@]}" cp "$tmp" "$f"
+      /^[[:space:]]*$/ { flush(); print; next }
+      { buf[++n] = $0 }
+      END { flush() }' "$f" >"$tmp"; then
+      echo "apt-install: awk failed on $f, leaving it unchanged" >&2
+      continue
+    fi
+    if cmp -s "$f" "$tmp"; then
+      continue
+    fi
+    echo "apt-install: rewriting $f"
+    diff -u "$f" "$tmp" | sed 's/^/apt-install:   /'
+    bak="$backup_dir/${#backup_list[@]}"
+    if ! ${sudo_cmd[@]+"${sudo_cmd[@]}"} cp -p "$f" "$bak"; then
+      echo "apt-install: could not back up $f, leaving it unchanged" >&2
+      continue
+    fi
+    backup_list+=("$f"$'\t'"$bak")
+    if ${sudo_cmd[@]+"${sudo_cmd[@]}"} cp "$tmp" "$f"; then
       changed=1
+    else
+      echo "apt-install: could not write $f" >&2
     fi
   done
   rm -f "$tmp"
   if [ "$changed" -eq 0 ]; then
-    echo "apt-install: apt sources already canonical, nothing to rewrite"
+    echo "apt-install: no apt source was rewritten"
     return 1
   fi
   return 0

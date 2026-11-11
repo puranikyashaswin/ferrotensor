@@ -67,11 +67,34 @@ jobs:
       FERROTENSOR_RUN_GPU_TESTS: "1"
     steps:
       - uses: actions/checkout@v4.2.2
-      # The Azure package mirror is down now and then. The script retries, then
-      # falls back to archive.ubuntu.com / security.ubuntu.com.
+      # Lavapipe comes from apt, and the runner has no route to the Ubuntu
+      # package hosts during an outage (every one of them failed to resolve for
+      # about three hours once). So the .deb files, dependencies included, are
+      # cached per runner image: a run with a cache hit installs them with dpkg
+      # and downloads nothing. On a miss, scripts/ci/apt-install.sh retries and
+      # falls back from the Azure mirror to archive.ubuntu.com, which covers one
+      # bad mirror but not an outage of every host; a miss during such an outage
+      # still fails. A cache saved on a PR branch is visible only to that PR, so
+      # other PRs are protected once this workflow has run on main.
+      - name: Runner image id
+        id: image
+        run: echo "id=${ImageOS}-${ImageVersion}" >> "$GITHUB_OUTPUT"
+      - name: Cache lavapipe packages
+        uses: actions/cache@v4.3.0
+        with:
+          path: ~/.cache/lavapipe-debs
+          # Bump the v1 suffix to discard a bad cache entry.
+          key: lavapipe-debs-v1-${{ steps.image.outputs.id }}
       - name: Install Mesa lavapipe
-        run: scripts/ci/apt-install.sh mesa-vulkan-drivers vulkan-tools
-      - run: vulkaninfo --summary
+        run: scripts/ci/install-lavapipe.sh "$HOME/.cache/lavapipe-debs"
+      # Diagnostic only; the self-check below decides whether an adapter works.
+      - name: Vulkan devices
+        run: |
+          if command -v vulkaninfo >/dev/null; then
+            vulkaninfo --summary
+          else
+            echo "vulkaninfo is not installed; skipping the summary"
+          fi
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2.9.2
       - name: Adapter and kernel self-check
