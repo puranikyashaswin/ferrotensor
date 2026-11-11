@@ -21,7 +21,9 @@ what the test suite and CI use, so every op is checked against finite
 differences on the CPU and against the CPU on the GPU. It is built for the
 people CUDA-first frameworks leave out (laptops, consumer and integrated
 GPUs) and for anyone who wants to read, and change, every layer from the API
-down to the shader. It is young: pre-1.0, f32 only, and small-scale by design.
+down to the shader. It is young: pre-1.0 and small-scale by design. Arithmetic and
+trainable parameters are f32; the CLI stores frozen LoRA base weights as f16 by
+default to save memory (`--f32-weights` keeps them f32).
 
 - [Install](#install) · [Quickstart](#quickstart) · [Python](#python) · [Features](#feature-matrix) · [Architecture](#architecture) · [Compared with candle, burn and tch](#compared-with-candle-burn-and-tch) · [Roadmap](#roadmap)
 - Docs: [how-to guide](https://puranikyashaswin.github.io/ferrotensor/guide/) · [architecture](docs/architecture.md) · [writing a kernel](docs/writing-a-kernel.md) · [use cases](docs/use-cases.md) · [LoRA SFT walkthrough](docs/examples/lora-sft.md) · [benchmarks](benchmarks/RESULTS.md) · [testing on your GPU](docs/testing-on-your-gpu.md) · [API docs](https://docs.rs/ferrotensor)

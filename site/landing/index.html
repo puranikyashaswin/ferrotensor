@@ -133,7 +133,7 @@
      "name": "What are Ferrotensor’s limits?",
      "acceptedAnswer": {
       "@type": "Answer",
-      "text": "It is pre-1.0 and f32 only, runs on a single GPU, and has no convolutions, sort or top-k in the tensor API yet. Chains of tiny ops are still faster on the CPU. LoRA fine-tuning is experimental and tested on small Llama-style models. The limits section above has the details."
+      "text": "It is pre-1.0, computes in f32 (the CLI stores frozen LoRA base weights as f16 by default), runs on a single GPU, and has no convolutions, sort or top-k in the tensor API yet. Chains of tiny ops are still faster on the CPU. LoRA fine-tuning is experimental and tested on small Llama-style models. The limits section above has the details."
      }
     }
    ]
@@ -206,7 +206,7 @@
         <div><dt>GPU</dt><dd>Metal, Vulkan, DX12 via wgpu</dd></div>
         <div><dt>Kernels</dt><dd>Hand-written WGSL</dd></div>
         <div><dt>Devices</dt><dd>GPU, plus a CPU reference device</dd></div>
-        <div><dt>Precision</dt><dd>f32</dd></div>
+        <div><dt>Precision</dt><dd>f32 (frozen LoRA base weights f16)</dd></div>
         <div><dt>Autograd</dt><dd>Reverse mode, checked against finite differences</dd></div>
         <div><dt>Bindings</dt><dd>Python 3.10+ (abi3 wheels)</dd></div>
         <div><dt>Needs</dt><dd>Rust 1.88+. No CUDA, cuDNN or libtorch</dd></div>
@@ -575,7 +575,7 @@ x = ft.<span class="f">tensor</span>([[<span class="n">0</span>, <span class="n"
       </div>
       <div class="faq-item">
         <h3 id="faq-limits">What are Ferrotensor’s limits?</h3>
-        <p>It is pre-1.0 and f32 only, runs on a single GPU, and has no convolutions, sort or top-k in the tensor API yet. Chains of tiny ops are still faster on the CPU. LoRA fine-tuning is experimental and tested on small Llama-style models. The <a href="#limits">limits section</a> above has the details.</p>
+        <p>It is pre-1.0, computes in f32 (the CLI stores frozen LoRA base weights as f16 by default), runs on a single GPU, and has no convolutions, sort or top-k in the tensor API yet. Chains of tiny ops are still faster on the CPU. LoRA fine-tuning is experimental and tested on small Llama-style models. The <a href="#limits">limits section</a> above has the details.</p>
       </div>
     </div>
   </div>

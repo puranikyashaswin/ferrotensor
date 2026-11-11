@@ -10,7 +10,9 @@ tensor API.
 The same API also runs on a CPU device. Every differentiable op is tested
 against finite differences on the CPU, and every GPU kernel against the CPU.
 
-It is young: pre-1.0, `f32` only, single GPU, and small-scale by design.
+It is young: pre-1.0, single GPU, and small-scale by design. Arithmetic and
+trainable parameters are `f32`; the CLI stores frozen LoRA base weights as `f16` by
+default to save memory (`--f32-weights` keeps them `f32`).
 
 ## Where to start
 
