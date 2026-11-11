@@ -4,6 +4,7 @@ import pytest
 
 import ferrotensor as ft
 import ferrotensor.nn.functional as F
+from conftest import close
 
 
 def test_regression_losses():

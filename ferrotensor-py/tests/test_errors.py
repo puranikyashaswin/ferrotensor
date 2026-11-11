@@ -132,7 +132,7 @@ def lr_setter(value):
         (lambda: ft.full((2,), "x"), TypeError, ""),
         (lambda: ft.tensor([1.0], requires_grad="yes"), TypeError, ""),
         # devices
-        (lambda: ft.Device(5), TypeError, "kind"),
+        (lambda: ft.Device(5), TypeError, "(?i)str"),
         (lambda: ft.randn(2, device="tpu"), ValueError, "unknown device"),
         (lambda: ft.ones(2).to("tpu"), ValueError, "unknown device"),
         (lambda: ft.ones(2).to(5), TypeError, "device"),
