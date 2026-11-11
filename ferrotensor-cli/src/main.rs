@@ -906,6 +906,16 @@ async fn train(mut args: TrainArgs) -> Result<()> {
             start_step = ckpt.training_state.step;
             args.seed = ckpt.training_state.seed;
             trainer.set_optimizer_steps(start_step);
+        } else if trainer.model.layers.iter().any(|l| {
+            matches!(&l.op, ferrotensor_graph::lfm::Lfm2LayerOp::Attention(a) if a.dropout_prob > 0.0)
+        }) {
+            eprintln!(
+                "warning: no training state at {}, so the step counter is not restored: \
+                 attention-dropout masks restart from step 0 (seeded by --seed {}) \
+                 instead of continuing the original run's sequence",
+                resume_state.display(),
+                args.seed
+            );
         }
         eprintln!(
             "resume: {} ({n} tensors), continuing at step {start_step}",
