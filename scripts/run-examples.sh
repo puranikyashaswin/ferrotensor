@@ -67,7 +67,9 @@ SKIPPED=(
   "ferrotensor-monitor/tui_demo|interactive terminal UI"
 )
 
-# Crates whose examples are not checked here (another change owns them).
+# Crates whose examples are not checked here. The trainer examples run in the
+# "Trainer examples" step of the GPU job in .github/workflows/ci.yml, and
+# peft_fixture runs in its "PEFT export against PyTorch + PEFT" step.
 IGNORED_CRATES=(ferrotensor-trainer)
 
 want_cpu=0
