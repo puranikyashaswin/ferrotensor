@@ -16,10 +16,10 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
-version = "0.5.0"
+version = "0.6.0"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/puranikyashaswin/ferrotensor"
-authors = ["Yashaswin Puranik <puranikyashaswinsharma@gmail.com>"]
+authors = ["Puranik Yashaswin Sharma <puranikyashaswinsharma@gmail.com>"]
 rust-version = "1.88"
 homepage = "https://github.com/puranikyashaswin/ferrotensor"
 
