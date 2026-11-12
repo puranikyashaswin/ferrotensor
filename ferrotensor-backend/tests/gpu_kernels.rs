@@ -1314,12 +1314,100 @@ fn hash3(x: u32, y: u32, z: u32) -> f32 {
     a.wrapping_add(b).wrapping_add(c) as f32 * 2.328_306_4e-10
 }
 
+/// CPU copy of the WGSL `fmix32` (Murmur3 finalizer).
+fn fmix32(mut h: u32) -> u32 {
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x85eb_ca6b);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0xc2b2_ae35);
+    h ^ (h >> 16)
+}
+
+/// CPU copy of the WGSL `dropout_scale` keep decision.
+fn dropout_keep(prob: f32, seed: u64, bh: u32, q: u32, k: u32) -> bool {
+    let key = fmix32(seed as u32 ^ fmix32((seed >> 32) as u32 ^ 0x9e37_79b9));
+    hash3(bh ^ key, q, k) >= prob
+}
+
+/// The `[seq_q, seq_k]` keep mask the forward kernel draws for `seed`,
+/// read back through the output: zero scores give uniform weights, and
+/// one-hot values (`head_dim == seq_k`) put weight j of row i in out[i, j].
+fn dropout_mask(prob: f32, seed: u64, sq: usize, sk: usize) -> Vec<bool> {
+    let g = gpu();
+    let q = vec![0.0f32; sq * sk];
+    let k = vec![0.0f32; sk * sk];
+    let v: Vec<f32> = (0..sk * sk)
+        .map(|i| if i / sk == i % sk { 1.0 } else { 0.0 })
+        .collect();
+    let out = zeros(&[1, sq, 1, sk]);
+    g.engine.flash_attention_v2(
+        &g.ctx,
+        &upload(&q, &[1, sq, 1, sk]),
+        &upload(&k, &[1, sk, 1, sk]),
+        &upload(&v, &[1, sk, 1, sk]),
+        &out,
+        false,
+        prob,
+        seed,
+        None,
+    );
+    read(&out).iter().map(|&x| x > 0.0).collect()
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn flash_attention_v2_dropout_masks_of_nearby_seeds_are_unrelated() {
+    // Masks used to hash (bh, q, k + seed): seed + 1 gave the mask of seed
+    // shifted by one key, and seeds equal in their low 32 bits gave the same
+    // mask. At p = 0.5 two unrelated masks agree at about half the positions.
+    let (prob, sq, sk) = (0.5f32, 64, 32);
+    let seed = 1000u64;
+    let a = dropout_mask(prob, seed, sq, sk);
+    for (idx, &kept) in a.iter().enumerate() {
+        let want = dropout_keep(prob, seed, 0, (idx / sk) as u32, (idx % sk) as u32);
+        assert_eq!(kept, want, "mask differs from the CPU reference at {idx}");
+    }
+    let kept = a.iter().filter(|&&x| x).count() as f32 / a.len() as f32;
+    assert!((kept - 0.5).abs() < 0.1, "kept fraction {kept}");
+
+    let agree = |pairs: &mut dyn Iterator<Item = (bool, bool)>| {
+        let (mut same, mut n) = (0usize, 0usize);
+        for (x, y) in pairs {
+            same += (x == y) as usize;
+            n += 1;
+        }
+        same as f32 / n as f32
+    };
+    let b = dropout_mask(prob, seed + 1, sq, sk);
+    let shifted = agree(
+        &mut (0..sq)
+            .flat_map(|i| (1..sk).map(move |j| (i, j)))
+            .map(|(i, j)| (a[i * sk + j], b[i * sk + j - 1])),
+    );
+    assert!(
+        (shifted - 0.5).abs() < 0.1,
+        "mask(seed + 1) is a shifted copy of mask(seed): agreement {shifted}"
+    );
+    let same_pos = agree(&mut a.iter().copied().zip(b.iter().copied()));
+    assert!(
+        (same_pos - 0.5).abs() < 0.1,
+        "seed + 1 agreement {same_pos}"
+    );
+    let high = dropout_mask(prob, seed + (1 << 32), sq, sk);
+    let high_agree = agree(&mut a.iter().copied().zip(high.iter().copied()));
+    assert!(
+        (high_agree - 0.5).abs() < 0.1,
+        "high seed bits ignored: agreement {high_agree}"
+    );
+}
+
 #[test]
 #[ignore = "needs a GPU; run with --ignored --test-threads=1"]
 fn flash_attention_v2_mask_and_dropout_forward_backward_match_cpu() {
     let g = gpu();
     let (b, sq, sk, h, hkv, d) = (2, 21, 21, 4, 2, 32);
-    let (prob, seed) = (0.2f32, 77u64);
+    // Both seed halves non-zero, so the kernels must read all 64 bits.
+    let (prob, seed) = (0.2f32, 0x9E37_79B9_0000_004Du64);
     let q = rand_vec(b * sq * h * d, 44);
     let k = rand_vec(b * sk * hkv * d, 45);
     let v = rand_vec(b * sk * hkv * d, 46);
@@ -1348,7 +1436,7 @@ fn flash_attention_v2_mask_and_dropout_forward_backward_match_cpu() {
     );
     let scale = 1.0 / (d as f32).sqrt();
     let keep = |bh: usize, i: usize, j: usize| {
-        if hash3(bh as u32, i as u32, j as u32 + seed as u32) >= prob {
+        if dropout_keep(prob, seed, bh as u32, i as u32, j as u32) {
             1.0 / (1.0 - prob)
         } else {
             0.0

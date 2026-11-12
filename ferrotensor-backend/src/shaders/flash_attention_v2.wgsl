@@ -44,7 +44,7 @@ struct FlashV2Params {
     mask_stride_q: u32,
     mask_stride_k: u32,
     window: u32,
-    _pad0: u32,
+    seed_hi: u32,
     _pad1: u32,
     _pad2: u32,
 };
@@ -67,11 +67,25 @@ fn hash3(x: u32, y: u32, z: u32) -> f32 {
     return f32(a + b + c) * 2.3283064365386963e-10; // * 1/2^32
 }
 
+// Murmur3 32-bit finalizer.
+fn fmix32(v: u32) -> u32 {
+    var h = v;
+    h = h ^ (h >> 16u);
+    h = h * 0x85ebca6bu;
+    h = h ^ (h >> 13u);
+    h = h * 0xc2b2ae35u;
+    h = h ^ (h >> 16u);
+    return h;
+}
+
 // Dropout multiplier for attention weight (bh, q, k): 0 if dropped,
-// 1 / (1 - p) if kept.
-fn dropout_scale(prob: f32, seed: u32, bh: u32, q_idx: u32, k_idx: u32) -> f32 {
+// 1 / (1 - p) if kept. Both halves of the 64-bit seed are mixed into one
+// key that enters the hash as its own term, so nearby seeds do not give
+// shifted copies of one pattern.
+fn dropout_scale(prob: f32, seed_lo: u32, seed_hi: u32, bh: u32, q_idx: u32, k_idx: u32) -> f32 {
     if (prob <= 0.0) { return 1.0; }
-    let r = hash3(bh, q_idx, k_idx + seed);
+    let key = fmix32(seed_lo ^ fmix32(seed_hi ^ 0x9e3779b9u));
+    let r = hash3(bh ^ key, q_idx, k_idx);
     return select(0.0, 1.0 / (1.0 - prob), r >= prob);
 }
 
@@ -197,7 +211,7 @@ fn flash_attention_v2_metal(
                     if (s[j] > FA_MASKED) {
                         let pj = exp(s[j] - m_new);
                         l_run += pj;
-                        let w = pj * dropout_scale(p.dropout_prob, p.seed_val, bh, q_idx, k_start + j);
+                        let w = pj * dropout_scale(p.dropout_prob, p.seed_val, p.seed_hi, bh, q_idx, k_start + j);
                         for (var c = 0u; c < d4; c++) {
                             acc[c] = fma(vec4<f32>(w), fa_v_tile[j * (FA_MAX_D / 4u) + c], acc[c]);
                         }
