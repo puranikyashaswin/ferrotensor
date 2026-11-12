@@ -126,6 +126,14 @@ struct ModelArgs {
     /// Frozen base weights are already f16 by default; kept for compatibility.
     #[arg(long, hide = true, conflicts_with = "f32_weights")]
     f16_weights: bool,
+    /// Store the frozen weights of the decoder blocks at 4 bits (affine,
+    /// groups of 64, about 4.5 bits per weight; computation stays f32).
+    /// This changes the model's outputs: it computes with the decoded
+    /// weights. lm_head stays f16; embeddings, norms and LoRA adapters stay
+    /// f32. Not allowed when base weights train. Use the same setting to
+    /// evaluate or generate with an adapter trained this way.
+    #[arg(long, conflicts_with = "f32_weights")]
+    q4_weights: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -416,6 +424,7 @@ struct Loaded {
     config: Lfm2Config,
     weights: WeightsContext,
     f16_weights: bool,
+    q4_weights: bool,
 }
 
 async fn load_base(args: &ModelArgs) -> Result<Loaded> {
@@ -451,6 +460,9 @@ async fn load_base(args: &ModelArgs) -> Result<Loaded> {
         config.hidden_size,
         config.vocab_size
     );
+    if args.q4_weights {
+        eprintln!("weights: 4-bit decoder blocks, f16 lm_head");
+    }
     Ok(Loaded {
         ctx,
         engine,
@@ -458,13 +470,14 @@ async fn load_base(args: &ModelArgs) -> Result<Loaded> {
         config,
         weights,
         f16_weights: !args.f32_weights,
+        q4_weights: args.q4_weights,
     })
 }
 
 /// Build the model. `saved` is the metadata of the file the model will load,
 /// if any: LoRA settings give the model adapters of that shape; trained base
 /// weights give it none and store every weight as f32 (what the file holds,
-/// and what training used), whatever `--f32-weights` says.
+/// and what training used), whatever `--f32-weights` or `--q4-weights` says.
 fn build_model(
     base: &Loaded,
     saved: Option<&LoraMetadata>,
@@ -478,7 +491,8 @@ fn build_model(
         base.config.clone(),
     )
     .with_trainable_base(trainable_base)
-    .with_f16_weights(base.f16_weights && !weights_file);
+    .with_f16_weights(base.f16_weights && !weights_file)
+    .with_q4_weights(base.q4_weights && !weights_file);
     if let Some(meta) = saved.filter(|m| m.trained_modules.is_none()) {
         builder = builder.with_lora(LoRaConfig {
             rank: meta.rank,
@@ -1715,6 +1729,40 @@ mod tests {
         assert!(classify::check_taps(&[3, 3], 4)
             .expect_err("duplicate")
             .contains("twice"));
+    }
+
+    #[test]
+    fn q4_weights_parse_on_every_command() {
+        let model = |args: &[&str]| match parse(args).expect("parse").command {
+            Command::Train(t) => t.model,
+            Command::Eval(e) => e.model,
+            Command::Generate(g) => g.model,
+            _ => panic!("expected train, eval or generate"),
+        };
+        let train = ["train", "--model", "m", "--data", "d.jsonl"];
+        let eval = ["eval", "--model", "m", "--data", "d.jsonl"];
+        let generate = ["generate", "--model", "m"];
+        for cmd in [&train[..], &eval[..], &generate[..]] {
+            assert!(!model(cmd).q4_weights, "{cmd:?}: off by default");
+            let mut with = cmd.to_vec();
+            with.push("--q4-weights");
+            let m = model(&with);
+            assert!(m.q4_weights, "{with:?}");
+            assert!(!m.f32_weights, "{with:?}: lm_head stays f16");
+        }
+        assert!(
+            parse(&[
+                "train",
+                "--model",
+                "m",
+                "--data",
+                "d",
+                "--q4-weights",
+                "--f32-weights"
+            ])
+            .is_err(),
+            "--q4-weights keeps lm_head f16, so it conflicts with --f32-weights"
+        );
     }
 
     #[test]

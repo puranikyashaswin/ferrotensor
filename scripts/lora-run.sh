@@ -7,9 +7,9 @@
 #   scripts/lora-run.sh HuggingFaceTB/SmolLM2-135M --batch-size 8 --grad-accum 1 --name b8
 #
 # Same data, split and hyperparameters as the walkthrough unless overridden:
-# 2,000 Alpaca examples for training, 64 held out, LoRA rank 8 on q/k/v/o,
-# lr 5e-4, 20 warmup steps, 8 sequences per step (--batch-size 1
-# --grad-accum 8). Frozen base weights are f16 (the CLI default);
+# 2,000 Alpaca examples for training, 64 held out, LoRA rank 8 on q/k/v/o, lr
+# 5e-4, 20 warmup steps, 8 sequences per step (--batch-size 1 --grad-accum 8).
+# Frozen base weights are f16 (the CLI default; 4-bit blocks with --q4-weights);
 # --f32-weights keeps them f32.
 # --checkpoint-blocks recomputes each block in backward (less GPU memory).
 # Everything goes under data/ (gitignored); the summary is
@@ -27,6 +27,7 @@ repo="$1"; shift
 steps=250
 seq_len=256
 batch_size=1
+q4_weights=0
 grad_accum=8
 f16_weights=1
 checkpoint_blocks=0
@@ -37,6 +38,7 @@ while [ $# -gt 0 ]; do
     --seq-len) seq_len="$2"; shift 2 ;;
     --batch-size) batch_size="$2"; shift 2 ;;
     --grad-accum) grad_accum="$2"; shift 2 ;;
+    --q4-weights) q4_weights=1; shift ;;
     --f16-weights) f16_weights=1; shift ;;
     --f32-weights) f16_weights=0; shift ;;
     --checkpoint-blocks) checkpoint_blocks=1; shift ;;
@@ -56,6 +58,7 @@ model_flags=()
 train_flags=()
 [ "$checkpoint_blocks" = 1 ] && train_flags=(--checkpoint-blocks)
 mkdir -p "$run_dir" data/alpaca
+[ "$q4_weights" = 1 ] && model_flags+=(--q4-weights)
 
 command -v hf >/dev/null || { echo "needs the hf CLI: pip install huggingface_hub" >&2; exit 1; }
 
@@ -123,12 +126,13 @@ for p in "${prompts[@]}"; do
 done
 
 python3 - "$run_dir" "$repo" "$steps" "$seq_len" "$(git rev-parse --short HEAD)" \
-  "$batch_size" "$grad_accum" "$f16_weights" <<'PY'
+  "$batch_size" "$grad_accum" "$f16_weights" "$q4_weights" <<'PY'
 import json, re, sys
 from pathlib import Path
 
 run, repo, steps, seq_len, commit = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
 batch_size, grad_accum, f16_weights = int(sys.argv[6]), int(sys.argv[7]), sys.argv[8] == "1"
+q4_weights = sys.argv[9] == "1"
 train = (run / "train.log").read_text()
 evals = (run / "eval.log").read_text()
 
@@ -145,13 +149,13 @@ mac = find(r"(\d+)\s+maximum resident set size", train, int)
 linux = find(r"Maximum resident set size \(kbytes\):\s*(\d+)", train, int)
 peak_bytes = mac if mac is not None else (linux * 1024 if linux is not None else None)
 
-# Each block is the command's stderr header (device/model/lora lines), the
+# Each block is the command's stderr header (device/model/weights/lora lines), the
 # generated text, then a "[N prompt + M new tokens, R tok/s, ...]" line.
 generations = []
 for block in (run / "generate.log").read_text().split("### ")[1:]:
     head, _, body = block.partition("\n")
     mode, _, prompt = head.partition(" | ")
-    lines = [l for l in body.strip().splitlines() if not re.match(r"(device|model|lora):\s", l)]
+    lines = [l for l in body.strip().splitlines() if not re.match(r"(device|model|weights|lora):\s", l)]
     stats = lines.pop() if lines and re.fullmatch(r"\[\d+ prompt \+ .*\]", lines[-1]) else None
     generations.append({"mode": mode, "prompt": prompt, "output": "\n".join(lines).strip(), "stats": stats})
 
@@ -166,6 +170,7 @@ summary = {
     "batch_size": batch_size,
     "grad_accum": grad_accum,
     "f16_weights": f16_weights,
+    "q4_weights": q4_weights,
     "heldout_loss_before": find(r"eval before: loss ([\d.]+)", train, float),
     "heldout_loss_after": find(r"loss ([\d.]+), perplexity", evals, float),
     "heldout_ppl_after": find(r"perplexity ([\d.]+)", evals, float),

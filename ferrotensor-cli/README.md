@@ -55,6 +55,43 @@ A full walkthrough with measured numbers is in
 - `ferrotensor-cli demo` (or `--demo`) plays a simulated training UI; it does not
   train anything.
 
+## Frozen base weights: f16, f32 or 4-bit
+
+By default the frozen linear-layer weights (attention, MLP and `lm_head`)
+are stored as f16 and every product is computed in f32; `--f32-weights`
+keeps them f32. Both compute the same model up to f16 rounding of the
+weights.
+
+`--q4-weights` (on `train`, `eval` and `generate`, off by default) stores
+the frozen weights of every decoder-block projection (`q/k/v/o_proj`,
+`gate/up/down_proj`) at 4 bits: affine codes in groups of 64 along the
+input dimension, one f16 scale and one f16 minimum per group, about 4.5
+bits per weight. They are quantised on the host while the model loads,
+from the f16/f32/bf16 safetensors, and the matmul decodes them and
+computes in f32. `lm_head` stays f16; the embedding, the norms and the
+LoRA adapters stay f32.
+
+This is not the same model. It computes with the decoded weights, so its
+logits, loss and gradients differ from the f16 or f32 base, and from
+PyTorch on the original checkpoint. The tests check that the 4-bit model
+equals, to f32 tolerance, the same model loaded in f32 from weights that
+were quantised and decoded on the host; how much quality, memory and speed
+change on real models has to be measured per model.
+
+- `--q4-weights` conflicts with `--f32-weights`, and is an error when base
+  weights train (`--train-modules` other than `lora`): 4-bit weights are
+  never trainable.
+- An adapter trained with `--q4-weights` learned to work with the 4-bit
+  weights, quantisation error included. Evaluate and sample it with
+  `--q4-weights` too. Loading it on the f16 or f32 base works (the shapes
+  are the same) but gives a different model from the one that was
+  trained, usually close to it; nothing checks or warns about this.
+- Checkpoints that are already quantised (MLX-style `<name>.scales`
+  tensors) are rejected with an error; load the f16/f32/bf16 checkpoint and
+  pass `--q4-weights` instead.
+- With `--memory-report`, the 4-bit weights appear under base weights as
+  "of which 4-bit".
+
 ## Where GPU memory goes: `--memory-report`
 
 `train --memory-report` prints a table of GPU memory by category after the
@@ -75,7 +112,7 @@ sequences) and at the highest point seen so far in the run. The rows:
 
 | Row | What it holds |
 |---|---|
-| base weights (frozen) | Model weights uploaded when the model is built, split into f16 (linear layers with the default f16 weights) and f32 (embedding, norms, or every weight with `--f32-weights`) |
+| base weights (frozen) | Model weights uploaded when the model is built, split into f16 (linear layers with the default f16 weights), 4-bit (decoder-block projections with `--q4-weights`) and f32 (embedding, norms, or every weight with `--f32-weights`) |
 | trainable parameters | The LoRA adapters, or the base weights `--train-modules` selects |
 | optimizer state | The AdamW moments, two f32 tensors per trainable tensor |
 | activations | Forward outputs and intermediates, kept by the autograd graph until the step's backward is done |
