@@ -43,7 +43,7 @@ use std::sync::{Arc, Mutex};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum MemoryCategory {
-    /// Frozen model weights (f16 or f32), uploaded when the model is built.
+    /// Frozen model weights (f32, f16 or 4-bit), uploaded when the model is built.
     BaseWeights = 0,
     /// Parameters the optimizer updates: LoRA adapters or trainable base weights.
     Trainable = 1,
@@ -132,6 +132,8 @@ pub struct CategoryBytes {
     pub logical_bytes: u64,
     /// Part of `allocated_bytes` in f16 tensors.
     pub f16_bytes: u64,
+    /// Part of `allocated_bytes` in 4-bit ([`DType::Q4`]) tensors.
+    pub q4_bytes: u64,
     /// Number of live buffers.
     pub buffers: u64,
 }
@@ -186,6 +188,7 @@ struct Counters {
     allocated: AtomicU64,
     logical: AtomicU64,
     f16: AtomicU64,
+    q4: AtomicU64,
     buffers: AtomicU64,
 }
 
@@ -278,7 +281,7 @@ pub(crate) struct Allocation {
     tracker: Arc<MemoryTracker>,
     id: u64,
     category: AtomicU8,
-    f16: bool,
+    dtype: DType,
     logical: u64,
     allocated: u64,
     /// Count the bytes as awaiting GPU once released (the buffer is
@@ -437,6 +440,7 @@ impl MemoryTracker {
                 allocated_bytes: c.allocated.load(Relaxed),
                 logical_bytes: c.logical.load(Relaxed),
                 f16_bytes: c.f16.load(Relaxed),
+                q4_bytes: c.q4.load(Relaxed),
                 buffers: c.buffers.load(Relaxed),
             };
             snap.live_bytes += out.allocated_bytes;
@@ -457,7 +461,7 @@ impl MemoryTracker {
         snap
     }
 
-    fn adjust(&self, category: u8, f16: bool, logical: u64, allocated: u64, add: bool) {
+    fn adjust(&self, category: u8, dtype: DType, logical: u64, allocated: u64, add: bool) {
         let c = &self.categories[category as usize];
         let op = |a: &AtomicU64, v: u64| {
             if add {
@@ -468,8 +472,10 @@ impl MemoryTracker {
         };
         op(&c.allocated, allocated);
         op(&c.logical, logical);
-        if f16 {
-            op(&c.f16, allocated);
+        match dtype {
+            DType::FP16 => op(&c.f16, allocated),
+            DType::Q4 => op(&c.q4, allocated),
+            DType::FP32 => {}
         }
         op(&c.buffers, 1);
     }
@@ -507,8 +513,7 @@ impl MemoryTracker {
         awaits_gpu: bool,
     ) -> Allocation {
         let allocated = wgpu_buffer_size(requested);
-        let f16 = dtype == DType::FP16;
-        self.adjust(category, f16, logical, allocated, true);
+        self.adjust(category, dtype, logical, allocated, true);
         let live = self.live.fetch_add(allocated, Relaxed) + allocated;
         self.note_peaks(live);
         let previous_peak = self.peak_live.fetch_max(live, Relaxed);
@@ -537,7 +542,7 @@ impl MemoryTracker {
             tracker: self.clone(),
             id,
             category: AtomicU8::new(category),
-            f16,
+            dtype,
             logical,
             allocated,
             awaits_gpu,
@@ -637,7 +642,7 @@ impl MemoryTracker {
     fn release(&self, a: &Allocation) {
         self.adjust(
             a.category.load(Relaxed),
-            a.f16,
+            a.dtype,
             a.logical,
             a.allocated,
             false,
@@ -656,8 +661,8 @@ impl MemoryTracker {
         if old == category as u8 {
             return;
         }
-        self.adjust(old, a.f16, a.logical, a.allocated, false);
-        self.adjust(category as u8, a.f16, a.logical, a.allocated, true);
+        self.adjust(old, a.dtype, a.logical, a.allocated, false);
+        self.adjust(category as u8, a.dtype, a.logical, a.allocated, true);
         if a.id == 0 && !self.is_detailed() {
             return;
         }
@@ -673,15 +678,19 @@ impl MemoryTracker {
                 from.allocated_bytes -= a.allocated;
                 from.logical_bytes -= a.logical;
                 from.buffers -= 1;
-                if a.f16 {
-                    from.f16_bytes -= a.allocated;
+                match a.dtype {
+                    DType::FP16 => from.f16_bytes -= a.allocated,
+                    DType::Q4 => from.q4_bytes -= a.allocated,
+                    DType::FP32 => {}
                 }
                 let to = &mut snap.categories[category as usize];
                 to.allocated_bytes += a.allocated;
                 to.logical_bytes += a.logical;
                 to.buffers += 1;
-                if a.f16 {
-                    to.f16_bytes += a.allocated;
+                match a.dtype {
+                    DType::FP16 => to.f16_bytes += a.allocated,
+                    DType::Q4 => to.q4_bytes += a.allocated,
+                    DType::FP32 => {}
                 }
                 if a.id != 0 {
                     for rec in snap.largest.iter_mut().filter(|r| r.id == a.id) {
@@ -797,6 +806,38 @@ mod tests {
         assert_eq!(snap.largest.len(), 2);
         assert_eq!(snap.largest[0].allocated_bytes, 400);
         drop((w, act));
+    }
+
+    #[test]
+    fn four_bit_weights_are_counted_apart_and_follow_retags() {
+        let t = tracker();
+        t.set_detailed(true);
+        let (h, q) = {
+            let _s = t.scope(MemoryCategory::BaseWeights);
+            let h = t.allocate(DType::FP16, &[10], 20, 20, false);
+            // A [64, 2] Q4 weight: 16 code words and 2 scale words.
+            let q = t.allocate(DType::Q4, &[64, 2], 72, 72, false);
+            (h, q)
+        };
+        let base = *t.current().category(MemoryCategory::BaseWeights);
+        assert_eq!(base.allocated_bytes, 92);
+        assert_eq!(base.logical_bytes, 92);
+        assert_eq!(base.f16_bytes, 20);
+        assert_eq!(base.q4_bytes, 72);
+        assert_eq!(base.buffers, 2);
+
+        q.set_category(MemoryCategory::Other);
+        let snap = t.current();
+        assert_eq!(snap.category(MemoryCategory::BaseWeights).q4_bytes, 0);
+        assert_eq!(snap.category(MemoryCategory::Other).q4_bytes, 72);
+        let peak = t.peak().unwrap();
+        assert_eq!(peak.category(MemoryCategory::BaseWeights).q4_bytes, 0);
+        assert_eq!(peak.category(MemoryCategory::Other).q4_bytes, 72);
+
+        drop((h, q));
+        let snap = t.current();
+        assert_eq!(snap.category(MemoryCategory::Other).q4_bytes, 0);
+        assert_eq!(snap.live_bytes, 0);
     }
 
     #[test]
