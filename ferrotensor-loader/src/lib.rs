@@ -15,6 +15,7 @@ use std::path::Path;
 use std::sync::Arc;
 use thiserror::Error;
 
+mod release;
 pub mod tokenizer;
 pub use tokenizer::{argmax, Sampler, Tokenizer};
 
@@ -284,6 +285,11 @@ impl WeightsContext {
     // We must pass a closure or return raw data copy.
     // For our usage: We want to upload to GPU immediately.
     /// Calls `callback` with the raw bytes and shape of a tensor.
+    ///
+    /// Afterwards the memory pages that hold only this tensor's bytes are
+    /// released from the process (on Unix), so a model load does not keep
+    /// the whole file resident; reading the tensor again faults them back
+    /// in from the file.
     pub fn read_bytes<F>(&self, name: &str, callback: F) -> Result<(), LoaderError>
     where
         F: FnOnce(&[u8], &[usize]),
@@ -296,6 +302,7 @@ impl WeightsContext {
             let st = SafeTensors::deserialize(mmap)?;
             let view = st.tensor(name)?;
             callback(view.data(), view.shape());
+            release::release(mmap, view.data());
             Ok(())
         } else {
             Err(LoaderError::MissingWeight(name.to_string()))
