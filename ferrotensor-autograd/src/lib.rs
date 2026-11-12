@@ -657,14 +657,17 @@ impl AutogradNode for SiLUGateNode {
 // Key for training large models on limited memory devices.
 
 /// A forward computation that [`checkpoint`] can replay during backward.
-pub trait CheckpointFn: Send + Sync {
+///
+/// The computation may capture `Tensor`s (weights, LoRA adapters); the graph
+/// is single-threaded, so no `Send`/`Sync` bound is needed.
+pub trait CheckpointFn {
     /// Run the forward computation on `inputs`.
     fn forward(&self, inputs: &[Tensor], engine: &ComputeEngine) -> Vec<Tensor>;
 }
 
 impl<F> CheckpointFn for F
 where
-    F: Fn(&[Tensor], &ComputeEngine) -> Vec<Tensor> + Send + Sync,
+    F: Fn(&[Tensor], &ComputeEngine) -> Vec<Tensor>,
 {
     fn forward(&self, inputs: &[Tensor], engine: &ComputeEngine) -> Vec<Tensor> {
         self(inputs, engine)
@@ -692,10 +695,23 @@ impl AutogradNode for CheckpointedNode {
         // Replay the forward pass from fresh leaves that share the input
         // data, backpropagate through the recomputed graph, and read the
         // gradients that reach the leaves.
+        //
+        // `grad` may share its buffer with another gradient, so it is only
+        // read. The nested backward adds the gradients of captured
+        // parameters straight into their own slots, releases the replay's
+        // intermediate gradients as it goes, and everything else the replay
+        // created is dropped when this function returns.
         let leaves: Vec<Tensor> = self
             .inputs
             .iter()
-            .map(|t| Tensor::new(t.ctx.clone(), t.data.as_ref().clone()))
+            .map(|t| {
+                let data = t.data.as_ref().clone();
+                if t.requires_grad {
+                    Tensor::new(t.ctx.clone(), data)
+                } else {
+                    Tensor::frozen(t.ctx.clone(), data)
+                }
+            })
             .collect();
         let outputs = self.checkpoint_fn.forward(&leaves, engine);
         let output = &outputs[self.output_index];
@@ -704,6 +720,10 @@ impl AutogradNode for CheckpointedNode {
         leaves
             .iter()
             .map(|leaf| {
+                if !leaf.requires_grad {
+                    // Never read: backward skips inputs that need no gradient.
+                    return UnifiedTensor::empty(&leaf.ctx, &[1]);
+                }
                 leaf.grad
                     .borrow()
                     .clone()
@@ -718,7 +738,7 @@ impl AutogradNode for CheckpointedNode {
 /// compute for memory.
 pub fn checkpoint<F>(inputs: Vec<Tensor>, forward_fn: F, engine: &ComputeEngine) -> Vec<Tensor>
 where
-    F: Fn(&[Tensor], &ComputeEngine) -> Vec<Tensor> + Send + Sync + 'static,
+    F: Fn(&[Tensor], &ComputeEngine) -> Vec<Tensor> + 'static,
 {
     let outputs = forward_fn(&inputs, engine);
     let checkpoint_fn: Arc<dyn CheckpointFn> = Arc::new(forward_fn);
@@ -739,17 +759,10 @@ where
 
 /// [`checkpoint`] for a single-input, single-output function.
 ///
-/// Checkpointing each transformer block keeps one activation per block
-/// instead of every intermediate:
-/// ```text
-/// let mut x = input;
-/// for layer in &layers {
-///     x = checkpoint_single(x, move |h, eng| layer.forward(h, eng), engine);
-/// }
-/// ```
+/// For a computation that captures weights, use [`checkpoint_with_params`].
 pub fn checkpoint_single<F>(input: Tensor, forward_fn: F, engine: &ComputeEngine) -> Tensor
 where
-    F: Fn(&Tensor, &ComputeEngine) -> Tensor + Send + Sync + 'static,
+    F: Fn(&Tensor, &ComputeEngine) -> Tensor + 'static,
 {
     let wrapper = move |inputs: &[Tensor], eng: &ComputeEngine| -> Vec<Tensor> {
         vec![forward_fn(&inputs[0], eng)]
@@ -757,6 +770,47 @@ where
     checkpoint(vec![input], wrapper, engine)
         .pop()
         .expect("checkpointed function returned one output")
+}
+
+/// [`checkpoint`] for a computation that also reads tensors it captures
+/// (weights, LoRA adapters) rather than receiving them as `inputs`.
+///
+/// Captured tensors that require a gradient receive it during backward,
+/// when the computation is replayed: once per backward pass through the
+/// output, added to whatever their gradient slots already hold. The outer
+/// graph cannot see them, so the outputs are marked as requiring a gradient
+/// whenever any of `params` does; otherwise a computation whose `inputs` are
+/// all frozen (the first decoder block reads the frozen embedding output)
+/// would be skipped by backward. Pass every captured tensor that may require
+/// a gradient in `params`.
+///
+/// The replay costs a second run of `forward_fn` during backward.
+///
+/// Checkpointing each decoder block keeps one activation per block:
+/// ```text
+/// let block = layer.clone(); // shares weights and gradient slots
+/// let params = block.params();
+/// let out = checkpoint_with_params(vec![x], &params, move |i, e| {
+///     vec![block.forward(e, &i[0], 0, None, None)]
+/// }, engine);
+/// ```
+pub fn checkpoint_with_params<F>(
+    inputs: Vec<Tensor>,
+    params: &[Tensor],
+    forward_fn: F,
+    engine: &ComputeEngine,
+) -> Vec<Tensor>
+where
+    F: Fn(&[Tensor], &ComputeEngine) -> Vec<Tensor> + 'static,
+{
+    let params_need_grad = params.iter().any(|p| p.requires_grad);
+    let mut outputs = checkpoint(inputs, forward_fn, engine);
+    if params_need_grad {
+        for output in &mut outputs {
+            output.requires_grad = true;
+        }
+    }
+    outputs
 }
 
 impl Tensor {
