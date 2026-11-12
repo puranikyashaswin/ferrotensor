@@ -6,6 +6,8 @@
 //! are read back and compared byte for byte with what the original path
 //! produced: read as f32, transpose into a second f32 copy, then upload the
 //! copy as f32 or convert it to f16 (kept below as a test-only reference).
+//! The host copy of the embedding table that the builder hands the model
+//! is compared with the table read back from the GPU.
 //! These tests need a GPU adapter, so they are `#[ignore]`d.
 
 use crate::lfm::{Lfm2LayerOp, Lfm2Model};
@@ -263,4 +265,45 @@ fn uploaded_weights_match_the_old_path_in_every_dtype() {
             }
         }
     }
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn host_embeddings_come_from_the_checkpoint_and_match_the_gpu_table() {
+    let gpu = gpu();
+    for dtype in [Dtype::F32, Dtype::F16, Dtype::BF16] {
+        let dir = TempDir::new("embed-host");
+        write_checkpoint(&dir.0, dtype, true);
+        let (model, _weights) = build(&gpu, &dir.0, true);
+        // Filled by the builder, so the first forward pass finds it and
+        // does not read the table back from the GPU.
+        let host = model
+            .host_embeddings()
+            .expect("the builder fills the host table");
+        let host_bytes: Vec<u8> = host.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let gpu_table = gpu_bytes(&gpu.ctx, &model.embed_tokens.data);
+        assert_bytes_eq(&format!("embed_host ({dtype:?})"), &host_bytes, &gpu_table);
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn models_assembled_by_hand_still_read_the_table_back_on_first_use() {
+    let gpu = gpu();
+    let dir = TempDir::new("embed-lazy");
+    write_checkpoint(&dir.0, Dtype::F32, true);
+    let (built, _weights) = build(&gpu, &dir.0, false);
+    let model = Lfm2Model::new(
+        built.embed_tokens,
+        built.embedding_norm,
+        built.layers,
+        built.norm_f,
+        built.lm_head,
+    );
+    assert!(model.host_embeddings().is_none());
+    let _ = model.forward(&gpu.engine, &[1, 2, 3], 0, None, None);
+    let host = model.host_embeddings().expect("filled on first use");
+    let host_bytes: Vec<u8> = host.iter().flat_map(|v| v.to_ne_bytes()).collect();
+    let gpu_table = gpu_bytes(&gpu.ctx, &model.embed_tokens.data);
+    assert_bytes_eq("embed_host (read back)", &host_bytes, &gpu_table);
 }

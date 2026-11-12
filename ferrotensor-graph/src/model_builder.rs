@@ -200,6 +200,20 @@ impl<'a> Lfm2ModelBuilder<'a> {
         }
     }
 
+    /// The token embeddings, and, unless they are stored quantized, the f32
+    /// values and shape uploaded for them: the model keeps those as its host
+    /// lookup table, and a tied `lm_head` is made from them, so the
+    /// checkpoint's table is read once and never read back from the GPU.
+    #[allow(clippy::type_complexity)]
+    fn load_embeddings(&self) -> Result<(Tensor, Option<(Vec<f32>, Vec<usize>)>)> {
+        if self.has("model.embed_tokens.scales") {
+            return Ok((self.load_tensor("model.embed_tokens")?, None));
+        }
+        let (data, shape) = self.read("model.embed_tokens.weight")?;
+        let tensor = self.wrap(UnifiedTensor::new(&self.ctx, &data, &shape));
+        Ok((tensor, Some((data, shape))))
+    }
+
     fn load_raw_tensor(&self, name: &str) -> Result<Tensor> {
         let (data, shape) = self.read(name)?;
         Ok(self.wrap(UnifiedTensor::new(&self.ctx, &data, &shape)))
@@ -374,7 +388,7 @@ impl<'a> Lfm2ModelBuilder<'a> {
         let n_layers = self.config.num_hidden_layers;
         log::info!("building {arch:?} model with {n_layers} layers");
 
-        let embed_tokens = self.load_tensor("model.embed_tokens")?;
+        let (embed_tokens, embed_table) = self.load_embeddings()?;
         let mut layers = Vec::with_capacity(n_layers);
         for i in 0..n_layers {
             layers.push(self.build_layer(i, arch)?);
@@ -394,8 +408,16 @@ impl<'a> Lfm2ModelBuilder<'a> {
         let lm_head = if self.has("lm_head.weight") {
             self.build_linear("lm_head", "lm_head", 0)?
         } else {
-            // Tied embeddings: the head is embed_tokens^T, `[hidden, vocab]`.
-            let (data, shape) = self.read("model.embed_tokens.weight")?;
+            // Tied embeddings: the head is embed_tokens^T, `[hidden, vocab]`,
+            // made from the table already in memory.
+            let read_again;
+            let (data, shape) = match &embed_table {
+                Some((data, shape)) => (data.as_slice(), shape.as_slice()),
+                None => {
+                    read_again = self.read("model.embed_tokens.weight")?;
+                    (read_again.0.as_slice(), read_again.1.as_slice())
+                }
+            };
             let [vocab, hidden] = shape[..] else {
                 return Err(BuildError(format!(
                     "model.embed_tokens.weight must be 2-D, got {shape:?}"
@@ -405,7 +427,7 @@ impl<'a> Lfm2ModelBuilder<'a> {
             // no transposed copy of the table on the host.
             let weight = self.wrap(UnifiedTensor::from_f32_transposed(
                 &self.ctx,
-                &data,
+                data,
                 vocab,
                 hidden,
                 self.linear_dtype(),
@@ -413,7 +435,11 @@ impl<'a> Lfm2ModelBuilder<'a> {
             self.maybe_add_lora(Linear::new(weight), "lm_head", 0)
         };
 
-        Ok(Lfm2Model::new(embed_tokens, None, layers, norm_f, lm_head))
+        let model = Lfm2Model::new(embed_tokens, None, layers, norm_f, lm_head);
+        Ok(match embed_table {
+            Some((table, _)) => model.with_host_embeddings(table),
+            None => model,
+        })
     }
 }
 
