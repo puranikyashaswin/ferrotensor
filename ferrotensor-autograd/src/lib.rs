@@ -215,10 +215,10 @@ impl AutogradNode for MatMulNode {
         // never reads, which skips a matmul per frozen weight.
         let grad_a = if self.a.requires_grad {
             let g = UnifiedTensor::empty(&self.a.ctx, &self.a.data.shape);
-            if self.b.data.dtype == DType::FP16 {
-                engine.matmul_bt_f16b(&self.a.ctx, grad, &self.b.data, &g);
-            } else {
-                engine.matmul_bt(&self.a.ctx, grad, &self.b.data, &g);
+            match self.b.data.dtype {
+                DType::FP16 => engine.matmul_bt_f16b(&self.a.ctx, grad, &self.b.data, &g),
+                DType::Q4 => engine.matmul_bt_q4b(&self.a.ctx, grad, &self.b.data, &g),
+                DType::FP32 => engine.matmul_bt(&self.a.ctx, grad, &self.b.data, &g),
             }
             g
         } else {
@@ -777,18 +777,33 @@ impl Tensor {
     ///
     /// `b` may be stored as f16 ([`UnifiedTensor::from_f32_as_f16`]) when it
     /// does not require a gradient, as for frozen base weights; the product
-    /// is still computed in f32.
+    /// is still computed in f32. `b` may also be 4-bit
+    /// ([`UnifiedTensor::from_f32_as_q4`]) under the same condition; the
+    /// input gradient then reads the same 4-bit tensor.
+    ///
+    /// # Panics
+    ///
+    /// If `b` is f16 or 4-bit and requires a gradient: such weights are
+    /// never trainable.
     pub fn matmul(a: &Tensor, b: &Tensor, engine: &ComputeEngine) -> Tensor {
         let out_shape = vec![a.data.shape[0], b.data.shape[1]];
         let out_data = UnifiedTensor::empty(&a.ctx, &out_shape);
-        if b.data.dtype == DType::FP16 {
-            assert!(
-                !b.requires_grad,
-                "matmul: an f16 right operand must not require a gradient"
-            );
-            engine.matmul_f16b(&a.ctx, &a.data, &b.data, &out_data);
-        } else {
-            engine.matmul(&a.ctx, &a.data, &b.data, &out_data);
+        match b.data.dtype {
+            DType::FP16 => {
+                assert!(
+                    !b.requires_grad,
+                    "matmul: an f16 right operand must not require a gradient"
+                );
+                engine.matmul_f16b(&a.ctx, &a.data, &b.data, &out_data);
+            }
+            DType::Q4 => {
+                assert!(
+                    !b.requires_grad,
+                    "matmul: a 4-bit right operand must not require a gradient"
+                );
+                engine.matmul_q4b(&a.ctx, &a.data, &b.data, &out_data);
+            }
+            DType::FP32 => engine.matmul(&a.ctx, &a.data, &b.data, &out_data),
         }
         let node = Arc::new(MatMulNode {
             a: a.clone(),
