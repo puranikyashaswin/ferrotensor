@@ -244,6 +244,6 @@ Usage and API coverage are in
 `ferrotensor-graph` builds a Llama/LFM2-style model from backend kernels (RMSNorm,
 RoPE, flash attention, SwiGLU), with optional LoRA on the projections.
 `ferrotensor-autograd` supplies the gradient tape and `ferrotensor-trainer` the loops
-(SFT with response-only loss, pretraining, mixed-precision loss scaling,
+(SFT with response-only loss, pretraining, an optional loss scaler that the CLI does not use,
 checkpoint save/resume). `ferrotensor-cli` is the front end. This stack is
 experimental; see the status table in the [README](../README.md).

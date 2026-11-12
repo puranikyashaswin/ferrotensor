@@ -6,13 +6,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use wgpu::{util::DeviceExt, Buffer};
 
-/// Data type for tensors - supports mixed precision training
+/// Element type of a tensor buffer.
+///
+/// Arithmetic is f32. [`DType::FP16`] is only a storage format for frozen
+/// weights (see [`UnifiedTensor::from_f32_as_f16`]); there is no f16
+/// activation, gradient or mixed-precision training path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DType {
     /// 32-bit float (the default).
     #[default]
     FP32,
-    /// 16-bit float (half precision, for memory savings).
+    /// 16-bit float storage, two values per 32-bit word. Only the `*_f16b`
+    /// matmuls read it, and they accumulate in f32.
     FP16,
 }
 
@@ -36,7 +41,7 @@ pub struct UnifiedTensor {
     /// Dimensions, outermost first.
     pub shape: Vec<usize>,
     /// Element type of the buffer.
-    pub dtype: DType, // Track tensor data type for mixed precision
+    pub dtype: DType,
 }
 
 #[derive(Debug)]
@@ -175,7 +180,7 @@ impl UnifiedTensor {
         Self::from_bytes_with_dtype(context, &bytes, shape, DType::FP16)
     }
 
-    /// Create an FP16 tensor (half precision for memory savings)
+    /// Create an empty FP16 tensor. No code in this workspace calls it.
     pub fn empty_fp16(context: &WgpuContext, shape: &[usize]) -> Self {
         Self::empty_with_dtype(context, shape, DType::FP16)
     }

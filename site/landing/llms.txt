@@ -1,6 +1,6 @@
 # Ferrotensor
 
-> Ferrotensor (also written Ferro Tensor) is a pure-Rust GPU machine-learning framework: tensors, reverse-mode autograd, `nn` layers, optimizers and LoRA fine-tuning that run on Metal, Vulkan or DX12 through wgpu and hand-written WGSL compute kernels, plus a CPU device used as the reference in tests. No CUDA, cuDNN or libtorch is needed. Python bindings wrap the same tensor API. Version {{ft_version}}, pre-1.0, f32 only, single GPU, licensed MIT OR Apache-2.0.
+> Ferrotensor (also written Ferro Tensor) is a pure-Rust GPU machine-learning framework: tensors, reverse-mode autograd, `nn` layers, optimizers and LoRA fine-tuning that run on Metal, Vulkan or DX12 through wgpu and hand-written WGSL compute kernels, plus a CPU device used as the reference in tests. No CUDA, cuDNN or libtorch is needed. Python bindings wrap the same tensor API. Version {{ft_version}}, pre-1.0, f32 arithmetic and trainable parameters (frozen LoRA base weights are stored as f16 by default in the CLI), single GPU, licensed MIT OR Apache-2.0.
 
 Install:
 
