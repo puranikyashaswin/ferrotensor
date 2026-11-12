@@ -26,7 +26,7 @@ trainable parameters are f32; the CLI stores frozen LoRA base weights as f16 by
 default to save memory (`--f32-weights` keeps them f32).
 
 - [Install](#install) · [Quickstart](#quickstart) · [Python](#python) · [Features](#feature-matrix) · [Architecture](#architecture) · [Compared with candle, burn and tch](#compared-with-candle-burn-and-tch) · [Roadmap](#roadmap)
-- Docs: [how-to guide](https://puranikyashaswin.github.io/ferrotensor/guide/) · [architecture](docs/architecture.md) · [writing a kernel](docs/writing-a-kernel.md) · [use cases](docs/use-cases.md) · [LoRA SFT walkthrough](docs/examples/lora-sft.md) · [adapters in PyTorch (PEFT)](docs/examples/peft-export.md) · [benchmarks](benchmarks/RESULTS.md) · [testing on your GPU](docs/testing-on-your-gpu.md) · [API docs](https://docs.rs/ferrotensor)
+- Docs: [how-to guide](https://puranikyashaswin.github.io/ferrotensor/guide/) · [architecture](docs/architecture.md) · [writing a kernel](docs/writing-a-kernel.md) · [use cases](docs/use-cases.md) · [LoRA SFT walkthrough](docs/examples/lora-sft.md) · [adapters in PyTorch (PEFT)](docs/examples/peft-export.md) · [benchmarks](benchmarks/RESULTS.md) · [testing on your GPU](docs/testing-on-your-gpu.md) · [Mac benchmark harness](docs/benchmarks-mac.md) · [API docs](https://docs.rs/ferrotensor)
 
 
 ## Highlights
