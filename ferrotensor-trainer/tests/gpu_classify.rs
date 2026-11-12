@@ -36,6 +36,7 @@ fn lora_meta() -> LoraMetadata {
         rank: 4,
         alpha: 8.0,
         target_modules: TARGETS.iter().map(|t| t.to_string()).collect(),
+        trained_modules: None,
     }
 }
 

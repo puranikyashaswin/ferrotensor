@@ -72,9 +72,12 @@ fn resume(gpu: &Gpu, dir: &Path, adapter: &Path, state: Option<&Path>) -> Traine
     if let Some(path) = state {
         let saved = TrainingCheckpoint::load(path).expect("load training state");
         let moments = saved.optimizer_state.as_ref().expect("optimizer state");
+        let load = optimizer
+            .load_state(&gpu.ctx, &named, moments)
+            .expect("load optimizer state");
         assert!(
-            optimizer.load_state(&gpu.ctx, &named, moments),
-            "the optimizer state did not match the model"
+            load.is_complete(),
+            "the optimizer state did not match the model: {load:?}"
         );
         steps_done = saved.training_state.step;
     }

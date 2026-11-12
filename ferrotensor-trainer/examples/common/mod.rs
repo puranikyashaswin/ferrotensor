@@ -185,6 +185,7 @@ pub fn lora_metadata() -> LoraMetadata {
         rank: c.rank,
         alpha: c.alpha,
         target_modules: c.target_modules,
+        trained_modules: None,
     }
 }
 

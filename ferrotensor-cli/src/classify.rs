@@ -350,6 +350,7 @@ pub(crate) async fn classify_train(args: ClassifyTrainArgs) -> Result<()> {
         rank: args.rank,
         alpha: args.alpha,
         target_modules: args.lora_targets.clone(),
+        trained_modules: None,
     };
     let model = build_up_to_deepest_tap(&mut base, &taps, &lora)?;
     let (rows, cut) = tokenize(&base, &records, args.max_len, &args.data)?;
