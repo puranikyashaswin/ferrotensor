@@ -208,11 +208,19 @@ h1, h2, h3 { line-height: 1.1; margin: 0; letter-spacing: -0.02em; }
 }
 
 .hero h1 {
-  font-size: clamp(3rem, 10vw, 6.75rem);
+  font-size: clamp(2.6rem, 6.4vw, 5rem);
   font-weight: 800;
   letter-spacing: -0.045em;
-  line-height: 0.95;
-  margin-bottom: 1.25rem;
+  line-height: 0.98;
+  margin-bottom: 1.4rem;
+  text-wrap: balance;
+}
+.h1-kick {
+  display: block;
+  margin-bottom: 0.9rem;
+  font: 700 clamp(1rem, 1.6vw, 1.15rem)/1 var(--mono);
+  letter-spacing: 0.02em;
+  color: var(--accent);
 }
 .lede {
   font-size: clamp(1.125rem, 2.1vw, 1.35rem);
@@ -399,6 +407,9 @@ html:not(.js) .panel + .panel { border-top: 1px dashed var(--line); }
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 1.25rem;
 }
+.cards-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.cards-2 .spark, .cards-2 .bars, .cards-2 .checks { max-width: 340px; }
+.bars .bar-in-old { fill: var(--ink); font-weight: 600; }
 .card {
   display: flex;
   flex-direction: column;
@@ -694,10 +705,127 @@ html:not(.js) .panel + .panel { border-top: 1px dashed var(--line); }
 
 /* ---------- Responsive ---------- */
 
+
+/* Hero proof panel: the PyTorch comparison, drawn as bars. */
+.btn-ghost { background: transparent; }
+.proof {
+  position: relative;
+  border: 1px solid var(--line-strong);
+  border-radius: 14px;
+  background: var(--surface);
+  padding: 1.4rem 1.4rem 1.2rem;
+  box-shadow: 0 1px 0 var(--line), 0 24px 48px -28px rgb(0 0 0 / 0.35);
+}
+.proof::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 3px;
+  border-radius: 14px 14px 0 0;
+  background: var(--accent);
+}
+.proof-h {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  margin: 0 0 0.9rem;
+  font: 600 0.72rem/1.3 var(--mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.proof-h span:first-child { color: var(--accent); }
+.proof-t { font-size: 1.22rem; line-height: 1.25; margin-bottom: 1.2rem; text-wrap: balance; }
+.pbars { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.85rem; }
+.pbars li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.35rem 0.75rem;
+  font-size: 0.88rem;
+  color: var(--ink-2);
+}
+.pb-v { font: 700 0.95rem/1.2 var(--mono); color: var(--ink); font-variant-numeric: tabular-nums; }
+.pb-bar { grid-column: 1 / -1; height: 10px; border-radius: 99px; background: var(--bg-alt); overflow: hidden; }
+.pb-bar i { display: block; height: 100%; width: var(--w); border-radius: inherit; background: var(--line-strong); }
+.pbars .pb-us { color: var(--ink); font-weight: 600; }
+.pbars .pb-us .pb-v { color: var(--accent); }
+.pbars .pb-us .pb-bar i { background: var(--accent); }
+.js .pb-bar i { transform-origin: left; animation: grow 0.9s cubic-bezier(.2,.7,.2,1) both; }
+.js .pbars li:nth-child(2) .pb-bar i { animation-delay: 0.15s; }
+.js .pbars li:nth-child(3) .pb-bar i { animation-delay: 0.3s; }
+@keyframes grow { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+@media (prefers-reduced-motion: reduce) { .js .pb-bar i { animation: none; } }
+.pb-cap { margin: 0.9rem 0 1.1rem; font-size: 0.8rem; color: var(--ink-3); }
+.pstats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.5rem;
+  margin: 0 0 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--line);
+}
+.pstats dt { font: 600 0.66rem/1.2 var(--mono); letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-3); }
+.pstats dd { margin: 0.3rem 0 0; font: 700 1rem/1 var(--mono); color: var(--ink); white-space: nowrap; }
+.proof-src { font-size: 0.88rem; font-weight: 600; color: var(--accent); text-decoration: none; }
+.proof-src::after { content: " →"; }
+.proof-src:hover { text-decoration: underline; }
+
+/* Hardware strip under the hero. */
+.runs {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem 1.75rem;
+  margin: 0;
+  padding: 1.1rem 0 1.4rem;
+  border-top: 1px solid var(--line);
+  font-size: 0.86rem;
+  color: var(--ink-3);
+}
+.runs b { color: var(--ink); font-weight: 650; margin-right: 0.35rem; }
+.run-k { font: 600 0.72rem/1 var(--mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent); }
+
+/* Direction: measured, next, planned. */
+.road {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 1rem;
+}
+.road li {
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+  padding: 1.1rem 1.1rem 1.2rem;
+}
+.road h3 { font-size: 1.02rem; margin: 0.8rem 0 0.45rem; }
+.road p { margin: 0; font-size: 0.9rem; color: var(--ink-2); line-height: 1.5; }
+.road a { color: var(--ink); text-decoration-color: var(--accent); }
+.pill {
+  display: inline-block;
+  padding: 0.28rem 0.55rem;
+  border: 1px solid var(--line-strong);
+  border-radius: 99px;
+  font: 600 0.68rem/1 var(--mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+}
+.road-done { border-color: var(--accent); }
+.road-done .pill { border-color: var(--accent); background: var(--accent); color: var(--accent-ink); }
+
+@media (max-width: 1100px) {
+  .road { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
 @media (max-width: 960px) {
   .hero-in { grid-template-columns: minmax(0, 1fr); }
   .sheet { max-width: 34rem; }
-  .cards { grid-template-columns: minmax(0, 1fr); max-width: 36rem; }
+  .cards, .cards-2 { grid-template-columns: minmax(0, 1fr); max-width: 36rem; }
+  .proof { max-width: 34rem; }
   .limits-in { grid-template-columns: minmax(0, 1fr); }
   .faq { grid-template-columns: minmax(0, 1fr); }
 }
@@ -735,6 +863,8 @@ html:not(.js) .panel + .panel { border-top: 1px dashed var(--line); }
 }
 
 @media (max-width: 480px) {
+  .road { grid-template-columns: minmax(0, 1fr); }
+  .pstats { grid-template-columns: repeat(2, minmax(0, 1fr)); row-gap: 0.9rem; }
   body { font-size: 1rem; }
   .top nav ul { gap: 0.25rem 0.9rem; }
   .top nav li.nav-wide { display: none; }
