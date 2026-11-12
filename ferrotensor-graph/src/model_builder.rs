@@ -3,11 +3,13 @@
 //! Loads Hugging Face safetensors checkpoints of two families into the same
 //! decoder structure, with optional LoRA adapters:
 //!
-//! * **Llama-style** (`model_type` `llama`/`mistral`, e.g. SmolLM2,
+//! * **Llama-style** (`model_type` `llama`/`mistral`/`qwen3`, e.g. SmolLM2,
 //!   TinyLlama): every block is RoPE grouped-query attention plus a SwiGLU
 //!   MLP; weights named `self_attn.{q,k,v,o}_proj`, `mlp.{gate,up,down}_proj`,
-//!   `input_layernorm`, `post_attention_layernorm` and `model.norm`.
-//! * **LFM2** (`layer_types` present): blocks are short convolutions or
+//!   `input_layernorm`, `post_attention_layernorm` and `model.norm`. When a
+//!   checkpoint has `self_attn.q_norm` / `self_attn.k_norm` (Qwen3), they are
+//!   loaded as per-head query/key norms ([`Attention::q_norm`]).
+//! * **LFM2** (see [`Architecture::detect`]): blocks are short convolutions or
 //!   attention, named `operator_norm`, `ffn_norm`, `feed_forward.w{1,2,3}`,
 //!   with the final norm stored as `model.embedding_norm`.
 //!
@@ -66,21 +68,26 @@ type Result<T> = std::result::Result<T, BuildError>;
 /// Weight-naming family of a checkpoint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Architecture {
-    /// Llama / Mistral / SmolLM2 naming; every block is attention.
+    /// Llama / Mistral / SmolLM2 / Qwen3 naming; every block is attention.
     Llama,
     /// Liquid LFM2 naming; conv and attention blocks per `layer_types`.
     Lfm2,
 }
 
 impl Architecture {
-    /// Infer the family from a config: `layer_types` or `model_type: lfm2`
-    /// mean LFM2, everything else is treated as Llama.
+    /// Infer the family from a config: `model_type: lfm2`, a `conv` entry
+    /// in `layer_types`, or `layer_types` without a `model_type` mean LFM2;
+    /// everything else is treated as Llama.
+    ///
+    /// `layer_types` alone does not mean LFM2: recent `transformers`
+    /// versions also write it (`full_attention` / `sliding_attention`) into
+    /// Qwen3 and other configs.
     pub fn detect(config: &Lfm2Config) -> Self {
-        let lfm = config
-            .model_type
-            .as_deref()
-            .is_some_and(|t| t.eq_ignore_ascii_case("lfm2"));
-        if lfm || !config.layer_types.is_empty() {
+        let model_type = config.model_type.as_deref();
+        let lfm = model_type.is_some_and(|t| t.eq_ignore_ascii_case("lfm2"))
+            || config.layer_types.iter().any(|t| t == "conv")
+            || (model_type.is_none() && !config.layer_types.is_empty());
+        if lfm {
             Self::Lfm2
         } else {
             Self::Llama
@@ -245,6 +252,22 @@ impl<'a> Lfm2ModelBuilder<'a> {
         Ok(RMSNorm::new(weight, self.config.norm_eps))
     }
 
+    /// The per-head norm `{prefix}.weight` (`[head_dim]`) if the checkpoint
+    /// has it.
+    fn build_head_norm(&self, prefix: &str, head_dim: usize) -> Result<Option<RMSNorm>> {
+        if !self.has(&format!("{prefix}.weight")) {
+            return Ok(None);
+        }
+        let norm = self.build_rms_norm(prefix)?;
+        if norm.weight.data.shape != [head_dim] {
+            return Err(BuildError(format!(
+                "{prefix}.weight has shape {:?}, expected [{head_dim}] (one weight per head dimension)",
+                norm.weight.data.shape
+            )));
+        }
+        Ok(Some(norm))
+    }
+
     fn build_mlp(&self, prefix: &str, arch: Architecture, seed: u64) -> Result<MLP> {
         // LFM2 names its SwiGLU projections w1 (gate), w3 (up), w2 (down).
         let [gate, up, down] = match arch {
@@ -300,6 +323,8 @@ impl<'a> Lfm2ModelBuilder<'a> {
             num_kv_heads,
             dropout_prob: self.config.attention_dropout.unwrap_or(0.0),
             rope_theta: self.config.rope_theta.unwrap_or(10000.0) as f32,
+            q_norm: self.build_head_norm(&format!("{prefix}.q_norm"), head_dim)?,
+            k_norm: self.build_head_norm(&format!("{prefix}.k_norm"), head_dim)?,
         })
     }
 
@@ -320,16 +345,30 @@ impl<'a> Lfm2ModelBuilder<'a> {
         let prefix = format!("model.layers.{layer_idx}");
         let seed = layer_idx as u64 + 1;
         match arch {
-            Architecture::Llama => Ok(Lfm2Block {
-                operator_norm: self.build_rms_norm(&format!("{prefix}.input_layernorm"))?,
-                op: Lfm2LayerOp::Attention(self.build_attention(
-                    &format!("{prefix}.self_attn"),
-                    arch,
-                    seed,
-                )?),
-                ffn_norm: self.build_rms_norm(&format!("{prefix}.post_attention_layernorm"))?,
-                mlp: self.build_mlp(&format!("{prefix}.mlp"), arch, seed)?,
-            }),
+            Architecture::Llama => {
+                // Qwen3 configs list every layer; sliding-window layers
+                // would need a windowed mask the attention path lacks.
+                if let Some(t) = self
+                    .config
+                    .layer_types
+                    .get(layer_idx)
+                    .filter(|t| t.as_str() != "full_attention")
+                {
+                    return Err(BuildError(format!(
+                        "layer {layer_idx} is {t:?}; only full attention is supported"
+                    )));
+                }
+                Ok(Lfm2Block {
+                    operator_norm: self.build_rms_norm(&format!("{prefix}.input_layernorm"))?,
+                    op: Lfm2LayerOp::Attention(self.build_attention(
+                        &format!("{prefix}.self_attn"),
+                        arch,
+                        seed,
+                    )?),
+                    ffn_norm: self.build_rms_norm(&format!("{prefix}.post_attention_layernorm"))?,
+                    mlp: self.build_mlp(&format!("{prefix}.mlp"), arch, seed)?,
+                })
+            }
             Architecture::Lfm2 => {
                 let layer_type = self
                     .config
