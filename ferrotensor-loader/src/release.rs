@@ -118,8 +118,8 @@ mod tests {
             // Inside its tensor, aligned at both ends.
             if !range.is_empty() {
                 assert!(range.start >= offset && range.end <= offset + len);
-                assert_eq!(range.start % A, 0);
-                assert_eq!(range.end % A, 0);
+                assert!(range.start.is_multiple_of(A));
+                assert!(range.end.is_multiple_of(A));
             }
             released.push((offset, offset + len, range));
             offset += len;

@@ -485,7 +485,7 @@ mod tests {
     fn transposed_bytes_match_on_edge_values() {
         let mut values = edge_values();
         // A whole number of rows of 13 (odd, so f16 rows end mid-word).
-        while values.len() % 13 != 0 {
+        while !values.len().is_multiple_of(13) {
             values.push(-0.0);
         }
         let rows = values.len() / 13;
