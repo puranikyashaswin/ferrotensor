@@ -1,17 +1,20 @@
 //! Model building blocks on top of `ferrotensor-autograd`: linear layers with
 //! LoRA, RMSNorm, RoPE grouped-query attention, SwiGLU MLPs, Llama and LFM2
-//! decoders, and the fused attention layers in [`flash_attention`].
+//! decoders, a sequence [`classifier`] head, and the fused attention layers in
+//! [`flash_attention`].
 
 use ferrotensor_autograd::Tensor;
 use ferrotensor_backend::{ComputeEngine, UnifiedTensor, WgpuContext};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+pub mod classifier;
 pub mod flash_attention;
 /// LFM2 (Liquid foundation model) blocks.
 pub mod lfm;
 pub mod model_builder;
 
+pub use classifier::{mean_pool_matrix, ClassifierHead};
 pub use flash_attention::{
     AttentionMask, FlashAttention, FlashAttentionGrads, GroupedQueryAttention,
     KVCache as FlashKVCache, MultiQueryAttention, SlidingWindowAttention,

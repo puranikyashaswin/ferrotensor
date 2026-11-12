@@ -319,6 +319,54 @@ impl Lfm2Model {
         self.lm_head.forward(engine, &x)
     }
 
+    /// Hidden states `[batch, seq, hidden]` after the blocks listed in
+    /// `taps`, in that order, for equally long `rows` of token ids starting
+    /// at position 0. Tap `l` is the output of block `l` (1-based), before
+    /// the final norm; tap 0 is the embedding output. Blocks after the
+    /// deepest tap are not run, so tapping only early blocks also truncates
+    /// the model.
+    ///
+    /// Pad shorter sequences on the right, as for
+    /// [`forward_batch`](Self::forward_batch).
+    ///
+    /// # Panics
+    /// If the rows differ in length, a tap exceeds the number of blocks, or
+    /// [`supports_batching`](Self::supports_batching) is false.
+    pub fn hidden_states_batch(
+        &self,
+        engine: &ComputeEngine,
+        rows: &[&[u32]],
+        taps: &[usize],
+    ) -> Vec<Tensor> {
+        assert!(
+            self.supports_batching(),
+            "hidden_states_batch needs an all-attention model"
+        );
+        let seq_len = rows.first().map_or(0, |r| r.len());
+        assert!(
+            rows.iter().all(|r| r.len() == seq_len),
+            "hidden_states_batch: rows must have the same length"
+        );
+        let deepest = taps.iter().copied().max().unwrap_or(0);
+        assert!(
+            deepest <= self.layers.len(),
+            "hidden_states_batch: tap {deepest} exceeds {} blocks",
+            self.layers.len()
+        );
+        let ctx = self.embed_tokens.ctx.clone();
+        let mut x = self.lookup_embeddings(&ctx, rows);
+        if let Some(norm) = &self.embedding_norm {
+            x = norm.forward(engine, &x);
+        }
+        let mut states = Vec::with_capacity(deepest + 1);
+        states.push(x.clone());
+        for layer in &self.layers[..deepest] {
+            x = layer.forward(engine, &x, 0, None, None);
+            states.push(x.clone());
+        }
+        taps.iter().map(|&tap| states[tap].clone()).collect()
+    }
+
     /// Embeddings `[rows, seq, hidden]` for equally long rows of ids.
     fn lookup_embeddings(
         &self,
