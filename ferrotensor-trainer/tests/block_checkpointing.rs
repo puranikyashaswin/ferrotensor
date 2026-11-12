@@ -11,7 +11,7 @@ mod common;
 
 use common::*;
 use ferrotensor_autograd::Tensor;
-use ferrotensor_graph::lfm::Lfm2Model;
+use ferrotensor_graph::lfm::{Lfm2LayerOp, Lfm2Model};
 use ferrotensor_graph::model_builder::Lfm2ModelBuilder;
 use ferrotensor_loader::{ModelLoader, WeightsContext};
 use ferrotensor_trainer::{Batch, StepStats};
@@ -71,17 +71,38 @@ fn compared_params(model: &Lfm2Model) -> Vec<(String, Tensor)> {
 /// Logits for one row (`forward`) or several equally long rows
 /// (`forward_batch`).
 fn logits(gpu: &Gpu, model: &Lfm2Model, rows: &[Vec<u32>]) -> Tensor {
+    logits_with_dropout(gpu, model, rows, None)
+}
+
+/// [`logits`] with attention dropout seeded by `seed` (training).
+fn logits_with_dropout(
+    gpu: &Gpu,
+    model: &Lfm2Model,
+    rows: &[Vec<u32>],
+    seed: Option<u64>,
+) -> Tensor {
     if rows.len() == 1 {
-        model.forward(&gpu.engine, &rows[0], 0, None, None)
+        model.forward_with_dropout(&gpu.engine, &rows[0], 0, None, None, seed)
     } else {
         let refs: Vec<&[u32]> = rows.iter().map(Vec::as_slice).collect();
-        model.forward_batch(&gpu.engine, &refs)
+        model.forward_batch_with_dropout(&gpu.engine, &refs, seed)
     }
 }
 
 /// The loss tensor and its value for `rows` against `targets`.
 fn loss(gpu: &Gpu, model: &Lfm2Model, rows: &[Vec<u32>], targets: &[Vec<u32>]) -> (Tensor, f32) {
-    let logits = logits(gpu, model, rows);
+    loss_with_dropout(gpu, model, rows, targets, None)
+}
+
+/// [`loss`] with attention dropout seeded by `seed`.
+fn loss_with_dropout(
+    gpu: &Gpu,
+    model: &Lfm2Model,
+    rows: &[Vec<u32>],
+    targets: &[Vec<u32>],
+    seed: Option<u64>,
+) -> (Tensor, f32) {
+    let logits = logits_with_dropout(gpu, model, rows, seed);
     if rows.len() == 1 {
         let mask = vec![1u8; targets[0].len()];
         let loss =
@@ -113,7 +134,18 @@ fn loss_and_grads(
     rows: &[Vec<u32>],
     targets: &[Vec<u32>],
 ) -> (f32, Grads) {
-    let (tensor, value) = loss(gpu, model, rows, targets);
+    loss_and_grads_with_dropout(gpu, model, rows, targets, None)
+}
+
+/// [`loss_and_grads`] with attention dropout seeded by `seed`.
+fn loss_and_grads_with_dropout(
+    gpu: &Gpu,
+    model: &Lfm2Model,
+    rows: &[Vec<u32>],
+    targets: &[Vec<u32>],
+    seed: Option<u64>,
+) -> (f32, Grads) {
+    let (tensor, value) = loss_with_dropout(gpu, model, rows, targets, seed);
     tensor.backward(&gpu.engine);
     let grads = compared_params(model)
         .into_iter()
@@ -460,4 +492,93 @@ fn trainer_steps_match_with_block_checkpointing() {
         "too few optimizer steps"
     );
     assert!(clipped, "clipping never applied");
+}
+
+/// Attention dropout probability of the dropout tests.
+const DROPOUT: f32 = 0.3;
+
+/// Set `attention_dropout` in the tiny model's `config.json`.
+fn set_attention_dropout(dir: &Path, p: f32) {
+    let path = dir.join("config.json");
+    let text = std::fs::read_to_string(&path).expect("read config");
+    let mut cfg: serde_json::Value = serde_json::from_str(&text).expect("parse config");
+    cfg["attention_dropout"] = serde_json::json!(p);
+    std::fs::write(&path, cfg.to_string()).expect("write config");
+}
+
+/// With attention dropout on, the replay in backward must draw the same masks
+/// as the first forward pass: loss and LoRA gradients are the same with
+/// checkpointing on and off, for one sequence and for a batch.
+#[test]
+#[ignore = "needs a GPU"]
+fn block_checkpointing_matches_plain_backward_with_attention_dropout() {
+    let dir = TempDir::new("ckpt-dropout");
+    write_tiny_llama(dir.path());
+    set_attention_dropout(dir.path(), DROPOUT);
+    let gpu = gpu();
+    let seed = Some(ferrotensor_graph::dropout::derive_seed(&[7, 0, 3, 1]));
+
+    let off = build(&gpu, dir.path(), false, false);
+    let on = build(&gpu, dir.path(), true, false);
+    for layer in &on.layers {
+        match &layer.op {
+            Lfm2LayerOp::Attention(a) => assert_eq!(a.dropout_prob, DROPOUT),
+            Lfm2LayerOp::Conv(_) => panic!("tiny Llama has no conv blocks"),
+        }
+    }
+    set_lora_b(&gpu, &off);
+    set_lora_b(&gpu, &on);
+
+    let seq = pattern_sequence();
+    let cases = [
+        one_row(),
+        (
+            vec![seq[0..16].to_vec(), seq[3..19].to_vec()],
+            vec![seq[1..17].to_vec(), seq[4..20].to_vec()],
+        ),
+    ];
+    for (rows, targets) in &cases {
+        // Dropout must change the loss, or this test checks nothing.
+        let (_, without) = loss_with_dropout(&gpu, &off, rows, targets, None);
+        let (_, with) = loss_with_dropout(&gpu, &off, rows, targets, seed);
+        assert_ne!(without, with, "attention dropout had no effect");
+
+        let result_off = loss_and_grads_with_dropout(&gpu, &off, rows, targets, seed);
+        let result_on = loss_and_grads_with_dropout(&gpu, &on, rows, targets, seed);
+        assert_same(&result_on, &result_off);
+        assert_lora_grads_present(&result_on.1);
+        for (_, t) in compared_params(&off).iter().chain(&compared_params(&on)) {
+            t.zero_grad();
+        }
+    }
+}
+
+/// The trainer derives a new dropout seed per step and micro-batch; with
+/// checkpointing, each block's replay must use the seed of its own forward
+/// pass, so a short run with dropout, accumulation and clipping is unchanged.
+#[test]
+#[ignore = "needs a GPU"]
+fn trainer_steps_match_with_block_checkpointing_and_attention_dropout() {
+    let dir = TempDir::new("ckpt-trainer-dropout");
+    write_tiny_llama(dir.path());
+    set_attention_dropout(dir.path(), DROPOUT);
+    let gpu = gpu();
+    let off = short_run(&gpu, dir.path(), false);
+    let on = short_run(&gpu, dir.path(), true);
+    assert_eq!(on.len(), off.len());
+    for (i, (a, b)) in on.iter().zip(&off).enumerate() {
+        assert!(
+            (a.loss - b.loss).abs() <= 1e-5 * b.loss.abs().max(1.0),
+            "step {i}: loss {} (checkpointed) vs {}",
+            a.loss,
+            b.loss
+        );
+        match (a.grad_norm, b.grad_norm) {
+            (Some(x), Some(y)) => {
+                assert!((x - y).abs() <= 1e-4 * y, "step {i}: grad norm {x} vs {y}")
+            }
+            (None, None) => {}
+            other => panic!("step {i}: grad norm {other:?}"),
+        }
+    }
 }
