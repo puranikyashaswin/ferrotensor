@@ -283,17 +283,16 @@ EOF</pre></figure></div></li></ol>
 <li><code>--train-modules all|attn|mlp|norm|lm_head</code> trains base weights instead of LoRA and saves the trained tensors, in f32, to <code>trained_weights.safetensors</code>. Pass that file to <code>--lora</code> in <code>eval</code> and <code>generate</code>, or to <code>--resume</code> with the same <code>--train-modules</code>.</li>
 <li><code>ferrotensor monitor</code> follows a run's <code>training_state.json</code> in a terminal dashboard.</li>
 </ul>
-<p>The same recipe on three model sizes on an NVIDIA A10G:</p>
-<table class="gt"><thead><tr><th>Model</th><th>Held-out loss</th><th>Per step</th><th>Adapter</th></tr></thead><tbody>
-<tr><td>SmolLM2-135M</td><td>2.4250 &rarr; 1.6521</td><td>1.28 s</td><td>3.7 MB</td></tr>
-<tr><td>SmolLM2-135M, <code>--batch-size 8 --grad-accum 1</code></td><td>2.4250 &rarr; 1.6521</td><td>0.57 s</td><td>3.7 MB</td></tr>
-<tr><td>SmolLM2-360M</td><td>2.0852 &rarr; 1.3228</td><td>1.69 s</td><td>6.6 MB</td></tr>
-<tr><td>SmolLM2-1.7B, f16 base weights</td><td>2.6474 &rarr; 1.0640</td><td>2.38 s</td><td>12.6 MB</td></tr>
+<p>The same recipe on three model sizes on an NVIDIA A10G (24 GB), 250 steps:</p>
+<table class="gt"><thead><tr><th>Model</th><th>Held-out loss</th></tr></thead><tbody>
+<tr><td>SmolLM2-135M</td><td>2.4250 &rarr; 1.6521</td></tr>
+<tr><td>SmolLM2-360M</td><td>2.0852 &rarr; 1.3228</td></tr>
+<tr><td>SmolLM2-1.7B, f16 base weights</td><td>2.6474 &rarr; 1.0640</td></tr>
 </tbody></table>
-<p>Frozen base weights are stored as f16 by default, which saves GPU memory (11.9 GiB instead of 14.7 GiB for SmolLM2-1.7B) at the same loss; <code>--f32-weights</code> keeps them f32. <code>--batch-size N</code> trains N sequences in one GPU pass with the same result, faster but with more GPU memory.</p>
-<p>On the same GPU, PyTorch + PEFT on CUDA with the same recipe reaches the same held-out loss within 0.005, starting from the identical loss before training.</p>
+<p>Frozen base weights are stored as f16 by default, which saves GPU memory; for SmolLM2-1.7B the held-out loss moves by 0.0017 against f32 weights. <code>--f32-weights</code> keeps them f32. <code>--checkpoint-blocks</code> recomputes each decoder block during backward instead of keeping its activations: in 0.7, LoRA on SmolLM2-1.7B peaks at 8,222 MiB of GPU memory by default and 5,245 MiB with the flag, with identical losses and 39% more time per step. <code>--batch-size N</code> trains N sequences in one GPU pass with the same result, faster but with more GPU memory.</p>
+<p>On the same GPU, PyTorch + PEFT on CUDA with the same recipe starts from the identical held-out loss and ends within 0.005 of Ferrotensor after 250 steps; Ferrotensor takes 1.2 to 3.1 times PyTorch's time per step.</p>
 <p>Every number, with the M2 run and the full PyTorch comparison, is in the <a href="../docs/examples/lora-sft.html">LoRA walkthrough</a>.</p></div>
-  <h3>Limits</h3><p class="gprose">Larger batches need more GPU memory: SmolLM2-1.7B with <code>--batch-size 8</code> does not fit in 24 GB. Activations and LoRA adapters are f32. Models above 1.7B have not been tested.</p>
+  <h3>Limits</h3><p class="gprose">Larger batches need more GPU memory; <code>--checkpoint-blocks</code> lowers it at the cost of time. Activations and LoRA adapters are f32. <code>--q4-weights</code> (4-bit base weights) is experimental and gives a worse held-out loss than f16. Models above 1.7B have not been tested.</p>
   <nav class="pn" aria-label="Previous and next guide"><a class="prev" href="#lora-data"><span>Previous</span>Download a model and prepare data</a><a class="next" href="#lora-eval-generate"><span>Next</span>Evaluate and chat with your adapter</a></nav>
 </article>
 <article class="g" id="lora-eval-generate" aria-labelledby="lora-eval-generate-t">
@@ -470,7 +469,7 @@ cargo run -p ferrotensor-benchmarks --release --bin tensor-api</pre></figure></d
   <a class="back" href="#start">All guides</a>
   <p class="eyebrow">05 · Contribute</p>
   <h2 id="gpu-tests-t">Run the GPU tests</h2>
-  <p class="glede">Check every kernel and gradient on your GPU against the CPU.</p>
+  <p class="glede">Check the kernels and gradients on your GPU against the CPU.</p>
   <p class="gmeta">Ferrotensor {{ft_version}} · 3 min</p>
   <figure class="sample gpanel"><figcaption><span class="lang">Shell</span><button class="gcopy" type="button" data-copy="FERROTENSOR_RUN_GPU_TESTS=1 cargo test --workspace -- --ignored --test-threads=1
 FERROTENSOR_RUN_GPU_TESTS=1 cargo test -p ferrotensor --lib
@@ -518,12 +517,12 @@ scripts/hardware-report.sh">Copy</button></figcaption><pre tabindex="0"><span cl
   <a class="back" href="#start">All guides</a>
   <p class="eyebrow">06 · Troubleshooting</p>
   <h2 id="slow-memory-t">Training is slow or uses too much memory</h2>
-  <p class="glede">Why tiny models are faster on the CPU, and what the GPU memory limits are.</p>
+  <p class="glede">Why tiny models are faster on the CPU, and how to lower GPU memory.</p>
   <p class="gmeta">Ferrotensor {{ft_version}} · 3 min</p>
-  <figure class="sample gpanel"><figcaption><span class="lang">Results</span><code>Seconds per LoRA step, SmolLM2-135M</code></figcaption><pre tabindex="0"><span class="ln"><span class="mk" aria-label="note 1">1</span>NVIDIA A10G, 0.4          20.2 s</span><span class="ln">MacBook Air M2, 0.4        8.8 s</span><span class="ln"><span class="mk" aria-label="note 2">2</span>NVIDIA A10G, 0.5          1.33 s</span><span class="ln"><span class="mk" aria-label="note 3">3</span>NVIDIA A10G, 0.6, batch 8 0.57 s</span></pre><p class="gnote">Real measurements: the same run in Ferrotensor 0.4, 0.5 and 0.6.</p></figure>
-  <ol class="notes"><li><span>Before 0.5, parts of the backward pass and the loss copied tensors to the CPU and back: about 2,000 blocking reads per step.</span></li><li><span>0.5 keeps them on the GPU and batches dispatches. Update if you are on an older version.</span></li><li><span>0.6 adds <code>--batch-size</code>: eight sequences in one GPU pass, same held-out loss.</span></li></ol>
+  <figure class="sample gpanel"><figcaption><span class="lang">Results</span><code>Peak GPU memory, SmolLM2-1.7B LoRA, NVIDIA A10G</code></figcaption><pre tabindex="0"><span class="ln"><span class="mk" aria-label="note 1">1</span>0.6                         11,607 MiB</span><span class="ln"><span class="mk" aria-label="note 2">2</span>0.7                          8,222 MiB</span><span class="ln"><span class="mk" aria-label="note 3">3</span>0.7, --checkpoint-blocks     5,245 MiB</span></pre><p class="gnote">Real measurements: <code>nvidia-smi</code> peak over 30 steps, f16 base weights, batch 1. Losses identical in all three.</p></figure>
+  <ol class="notes"><li><span>The 0.6 baseline.</span></li><li><span>0.7 hands each intermediate gradient back once it is used and reuses freed buffers; on by default.</span></li><li><span><code>--checkpoint-blocks</code> recomputes each decoder block during backward: 19 to 39% more time per step.</span></li></ol>
   <h3>Steps</h3>
-  <ol class="steps"><li><div><p>Use the latest release: <code>cargo install ferrotensor-cli --force</code>.</p></div></li><li><div><p>For very small models, use the CPU. Every GPU dispatch has a fixed cost, so a 1,218-parameter MLP trains about 10x faster on the CPU.</p></div></li><li><div><p>If GPU memory allows, train several sequences per pass: <code>--batch-size 8 --grad-accum 1</code> gives the same result as the default 8 steps of accumulation, 2.2x faster for SmolLM2-135M on an A10G.</p></div></li><li><div><p>Out of GPU memory? Lower <code>--batch-size</code>, and keep the default f16 base weights. SmolLM2-1.7B trains in 11.9 GiB of GPU memory and 5.3 GB of host memory (20 GB in 0.5).</p></div></li></ol>
+  <ol class="steps"><li><div><p>Use the latest release: <code>cargo install ferrotensor-cli --force</code>.</p></div></li><li><div><p>For very small models, use the CPU. Every GPU dispatch has a fixed cost, so a 1,218-parameter MLP trains about 10x faster on the CPU.</p></div></li><li><div><p>If GPU memory allows, train several sequences per pass: <code>--batch-size 8 --grad-accum 1</code> gives the same result as the default 8 steps of accumulation, 2.2x faster for SmolLM2-135M on an A10G.</p></div></li><li><div><p>Out of GPU memory? Add <code>--checkpoint-blocks</code>, lower <code>--batch-size</code>, and keep the default f16 base weights. <code>train --memory-report</code> shows where the memory goes. SmolLM2-1.7B peaks at 5.3 GB of host memory with every option.</p></div></li></ol>
   
   <h3>Details</h3><div class="gprose"><p>Try <a href="#fusion">op fusion</a> for Tensor API programs with long element-wise chains, and <code>--lite</code> for LoRA on small machines.</p></div>
   <h3>Limits</h3><p class="gprose">Activations, gradients and LoRA adapters are f32; only frozen base weights are f16.</p>

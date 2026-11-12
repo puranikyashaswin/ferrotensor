@@ -44,9 +44,19 @@ PAGES = {
         "character-level transformer, GPU matmul and attention, similarity search.",
     ),
     "examples/lora-sft.html": (
-        "LoRA fine-tuning on a MacBook or NVIDIA GPU | Ferrotensor",
-        "Fine-tune SmolLM2 with LoRA: 135M on an 8 GB Apple M2 (held-out loss 2.43 to 1.65), and "
-        "135M to 1.7B on an NVIDIA A10G, every command shown.",
+        "LoRA fine-tuning walkthrough: SmolLM2 | Ferrotensor",
+        "Fine-tune SmolLM2 with LoRA on an NVIDIA A10G and an Apple M2: every command, the "
+        "PyTorch + PEFT comparison, gradient checks and GPU memory.",
+    ),
+    "examples/classify.html": (
+        "Text classification with LoRA | Ferrotensor",
+        "Fine-tune a Llama-style decoder as a text classifier with ferrotensor classify-train, "
+        "and write per-line class probabilities with classify-predict.",
+    ),
+    "benchmarks-mac.html": (
+        "Ferrotensor, mlx-lm and PyTorch on a Mac",
+        "scripts/bench_mac.sh trains the same LoRA recipe with Ferrotensor, mlx-lm and PyTorch + "
+        "PEFT on an Apple-silicon Mac and prints one table.",
     ),
     "architecture.html": (
         "Ferrotensor architecture: from tensor op to WGSL kernel",

@@ -8,7 +8,7 @@ Install:
 - Rust 1.88+ library: `cargo add ferrotensor`
 - LoRA command-line tool (`train`, `eval`, `generate`): `cargo install ferrotensor-cli`
 
-Measured on a MacBook Air (Apple M2, 8 GB): LoRA fine-tuning of SmolLM2-135M took held-out loss from 2.43 to 1.65 in 250 steps with 3.3 GB peak memory; f32 matmul reaches 611 GFLOPS at 4096³. On an NVIDIA A10G through Vulkan, the same LoRA recipe took SmolLM2-1.7B from 2.65 to 1.07 held-out loss in 250 steps at 2.5 s per step.
+Tested on an NVIDIA A10G (24 GB) through Vulkan, an Apple M2 (8 GB) through Metal, and software Vulkan (Mesa lavapipe) in CI; other GPUs are untested. On the A10G, LoRA on SmolLM2-1.7B took held-out loss from 2.65 to 1.06 in 250 steps; against PyTorch + PEFT on CUDA with the same recipe on the same GPU, the held-out loss is identical before training and within 0.005 after, and Ferrotensor runs at 0.32 to 0.84 of PyTorch's speed. LoRA loss and gradients are checked against PyTorch autograd in CI. Peak GPU memory for LoRA on SmolLM2-1.7B is 8,222 MiB in 0.7 (11,607 MiB in 0.6) and 5,245 MiB with --checkpoint-blocks, with identical losses.
 
 ## Docs
 
@@ -17,7 +17,7 @@ Measured on a MacBook Air (Apple M2, 8 GB): LoRA fine-tuning of SmolLM2-135M too
 - [Python quickstart](https://ferrotensor.dev/docs/python.html): train a model from Python, CPU or GPU
 - [Use cases](https://ferrotensor.dev/docs/use-cases.html): runnable Rust examples with their real output
 - [How-to guide](https://ferrotensor.dev/guide/): 19 step-by-step guides with real output, from installing and checking your GPU to LoRA fine-tuning, training in Rust or Python, and troubleshooting
-- [LoRA fine-tuning on a laptop](https://ferrotensor.dev/docs/examples/lora-sft.html): end-to-end walkthrough with every command
+- [LoRA fine-tuning walkthrough](https://ferrotensor.dev/docs/examples/lora-sft.html): end-to-end walkthrough with every command
 - [Architecture](https://ferrotensor.dev/docs/architecture.html): how a tensor op reaches a WGSL kernel
 - [Writing a kernel](https://ferrotensor.dev/docs/writing-a-kernel.html): adding a GPU op
 - [Benchmarks](https://ferrotensor.dev/docs/benchmarks.html): kernel and tensor-API timings with method

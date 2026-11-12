@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Ferrotensor: fine-tune LLMs on any GPU, in pure Rust</title>
-<meta name="description" content="LoRA fine-tuning up to 1.7B parameters in pure Rust on WebGPU (Metal, Vulkan, DX12) with hand-written WGSL kernels and the same loss as PyTorch.">
+<title>Ferrotensor: LoRA fine-tuning in pure Rust on wgpu</title>
+<meta name="description" content="LoRA fine-tuning up to 1.7B parameters in pure Rust through wgpu (Vulkan, Metal, DX12), with loss and gradients checked against PyTorch.">
 <meta name="google-site-verification" content="l0rdpJ2u3IDZ3tYvyRXBufrQao6aw862u_PVg9fvwkE">
 <link rel="canonical" href="https://ferrotensor.dev/">
 <meta name="color-scheme" content="light dark">
@@ -14,18 +14,18 @@
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="Ferrotensor">
-<meta property="og:title" content="Ferrotensor: fine-tune LLMs on any GPU, in pure Rust">
-<meta property="og:description" content="LoRA fine-tuning up to 1.7B parameters in pure Rust on WebGPU (Metal, Vulkan, DX12) with hand-written WGSL kernels and the same loss as PyTorch.">
+<meta property="og:title" content="Ferrotensor: LoRA fine-tuning in pure Rust on wgpu">
+<meta property="og:description" content="LoRA fine-tuning up to 1.7B parameters in pure Rust through wgpu (Vulkan, Metal, DX12), with loss and gradients checked against PyTorch.">
 <meta property="og:url" content="https://ferrotensor.dev/">
 <meta property="og:image" content="https://ferrotensor.dev/og.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
-<meta property="og:image:alt" content="Ferrotensor: fine-tune language models on any GPU in pure Rust, with the same held-out loss as PyTorch on CUDA.">
+<meta property="og:image:alt" content="Ferrotensor: LoRA fine-tuning in pure Rust through wgpu, with loss and gradients checked against PyTorch.">
 <meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="Ferrotensor: fine-tune LLMs on any GPU, in pure Rust">
-<meta name="twitter:description" content="LoRA fine-tuning up to 1.7B parameters in pure Rust on WebGPU (Metal, Vulkan, DX12) with hand-written WGSL kernels and the same loss as PyTorch.">
+<meta name="twitter:title" content="Ferrotensor: LoRA fine-tuning in pure Rust on wgpu">
+<meta name="twitter:description" content="LoRA fine-tuning up to 1.7B parameters in pure Rust through wgpu (Vulkan, Metal, DX12), with loss and gradients checked against PyTorch.">
 <meta name="twitter:image" content="https://ferrotensor.dev/og.png">
-<meta name="twitter:image:alt" content="Ferrotensor: fine-tune language models on any GPU, in pure Rust.">
+<meta name="twitter:image:alt" content="Ferrotensor: LoRA fine-tuning in pure Rust through wgpu.">
 <script type="application/ld+json">
 {
  "@context": "https://schema.org",
@@ -109,7 +109,7 @@
      "name": "Can I fine-tune a model on a MacBook?",
      "acceptedAnswer": {
       "@type": "Answer",
-      "text": "Yes, a small one. On a MacBook Air with an Apple M2 and 8 GB of memory, LoRA fine-tuning of SmolLM2-135M on 2,000 Alpaca examples took the held-out loss from 2.43 to 1.65 in 250 steps, at 8.8 s per step and 3.3 GB peak memory. The LoRA path is experimental and aimed at small Llama-style models; the LoRA walkthrough lists every command."
+      "text": "Yes, a small one. On a MacBook Air with an Apple M2 and 8 GB of memory, LoRA fine-tuning of SmolLM2-135M on 2,000 Alpaca examples took the held-out loss from 2.43 to 1.65 in 250 steps with a 0.4 build; there are no current Mac speed or memory numbers. The LoRA path is experimental and aimed at small Llama-style models; the LoRA walkthrough lists every command."
      }
     },
     {
@@ -133,7 +133,7 @@
      "name": "How close is Ferrotensor to PyTorch?",
      "acceptedAnswer": {
       "@type": "Answer",
-      "text": "On the same NVIDIA A10G with the same LoRA recipe, Ferrotensor and PyTorch + PEFT on CUDA give the same held-out loss before training to four decimals, and after 250 steps Ferrotensor is within 0.005 (1.0640 against 1.0608 for SmolLM2-1.7B). It runs at 84% of PyTorch's speed for SmolLM2-135M and 37% for SmolLM2-1.7B, where large matrix multiplications dominate. The LoRA walkthrough has the full table."
+      "text": "On the same NVIDIA A10G with the same LoRA recipe, Ferrotensor and PyTorch + PEFT on CUDA give the same held-out loss before training to four decimals, and after 250 steps Ferrotensor is within 0.005 (1.0640 against 1.0608 for SmolLM2-1.7B), one seed per run. Ferrotensor is slower: 0.84 of PyTorch's speed for SmolLM2-135M at batch 1, 0.32 at batch 8 and 0.37 for SmolLM2-1.7B. LoRA loss and gradients are also checked against PyTorch autograd in CI, on a tiny model. The LoRA walkthrough has the full table."
      }
     },
     {
@@ -141,7 +141,7 @@
      "name": "What are Ferrotensor’s limits?",
      "acceptedAnswer": {
       "@type": "Answer",
-      "text": "It is pre-1.0 and runs on a single GPU. Arithmetic, activations, gradients and the tensor API are f32 (the CLI stores frozen LoRA base weights as f16 by default), and the tensor API has no convolutions, sort or top-k yet. Chains of tiny ops are still faster on the CPU. LoRA fine-tuning is tested on Llama-style models from 135M to 1.7B parameters. The limits section above has the details."
+      "text": "It is pre-1.0 and runs on a single GPU. Arithmetic, activations, gradients and the tensor API are f32 (the CLI stores frozen LoRA base weights as f16 by default), and the tensor API has no convolutions, sort or top-k yet. Chains of tiny ops are still faster on the CPU. LoRA fine-tuning is tested on Llama-style models from 135M to 1.7B parameters, and is slower than PyTorch on CUDA. Every training number is from one NVIDIA A10G; other GPUs are untested beyond an Apple M2 and software Vulkan. The limits section above has the details."
      }
     }
    ]
@@ -179,8 +179,8 @@
   <div class="wrap hero-in">
     <div class="hero-copy">
       <p class="kicker"><span>v{{ft_version}}</span><span>Rust · WebGPU</span><span>MIT OR Apache-2.0</span></p>
-      <h1 id="hero-title"><span class="h1-kick">Ferrotensor</span>Fine-tune language models on any&nbsp;GPU.</h1>
-      <p class="lede">LoRA fine-tuning up to 1.7B parameters, written in Rust on WebGPU. The same hand-written WGSL kernels run on Apple GPUs through Metal and on NVIDIA and other GPUs through Vulkan or DX12. No CUDA toolchain, and the same held-out loss as PyTorch.</p>
+      <h1 id="hero-title"><span class="h1-kick">Ferrotensor</span>Fine-tune language models in pure&nbsp;Rust.</h1>
+      <p class="lede">LoRA fine-tuning up to 1.7B parameters, written in Rust on wgpu. The same hand-written WGSL kernels run through Vulkan, Metal or DX12, with no CUDA toolchain. Tested on an NVIDIA A10G, an Apple M2 and software Vulkan in CI; other GPUs are untested, and <a href="docs/testing-on-your-gpu.html">reports are welcome</a>.</p>
 
       <div class="install" data-tabs>
         <div class="tablist" role="tablist" aria-label="Install with">
@@ -211,18 +211,18 @@
 
     <aside class="proof" aria-labelledby="proof-title">
       <p class="proof-h"><span>Measured</span><span>NVIDIA A10G · 250 steps</span></p>
-      <h2 id="proof-title" class="proof-t">SmolLM2-1.7B with LoRA: the same loss as PyTorch on CUDA</h2>
+      <h2 id="proof-title" class="proof-t">SmolLM2-1.7B with LoRA: within 0.005 of PyTorch on CUDA</h2>
       <ul class="pbars" aria-label="Held-out loss, lower is better">
         <li><span class="pb-l">Before training</span><span class="pb-v">2.6474</span><span class="pb-bar"><i style="--w:100%"></i></span></li>
         <li class="pb-us"><span class="pb-l">Ferrotensor, WebGPU on Vulkan</span><span class="pb-v">1.0640</span><span class="pb-bar"><i style="--w:40.2%"></i></span></li>
         <li><span class="pb-l">PyTorch + PEFT, CUDA</span><span class="pb-v">1.0608</span><span class="pb-bar"><i style="--w:40.1%"></i></span></li>
       </ul>
-      <p class="pb-cap">Held-out loss on 2,744 Alpaca tokens, lower is better. Same GPU, same data, same recipe.</p>
+      <p class="pb-cap">Held-out loss on 2,744 Alpaca tokens, lower is better. Same GPU, same data, same recipe, one seed each; Ferrotensor (0.6 build) at 0.37 of PyTorch's speed.</p>
       <dl class="pstats">
-        <div><dt>GPU memory</dt><dd>11.9&nbsp;GiB</dd></div>
+        <div><dt>GPU memory, 0.7</dt><dd>8,222&nbsp;MiB</dd></div>
+        <div><dt>With <code>--checkpoint-blocks</code></dt><dd>5,245&nbsp;MiB</dd></div>
         <div><dt>Host memory</dt><dd>5.3&nbsp;GB</dd></div>
-        <div><dt>Per step</dt><dd>2.38&nbsp;s</dd></div>
-        <div><dt>Adapter</dt><dd>12.6&nbsp;MB</dd></div>
+        <div><dt>Speed vs PyTorch</dt><dd>0.37×</dd></div>
       </dl>
       <a class="proof-src" href="docs/examples/lora-sft.html#against-pytorch--peft-on-cuda-same-gpu">Method and every number</a>
     </aside>
@@ -230,7 +230,7 @@
   <div class="wrap">
     <ul class="runs" aria-label="Hardware with published results">
       <li class="run-k">Measured on</li>
-      <li><b>Apple M2</b> Metal, 8&nbsp;GB laptop</li>
+      <li><b>Apple M2</b> Metal, 0.4 build</li>
       <li><b>NVIDIA A10G</b> Vulkan</li>
       <li><b>NVIDIA Tesla T4</b> Vulkan</li>
       <li><b>Software Vulkan</b> every pull request</li>
@@ -253,63 +253,64 @@
         <p class="card-k">Scale</p>
         <p class="figure"><a href="docs/examples/lora-sft.html#batching-f16-base-weights-and-lower-host-memory-06">1.7B</a> <span class="unit">params</span></p>
         <p class="figure-cap">LoRA fine-tuning on one 24&nbsp;GB GPU</p>
-        <svg class="bars" viewBox="0 0 260 74" role="img" aria-labelledby="mem-t">
-          <title id="mem-t">Peak host memory for SmolLM2-1.7B: 20.01 GB in 0.5, 5.33 GB in 0.6.</title>
-          <rect class="bar-old" x="0" y="8" width="260" height="20" rx="2"/>
-          <text class="bar-in-old" x="8" y="23">0.5 · 20.0 GB host memory</text>
-          <rect class="bar-new" x="0" y="42" width="69" height="20" rx="2"/>
-          <text x="76" y="57">0.6 · 5.3 GB</text>
+        <svg class="bars" viewBox="0 0 260 92" role="img" aria-labelledby="mem-t">
+          <title id="mem-t">Peak GPU memory for LoRA on SmolLM2-1.7B on an NVIDIA A10G: 11,607 MiB in 0.6, 8,222 MiB in 0.7, 5,245 MiB in 0.7 with --checkpoint-blocks. Losses identical in all three.</title>
+          <rect class="bar-old" x="0" y="4" width="260" height="20" rx="2"/>
+          <text class="bar-in-old" x="8" y="19">0.6 · 11,607 MiB GPU memory</text>
+          <rect class="bar-old" x="0" y="36" width="184" height="20" rx="2"/>
+          <text class="bar-in-old" x="8" y="51">0.7 · 8,222 MiB</text>
+          <rect class="bar-new" x="0" y="68" width="117" height="20" rx="2"/>
+          <text class="bar-in" x="8" y="83">5,245 MiB</text>
+          <text x="124" y="83">--checkpoint-blocks</text>
         </svg>
         <ul class="facts">
           <li>Held-out loss <a href="docs/examples/lora-sft.html#batching-f16-base-weights-and-lower-host-memory-06">2.6474 → 1.0640</a> in 250 steps</li>
-          <li>Frozen weights stored as f16 by default: <a href="docs/examples/lora-sft.html#batching-f16-base-weights-and-lower-host-memory-06">11.9&nbsp;GiB</a> of GPU memory instead of 14.7</li>
+          <li>Losses <a href="docs/examples/lora-sft.html#less-gpu-memory-07">identical at every stage</a>; <code>--checkpoint-blocks</code> costs 19 to 39% more time per step</li>
           <li>SmolLM2-135M, 360M and 1.7B <a href="docs/examples/lora-sft.html#on-an-nvidia-gpu-three-model-sizes">measured with one script</a></li>
         </ul>
-        <a class="card-src" href="docs/examples/lora-sft.html#on-an-nvidia-gpu-three-model-sizes">Results for three model sizes</a>
+        <a class="card-src" href="docs/examples/lora-sft.html#less-gpu-memory-07">GPU memory by stage and model</a>
       </article>
 
       <article class="card">
         <p class="card-k">Speed</p>
-        <p class="figure"><a href="docs/examples/lora-sft.html#batching-f16-base-weights-and-lower-host-memory-06">35×</a> <span class="unit">faster</span></p>
-        <p class="figure-cap">LoRA step since 0.4, SmolLM2-135M on an A10G</p>
+        <p class="figure"><a href="docs/examples/lora-sft.html#against-pytorch--peft-on-cuda-same-gpu">0.32–0.84×</a> <span class="unit">PyTorch</span></p>
+        <p class="figure-cap">LoRA step speed against PyTorch + PEFT on CUDA, same A10G</p>
         <svg class="bars" viewBox="0 0 260 92" role="img" aria-labelledby="speed-t">
-          <title id="speed-t">Seconds per LoRA step for SmolLM2-135M on an NVIDIA A10G: 20.2 in 0.4, 1.33 in 0.5, 0.57 in 0.6 with batch 8.</title>
-          <rect class="bar-old" x="0" y="4" width="260" height="20" rx="2"/>
-          <text class="bar-in-old" x="8" y="19">0.4 · 20.2 s</text>
-          <rect class="bar-old" x="0" y="36" width="17" height="20" rx="2"/>
-          <text x="24" y="51">0.5 · 1.33 s</text>
-          <rect class="bar-new" x="0" y="68" width="7.5" height="20" rx="2"/>
-          <text x="15" y="83">0.6, batch 8 · 0.57 s</text>
+          <title id="speed-t">Ferrotensor's LoRA speed as a fraction of PyTorch + PEFT on CUDA on the same NVIDIA A10G: 0.84 for SmolLM2-135M at batch 1, 0.32 at batch 8, 0.37 for SmolLM2-1.7B.</title>
+          <rect class="bar-new" x="0" y="4" width="218" height="20" rx="2"/>
+          <text class="bar-in" x="8" y="19">135M, batch 1 · 0.84×</text>
+          <rect class="bar-new" x="0" y="36" width="83" height="20" rx="2"/>
+          <text x="90" y="51">135M, batch 8 · 0.32×</text>
+          <rect class="bar-new" x="0" y="68" width="96" height="20" rx="2"/>
+          <text x="103" y="83">1.7B, batch 1 · 0.37×</text>
         </svg>
         <ul class="facts">
-          <li>84% of <a href="docs/examples/lora-sft.html#against-pytorch--peft-on-cuda-same-gpu">PyTorch's speed on CUDA</a> for SmolLM2-135M</li>
+          <li>Slower than PyTorch on CUDA: <a href="docs/examples/lora-sft.html#against-pytorch--peft-on-cuda-same-gpu">1.2 to 3.1 times</a> its time per step</li>
           <li><code>--batch-size 8</code> trains eight sequences in <a href="docs/examples/lora-sft.html#batching-f16-base-weights-and-lower-host-memory-06">one GPU pass</a>, same loss</li>
-          <li>Matmul in WGSL: <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/benchmarks/RESULTS.md">9.1&nbsp;TFLOPS</a> on the A10G at 4096³</li>
         </ul>
-        <a class="card-src" href="docs/benchmarks.html">Benchmarks and method</a>
+        <a class="card-src" href="docs/examples/lora-sft.html#against-pytorch--peft-on-cuda-same-gpu">The comparison and its conditions</a>
       </article>
 
       <article class="card">
         <p class="card-k">Checked correctness</p>
-        <p class="figure"><a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/docs/examples/lora-sft.md#correctness-checks">240<span class="slash">/</span>240</a></p>
-        <p class="figure-cap">LoRA adapter gradients matched PyTorch autograd</p>
-        <svg class="checks" viewBox="0 0 260 58" aria-hidden="true">
-          <g><rect class="cell" x="0" y="0" width="5" height="5" rx="1"/><rect class="cell" x="6.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="13" y="0" width="5" height="5" rx="1"/><rect class="cell" x="19.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="26" y="0" width="5" height="5" rx="1"/><rect class="cell" x="32.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="39" y="0" width="5" height="5" rx="1"/><rect class="cell" x="45.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="52" y="0" width="5" height="5" rx="1"/><rect class="cell" x="58.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="65" y="0" width="5" height="5" rx="1"/><rect class="cell" x="71.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="78" y="0" width="5" height="5" rx="1"/><rect class="cell" x="84.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="91" y="0" width="5" height="5" rx="1"/><rect class="cell" x="97.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="104" y="0" width="5" height="5" rx="1"/><rect class="cell" x="110.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="117" y="0" width="5" height="5" rx="1"/><rect class="cell" x="123.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="130" y="0" width="5" height="5" rx="1"/><rect class="cell" x="136.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="143" y="0" width="5" height="5" rx="1"/><rect class="cell" x="149.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="156" y="0" width="5" height="5" rx="1"/><rect class="cell" x="162.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="169" y="0" width="5" height="5" rx="1"/><rect class="cell" x="175.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="182" y="0" width="5" height="5" rx="1"/><rect class="cell" x="188.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="195" y="0" width="5" height="5" rx="1"/><rect class="cell" x="201.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="208" y="0" width="5" height="5" rx="1"/><rect class="cell" x="214.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="221" y="0" width="5" height="5" rx="1"/><rect class="cell" x="227.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="234" y="0" width="5" height="5" rx="1"/><rect class="cell" x="240.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="247" y="0" width="5" height="5" rx="1"/><rect class="cell" x="253.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="0" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="6.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="13" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="19.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="26" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="32.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="39" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="45.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="52" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="58.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="65" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="71.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="78" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="84.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="91" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="97.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="104" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="110.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="117" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="123.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="130" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="136.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="143" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="149.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="156" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="162.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="169" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="175.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="182" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="188.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="195" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="201.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="208" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="214.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="221" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="227.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="234" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="240.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="247" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="253.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="0" y="13" width="5" height="5" rx="1"/><rect class="cell" x="6.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="13" y="13" width="5" height="5" rx="1"/><rect class="cell" x="19.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="26" y="13" width="5" height="5" rx="1"/><rect class="cell" x="32.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="39" y="13" width="5" height="5" rx="1"/><rect class="cell" x="45.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="52" y="13" width="5" height="5" rx="1"/><rect class="cell" x="58.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="65" y="13" width="5" height="5" rx="1"/><rect class="cell" x="71.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="78" y="13" width="5" height="5" rx="1"/><rect class="cell" x="84.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="91" y="13" width="5" height="5" rx="1"/><rect class="cell" x="97.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="104" y="13" width="5" height="5" rx="1"/><rect class="cell" x="110.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="117" y="13" width="5" height="5" rx="1"/><rect class="cell" x="123.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="130" y="13" width="5" height="5" rx="1"/><rect class="cell" x="136.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="143" y="13" width="5" height="5" rx="1"/><rect class="cell" x="149.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="156" y="13" width="5" height="5" rx="1"/><rect class="cell" x="162.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="169" y="13" width="5" height="5" rx="1"/><rect class="cell" x="175.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="182" y="13" width="5" height="5" rx="1"/><rect class="cell" x="188.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="195" y="13" width="5" height="5" rx="1"/><rect class="cell" x="201.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="208" y="13" width="5" height="5" rx="1"/><rect class="cell" x="214.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="221" y="13" width="5" height="5" rx="1"/><rect class="cell" x="227.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="234" y="13" width="5" height="5" rx="1"/><rect class="cell" x="240.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="247" y="13" width="5" height="5" rx="1"/><rect class="cell" x="253.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="0" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="6.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="13" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="19.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="26" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="32.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="39" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="45.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="52" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="58.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="65" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="71.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="78" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="84.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="91" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="97.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="104" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="110.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="117" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="123.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="130" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="136.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="143" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="149.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="156" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="162.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="169" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="175.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="182" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="188.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="195" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="201.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="208" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="214.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="221" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="227.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="234" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="240.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="247" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="253.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="0" y="26" width="5" height="5" rx="1"/><rect class="cell" x="6.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="13" y="26" width="5" height="5" rx="1"/><rect class="cell" x="19.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="26" y="26" width="5" height="5" rx="1"/><rect class="cell" x="32.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="39" y="26" width="5" height="5" rx="1"/><rect class="cell" x="45.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="52" y="26" width="5" height="5" rx="1"/><rect class="cell" x="58.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="65" y="26" width="5" height="5" rx="1"/><rect class="cell" x="71.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="78" y="26" width="5" height="5" rx="1"/><rect class="cell" x="84.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="91" y="26" width="5" height="5" rx="1"/><rect class="cell" x="97.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="104" y="26" width="5" height="5" rx="1"/><rect class="cell" x="110.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="117" y="26" width="5" height="5" rx="1"/><rect class="cell" x="123.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="130" y="26" width="5" height="5" rx="1"/><rect class="cell" x="136.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="143" y="26" width="5" height="5" rx="1"/><rect class="cell" x="149.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="156" y="26" width="5" height="5" rx="1"/><rect class="cell" x="162.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="169" y="26" width="5" height="5" rx="1"/><rect class="cell" x="175.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="182" y="26" width="5" height="5" rx="1"/><rect class="cell" x="188.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="195" y="26" width="5" height="5" rx="1"/><rect class="cell" x="201.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="208" y="26" width="5" height="5" rx="1"/><rect class="cell" x="214.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="221" y="26" width="5" height="5" rx="1"/><rect class="cell" x="227.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="234" y="26" width="5" height="5" rx="1"/><rect class="cell" x="240.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="247" y="26" width="5" height="5" rx="1"/><rect class="cell" x="253.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="0" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="6.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="13" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="19.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="26" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="32.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="39" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="45.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="52" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="58.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="65" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="71.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="78" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="84.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="91" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="97.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="104" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="110.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="117" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="123.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="130" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="136.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="143" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="149.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="156" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="162.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="169" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="175.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="182" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="188.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="195" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="201.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="208" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="214.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="221" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="227.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="234" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="240.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="247" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="253.5" y="32.5" width="5" height="5" rx="1"/></g>
-          <text x="0" y="54">one square per adapter gradient</text>
+        <p class="figure"><a href="docs/examples/lora-sft.html#correctness-checks">9.5e-7</a></p>
+        <p class="figure-cap">largest gradient difference from PyTorch autograd, checked in CI</p>
+        <svg class="checks" viewBox="0 0 260 44" aria-hidden="true">
+          <g><rect class="cell" x="0" y="0" width="8" height="8" rx="1"/><rect class="cell" x="10.4" y="0" width="8" height="8" rx="1"/><rect class="cell" x="20.8" y="0" width="8" height="8" rx="1"/><rect class="cell" x="31.2" y="0" width="8" height="8" rx="1"/><rect class="cell" x="41.6" y="0" width="8" height="8" rx="1"/><rect class="cell" x="52" y="0" width="8" height="8" rx="1"/><rect class="cell" x="62.4" y="0" width="8" height="8" rx="1"/><rect class="cell" x="72.8" y="0" width="8" height="8" rx="1"/><rect class="cell" x="83.2" y="0" width="8" height="8" rx="1"/><rect class="cell" x="93.6" y="0" width="8" height="8" rx="1"/><rect class="cell" x="104" y="0" width="8" height="8" rx="1"/><rect class="cell" x="114.4" y="0" width="8" height="8" rx="1"/><rect class="cell" x="124.8" y="0" width="8" height="8" rx="1"/><rect class="cell" x="135.2" y="0" width="8" height="8" rx="1"/><rect class="cell" x="145.6" y="0" width="8" height="8" rx="1"/><rect class="cell" x="156" y="0" width="8" height="8" rx="1"/><rect class="cell" x="166.4" y="0" width="8" height="8" rx="1"/><rect class="cell" x="176.8" y="0" width="8" height="8" rx="1"/><rect class="cell" x="187.2" y="0" width="8" height="8" rx="1"/><rect class="cell" x="197.6" y="0" width="8" height="8" rx="1"/><rect class="cell" x="208" y="0" width="8" height="8" rx="1"/><rect class="cell" x="218.4" y="0" width="8" height="8" rx="1"/><rect class="cell" x="228.8" y="0" width="8" height="8" rx="1"/><rect class="cell" x="239.2" y="0" width="8" height="8" rx="1"/><rect class="cell" x="249.6" y="0" width="8" height="8" rx="1"/><rect class="cell" x="0" y="12" width="8" height="8" rx="1"/><rect class="cell" x="10.4" y="12" width="8" height="8" rx="1"/><rect class="cell" x="20.8" y="12" width="8" height="8" rx="1"/><rect class="cell" x="31.2" y="12" width="8" height="8" rx="1"/><rect class="cell" x="41.6" y="12" width="8" height="8" rx="1"/><rect class="cell" x="52" y="12" width="8" height="8" rx="1"/><rect class="cell" x="62.4" y="12" width="8" height="8" rx="1"/><rect class="cell" x="72.8" y="12" width="8" height="8" rx="1"/><rect class="cell" x="83.2" y="12" width="8" height="8" rx="1"/><rect class="cell" x="93.6" y="12" width="8" height="8" rx="1"/><rect class="cell" x="104" y="12" width="8" height="8" rx="1"/><rect class="cell" x="114.4" y="12" width="8" height="8" rx="1"/><rect class="cell" x="124.8" y="12" width="8" height="8" rx="1"/><rect class="cell" x="135.2" y="12" width="8" height="8" rx="1"/><rect class="cell" x="145.6" y="12" width="8" height="8" rx="1"/><rect class="cell" x="156" y="12" width="8" height="8" rx="1"/><rect class="cell" x="166.4" y="12" width="8" height="8" rx="1"/><rect class="cell" x="176.8" y="12" width="8" height="8" rx="1"/><rect class="cell" x="187.2" y="12" width="8" height="8" rx="1"/><rect class="cell" x="197.6" y="12" width="8" height="8" rx="1"/><rect class="cell" x="208" y="12" width="8" height="8" rx="1"/><rect class="cell" x="218.4" y="12" width="8" height="8" rx="1"/><rect class="cell" x="228.8" y="12" width="8" height="8" rx="1"/><rect class="cell" x="239.2" y="12" width="8" height="8" rx="1"/><rect class="cell" x="249.6" y="12" width="8" height="8" rx="1"/></g>
+          <text x="0" y="40">one square per gradient tensor compared</text>
         </svg>
         <ul class="facts">
           <li>Held-out loss before training <a href="docs/examples/lora-sft.html#against-pytorch--peft-on-cuda-same-gpu">identical to PyTorch</a> to four decimals, for 135M and 1.7B</li>
-          <li>Every differentiable op <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/README.md#highlights">tested against finite differences</a> on the CPU</li>
-          <li>Every GPU kernel <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/README.md#highlights">tested against a CPU reference</a></li>
-          <li>Model logits matched <code>transformers</code> to <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/docs/examples/lora-sft.md#correctness-checks">about 1e-5</a>; worst gradient error 0.2%</li>
+          <li>Loss, logits and every LoRA gradient of a tiny model <a href="docs/examples/lora-sft.html#correctness-checks">checked against PyTorch autograd</a> on every pull request</li>
+          <li>Exported PEFT adapters <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/docs/examples/peft-export.md">reproduce the logits in PyTorch</a> within 1e-3</li>
         </ul>
         <a class="card-src" href="docs/examples/lora-sft.html#correctness-checks">How it was checked</a>
       </article>
 
       <article class="card">
-        <p class="card-k">Also on an 8&nbsp;GB laptop</p>
+        <p class="card-k">Also on an Apple M2</p>
         <p class="figure"><a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/docs/examples/lora-sft.md#result">2.43 <span aria-label="to">→</span> 1.65</a></p>
-        <p class="figure-cap">held-out loss, SmolLM2-135M on Alpaca, Apple M2</p>
+        <p class="figure-cap">held-out loss, SmolLM2-135M on Alpaca, Apple M2 (8&nbsp;GB), 0.4 build</p>
         <svg class="spark" viewBox="0 0 260 74" role="img" aria-labelledby="spark-t">
           <title id="spark-t">Held-out loss by step: 2.425 at 0, 1.815 at 50, 1.698 at 100, 1.670 at 150, 1.658 at 200, 1.652 at 250.</title>
           <line class="spark-base" x1="0" y1="70" x2="260" y2="70"/>
@@ -321,7 +322,6 @@
         </svg>
         <ul class="facts">
           <li><a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/docs/examples/lora-sft.md#result">Perplexity 11.3 → 5.2</a> in 250 steps</li>
-          <li><a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/docs/examples/lora-sft.md#result">3.3&nbsp;GB peak memory</a>, 8.8&nbsp;s per step</li>
           <li>A <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/docs/examples/lora-sft.md#result">3.7&nbsp;MB adapter</a> that reloads to the same loss</li>
         </ul>
         <a class="card-src" href="docs/examples/lora-sft.html">Walkthrough with every command</a>
@@ -413,8 +413,8 @@ x = ft.<span class="f">tensor</span>([[<span class="n">0</span>, <span class="n"
 <text class="a-s" x="12" y="199.0" font-size="13">Python bindings: ferrotensor-py</text>
 <rect class="a-box" x="0" y="258" width="440" height="134" rx="6"/>
 <text class="a-t" x="12" y="311.2" font-size="16">Own WGSL kernels</text>
-<text class="a-s" x="12" y="332.8" font-size="13">plus a CPU device: every GPU kernel is</text>
-<text class="a-s" x="12" y="351.0" font-size="13">checked against the CPU reference</text>
+<text class="a-s" x="12" y="332.8" font-size="13">plus a CPU device that the tests use</text>
+<text class="a-s" x="12" y="351.0" font-size="13">as the reference for the GPU</text>
 <line class="a-line" x1="220.0" y1="88" x2="220.0" y2="105" marker-end="url(#ah-wide)"/>
 <line class="a-line" x1="220.0" y1="240" x2="220.0" y2="257" marker-end="url(#ah-wide)"/>
 <rect class="a-box a-acc" x="520" y="30" width="440" height="58" rx="6"/>
@@ -511,12 +511,13 @@ x = ft.<span class="f">tensor</span>([[<span class="n">0</span>, <span class="n"
   <div class="wrap">
     <header class="sec-head">
       <p class="eyebrow">04 · Direction</p>
-      <h2 id="direction-title">Train anywhere: every GPU, data that stays on the device</h2>
-      <p>One Rust codebase that fine-tunes models on whatever GPU you have, with no vendor toolchain to install. What is measured, and what comes next:</p>
+      <h2 id="direction-title">Where it goes next: more GPUs, data that stays on the device</h2>
+      <p>One Rust codebase that fine-tunes models through Vulkan, Metal or DX12, with no vendor toolchain to install. What is measured, and what comes next:</p>
     </header>
     <ol class="road">
-      <li class="road-done"><span class="pill">Measured</span><h3>Apple and NVIDIA GPUs</h3><p>The same LoRA recipe reaches the same held-out loss on an Apple M2 through Metal and an NVIDIA A10G through Vulkan.</p></li>
-      <li class="road-done"><span class="pill">Measured</span><h3>Parity with PyTorch</h3><p>Same GPU and recipe as PyTorch + PEFT on CUDA: identical loss before training, within 0.005 after.</p></li>
+      <li class="road-done"><span class="pill">Measured</span><h3>Apple and NVIDIA GPUs</h3><p>The same LoRA recipe gave SmolLM2-135M the same held-out loss on an Apple M2 through Metal (0.4 build) and an NVIDIA A10G through Vulkan.</p></li>
+      <li class="road-done"><span class="pill">Measured</span><h3>Parity with PyTorch</h3><p>Same GPU and recipe as PyTorch + PEFT on CUDA: identical loss before training, within 0.005 after, at 0.32 to 0.84 of its speed. LoRA gradients checked against PyTorch autograd in CI.</p></li>
+      <li class="road-done"><span class="pill">Measured</span><h3>Less GPU memory</h3><p>LoRA on SmolLM2-1.7B: 11,607 MiB in 0.6, 8,222 MiB in 0.7 and 5,245 MiB with <code>--checkpoint-blocks</code>, with identical losses.</p></li>
       <li><span class="pill">Next</span><h3>AMD and Intel GPUs</h3><p>The same Vulkan and DX12 path, waiting for its first published results. <a href="docs/testing-on-your-gpu.html">Test it on your GPU</a>.</p></li>
       <li><span class="pill">Next</span><h3>Faster large matmuls</h3><p>Matmul tiles tuned per GPU, to close the gap with cuBLAS on billion-parameter models.</p></li>
       <li><span class="pill">Planned</span><h3>Fine-tuning in a browser tab</h3><p>wgpu also targets WebGPU in the browser: LoRA on the visitor's own GPU, with the training data never uploaded.</p></li>
@@ -586,7 +587,7 @@ x = ft.<span class="f">tensor</span>([[<span class="n">0</span>, <span class="n"
     </div>
     <div class="choose">
       <p>Choose <strong>candle</strong> for inference of popular models, <strong>burn</strong> for a mature all-Rust training framework, <strong>tch-rs</strong> when you need exact PyTorch semantics and CUDA.</p>
-      <p>Choose <strong>Ferrotensor</strong> to fine-tune language models on whatever GPU you have, Apple or NVIDIA or other Vulkan and DX12 hardware, without installing CUDA, with results checked against PyTorch, in a codebase small enough to read and change end to end. It has a smaller op set and model zoo than these projects and has not been benchmarked against them.</p>
+      <p>Choose <strong>Ferrotensor</strong> to fine-tune language models through Vulkan, Metal or DX12 without installing CUDA (tested on an NVIDIA A10G, an Apple M2 and software Vulkan), with results checked against PyTorch, in a codebase small enough to read and change end to end. It has a smaller op set and model zoo than these projects and has not been benchmarked against them.</p>
     </div>
   </div>
 </section>
@@ -601,10 +602,11 @@ x = ft.<span class="f">tensor</span>([[<span class="n">0</span>, <span class="n"
     <ul class="limits">
       <li><strong>Mostly f32.</strong> The LoRA command stores frozen weights as f16; activations, gradients and the tensor API are f32, with no <code>f16</code> or <code>bf16</code> tensors yet.</li>
       <li><strong>One GPU.</strong> No multi-GPU or distributed training; the CLI's <code>--world-size</code> flag is a prototype.</li>
-      <li><strong>Up to 1.7B measured.</strong> LoRA fine-tuning is tested on Llama-style models from SmolLM2-135M to 1.7B; larger models are untested, and SmolLM2-1.7B at batch 8 does not fit in 24&nbsp;GB. Released LFM2 checkpoints are not supported.</li>
+      <li><strong>Up to 1.7B measured.</strong> LoRA fine-tuning is tested on Llama-style models from SmolLM2-135M to 1.7B; larger models are untested. Released LFM2 checkpoints are not supported.</li>
       <li><strong>Tiny workloads are faster on the CPU.</strong> A chain of 100 tiny ops still takes <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/benchmarks/RESULTS.md#what-is-still-slow">about 17× as long on the GPU</a> as on the CPU; op fusion is the next step.</li>
       <li><strong>Not every op.</strong> No convolutions, sort, top-k or cumsum in the tensor API.</li>
-      <li><strong>Behind cuBLAS on big matmuls.</strong> SmolLM2-1.7B trains at <a href="docs/examples/lora-sft.html#against-pytorch--peft-on-cuda-same-gpu">37% of PyTorch's speed</a> on the same NVIDIA GPU, and matmul reaches <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/benchmarks/RESULTS.md#context">about 17% of the M2's FP32 peak</a>; WGSL does not expose the matrix instructions that close that gap.</li>
+      <li><strong>Slower than PyTorch on CUDA.</strong> On the same NVIDIA A10G, a LoRA step takes <a href="docs/examples/lora-sft.html#against-pytorch--peft-on-cuda-same-gpu">1.2 to 3.1 times</a> PyTorch's time (0.84, 0.32 and 0.37 of its speed). Most of the gap is likely in large matmuls, where PyTorch uses cuBLAS; it is not profiled kernel by kernel.</li>
+      <li><strong>One NVIDIA GPU measured.</strong> Every training number is from one A10G. AMD, Intel and DX12 are untested; the Apple M2 result is from a 0.4 build. <a href="docs/testing-on-your-gpu.html">Test it on your GPU</a>.</li>
       <li><strong>Pre-1.0.</strong> The API can still change, and Python wheels exist for macOS arm64 and Linux x86_64 only (other platforms build from source).</li>
     </ul>
   </div>
@@ -627,7 +629,7 @@ x = ft.<span class="f">tensor</span>([[<span class="n">0</span>, <span class="n"
       </div>
       <div class="faq-item">
         <h3 id="faq-macbook">Can I fine-tune a model on a MacBook?</h3>
-        <p>Yes, a small one. On a MacBook Air with an Apple M2 and 8&nbsp;GB of memory, LoRA fine-tuning of SmolLM2-135M on 2,000 Alpaca examples took the held-out loss from 2.43 to 1.65 in 250 steps, at 8.8&nbsp;s per step and 3.3&nbsp;GB peak memory. The LoRA path is experimental and aimed at small Llama-style models; the <a href="docs/examples/lora-sft.html">LoRA walkthrough</a> lists every command.</p>
+        <p>Yes, a small one. On a MacBook Air with an Apple M2 and 8&nbsp;GB of memory, LoRA fine-tuning of SmolLM2-135M on 2,000 Alpaca examples took the held-out loss from 2.43 to 1.65 in 250 steps with a 0.4 build; there are no current Mac speed or memory numbers. The LoRA path is experimental and aimed at small Llama-style models; the <a href="docs/examples/lora-sft.html">LoRA walkthrough</a> lists every command.</p>
       </div>
       <div class="faq-item">
         <h3 id="faq-install">How do I install Ferrotensor in Python or Rust?</h3>
@@ -639,11 +641,11 @@ x = ft.<span class="f">tensor</span>([[<span class="n">0</span>, <span class="n"
       </div>
       <div class="faq-item">
         <h3 id="faq-pytorch">How close is Ferrotensor to PyTorch?</h3>
-        <p>On the same NVIDIA A10G with the same LoRA recipe, Ferrotensor and PyTorch + PEFT on CUDA give the same held-out loss before training to four decimals, and after 250 steps Ferrotensor is within 0.005 (1.0640 against 1.0608 for SmolLM2-1.7B). It runs at 84% of PyTorch's speed for SmolLM2-135M and 37% for SmolLM2-1.7B, where large matrix multiplications dominate. The <a href="docs/examples/lora-sft.html#against-pytorch--peft-on-cuda-same-gpu">LoRA walkthrough</a> has the full table.</p>
+        <p>On the same NVIDIA A10G with the same LoRA recipe, Ferrotensor and PyTorch + PEFT on CUDA give the same held-out loss before training to four decimals, and after 250 steps Ferrotensor is within 0.005 (1.0640 against 1.0608 for SmolLM2-1.7B), one seed per run. Ferrotensor is slower: 0.84 of PyTorch's speed for SmolLM2-135M at batch 1, 0.32 at batch 8 and 0.37 for SmolLM2-1.7B. LoRA loss and gradients are also checked against PyTorch autograd in CI, on a tiny model. The <a href="docs/examples/lora-sft.html#against-pytorch--peft-on-cuda-same-gpu">LoRA walkthrough</a> has the full table.</p>
       </div>
       <div class="faq-item">
         <h3 id="faq-limits">What are Ferrotensor’s limits?</h3>
-        <p>It is pre-1.0 and runs on a single GPU. Arithmetic, activations, gradients and the tensor API are f32 (the CLI stores frozen LoRA base weights as f16 by default), and the tensor API has no convolutions, sort or top-k yet. Chains of tiny ops are still faster on the CPU. LoRA fine-tuning is tested on Llama-style models from 135M to 1.7B parameters. The <a href="#limits">limits section</a> above has the details.</p>
+        <p>It is pre-1.0 and runs on a single GPU. Arithmetic, activations, gradients and the tensor API are f32 (the CLI stores frozen LoRA base weights as f16 by default), and the tensor API has no convolutions, sort or top-k yet. Chains of tiny ops are still faster on the CPU. LoRA fine-tuning is tested on Llama-style models from 135M to 1.7B parameters, and is slower than PyTorch on CUDA. Every training number is from one NVIDIA A10G; other GPUs are untested beyond an Apple M2 and software Vulkan. The <a href="#limits">limits section</a> above has the details.</p>
       </div>
     </div>
   </div>

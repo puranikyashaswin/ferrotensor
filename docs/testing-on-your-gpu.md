@@ -1,10 +1,12 @@
 # Testing Ferrotensor on your GPU
 
-Ferrotensor runs on any GPU wgpu supports: Metal on macOS, Vulkan on Linux and
-Windows, DX12 on Windows. So far the numbers in this repository come from an
-Apple M2 through Metal and from an NVIDIA A10G and a Tesla T4 through Vulkan
-([results](../benchmarks/RESULTS.md)). Results from AMD and Intel GPUs, and
-from DX12, are the most useful thing you can contribute.
+Ferrotensor runs through wgpu: Metal on macOS, Vulkan on Linux and Windows,
+DX12 on Windows. It has been tested on an NVIDIA A10G (24 GB) through Vulkan,
+an Apple M2 (8 GB) through Metal, and software Vulkan (Mesa lavapipe) in CI;
+the kernel benchmarks also ran on a Tesla T4 through Vulkan
+([results](../benchmarks/RESULTS.md)). Other GPUs are untested. Results from
+AMD and Intel GPUs, and from DX12, are the most useful thing you can
+contribute.
 
 ## 1. See which GPU Ferrotensor uses
 
@@ -49,7 +51,7 @@ FERROTENSOR_RUN_GPU_TESTS=1 cargo test --workspace -- --ignored --test-threads=1
 cargo run -p ferrotensor-benchmarks --release --bin tensor-api
 ```
 
-The first command runs every kernel against its CPU reference on your GPU.
+The first command runs the GPU test suites on your GPU, which compare the kernels with CPU references and the LoRA gradients with PyTorch fixtures.
 The second prints CPU and GPU timings for the Tensor API.
 
 ## 4. Or measure everything in one go
