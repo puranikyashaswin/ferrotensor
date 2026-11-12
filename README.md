@@ -172,7 +172,7 @@ tested, incomplete, or only checked on one machine.
 | Flash attention kernels (`ferrotensor-backend`) | **Experimental** | Forward v2 and a backward kernel; see the `flash_attention_*` cases in `ferrotensor-autograd/tests/grad_check.rs` |
 | Checkpoint/resume (`ferrotensor-trainer`) | **Experimental** | |
 | Loss scaler (`GradScaler` in `ferrotensor-trainer`) | **Experimental** | A library type: `Trainer::with_grad_scaler` attaches it, the CLI does not use it, and `ferrotensor demo` only constructs one. Gradients are f32, so there is no f16 underflow for it to guard against |
-| Mixed-precision (f16 activations and gradients) training | Planned | Today only frozen LoRA base weights are f16; arithmetic, activations, gradients and adapters are f32 |
+| Mixed-precision (f16 activations and gradients) training | Planned | Today only frozen LoRA base weights are stored below f32 (f16 by default, 4-bit with `--q4-weights`); arithmetic, activations, gradients and adapters are f32 |
 | Terminal monitor, Hub download helpers | **Experimental** | `ferrotensor-monitor`, `ferrotensor-hub` |
 | `f16` / `bf16` tensors in the `ferrotensor` API | Planned | |
 | Convolutions, sort/top-k, cumsum in the `ferrotensor` API | Planned | |
