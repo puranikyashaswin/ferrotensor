@@ -36,6 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         rank: 4,
         alpha: 8.0,
         target_modules: PEFT_TARGET_MODULES.iter().map(|t| t.to_string()).collect(),
+        trained_modules: None,
     };
     let config = ferrotensor_loader::ModelLoader::load_config(model_dir.join("config.json"))?;
     let mut weights = ferrotensor_loader::WeightsContext::new();

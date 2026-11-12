@@ -43,7 +43,10 @@ A full walkthrough with measured numbers is in
 - Pretraining data (`--task pretrain`): `.txt` lines, a `.json` array of
   strings or token ids, or packed little-endian `u32` tokens in `.bin`.
 - Outputs in `--out`: `lora_adapters.safetensors` (+ `.state.json` for
-  `--resume`), `metrics.jsonl` (one line per logged step / eval) and
+  `--resume`; with `--train-modules` other than `lora` the file is
+  `trained_weights.safetensors` and holds the f32 base weights that
+  trained, which `eval --lora`, `generate --lora` and `--resume` load),
+  `metrics.jsonl` (one line per logged step / eval) and
   `training_state.json` (read by `ferrotensor-cli monitor`).
 - `classify-train` fine-tunes the model with LoRA as a text classifier from
   JSONL `{"text", "label"}` lines and `classify-predict` writes per-line

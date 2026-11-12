@@ -439,6 +439,7 @@ pub async fn save_peft_adapter(
         rank,
         alpha: f32::from_bits(alpha),
         target_modules: Vec::new(),
+        trained_modules: None,
     };
     write_peft_checked(
         &checkpoint,
@@ -587,6 +588,7 @@ pub fn load_peft_adapter(dir: &Path) -> Result<LoraCheckpoint> {
             rank: config.r,
             alpha,
             target_modules: targets.into_iter().map(str::to_string).collect(),
+            trained_modules: None,
         }),
     })
 }
@@ -635,6 +637,7 @@ mod tests {
                 rank: 2,
                 alpha: 16.0,
                 target_modules: vec!["q_proj".into(), "gate_proj".into(), "lm_head".into()],
+                trained_modules: None,
             }),
         }
     }

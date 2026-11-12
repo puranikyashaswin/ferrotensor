@@ -1093,15 +1093,38 @@ pub trait Optimizer: Send + Sync {
     ) -> Option<OptimizerCheckpoint> {
         None
     }
-    /// Restore state saved by [`save_state`](Optimizer::save_state);
-    /// returns whether it was applied.
+    /// Restore state saved by [`save_state`](Optimizer::save_state) into the
+    /// parameters of `named_params`.
+    ///
+    /// The result says how many parameters got their saved state back and
+    /// how many saved entries went unused; an error means the state does not
+    /// fit the parameters (a moment of the wrong shape) and nothing was
+    /// changed. The default reports that the optimizer keeps no state.
     fn load_state(
         &mut self,
         _ctx: &Arc<WgpuContext>,
         _named_params: &HashMap<String, Tensor>,
         _state: &OptimizerCheckpoint,
-    ) -> bool {
-        false
+    ) -> Result<OptimizerLoad, String> {
+        Err("this optimizer cannot restore saved state".to_string())
+    }
+}
+
+/// What [`Optimizer::load_state`] did with a saved state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OptimizerLoad {
+    /// Parameters that got their saved state back.
+    pub matched: usize,
+    /// Parameters that had no saved state and start from zero.
+    pub missing: usize,
+    /// Saved entries (by parameter name) that no parameter took.
+    pub unused: usize,
+}
+
+impl OptimizerLoad {
+    /// Whether every parameter got its state and every saved entry was used.
+    pub fn is_complete(&self) -> bool {
+        self.missing == 0 && self.unused == 0
     }
 }
 
@@ -1284,15 +1307,28 @@ impl Optimizer for AdamW {
             v_states,
         }))
     }
-    /// Restore state saved by [`save_state`](Optimizer::save_state);
-    /// returns whether it was applied.
+    /// Restore state saved by [`save_state`](Optimizer::save_state).
+    ///
+    /// A parameter takes its saved state when `state` has both moments under
+    /// its name; a moment whose shape differs from the parameter's is an
+    /// error and nothing is changed. When no parameter matches, the
+    /// optimizer is left as it was and the result says so; otherwise the
+    /// hyperparameters and step count of the checkpoint are restored too.
     fn load_state(
         &mut self,
         ctx: &Arc<WgpuContext>,
         named_params: &HashMap<String, Tensor>,
         state: &OptimizerCheckpoint,
-    ) -> bool {
+    ) -> Result<OptimizerLoad, String> {
         let OptimizerCheckpoint::AdamW(state) = state;
+        let shapes: HashMap<&str, &[usize]> = named_params
+            .iter()
+            .map(|(name, p)| (name.as_str(), p.data.shape.as_slice()))
+            .collect();
+        let (matched, report) = match_moments(&shapes, state)?;
+        if matched.is_empty() {
+            return Ok(report);
+        }
         self.lr = state.lr;
         self.beta1 = state.beta1;
         self.beta2 = state.beta2;
@@ -1301,27 +1337,56 @@ impl Optimizer for AdamW {
         self.t = state.t;
         self.m_states.clear();
         self.v_states.clear();
-
-        for (name, tensor_state) in &state.m_states {
-            if let Some(param) = named_params.get(name) {
-                let key = Arc::as_ptr(&param.data) as usize;
-                self.m_states.insert(
-                    key,
-                    UnifiedTensor::new(ctx, &tensor_state.data, &tensor_state.shape),
-                );
-            }
+        for name in matched {
+            let key = Arc::as_ptr(&named_params[name].data) as usize;
+            let (m, v) = (&state.m_states[name], &state.v_states[name]);
+            self.m_states
+                .insert(key, UnifiedTensor::new(ctx, &m.data, &m.shape));
+            self.v_states
+                .insert(key, UnifiedTensor::new(ctx, &v.data, &v.shape));
         }
-        for (name, tensor_state) in &state.v_states {
-            if let Some(param) = named_params.get(name) {
-                let key = Arc::as_ptr(&param.data) as usize;
-                self.v_states.insert(
-                    key,
-                    UnifiedTensor::new(ctx, &tensor_state.data, &tensor_state.shape),
-                );
-            }
-        }
-        true
+        Ok(report)
     }
+}
+
+/// Which saved moments belong to which parameters, without touching a
+/// device. `shapes` maps parameter names to their shapes. Returns the names
+/// that take both saved moments, and the counts; fails when a saved moment
+/// does not fit its parameter.
+fn match_moments<'a>(
+    shapes: &HashMap<&str, &[usize]>,
+    state: &'a AdamWCheckpoint,
+) -> Result<(Vec<&'a str>, OptimizerLoad), String> {
+    let mut saved: Vec<&String> = state.m_states.keys().chain(state.v_states.keys()).collect();
+    saved.sort();
+    saved.dedup();
+    let mut matched = Vec::new();
+    for &name in &saved {
+        let (Some(shape), Some(m), Some(v)) = (
+            shapes.get(name.as_str()),
+            state.m_states.get(name),
+            state.v_states.get(name),
+        ) else {
+            continue;
+        };
+        for (kind, moment) in [("first", m), ("second", v)] {
+            if moment.shape != *shape || moment.data.len() != shape.iter().product::<usize>() {
+                return Err(format!(
+                    "saved {kind} moment of {name} has shape {:?} ({} values), the parameter has shape {:?}",
+                    moment.shape,
+                    moment.data.len(),
+                    shape
+                ));
+            }
+        }
+        matched.push(name.as_str());
+    }
+    let report = OptimizerLoad {
+        matched: matched.len(),
+        missing: shapes.len() - matched.len(),
+        unused: saved.len() - matched.len(),
+    };
+    Ok((matched, report))
 }
 
 // --- Learning Rate Schedulers ---
@@ -1557,5 +1622,127 @@ mod tests {
         assert_eq!(&lrs[..5], &[0.0, 0.25, 0.5, 0.75, 1.0]);
         assert!((lrs[9] - 0.55).abs() < 1e-6);
         assert_eq!(lrs[14], 0.1);
+    }
+
+    fn moment(shape: &[usize]) -> OptimizerTensorState {
+        OptimizerTensorState {
+            shape: shape.to_vec(),
+            data: vec![0.5; shape.iter().product()],
+        }
+    }
+
+    /// Parameter shapes by name, as `load_state` sees them.
+    fn param_shapes(list: &[(&str, Vec<usize>)]) -> HashMap<String, Vec<usize>> {
+        list.iter()
+            .map(|(n, s)| (n.to_string(), s.clone()))
+            .collect()
+    }
+
+    fn borrowed(shapes: &HashMap<String, Vec<usize>>) -> HashMap<&str, &[usize]> {
+        shapes
+            .iter()
+            .map(|(n, s)| (n.as_str(), s.as_slice()))
+            .collect()
+    }
+
+    fn saved_state(params: &[(&str, Vec<usize>)]) -> AdamWCheckpoint {
+        let states = || {
+            params
+                .iter()
+                .map(|(n, s)| (n.to_string(), moment(s)))
+                .collect::<HashMap<_, _>>()
+        };
+        AdamWCheckpoint {
+            lr: 1e-3,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+            weight_decay: 0.0,
+            t: 3.0,
+            m_states: states(),
+            v_states: states(),
+        }
+    }
+
+    #[test]
+    fn saved_moments_match_the_same_parameters() {
+        let owned = param_shapes(&[("a.weight", vec![2, 3]), ("b.weight", vec![4])]);
+        let params = borrowed(&owned);
+        let state = saved_state(&[("a.weight", vec![2, 3]), ("b.weight", vec![4])]);
+        let (matched, report) = match_moments(&params, &state).expect("fits");
+        assert_eq!(matched, vec!["a.weight", "b.weight"]);
+        assert_eq!(
+            report,
+            OptimizerLoad {
+                matched: 2,
+                missing: 0,
+                unused: 0
+            }
+        );
+        assert!(report.is_complete());
+    }
+
+    #[test]
+    fn saved_moments_of_other_parameters_match_none() {
+        let owned = param_shapes(&[("x.weight", vec![2, 3]), ("y.weight", vec![4])]);
+        let params = borrowed(&owned);
+        let state = saved_state(&[("a.weight", vec![2, 3]), ("b.weight", vec![4])]);
+        let (matched, report) = match_moments(&params, &state).expect("no shape clash");
+        assert!(matched.is_empty());
+        assert_eq!(
+            report,
+            OptimizerLoad {
+                matched: 0,
+                missing: 2,
+                unused: 2
+            }
+        );
+        assert!(!report.is_complete());
+    }
+
+    #[test]
+    fn partial_overlap_reports_both_sides() {
+        let owned = param_shapes(&[
+            ("a.weight", vec![2]),
+            ("b.weight", vec![2]),
+            ("c.weight", vec![2]),
+        ]);
+        let params = borrowed(&owned);
+        let state = saved_state(&[("a.weight", vec![2]), ("old.weight", vec![2])]);
+        let (matched, report) = match_moments(&params, &state).expect("fits");
+        assert_eq!(matched, vec!["a.weight"]);
+        assert_eq!(
+            report,
+            OptimizerLoad {
+                matched: 1,
+                missing: 2,
+                unused: 1
+            }
+        );
+    }
+
+    #[test]
+    fn a_moment_with_only_one_half_is_not_applied() {
+        let owned = param_shapes(&[("a.weight", vec![2])]);
+        let params = borrowed(&owned);
+        let mut state = saved_state(&[("a.weight", vec![2])]);
+        state.v_states.clear();
+        let (matched, report) = match_moments(&params, &state).expect("fits");
+        assert!(matched.is_empty());
+        assert_eq!((report.missing, report.unused), (1, 1));
+    }
+
+    #[test]
+    fn a_moment_of_the_wrong_shape_is_an_error() {
+        let owned = param_shapes(&[("a.weight", vec![2, 3])]);
+        let params = borrowed(&owned);
+        let state = saved_state(&[("a.weight", vec![3, 2])]);
+        let err = match_moments(&params, &state).unwrap_err();
+        assert!(err.contains("a.weight") && err.contains("shape"), "{err}");
+
+        // A shape that agrees with a value count that does not.
+        let mut state = saved_state(&[("a.weight", vec![2, 3])]);
+        state.v_states.get_mut("a.weight").unwrap().data.pop();
+        assert!(match_moments(&params, &state).is_err());
     }
 }
