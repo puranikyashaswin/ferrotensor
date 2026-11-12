@@ -337,26 +337,20 @@ fn write_transposed(src: &[f32], rows: usize, cols: usize, dtype: DType, out: &m
     debug_assert!(out.len() >= src.len() * dtype.size_bytes());
     match dtype {
         DType::FP32 => {
-            let mut chunks = out.chunks_exact_mut(4);
+            let mut chunks = out.as_chunks_mut::<4>().0.iter_mut();
             for col in 0..cols {
                 for row in 0..rows {
-                    let bytes = src[row * cols + col].to_ne_bytes();
-                    chunks
-                        .next()
-                        .expect("output holds every value")
-                        .copy_from_slice(&bytes);
+                    *chunks.next().expect("output holds every value") =
+                        src[row * cols + col].to_ne_bytes();
                 }
             }
         }
         DType::FP16 => {
-            let mut chunks = out.chunks_exact_mut(2);
+            let mut chunks = out.as_chunks_mut::<2>().0.iter_mut();
             for col in 0..cols {
                 for row in 0..rows {
-                    let bytes = half::f16::from_f32(src[row * cols + col]).to_le_bytes();
-                    chunks
-                        .next()
-                        .expect("output holds every value")
-                        .copy_from_slice(&bytes);
+                    *chunks.next().expect("output holds every value") =
+                        half::f16::from_f32(src[row * cols + col]).to_le_bytes();
                 }
             }
         }
@@ -519,8 +513,10 @@ mod tests {
         let src = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         let out = new_transposed_bytes(&src, 2, 3, DType::FP32);
         let values: Vec<f32> = out
-            .chunks_exact(4)
-            .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_ne_bytes(*c))
             .collect();
         assert_eq!(values, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
     }

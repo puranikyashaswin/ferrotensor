@@ -101,8 +101,10 @@ fn tensors_read_in_reverse_order_and_twice_are_unchanged() {
     let (values, shape) = weights.read_f32_tensor("c").expect("read c");
     assert_eq!(shape, vec![513, 255]);
     let want: Vec<f32> = expected["c"]
-        .chunks_exact(2)
-        .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| half::bf16::from_le_bytes(*b).to_f32())
         .collect();
     let (values2, _) = weights.read_f32_tensor("c").expect("read c again");
     for got in [&values, &values2] {
