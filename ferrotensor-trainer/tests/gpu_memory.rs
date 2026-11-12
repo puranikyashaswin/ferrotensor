@@ -213,7 +213,9 @@ fn dropped_buffers_await_the_gpu_until_synchronize() {
     let mem = ctx.memory();
     let shape = [1024];
     let bytes = f32_bytes(1024);
-    // Room in the pool for exactly one buffer of this size.
+    // Room in the pool for exactly one buffer of this size, and buffers
+    // beyond it dropped at once (pool overflow off).
+    ctx.pool.set_overflow(false);
     ctx.pool.clear();
     ctx.pool.set_max_pooled_bytes(bytes);
     ctx.synchronize();
@@ -241,7 +243,11 @@ fn dropped_buffers_await_the_gpu_until_synchronize() {
     assert_eq!(mem.awaiting_gpu_bytes(), bytes + 4);
 
     ctx.flush();
-    assert_eq!(mem.awaiting_gpu_bytes(), bytes + 4, "flush does not poll");
+    assert_eq!(
+        mem.awaiting_gpu_bytes(),
+        bytes + 4,
+        "counted until the submission is known to have finished"
+    );
     ctx.synchronize();
     assert_eq!(
         mem.awaiting_gpu_bytes(),

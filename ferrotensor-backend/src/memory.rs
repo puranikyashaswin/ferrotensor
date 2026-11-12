@@ -9,14 +9,15 @@
 //! for reuse are counted separately as idle pool bytes.
 //!
 //! A buffer Ferrotensor drops is not freed on the GPU at once: wgpu destroys
-//! it only once the work that uses it has finished and the device is polled,
-//! which happens when the context waits for the GPU
-//! ([`WgpuContext::synchronize`](crate::WgpuContext::synchronize) or a read
-//! back to the host). Recorded work is submitted in batches and
-//! [`flush`](crate::WgpuContext::flush) does not poll, so dropped buffers
-//! (tensors the pool does not keep, e.g. beyond its cap, and the uniform and
-//! scratch buffers each kernel dispatch creates) are counted as *awaiting
-//! GPU* from the drop until the next such wait.
+//! it only once the work that uses it has finished and the device is
+//! maintained, which wgpu does on every queue submission and device poll.
+//! Recorded work is submitted in numbered batches; dropped buffers (tensors
+//! the pool does not keep, and the uniform and scratch buffers each kernel
+//! dispatch creates) are counted as *awaiting GPU* from the drop until the
+//! batch being recorded at the drop is known to have finished. That is
+//! learned at a later submission or poll, and at the latest when the context
+//! waits for the GPU ([`WgpuContext::synchronize`](crate::WgpuContext::synchronize)
+//! or a read back to the host).
 //!
 //! The current category is one value per tracker, not per thread: tag
 //! from one thread at a time and drop scopes in reverse order (checked in
@@ -34,7 +35,7 @@
 //! Monitor show.
 
 use crate::DType;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
@@ -211,6 +212,13 @@ pub struct MemoryTracker {
     awaiting_gpu: AtomicU64,
     peak_awaiting_gpu: AtomicU64,
     peak_total: AtomicU64,
+    /// Bytes counted in `awaiting_gpu` by the submission being recorded
+    /// when they were dropped, oldest first.
+    awaiting_by_submission: Mutex<VecDeque<(u64, u64)>>,
+    /// Number of the submission being recorded (the first is 1).
+    recording: AtomicU64,
+    /// Highest submission known to have finished on the GPU.
+    completed: AtomicU64,
     detailed: AtomicBool,
     registry: Mutex<Registry>,
 }
@@ -227,6 +235,9 @@ impl Default for MemoryTracker {
             awaiting_gpu: AtomicU64::new(0),
             peak_awaiting_gpu: AtomicU64::new(0),
             peak_total: AtomicU64::new(0),
+            awaiting_by_submission: Mutex::new(VecDeque::new()),
+            recording: AtomicU64::new(1),
+            completed: AtomicU64::new(0),
             detailed: AtomicBool::new(false),
             registry: Mutex::new(Registry::default()),
         }
@@ -363,8 +374,9 @@ impl MemoryTracker {
         self.peak_held.load(Relaxed)
     }
 
-    /// Bytes of buffers dropped since the context last waited for the GPU;
-    /// wgpu may not have destroyed them yet (see the [module docs](self)).
+    /// Bytes of buffers dropped while recording work not yet known to have
+    /// finished on the GPU; wgpu may not have destroyed them yet (see the
+    /// [module docs](self)).
     pub fn awaiting_gpu_bytes(&self) -> u64 {
         self.awaiting_gpu.load(Relaxed)
     }
@@ -560,18 +572,66 @@ impl MemoryTracker {
     }
 
     /// A buffer of `requested` bytes was dropped; wgpu destroys it once the
-    /// work using it has finished and the device is polled.
+    /// work using it has finished and the device is polled. Counted against
+    /// the submission being recorded now.
     pub(crate) fn gpu_dropped(&self, requested: u64) {
         let size = wgpu_buffer_size(requested);
-        let awaiting = self.awaiting_gpu.fetch_add(size, Relaxed) + size;
-        self.peak_awaiting_gpu.fetch_max(awaiting, Relaxed);
+        {
+            let mut by_submission = self.awaiting_by_submission.lock().unwrap();
+            let serial = self.recording.load(Relaxed);
+            match by_submission.back_mut() {
+                Some((s, bytes)) if *s == serial => *bytes += size,
+                _ => by_submission.push_back((serial, size)),
+            }
+            let awaiting = self.awaiting_gpu.fetch_add(size, Relaxed) + size;
+            self.peak_awaiting_gpu.fetch_max(awaiting, Relaxed);
+        }
         self.note_peaks(self.live_bytes());
     }
 
-    /// The context waited for all submitted work and polled the device, so
-    /// wgpu has destroyed the buffers dropped before.
+    /// Number of the submission being recorded.
+    pub(crate) fn recording_serial(&self) -> u64 {
+        self.recording.load(Relaxed)
+    }
+
+    /// Highest submission known to have finished on the GPU.
+    pub(crate) fn completed_serial(&self) -> u64 {
+        self.completed.load(Relaxed)
+    }
+
+    /// The submission being recorded is about to be submitted: returns its
+    /// number; buffers dropped from now on count against the next one.
+    pub(crate) fn begin_submission(&self) -> u64 {
+        let _by_submission = self.awaiting_by_submission.lock().unwrap();
+        self.recording.fetch_add(1, Relaxed)
+    }
+
+    /// Submission `serial` (and every one before it) finished on the GPU,
+    /// and the device was maintained, so wgpu has destroyed the buffers
+    /// dropped while it was being recorded.
+    pub(crate) fn gpu_completed(&self, serial: u64) {
+        let mut by_submission = self.awaiting_by_submission.lock().unwrap();
+        self.completed.fetch_max(serial, Relaxed);
+        while let Some(&(s, bytes)) = by_submission.front() {
+            if s > serial {
+                break;
+            }
+            by_submission.pop_front();
+            self.awaiting_gpu.fetch_sub(bytes, Relaxed);
+        }
+    }
+
+    /// The context submitted all recorded work, waited for it and polled
+    /// the device, so wgpu has destroyed the buffers dropped before.
     pub(crate) fn gpu_reclaimed(&self) {
+        let mut by_submission = self.awaiting_by_submission.lock().unwrap();
+        by_submission.clear();
         self.awaiting_gpu.store(0, Relaxed);
+        // Everything recorded so far was submitted and has finished, so
+        // close the current batch number: buffers returned under it are
+        // free, and buffers dropped from now on count against the next.
+        let finished = self.recording.fetch_add(1, Relaxed);
+        self.completed.fetch_max(finished, Relaxed);
     }
 
     fn release(&self, a: &Allocation) {
@@ -829,6 +889,63 @@ mod tests {
         assert_eq!(t.peak_total_bytes(), 16);
         let snap = t.current();
         assert_eq!(sum(&snap), snap.live_bytes);
+    }
+
+    #[test]
+    fn awaiting_gpu_drops_as_submissions_finish() {
+        let t = tracker();
+        // Submission 1: two buffers and a dispatch's uniform dropped.
+        let a = t.allocate(DType::FP32, &[256], 1024, 1024, true);
+        let b = t.allocate(DType::FP32, &[128], 512, 512, true);
+        drop((a, b));
+        t.count_dispatch_buffer(16);
+        assert_eq!(t.begin_submission(), 1);
+        // Submission 2 is being recorded.
+        t.count_dispatch_buffer(16);
+        let c = t.allocate(DType::FP32, &[64], 256, 256, true);
+        drop(c);
+        assert_eq!(t.awaiting_gpu_bytes(), 1024 + 512 + 16 + 16 + 256);
+        assert_eq!(t.begin_submission(), 2);
+        assert_eq!(t.recording_serial(), 3);
+
+        // Only what was dropped while recording unfinished work is counted.
+        t.gpu_completed(1);
+        assert_eq!(t.completed_serial(), 1);
+        assert_eq!(t.awaiting_gpu_bytes(), 16 + 256);
+        // Callbacks may run late or twice; the counter never goes below zero.
+        t.gpu_completed(1);
+        assert_eq!(t.awaiting_gpu_bytes(), 16 + 256);
+        t.count_dispatch_buffer(8);
+        t.gpu_completed(2);
+        assert_eq!(t.awaiting_gpu_bytes(), 8, "submission 3 still recording");
+        assert_eq!(t.peak_awaiting_gpu_bytes(), 1024 + 512 + 16 + 16 + 256);
+
+        // Waiting for the GPU clears the rest and closes batch 3, which
+        // had nothing left to submit.
+        t.gpu_reclaimed();
+        assert_eq!(t.awaiting_gpu_bytes(), 0);
+        assert_eq!(t.completed_serial(), 3);
+        assert_eq!(t.recording_serial(), 4);
+    }
+
+    #[test]
+    fn awaiting_gpu_stays_within_unfinished_submissions() {
+        // Many batches, each dropping the same bytes, with the GPU two
+        // batches behind: the count stays at the unfinished batches' drops.
+        let t = tracker();
+        let per_batch = 4096u64;
+        for batch in 1..=50u64 {
+            for _ in 0..4 {
+                drop(t.allocate(DType::FP32, &[256], 1024, 1024, true));
+            }
+            assert_eq!(t.begin_submission(), batch);
+            if batch > 2 {
+                t.gpu_completed(batch - 2);
+            }
+            assert!(t.awaiting_gpu_bytes() <= 2 * per_batch);
+        }
+        assert_eq!(t.peak_awaiting_gpu_bytes(), 3 * per_batch);
+        assert!(t.peak_total_bytes() <= 3 * per_batch + 1024);
     }
 
     #[test]
