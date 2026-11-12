@@ -8,6 +8,9 @@
 //! learned one and the search code stays the same.
 //!
 //! Run with: cargo run --release -p ferrotensor --example similarity_search
+//!
+//! The example exits with an error unless the best match for every query is
+//! one of the two documents written about the same topic.
 
 use ferrotensor::prelude::*;
 
@@ -71,5 +74,12 @@ fn main() {
         for &d in ranked.iter().take(2) {
             println!("  {:.3}  {}", row[d], docs[d]);
         }
+        // Documents 2q and 2q + 1 are the two about query q's topic.
+        assert_eq!(
+            ranked[0] / 2,
+            q,
+            "best match for {query:?} is {:?}",
+            docs[ranked[0]]
+        );
     }
 }

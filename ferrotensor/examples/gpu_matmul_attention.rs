@@ -6,6 +6,13 @@
 //! benchmark; see `benchmarks/` for the real harness.
 //!
 //! Run with: cargo run --release -p ferrotensor --example gpu_matmul_attention
+//!
+//! The example exits with an error when the CPU and GPU results differ by more
+//! than 1e-3. Two environment variables are for CI, where the GPU is software
+//! Vulkan on the CPU:
+//!
+//! - FERROTENSOR_EXAMPLE_QUICK=1 runs only the smaller sizes.
+//! - FERROTENSOR_REQUIRE_GPU=1 makes a missing GPU an error instead of a skip.
 
 use std::time::Instant;
 
@@ -15,7 +22,15 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
     a.iter()
         .zip(b)
         .map(|(x, y)| (x - y).abs())
-        .fold(0.0, f32::max)
+        // A NaN difference must stay NaN so the check below fails on it.
+        .fold(0.0, |m, d| if d.is_nan() || d > m { d } else { m })
+}
+
+/// Largest allowed difference between the CPU and GPU results.
+const TOLERANCE: f32 = 1e-3;
+
+fn env_set(name: &str) -> bool {
+    std::env::var(name).as_deref() == Ok("1")
 }
 
 /// Best-of-`runs` wall time in milliseconds, after one warm-up call.
@@ -32,9 +47,14 @@ fn time_ms(runs: usize, mut f: impl FnMut() -> Vec<f32>) -> (f64, Vec<f32>) {
 
 fn main() {
     let Some(gpu) = Device::gpu() else {
+        assert!(
+            !env_set("FERROTENSOR_REQUIRE_GPU"),
+            "FERROTENSOR_REQUIRE_GPU=1 but no GPU adapter is available"
+        );
         println!("no GPU adapter available; nothing to compare");
         return;
     };
+    let quick = env_set("FERROTENSOR_EXAMPLE_QUICK");
     let cpu = Device::cpu();
     println!("gpu: {} ({})\n", gpu.name(), gpu.backend());
 
@@ -43,16 +63,25 @@ fn main() {
         "{:>6} {:>10} {:>10} {:>9} {:>12}",
         "n", "cpu ms", "gpu ms", "speedup", "max |diff|"
     );
-    for n in [256usize, 512, 1024, 2048] {
+    let matmul_sizes: &[usize] = if quick {
+        &[256, 512]
+    } else {
+        &[256, 512, 1024, 2048]
+    };
+    for &n in matmul_sizes {
         let a = Tensor::randn(&[n, n], &cpu);
         let b = Tensor::randn(&[n, n], &cpu);
         let (ga, gb) = (a.to_device(&gpu), b.to_device(&gpu));
         let (t_cpu, r_cpu) = time_ms(2, || a.matmul(&b).to_vec());
         let (t_gpu, r_gpu) = time_ms(5, || ga.matmul(&gb).to_vec());
+        let diff = max_abs_diff(&r_cpu, &r_gpu);
         println!(
-            "{n:>6} {t_cpu:>10.1} {t_gpu:>10.1} {:>8.1}x {:>12.2e}",
-            t_cpu / t_gpu,
-            max_abs_diff(&r_cpu, &r_gpu)
+            "{n:>6} {t_cpu:>10.1} {t_gpu:>10.1} {:>8.1}x {diff:>12.2e}",
+            t_cpu / t_gpu
+        );
+        assert!(
+            diff < TOLERANCE,
+            "matmul n={n}: CPU and GPU differ by {diff}"
         );
     }
 
@@ -61,7 +90,8 @@ fn main() {
         "{:>6} {:>10} {:>10} {:>9} {:>12}",
         "seq", "cpu ms", "gpu ms", "speedup", "max |diff|"
     );
-    for seq in [128usize, 512] {
+    let attention_lengths: &[usize] = if quick { &[128] } else { &[128, 512] };
+    for &seq in attention_lengths {
         let shape = [1, 8, seq, 64];
         let (q, k, v) = (
             Tensor::randn(&shape, &cpu),
@@ -75,10 +105,14 @@ fn main() {
         let (t_gpu, r_gpu) = time_ms(5, || {
             F::scaled_dot_product_attention(&gq, &gk, &gv, true).to_vec()
         });
+        let diff = max_abs_diff(&r_cpu, &r_gpu);
         println!(
-            "{seq:>6} {t_cpu:>10.1} {t_gpu:>10.1} {:>8.1}x {:>12.2e}",
-            t_cpu / t_gpu,
-            max_abs_diff(&r_cpu, &r_gpu)
+            "{seq:>6} {t_cpu:>10.1} {t_gpu:>10.1} {:>8.1}x {diff:>12.2e}",
+            t_cpu / t_gpu
+        );
+        assert!(
+            diff < TOLERANCE,
+            "attention seq={seq}: CPU and GPU differ by {diff}"
         );
     }
 }

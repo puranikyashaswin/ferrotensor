@@ -2,6 +2,9 @@
 //!
 //! Run with: cargo run --release -p ferrotensor --example mlp_two_moons
 //! Set FERROTENSOR_DEVICE=gpu to train on the GPU instead of the CPU.
+//!
+//! The example exits with an error unless the loss fell during training and the
+//! model classifies the held-out points well.
 
 use ferrotensor::data::{DataLoader, Sample, TensorDataset};
 use ferrotensor::optim::{LrScheduler, WarmupCosineLr};
@@ -74,6 +77,9 @@ fn main() {
     let tx = Tensor::from_data(&flat, &[test_x.len(), 2], &device);
 
     let mut step = 0;
+    let mut first_loss = f32::NAN;
+    let mut last_loss = f32::NAN;
+    let mut final_acc = 0.0f32;
     for epoch in 0..epochs {
         let mut total = 0.0;
         for (x, y) in loader.epoch(epoch as u64) {
@@ -85,13 +91,28 @@ fn main() {
             opt.step();
             total += loss.item();
         }
+        let mean_loss = total / loader.num_batches() as f32;
+        if epoch == 0 {
+            first_loss = mean_loss;
+        }
+        last_loss = mean_loss;
         if epoch % 10 == 0 || epoch == epochs - 1 {
             let acc = F::accuracy(&model.forward(&tx), &test_y);
+            final_acc = acc;
             println!(
-                "epoch {epoch:>2}  train loss {:.4}  test accuracy {:.1}%",
-                total / loader.num_batches() as f32,
+                "epoch {epoch:>2}  train loss {mean_loss:.4}  test accuracy {:.1}%",
                 acc * 100.0
             );
         }
     }
+
+    assert!(
+        last_loss < first_loss,
+        "the loss did not fall: {first_loss} at epoch 0, {last_loss} at the end"
+    );
+    assert!(
+        final_acc > 0.9,
+        "test accuracy is only {:.1}%",
+        final_acc * 100.0
+    );
 }

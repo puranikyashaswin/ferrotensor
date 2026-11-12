@@ -1,3 +1,11 @@
+//! One Llama block (RMSNorm, attention, RMSNorm, gated MLP) on the GPU, with
+//! constant weights and a single token of ones.
+//!
+//! Run with: `cargo run -p ferrotensor-graph --example llama_block`
+//!
+//! Every weight is a constant, so by symmetry all four output values must be
+//! equal and finite; the example exits with an error otherwise.
+
 use ferrotensor_autograd::Tensor;
 use ferrotensor_backend::{ComputeEngine, UnifiedTensor, WgpuContext};
 use ferrotensor_graph::{Attention, Linear, LlamaBlock, RMSNorm, MLP};
@@ -60,5 +68,16 @@ fn main() {
 
         let result = out.data.to_vec(&ctx).await;
         println!("Block Output: {:?}", result);
+
+        assert_eq!(result.len(), dim);
+        assert!(
+            result.iter().all(|v| v.is_finite()),
+            "block output is not finite: {result:?}"
+        );
+        let tolerance = 1e-3 * result[0].abs().max(1.0);
+        assert!(
+            result.iter().all(|v| (v - result[0]).abs() <= tolerance),
+            "block output should be the same in every position: {result:?}"
+        );
     });
 }
