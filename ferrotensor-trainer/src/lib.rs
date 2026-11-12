@@ -6,7 +6,8 @@
 //! gradient-norm clipping, an optional learning-rate schedule, a loss scaler
 //! and file-based multi-process gradient averaging. [`data`] builds SFT and
 //! pretraining datasets, [`checkpoint`] saves and restores LoRA adapters and
-//! optimizer state.
+//! optimizer state. [`classify`] fine-tunes a decoder with LoRA as a
+//! sequence classifier ([`ClassifierTrainer`]).
 
 #![warn(missing_docs)]
 
@@ -18,11 +19,13 @@ use ferrotensor_graph::lfm::Lfm2Model;
 use std::sync::Arc;
 
 pub mod checkpoint;
+pub mod classify;
 pub mod data;
 pub mod demo;
 pub mod distributed;
 pub mod scaler;
 
+pub use classify::{ClassifierStepStats, ClassifierTrainer};
 pub use data::{build_sft_example, Batch, DataLoader, Dataset, TextDataset, TrainingExample};
 pub use demo::{print_banner, run_demo, DemoConfig};
 pub use scaler::{GradScaler, GradScalerStats};
@@ -434,7 +437,11 @@ impl Trainer {
 
 /// L2 norm over all gradient tensors: partial sums of squares on the GPU,
 /// read back once and added up on the host in f64.
-fn global_grad_norm(grads: &[UnifiedTensor], ctx: &WgpuContext, engine: &ComputeEngine) -> f32 {
+pub(crate) fn global_grad_norm(
+    grads: &[UnifiedTensor],
+    ctx: &WgpuContext,
+    engine: &ComputeEngine,
+) -> f32 {
     let chunks: usize = grads
         .iter()
         .map(|g| {

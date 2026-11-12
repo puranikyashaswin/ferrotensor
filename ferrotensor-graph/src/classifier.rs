@@ -14,12 +14,17 @@ use ferrotensor_backend::{ComputeEngine, UnifiedTensor, WgpuContext};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// A frozen `[batch, batch * seq]` matrix that averages each row's first
-/// `lengths[row]` positions: multiplied with hidden states flattened to
-/// `[batch * seq, hidden]` it gives the masked mean `[batch, hidden]`.
+/// A frozen `[batch, batch * seq]` matrix that averages each row's real
+/// tokens: multiplied with hidden states flattened to `[batch * seq, hidden]`
+/// it gives the masked mean `[batch, hidden]`.
 ///
 /// Sequences are padded on the right, so the real tokens of row `r` are
-/// positions `0..lengths[r]`. A row of length 0 pools to zeros.
+/// positions `0..lengths[r]`. With `skip_first` the mean runs over
+/// `1..lengths[r]` instead: the first position of a causal decoder sees only
+/// itself and often acts as an attention sink with outsized activations, so
+/// it can dominate the mean without saying anything about the sequence. A
+/// row with no position to average (length 0, or 1 with `skip_first`) pools
+/// to zeros.
 ///
 /// # Panics
 /// If `lengths.len() != batch` or a length exceeds `seq`.
@@ -28,16 +33,18 @@ pub fn mean_pool_matrix(
     batch: usize,
     seq: usize,
     lengths: &[usize],
+    skip_first: bool,
 ) -> Tensor {
     assert_eq!(lengths.len(), batch, "mean_pool_matrix: one length per row");
     let mut data = vec![0.0f32; batch * batch * seq];
+    let first = usize::from(skip_first);
     for (row, &len) in lengths.iter().enumerate() {
         assert!(len <= seq, "mean_pool_matrix: length {len} exceeds {seq}");
-        if len == 0 {
+        if len <= first {
             continue;
         }
         let start = row * batch * seq + row * seq;
-        data[start..start + len].fill(1.0 / len as f32);
+        data[start + first..start + len].fill(1.0 / (len - first) as f32);
     }
     Tensor::frozen(
         ctx.clone(),
@@ -47,9 +54,9 @@ pub fn mean_pool_matrix(
 
 /// Classification head over the hidden states of one or more decoder blocks.
 ///
-/// For every tapped block: masked mean over the sequence, RMSNorm with a
-/// learned scale, then a bias-free linear layer to `classes` logits. The
-/// logits of all taps are summed.
+/// For every tapped block: masked mean over the sequence (see
+/// [`mean_pool_matrix`]), RMSNorm with a learned scale, then a bias-free
+/// linear layer to `classes` logits. The logits of all taps are summed.
 pub struct ClassifierHead {
     /// Tapped blocks, 1-based: tap `l` is the output of block `l`, as in
     /// [`Lfm2Model::hidden_states_batch`].
@@ -60,6 +67,10 @@ pub struct ClassifierHead {
     pub weights: Vec<Tensor>,
     /// Epsilon inside the RMSNorm of the pooled vectors.
     pub eps: f32,
+    /// Leave each row's first token out of the mean (see
+    /// [`mean_pool_matrix`]). Off unless set with
+    /// [`with_skip_first`](Self::with_skip_first).
+    pub skip_first: bool,
 }
 
 impl ClassifierHead {
@@ -111,6 +122,7 @@ impl ClassifierHead {
             norms,
             weights,
             eps: 1e-5,
+            skip_first: false,
         }
     }
 
@@ -148,7 +160,19 @@ impl ClassifierHead {
             norms,
             weights,
             eps: 1e-5,
+            skip_first: false,
         }
+    }
+
+    /// Set whether the first token of every row is left out of the mean.
+    pub fn with_skip_first(mut self, skip_first: bool) -> Self {
+        self.skip_first = skip_first;
+        self
+    }
+
+    /// Width of the pooled hidden states.
+    pub fn hidden(&self) -> usize {
+        self.weights[0].data.shape[0]
     }
 
     /// Number of labels.
@@ -200,7 +224,7 @@ impl ClassifierHead {
             [batch, seq, _] => (*batch, *seq),
             shape => panic!("ClassifierHead expects [batch, seq, hidden], got {shape:?}"),
         };
-        let pool = mean_pool_matrix(&hidden_states[0].ctx, batch, seq, lengths);
+        let pool = mean_pool_matrix(&hidden_states[0].ctx, batch, seq, lengths, self.skip_first);
         let mut logits: Option<Tensor> = None;
         for (i, hidden) in hidden_states.iter().enumerate() {
             let flat = Tensor::reshape_2d(hidden);

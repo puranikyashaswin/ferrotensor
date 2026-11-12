@@ -45,5 +45,9 @@ A full walkthrough with measured numbers is in
 - Outputs in `--out`: `lora_adapters.safetensors` (+ `.state.json` for
   `--resume`), `metrics.jsonl` (one line per logged step / eval) and
   `training_state.json` (read by `ferrotensor-cli monitor`).
+- `classify-train` fine-tunes the model with LoRA as a text classifier from
+  JSONL `{"text", "label"}` lines and `classify-predict` writes per-line
+  class probabilities; see
+  [docs/examples/classify.md](../docs/examples/classify.md).
 - `ferrotensor-cli demo` (or `--demo`) plays a simulated training UI; it does not
   train anything.
