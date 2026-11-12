@@ -85,7 +85,7 @@ sequences) and at the highest point seen so far in the run. The rows:
 | readback staging | Buffers that copy results to the host |
 | other | Buffers created outside these phases (e.g. gradient-norm partial sums) |
 | total (live tensors) | The sum of the rows above |
-| pool idle (cap 512 MiB) | Freed buffers the pool keeps for reuse; still allocated on the GPU. The pool keeps at most the cap shown, so this row often sits at the cap |
+| pool idle (cap 512 MiB) | Freed buffers the pool keeps for reuse; still allocated on the GPU. Once the GPU has finished with them the pool keeps at most the cap shown; while it still runs the work recorded before they were freed, the pool keeps them above the cap so later ops can reuse them (see below) |
 | total held (live + pool idle) | The highest live plus pool-idle bytes of the phase, and of the run so far |
 | freed, awaiting GPU | Buffers Ferrotensor has dropped but wgpu may not have destroyed yet (see below); the highest of the phase and of the run |
 | total incl. awaiting GPU | The highest live plus pool-idle plus awaiting-GPU bytes of the phase and of the run: the closest figure to what the GPU holds |
@@ -95,14 +95,24 @@ The last three are the highest each value reached, so they can come from
 other moments and need not add up with the rows above.
 
 A buffer Ferrotensor drops stays on the GPU until wgpu destroys it, which
-it does only after the work using it has run and the device is polled.
-Kernels are recorded and submitted in batches, and the device is polled
-only when Ferrotensor waits for the GPU (a read back to the host, or a
-synchronisation). Between two waits, every tensor the pool does not keep
-(beyond its cap, or created from host data), every per-dispatch uniform,
-dummy and scratch buffer, the readback copy after the read, and the
-temporary buffer of a quantised weight upload are still on the GPU; the
-report counts them as awaiting GPU until the next wait.
+it does only after the work using it has run and the device is maintained
+(on every batch submission and device poll). Kernels are recorded and
+submitted in batches, and the host usually records well ahead of the GPU.
+Every tensor the pool does not keep (created from host data, or beyond its
+cap with pool overflow off), every per-dispatch uniform, dummy and scratch
+buffer, the readback copy after the read, and the temporary buffer of a
+quantised weight upload stay on the GPU until the batch recorded when they
+were dropped has finished; the report counts them as awaiting GPU until
+that is known (at a later submission, or at the latest the next wait for
+the GPU).
+
+Pool overflow: dropping a buffer frees nothing until the GPU has finished
+the work recorded before the drop, so freed tensor buffers beyond the
+pool's cap are kept for reuse until then, and only then dropped (and
+destroyed at once). A later op that needs a buffer of the same size takes
+one of them instead of allocating a new one. Results are the same either
+way. Set `FERROTENSOR_POOL_OVERFLOW=0` to drop buffers beyond the cap as
+they are freed instead, e.g. to compare the two with `--memory-report`.
 
 With `--memory-report`, every point where the report samples (after the
 model load, before the first step and after each reported step) waits for
