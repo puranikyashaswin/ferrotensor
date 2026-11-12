@@ -22,7 +22,10 @@ fn shader_source() -> String {
     let flash_v2_src = include_str!("../shaders/flash_attention_v2.wgsl");
     let flash_v2_bw_src = include_str!("../shaders/flash_attention_v2_backward.wgsl");
     let matmul_h_src = half_b_matmul(matmul_src);
-    format!("{kernels_src}\n{matmul_src}\n{matmul_h_src}\n{flash_v2_src}\n{flash_v2_bw_src}")
+    let matmul_q4_src = q4_b_matmul(matmul_src);
+    format!(
+        "{kernels_src}\n{matmul_src}\n{matmul_h_src}\n{matmul_q4_src}\n{flash_v2_src}\n{flash_v2_bw_src}"
+    )
 }
 
 /// `matmul_blocked_h`: the matmul kernel with `b` stored as f16 pairs packed
@@ -45,6 +48,31 @@ fn half_b_matmul(src: &str) -> String {
     .replace("matmul_blocked", "matmul_blocked_h")
     .replace("mmb_", "mmh_")
     .replace("MMB_", "MMH_")
+}
+
+/// `matmul_blocked_q4`: the matmul kernel with `b` in the 4-bit format of
+/// [`crate::q4`] (codes then per-group scale/min words in one `u32`
+/// buffer; logical `b[K, N]` stored in `[N, K]` order). Generated from
+/// matmul.wgsl like [`half_b_matmul`]; only the `b` binding and its loader
+/// differ. The storage index is `gn * k + gk` in mode 0 and `gk * n + gn`
+/// in mode 1 (the reverse of the f16 kernel, because of the `[N, K]` order);
+/// the scale words start at `((k * n + 63) / 64) * 8`, after the codes.
+fn q4_b_matmul(src: &str) -> String {
+    const B_DECL: &str = "var<storage, read> mmb_b: array<f32>;";
+    const B_LOAD: &str =
+        "    if (mode == 1u) { return mmb_b[gn * k + gk]; }\n    return mmb_b[gk * n + gn];";
+    assert!(
+        src.contains(B_DECL) && src.contains(B_LOAD),
+        "matmul.wgsl changed"
+    );
+    src.replace(
+        B_LOAD,
+        "    var j = gn * k + gk;\n    if (mode == 1u) { j = gk * n + gn; }\n    let q = (mmb_b[j >> 3u] >> ((j & 7u) * 4u)) & 15u;\n    let sm = unpack2x16float(mmb_b[((k * n + 63u) >> 6u) * 8u + (j >> 6u)]);\n    return f32(q) * sm.x + sm.y;",
+    )
+    .replace(B_DECL, "var<storage, read> mmb_b: array<u32>;")
+    .replace("matmul_blocked", "matmul_blocked_q4")
+    .replace("mmb_", "mmq_")
+    .replace("MMB_", "MMQ_")
 }
 
 /// A compiled compute pipeline together with its bind group layout.
@@ -107,6 +135,7 @@ fn uniform(ctx: &WgpuContext, bytes: &[u8]) -> Buffer {
 pub struct ComputeEngine {
     matmul: Kernel,
     matmul_h: Kernel,
+    matmul_q4: Kernel,
     rope: Kernel,
     rms_norm: Kernel,
     rms_norm_bw: Kernel,
@@ -162,6 +191,7 @@ impl ComputeEngine {
         Self {
             matmul: k("matmul_blocked"),
             matmul_h: k("matmul_blocked_h"),
+            matmul_q4: k("matmul_blocked_q4"),
             rope: k("rope"),
             rms_norm: k("rms_norm"),
             rms_norm_bw: k("rms_norm_backward"),

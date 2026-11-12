@@ -31,6 +31,7 @@ mod engine;
 pub mod memory;
 /// Size-keyed reuse of GPU buffers.
 pub mod pool;
+pub mod q4;
 mod tensor;
 
 pub use context::{WgpuContext, UPLOAD_RELEASE_BYTES};

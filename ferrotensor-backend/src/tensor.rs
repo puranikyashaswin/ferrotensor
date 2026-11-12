@@ -20,14 +20,25 @@ pub enum DType {
     /// 16-bit float storage, two values per 32-bit word. Only the `*_f16b`
     /// matmuls read it, and they accumulate in f32.
     FP16,
+    /// 4-bit affine codes with per-group f16 scale and minimum (see
+    /// [`crate::q4`]); built only with [`UnifiedTensor::from_f32_as_q4`].
+    Q4,
 }
 
 impl DType {
-    /// Size of a single element in bytes
+    /// Size of a single element in bytes.
+    ///
+    /// # Panics
+    ///
+    /// For [`DType::Q4`], which has no per-element size (codes and group
+    /// scales share one buffer, see [`crate::q4::packed_words`]).
     pub fn size_bytes(&self) -> usize {
         match self {
             DType::FP32 => 4,
             DType::FP16 => 2,
+            DType::Q4 => panic!(
+                "DType::Q4 has no per-element size; build Q4 tensors with UnifiedTensor::from_f32_as_q4"
+            ),
         }
     }
 }
@@ -64,7 +75,11 @@ impl TensorData {
         dtype: DType,
     ) -> Self {
         let numel = shape.iter().product::<usize>() as u64;
-        let logical = (numel * dtype.size_bytes() as u64).min(size_in_bytes);
+        let logical = match dtype {
+            // Codes and group scales: the packed buffer is what the shape needs.
+            DType::Q4 => size_in_bytes,
+            _ => (numel * dtype.size_bytes() as u64).min(size_in_bytes),
+        };
         // A buffer without a pool is dropped with the tensor; a pooled one
         // is kept or dropped by the pool, which counts it either way.
         let memory =
@@ -164,6 +179,10 @@ impl UnifiedTensor {
 
     /// An uninitialised tensor of `dtype` drawn from the buffer pool.
     pub fn empty_with_dtype(context: &WgpuContext, shape: &[usize], dtype: DType) -> Self {
+        assert!(
+            dtype != DType::Q4,
+            "empty_with_dtype: Q4 tensors are built with from_f32_as_q4"
+        );
         let size_in_bytes = (shape.iter().product::<usize>() * dtype.size_bytes()) as u64;
         let buffer = context.pool.get(&context.device, size_in_bytes);
         Self {
@@ -238,6 +257,28 @@ impl UnifiedTensor {
         Self::from_bytes_with_dtype(context, &bytes, shape, DType::FP16)
     }
 
+    /// Quantises row-major `data` of 2-D `shape` `[k, n]` to the 4-bit
+    /// format of [`crate::q4`] as a [`DType::Q4`] tensor of logical shape
+    /// `shape`: about 4.5 bits per weight. Read it with the `*_q4b`
+    /// matmuls, not [`to_vec`](Self::to_vec). Fails, uploading nothing, on
+    /// NaN or infinite values and on values beyond the f16 range.
+    pub fn from_f32_as_q4(
+        context: &WgpuContext,
+        data: &[f32],
+        shape: &[usize],
+    ) -> Result<Self, crate::q4::Q4Error> {
+        let [k, n] = shape[..] else {
+            panic!("from_f32_as_q4 expects a 2-D shape, got {shape:?}");
+        };
+        let words = crate::q4::quantize(data, k, n)?;
+        Ok(Self::from_bytes_with_dtype(
+            context,
+            bytemuck::cast_slice(&words),
+            shape,
+            DType::Q4,
+        ))
+    }
+
     /// Create an empty FP16 tensor. No code in this workspace calls it.
     pub fn empty_fp16(context: &WgpuContext, shape: &[usize]) -> Self {
         Self::empty_with_dtype(context, shape, DType::FP16)
@@ -252,6 +293,13 @@ impl UnifiedTensor {
             current_elements, new_elements,
             "Cannot reshape tensor of size {} to {:?}",
             current_elements, new_shape
+        );
+        // The 4-bit storage order and grouping depend on the 2-D shape.
+        assert!(
+            self.dtype != DType::Q4 || new_shape == self.shape.as_slice(),
+            "Cannot reshape a Q4 tensor of shape {:?} to {:?}",
+            self.shape,
+            new_shape
         );
 
         Self {

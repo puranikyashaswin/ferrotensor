@@ -184,6 +184,7 @@ fn dtype_name(dtype: DType) -> &'static str {
     match dtype {
         DType::FP32 => "f32",
         DType::FP16 => "f16",
+        DType::Q4 => "q4",
     }
 }
 
@@ -198,6 +199,7 @@ fn snapshot_json(s: &MemorySnapshot) -> Value {
                     "allocated_bytes": b.allocated_bytes,
                     "logical_bytes": b.logical_bytes,
                     "f16_bytes": b.f16_bytes,
+                    "q4_bytes": b.q4_bytes,
                     "buffers": b.buffers,
                 }),
             )
@@ -267,10 +269,11 @@ impl MemoryReport {
             );
             if c == MemoryCategory::BaseWeights {
                 row("  of which f16", pc.f16_bytes, oc.f16_bytes, None);
+                row("  of which 4-bit", pc.q4_bytes, oc.q4_bytes, None);
                 row(
                     "  of which f32",
-                    pc.allocated_bytes - pc.f16_bytes,
-                    oc.allocated_bytes - oc.f16_bytes,
+                    pc.allocated_bytes - pc.f16_bytes - pc.q4_bytes,
+                    oc.allocated_bytes - oc.f16_bytes - oc.q4_bytes,
                     None,
                 );
             }
