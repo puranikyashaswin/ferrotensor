@@ -8,6 +8,7 @@
 
 use ferrotensor_autograd::{AdamWCheckpoint, OptimizerCheckpoint, OptimizerTensorState, Tensor};
 use ferrotensor_backend::WgpuContext;
+use ferrotensor_graph::lfm::legacy_llama_name;
 use ferrotensor_loader::{LoaderError, WeightsContext};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -169,9 +170,15 @@ pub fn load_lora_checkpoint<P: AsRef<Path>>(
 /// Copy checkpoint values into the matching `tensors`.
 ///
 /// Every tensor in `tensors` must be present in the checkpoint with the
-/// same shape; otherwise nothing is written and the error names the first
-/// problem (a different rank or target set usually causes it). Returns the
-/// number of tensors restored.
+/// same shape, and every tensor of the checkpoint must be used; otherwise
+/// nothing is written and the error names the first problem (a different
+/// rank or target set usually causes it). Returns the number of tensors
+/// restored.
+///
+/// Adapters for Llama-style models written before Ferrotensor used Hugging
+/// Face names for Llama blocks (`feed_forward.*`, `operator_norm`,
+/// `ffn_norm`) load too: a name the checkpoint lacks is looked up under its
+/// old form ([`legacy_llama_name`]).
 pub fn apply_checkpoint(
     ctx: &Arc<WgpuContext>,
     checkpoint: &LoraCheckpoint,
@@ -179,26 +186,75 @@ pub fn apply_checkpoint(
 ) -> Result<usize, String> {
     let mut names: Vec<&String> = tensors.keys().collect();
     names.sort();
-    for name in &names {
-        let tensor = &tensors[*name];
-        match checkpoint.tensors.get(*name) {
-            None => return Err(format!("adapter file has no tensor {name}")),
-            Some((shape, _)) if *shape != tensor.data.shape => {
+    let mut sources: Vec<(&String, String)> = Vec::with_capacity(names.len());
+    for name in names {
+        let tensor = &tensors[name];
+        let legacy = legacy_llama_name(name).filter(|old| checkpoint.tensors.contains_key(old));
+        let key = match (checkpoint.tensors.contains_key(name), legacy) {
+            (true, Some(old)) => {
                 return Err(format!(
-                    "tensor {name}: adapter file has shape {shape:?}, model expects {:?}",
-                    tensor.data.shape
+                    "adapter file has both {name} and its old name {old}"
                 ))
             }
-            Some(_) => {}
+            (true, None) => name.clone(),
+            (false, Some(old)) => old,
+            (false, None) => return Err(format!("adapter file has no tensor {name}")),
+        };
+        let (shape, _) = &checkpoint.tensors[&key];
+        if *shape != tensor.data.shape {
+            return Err(format!(
+                "tensor {key}: adapter file has shape {shape:?}, model expects {:?}",
+                tensor.data.shape
+            ));
         }
+        sources.push((name, key));
     }
-    for name in names {
-        if let Some((_, values)) = checkpoint.tensors.get(name) {
-            let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-            tensors[name].data.write_data(ctx, &bytes);
-        }
+    let used: std::collections::HashSet<&str> = sources.iter().map(|(_, k)| k.as_str()).collect();
+    let mut unused: Vec<&String> = checkpoint
+        .tensors
+        .keys()
+        .filter(|k| !used.contains(k.as_str()))
+        .collect();
+    if !unused.is_empty() {
+        unused.sort();
+        return Err(format!(
+            "adapter file has {} tensor(s) the model does not have, e.g. {} (were other LoRA targets trained?)",
+            unused.len(),
+            unused[0]
+        ));
+    }
+    for (name, key) in &sources {
+        let (_, values) = &checkpoint.tensors[key];
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        tensors[*name].data.write_data(ctx, &bytes);
     }
     Ok(tensors.len())
+}
+
+/// Rename optimizer moments stored under old Llama-block names
+/// ([`legacy_llama_name`]) to the names in `params`, so a run started before
+/// the rename resumes with its moments. Returns how many were renamed.
+pub fn upgrade_optimizer_names(
+    state: &mut OptimizerCheckpoint,
+    params: &HashMap<String, Tensor>,
+) -> usize {
+    let OptimizerCheckpoint::AdamW(adam) = state;
+    let mut renamed = 0;
+    for states in [&mut adam.m_states, &mut adam.v_states] {
+        for name in params.keys() {
+            if states.contains_key(name) {
+                continue;
+            }
+            let Some(old) = legacy_llama_name(name) else {
+                continue;
+            };
+            if let Some(moment) = states.remove(&old) {
+                states.insert(name.clone(), moment);
+                renamed += 1;
+            }
+        }
+    }
+    renamed
 }
 
 /// Progress and settings of a training run (also read by `ferrotensor-monitor`

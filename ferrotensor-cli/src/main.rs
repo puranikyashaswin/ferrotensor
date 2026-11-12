@@ -8,6 +8,7 @@
 //! ferrotensor-cli classify-train   --model DIR --data train.jsonl --output runs/cls
 //! ferrotensor-cli classify-predict --model DIR --classifier runs/cls --data test.jsonl --output probs.jsonl
 //! ferrotensor-cli info --check
+//! ferrotensor-cli export-adapter --lora runs/sft/lora_adapters.safetensors --model DIR --output runs/sft/peft
 //! ```
 
 mod classify;
@@ -16,13 +17,14 @@ mod info;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use ferrotensor_autograd::{AdamW, WarmupCosineScheduler};
 use ferrotensor_backend::{ComputeEngine, WgpuContext};
-use ferrotensor_graph::lfm::Lfm2Model;
+use ferrotensor_graph::lfm::{legacy_llama_name, Lfm2Model};
 use ferrotensor_graph::model_builder::{Lfm2ModelBuilder, LoRaConfig};
 use ferrotensor_loader::{Lfm2Config, ModelLoader, Sampler, Tokenizer, WeightsContext};
 use ferrotensor_trainer::checkpoint::{
-    apply_checkpoint, load_lora_checkpoint, save_lora_checkpoint, LoraMetadata, TrainingCheckpoint,
-    TrainingState,
+    apply_checkpoint, load_lora_checkpoint, save_lora_checkpoint, upgrade_optimizer_names,
+    LoraCheckpoint, LoraMetadata, TrainingCheckpoint, TrainingState,
 };
+use ferrotensor_trainer::peft::{export_peft_adapter, is_peft_adapter_dir, load_peft_adapter};
 use ferrotensor_trainer::{
     build_sft_example, masked_cross_entropy_from_logits, DataLoader, Dataset, FileGradSyncConfig,
     TextDataset, Trainer,
@@ -71,6 +73,8 @@ enum Command {
     Monitor,
     /// Show the GPUs wgpu can use and, with --check, test the kernels on one.
     Info(info::InfoArgs),
+    /// Convert a LoRA adapter to another format (PEFT, for PyTorch).
+    ExportAdapter(ExportAdapterArgs),
     /// Print how to run the kernel benchmarks.
     #[command(long_flag = "benchmark")]
     Benchmark,
@@ -249,16 +253,44 @@ struct EvalArgs {
     model: ModelArgs,
     #[command(flatten)]
     data: DataArgs,
-    /// LoRA adapter to apply.
+    /// LoRA adapter to apply: a Ferrotensor file or a PEFT adapter directory.
     #[arg(long, value_name = "FILE")]
     lora: Option<PathBuf>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum AdapterFormat {
+    /// Hugging Face PEFT: adapter_model.safetensors + adapter_config.json,
+    /// loadable with `peft.PeftModel.from_pretrained`.
+    Peft,
+}
+
+#[derive(Args, Debug)]
+struct ExportAdapterArgs {
+    /// Adapter written by `train`.
+    #[arg(long, alias = "adapter", value_name = "FILE")]
+    lora: PathBuf,
+    /// Base model directory the adapter was trained on (only config.json is read).
+    #[arg(long, value_name = "DIR")]
+    model: PathBuf,
+    /// Output directory.
+    #[arg(long, alias = "out", value_name = "DIR")]
+    output: PathBuf,
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = AdapterFormat::Peft)]
+    format: AdapterFormat,
+    /// Value of base_model_name_or_path in adapter_config.json (a Hub id
+    /// such as HuggingFaceTB/SmolLM2-135M) [default: the --model path].
+    #[arg(long, value_name = "NAME")]
+    base_model: Option<String>,
 }
 
 #[derive(Args, Debug)]
 struct GenerateArgs {
     #[command(flatten)]
     model: ModelArgs,
-    /// LoRA adapter to apply (rank, alpha and targets are read from the file).
+    /// LoRA adapter to apply: a Ferrotensor file (rank, alpha and targets are
+    /// read from it) or a PEFT adapter directory.
     #[arg(long, value_name = "FILE")]
     lora: Option<PathBuf>,
     /// The user message (wrapped in the ChatML template unless --raw).
@@ -335,6 +367,7 @@ fn main() {
             Ok(())
         }
         Command::Info(args) => info::run(args),
+        Command::ExportAdapter(args) => export_adapter(args),
         Command::Monitor => ferrotensor_monitor::run().map_err(|e| format!("monitor: {e}").into()),
         Command::Benchmark => {
             println!(
@@ -427,9 +460,18 @@ fn build_model(
     Ok(builder.build()?)
 }
 
+/// Read an adapter: a Ferrotensor safetensors file or a PEFT directory.
+fn read_adapter(path: &Path) -> Result<LoraCheckpoint> {
+    if is_peft_adapter_dir(path) {
+        load_peft_adapter(path)
+    } else {
+        load_lora_checkpoint(path)
+    }
+}
+
 /// Load `path` and copy it into the model's LoRA tensors.
 fn restore_adapter(base: &Loaded, model: &Lfm2Model, path: &Path) -> Result<usize> {
-    let ckpt = load_lora_checkpoint(path)?;
+    let ckpt = read_adapter(path)?;
     let n = apply_checkpoint(&base.ctx, &ckpt, &model.named_lora_params())
         .map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(n)
@@ -437,13 +479,42 @@ fn restore_adapter(base: &Loaded, model: &Lfm2Model, path: &Path) -> Result<usiz
 
 /// The LoRA settings stored in an adapter file.
 fn adapter_metadata(path: &Path) -> Result<LoraMetadata> {
-    load_lora_checkpoint(path)?.metadata.ok_or_else(|| {
+    read_adapter(path)?.metadata.ok_or_else(|| {
         format!(
             "{} has no LoRA metadata (rank/alpha/targets); it was not written by ferrotensor-cli",
             path.display()
         )
         .into()
     })
+}
+
+// ---------------------------------------------------------------------------
+// export-adapter
+
+/// Convert an adapter file without loading the model's weights or a GPU.
+fn export_adapter(args: ExportAdapterArgs) -> Result<()> {
+    let config_path = args.model.join("config.json");
+    let config = ModelLoader::load_config(&config_path)
+        .map_err(|e| format!("cannot read {}: {e}", config_path.display()))?;
+    let ckpt = load_lora_checkpoint(&args.lora)?;
+    let base_model = args
+        .base_model
+        .unwrap_or_else(|| args.model.display().to_string());
+    match args.format {
+        AdapterFormat::Peft => {
+            let export = export_peft_adapter(&ckpt, &config, &base_model, &args.output)
+                .map_err(|e| format!("{}: {e}", args.lora.display()))?;
+            println!(
+                "wrote {} ({} tensors, r {}, lora_alpha {}, targets {})",
+                args.output.display(),
+                export.tensors,
+                export.rank,
+                export.alpha,
+                export.target_modules.join(",")
+            );
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -750,16 +821,17 @@ fn select_train_params(
             )
         }
         m => {
-            let key = match m {
-                "attn" | "attention" => "self_attn",
-                "mlp" => "feed_forward",
-                "head" => "lm_head",
-                other => other,
+            // Llama blocks name the MLP `mlp`, LFM2 blocks `feed_forward`.
+            let keys = match m {
+                "attn" | "attention" => vec!["self_attn"],
+                "mlp" => vec![".mlp.", ".feed_forward."],
+                "head" => vec!["lm_head"],
+                other => vec![other],
             };
             model
                 .named_params()
                 .into_iter()
-                .filter(|(n, _)| n.contains(key))
+                .filter(|(n, _)| keys.iter().any(|k| n.contains(k)))
                 .collect()
         }
     };
@@ -836,7 +908,10 @@ async fn train(mut args: TrainArgs) -> Result<()> {
     let named_params = select_train_params(&model, &args.train_modules)?;
     let train_params: Vec<_> = {
         let mut names: Vec<&String> = named_params.keys().collect();
-        names.sort();
+        // Sorted by the names Llama blocks had before they took Hugging Face
+        // names, so the parameter order (and the gradient-norm sum) is the
+        // same as in earlier releases.
+        names.sort_by_cached_key(|n| legacy_llama_name(n).unwrap_or_else(|| n.to_string()));
         names.into_iter().map(|n| named_params[n].clone()).collect()
     };
 
@@ -905,8 +980,9 @@ async fn train(mut args: TrainArgs) -> Result<()> {
                 args.data.seq_len,
                 &args.model.model.display().to_string(),
             )?;
-            if let Some(opt) = &ckpt.optimizer_state {
-                if !trainer.optimizer.load_state(&base.ctx, &named_params, opt) {
+            if let Some(mut opt) = ckpt.optimizer_state.clone() {
+                upgrade_optimizer_names(&mut opt, &named_params);
+                if !trainer.optimizer.load_state(&base.ctx, &named_params, &opt) {
                     log::warn!(
                         "optimizer state in {} did not apply",
                         resume_state.display()
@@ -1226,6 +1302,30 @@ mod tests {
             panic!("expected info");
         };
         assert!(!i.check && !i.json);
+    }
+
+    #[test]
+    fn export_adapter_parses_its_flags() {
+        let cli = parse(&[
+            "export-adapter",
+            "--adapter",
+            "a.safetensors",
+            "--model",
+            "m",
+            "--output",
+            "out",
+            "--format",
+            "peft",
+        ])
+        .expect("parse");
+        let Command::ExportAdapter(e) = cli.command else {
+            panic!("expected export-adapter");
+        };
+        assert_eq!(e.lora, PathBuf::from("a.safetensors"));
+        assert_eq!(e.output, PathBuf::from("out"));
+        assert_eq!(e.format, AdapterFormat::Peft);
+        assert!(e.base_model.is_none());
+        assert!(parse(&["export-adapter", "--lora", "a", "--model", "m"]).is_err());
     }
 
     #[test]
