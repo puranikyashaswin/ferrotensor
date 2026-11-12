@@ -467,3 +467,103 @@ fn kv_cache_decoding_matches_full_recompute() {
         assert!((x - y).abs() < 1e-3, "logit {i}: full {x} vs cached {y}");
     }
 }
+
+/// LoRA on all seven projections of a Llama layer, plus the tied `lm_head`.
+fn all_projections_lora() -> ferrotensor_graph::model_builder::LoRaConfig {
+    ferrotensor_graph::model_builder::LoRaConfig {
+        rank: 4,
+        alpha: 8.0,
+        target_modules: [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+            "lm_head",
+        ]
+        .map(String::from)
+        .to_vec(),
+    }
+}
+
+/// An adapter tensor's `(name, shape, values)`.
+type Named = (String, Vec<usize>, Vec<f32>);
+
+/// Every adapter tensor, `lora_A` and `lora_B` alike, sorted by name.
+fn adapter_matrices(gpu: &Gpu, model: &ferrotensor_graph::lfm::Lfm2Model) -> Vec<Named> {
+    let (names, params) = sorted_lora_params(model);
+    names
+        .into_iter()
+        .zip(params)
+        .map(|(name, t)| (name, t.data.shape.clone(), host(gpu, &t)))
+        .collect()
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn lora_a_matrices_all_start_different() {
+    let dir = TempDir::new("lora-init");
+    write_tiny_llama(dir.path());
+    let gpu = gpu();
+    let model = build_model_with_lora(&gpu, dir.path(), all_projections_lora());
+    let all = adapter_matrices(&gpu, &model);
+    let a: Vec<&Named> = all.iter().filter(|m| m.0.contains("lora_A")).collect();
+    let b: Vec<&Named> = all.iter().filter(|m| m.0.contains("lora_B")).collect();
+    assert_eq!(
+        a.len(),
+        LAYERS * 7 + 1,
+        "seven projections per layer + lm_head"
+    );
+    assert_eq!(b.len(), a.len());
+
+    let mut equal_shape_pairs = 0;
+    for (i, x) in a.iter().enumerate() {
+        for y in &a[i + 1..] {
+            if x.1 == y.1 {
+                equal_shape_pairs += 1;
+                assert_ne!(x.2, y.2, "{} and {} start from the same A", x.0, y.0);
+            }
+        }
+    }
+    // q/o, k/v and gate/up (and the lm_head) share shapes in every layer, so
+    // the comparison above covers the cases that used to collide.
+    assert!(equal_shape_pairs >= LAYERS * 3, "{equal_shape_pairs} pairs");
+
+    for (name, shape, values) in &a {
+        let bound = 1.0 / (shape[0] as f32).sqrt();
+        assert!(
+            values.iter().all(|v| v.abs() <= bound),
+            "{name} outside +-1/sqrt(in)"
+        );
+        assert!(values.iter().any(|v| *v != 0.0), "{name} is all zero");
+    }
+    for (name, _, values) in &b {
+        assert!(
+            values.iter().all(|v| *v == 0.0),
+            "{name} does not start at 0"
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn lora_init_is_identical_across_builds() {
+    let dir = TempDir::new("lora-init-det");
+    write_tiny_llama(dir.path());
+    let gpu = gpu();
+    let first = adapter_matrices(
+        &gpu,
+        &build_model_with_lora(&gpu, dir.path(), all_projections_lora()),
+    );
+    let second = adapter_matrices(
+        &gpu,
+        &build_model_with_lora(&gpu, dir.path(), all_projections_lora()),
+    );
+    assert_eq!(first.len(), second.len());
+    for (x, y) in first.iter().zip(&second) {
+        assert_eq!(x.0, y.0);
+        assert_eq!(x.2, y.2, "{} differs between builds", x.0);
+    }
+}

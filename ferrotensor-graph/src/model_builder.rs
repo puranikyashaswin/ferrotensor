@@ -228,7 +228,7 @@ impl<'a> Lfm2ModelBuilder<'a> {
                     shape[1],
                     lora_cfg.rank,
                     lora_cfg.alpha,
-                    seed,
+                    lora_seed(seed, module_name),
                 );
                 return Linear::with_lora(linear.weight, lora);
             }
@@ -236,8 +236,9 @@ impl<'a> Lfm2ModelBuilder<'a> {
         linear
     }
 
-    /// `module_name` is matched against the LoRA target modules; `seed`
-    /// keeps adapters of equal shape distinct.
+    /// `module_name` is matched against the LoRA target modules; `seed` is
+    /// the layer's seed. The adapter's own seed also depends on
+    /// `module_name`, so adapters of equal shape within a layer differ too.
     fn build_linear(&self, prefix: &str, module_name: &str, seed: u64) -> Result<Linear> {
         let weight = if self.has(&format!("{prefix}.scales")) {
             self.load_tensor(prefix)?
@@ -466,9 +467,70 @@ pub fn load_lfm2_model(
     builder.build().map_err(|e| e.to_string())
 }
 
+/// The generator seed of the adapter on `module_name` in the layer with seed
+/// `layer_seed` (`layer_idx + 1`; `0` for `lm_head`).
+///
+/// FNV-1a over the name bytes and then the layer seed's little-endian bytes,
+/// followed by the splitmix64 finalizer so that nearby inputs give unrelated
+/// seeds. It is written out by hand because `DefaultHasher` is not stable
+/// across Rust versions, and adapters must initialise identically on every
+/// build.
+fn lora_seed(layer_seed: u64, module_name: &str) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = FNV_OFFSET;
+    for byte in module_name.bytes().chain(layer_seed.to_le_bytes()) {
+        h ^= u64::from(byte);
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94d0_49bb_1331_11eb);
+    h ^ (h >> 31)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Lfm2ModelBuilder;
+    use super::{lora_seed, Lfm2ModelBuilder};
+
+    #[test]
+    fn lora_seed_is_pinned() {
+        // Fixed values: a change here changes every adapter's initial A.
+        assert_eq!(lora_seed(1, "q_proj"), 0x5f28_d619_21d3_ddb3);
+        assert_eq!(lora_seed(1, "o_proj"), 0xfabf_d797_7f14_3d7c);
+        assert_eq!(lora_seed(2, "q_proj"), 0x4bae_9242_648e_2fc1);
+        assert_eq!(lora_seed(0, "lm_head"), 0x6d1a_1dff_acc3_0def);
+    }
+
+    #[test]
+    fn lora_seed_differs_per_layer_and_projection() {
+        let names = [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+            "in_proj",
+            "out_proj",
+            "w1",
+            "w2",
+            "w3",
+        ];
+        let mut seeds = std::collections::HashSet::new();
+        let mut count = 0;
+        for layer in 1..=128u64 {
+            for name in names {
+                seeds.insert(lora_seed(layer, name));
+                count += 1;
+            }
+        }
+        seeds.insert(lora_seed(0, "lm_head"));
+        count += 1;
+        assert_eq!(seeds.len(), count, "two adapters would share a seed");
+    }
 
     #[test]
     fn transpose_2d_swaps_rows_and_columns() {
