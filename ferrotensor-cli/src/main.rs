@@ -224,6 +224,11 @@ struct TrainArgs {
     /// Consumer-hardware preset: seq-len 128, rank 4, grad-accum 8 unless set.
     #[arg(long)]
     lite: bool,
+    /// Recompute each decoder block during backward instead of keeping its
+    /// activations: less GPU memory for a second forward pass through every
+    /// block per step. Results are unchanged.
+    #[arg(long)]
+    checkpoint_blocks: bool,
     /// Number of processes in file-based data-parallel training (prototype).
     #[arg(long, default_value_t = 1)]
     world_size: usize,
@@ -860,6 +865,10 @@ async fn train(mut args: TrainArgs) -> Result<()> {
         .max(1);
     let warmup = args.warmup_steps.min(total_steps.saturating_sub(1));
 
+    let model = model.with_block_checkpointing(args.checkpoint_blocks);
+    if args.checkpoint_blocks {
+        eprintln!("block checkpointing: on");
+    }
     let mut optimizer = AdamW::new(base.engine.clone(), args.lr);
     optimizer.weight_decay = args.weight_decay;
     let scheduler = WarmupCosineScheduler::new(args.lr, args.lr * 0.1, warmup, total_steps);
@@ -1177,6 +1186,20 @@ mod tests {
         assert_eq!(t.lora_targets, vec!["q_proj", "v_proj"]);
         assert_eq!(t.max_steps, Some(5));
         assert!((t.lr - 1e-3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn train_parses_checkpoint_blocks() {
+        let checkpoint_blocks = |extra: &[&str]| {
+            let mut args = vec!["train", "--model", "m", "--data", "d.jsonl"];
+            args.extend_from_slice(extra);
+            match parse(&args).expect("parse").command {
+                Command::Train(t) => t.checkpoint_blocks,
+                _ => panic!("expected train"),
+            }
+        };
+        assert!(checkpoint_blocks(&["--checkpoint-blocks"]));
+        assert!(!checkpoint_blocks(&[]));
     }
 
     #[test]
