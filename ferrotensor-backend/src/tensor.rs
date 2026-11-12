@@ -227,3 +227,301 @@ impl UnifiedTensor {
         res
     }
 }
+
+impl UnifiedTensor {
+    /// Uploads the transpose of the row-major `[rows, cols]` matrix `data`
+    /// as a `[cols, rows]` tensor of `dtype`, converting each value while it
+    /// is written into the buffer's mapped memory, so no transposed or
+    /// converted copy is made on the host.
+    ///
+    /// The buffer holds the same bytes as transposing `data` and passing the
+    /// result to [`new`](Self::new) ([`DType::FP32`]) or
+    /// [`from_f32_as_f16`](Self::from_f32_as_f16) ([`DType::FP16`]).
+    ///
+    /// # Panics
+    /// If `data.len() != rows * cols`.
+    pub fn from_f32_transposed(
+        context: &WgpuContext,
+        data: &[f32],
+        rows: usize,
+        cols: usize,
+        dtype: DType,
+    ) -> Self {
+        assert_eq!(
+            data.len(),
+            rows * cols,
+            "from_f32_transposed: {} values for a [{rows}, {cols}] matrix",
+            data.len()
+        );
+        let len = upload_len(data.len(), dtype);
+        Self::from_fill(context, len, &[cols, rows], dtype, |out| {
+            write_transposed(data, rows, cols, dtype, out)
+        })
+    }
+
+    /// A tensor of `dtype` whose first `size_in_bytes` bytes `fill` writes
+    /// straight into the buffer's mapped memory (zeroed beforehand). The
+    /// buffer is laid out as by `create_buffer_init`, which
+    /// [`from_bytes_with_dtype`](Self::from_bytes_with_dtype) uses: its
+    /// size is rounded up to whole 32-bit words, at least one, with zeros
+    /// after the data, and a zero-byte tensor gets an empty, unmapped buffer.
+    fn from_fill(
+        context: &WgpuContext,
+        size_in_bytes: usize,
+        shape: &[usize],
+        dtype: DType,
+        fill: impl FnOnce(&mut [u8]),
+    ) -> Self {
+        let usage = wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC;
+        let buffer = if size_in_bytes == 0 {
+            let empty: &mut [u8] = &mut [];
+            fill(empty);
+            context.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Byte Tensor"),
+                size: 0,
+                usage,
+                mapped_at_creation: false,
+            })
+        } else {
+            let align_mask = wgpu::COPY_BUFFER_ALIGNMENT - 1;
+            let padded = ((size_in_bytes as u64 + align_mask) & !align_mask)
+                .max(wgpu::COPY_BUFFER_ALIGNMENT);
+            let buffer = context.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Byte Tensor"),
+                size: padded,
+                usage,
+                mapped_at_creation: true,
+            });
+            {
+                let mut mapped = buffer.slice(..).get_mapped_range_mut();
+                fill(&mut mapped[..size_in_bytes]);
+            }
+            buffer.unmap();
+            buffer
+        };
+        context.note_upload(size_in_bytes as u64);
+        Self {
+            data: Arc::new(TensorData {
+                buffer: Arc::new(buffer),
+                size_in_bytes: size_in_bytes as u64,
+                pool: None,
+            }),
+            shape: shape.to_vec(),
+            dtype,
+        }
+    }
+}
+
+/// Bytes [`UnifiedTensor::from_f32_transposed`] uploads for `n` values:
+/// four per value for [`DType::FP32`]; for [`DType::FP16`] two per value,
+/// rounded up to whole 32-bit words and at least one word, as in
+/// [`UnifiedTensor::from_f32_as_f16`].
+fn upload_len(n: usize, dtype: DType) -> usize {
+    match dtype {
+        DType::FP32 => n * 4,
+        DType::FP16 => (n * 2).next_multiple_of(4).max(4),
+    }
+}
+
+/// Writes the `[cols, rows]` transpose of the row-major `[rows, cols]`
+/// matrix `src` into `out` as `dtype` values: f32 in native byte order (as
+/// `bytemuck` casts them for [`UnifiedTensor::new`]) or little-endian f16
+/// rounded by `half::f16::from_f32` (as in
+/// [`UnifiedTensor::from_f32_as_f16`]). Bytes past the values are left as
+/// they are. `out` is filled front to back, so writes to mapped GPU memory
+/// stay sequential.
+fn write_transposed(src: &[f32], rows: usize, cols: usize, dtype: DType, out: &mut [u8]) {
+    debug_assert_eq!(src.len(), rows * cols);
+    debug_assert!(out.len() >= src.len() * dtype.size_bytes());
+    match dtype {
+        DType::FP32 => {
+            let mut chunks = out.chunks_exact_mut(4);
+            for col in 0..cols {
+                for row in 0..rows {
+                    let bytes = src[row * cols + col].to_ne_bytes();
+                    chunks
+                        .next()
+                        .expect("output holds every value")
+                        .copy_from_slice(&bytes);
+                }
+            }
+        }
+        DType::FP16 => {
+            let mut chunks = out.chunks_exact_mut(2);
+            for col in 0..cols {
+                for row in 0..rows {
+                    let bytes = half::f16::from_f32(src[row * cols + col]).to_le_bytes();
+                    chunks
+                        .next()
+                        .expect("output holds every value")
+                        .copy_from_slice(&bytes);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{upload_len, write_transposed, DType};
+
+    /// The bytes the model builder uploaded for a transposed linear weight
+    /// before `from_f32_transposed`: a transposed f32 copy, then either its
+    /// bytes as `UnifiedTensor::new` sees them or the f16 bytes
+    /// `UnifiedTensor::from_f32_as_f16` builds. Kept as the reference.
+    fn old_transposed_bytes(src: &[f32], rows: usize, cols: usize, dtype: DType) -> Vec<u8> {
+        let mut transposed = vec![0.0; src.len()];
+        for row in 0..rows {
+            for col in 0..cols {
+                transposed[col * rows + row] = src[row * cols + col];
+            }
+        }
+        match dtype {
+            DType::FP32 => bytemuck::cast_slice::<f32, u8>(&transposed).to_vec(),
+            DType::FP16 => {
+                let mut bytes: Vec<u8> = transposed
+                    .iter()
+                    .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
+                    .collect();
+                bytes.resize(bytes.len().next_multiple_of(4).max(4), 0);
+                bytes
+            }
+        }
+    }
+
+    /// What `from_fill` hands to `write_transposed`: a zeroed buffer.
+    fn new_transposed_bytes(src: &[f32], rows: usize, cols: usize, dtype: DType) -> Vec<u8> {
+        let mut out = vec![0u8; upload_len(src.len(), dtype)];
+        write_transposed(src, rows, cols, dtype, &mut out);
+        out
+    }
+
+    fn pseudo_random_bits(n: usize, mut seed: u64) -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                f32::from_bits(seed as u32)
+            })
+            .collect()
+    }
+
+    /// Values at and around every special case of the f32 to f16 rounding.
+    fn edge_values() -> Vec<f32> {
+        let mut v = vec![
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            -f32::NAN,
+            f32::from_bits(0x7f80_0001), // signalling NaN, low payload
+            f32::from_bits(0x7fc1_2345), // quiet NaN with payload
+            f32::from_bits(0xffbf_ffff), // negative NaN, all payload bits
+            f32::from_bits(1),           // smallest f32 subnormal
+            f32::from_bits(0x007f_ffff), // largest f32 subnormal
+            -f32::from_bits(0x0040_0000),
+            f32::MIN_POSITIVE,
+            f32::MAX,
+            f32::MIN,
+            65504.0, // f16 max
+            65519.0, // rounds down to f16 max
+            65520.0, // overflows f16 to infinity
+            -65520.0,
+            1e10,
+            2f32.powi(-14),                               // f16 smallest normal
+            2f32.powi(-24),                               // f16 smallest subnormal
+            2f32.powi(-25), // half of it: a tie, rounds to even (zero)
+            f32::from_bits(2f32.powi(-25).to_bits() + 1), // rounds up
+            1.0e-9,         // underflows f16 to zero
+            -1.0e-9,
+            0.1,
+            1.0 + 2f32.powi(-11), // tie between two f16 values
+            1.0 + 3.0 * 2f32.powi(-11),
+            2049.0,
+        ];
+        // Every f16 value widened to f32, plus its f32 neighbours.
+        for bits in (0u16..=u16::MAX).step_by(7) {
+            let x = half::f16::from_bits(bits).to_f32();
+            v.push(x);
+            v.push(f32::from_bits(x.to_bits().wrapping_add(1)));
+            v.push(f32::from_bits(x.to_bits().wrapping_sub(1)));
+        }
+        v
+    }
+
+    fn assert_same(src: &[f32], rows: usize, cols: usize) {
+        for dtype in [DType::FP32, DType::FP16] {
+            let old = old_transposed_bytes(src, rows, cols, dtype);
+            let new = new_transposed_bytes(src, rows, cols, dtype);
+            assert_eq!(
+                old.len(),
+                new.len(),
+                "{dtype:?} [{rows}, {cols}]: byte length"
+            );
+            if let Some(i) = old.iter().zip(&new).position(|(a, b)| a != b) {
+                panic!("{dtype:?} [{rows}, {cols}]: first differing byte at {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn transposed_bytes_match_the_old_three_step_upload() {
+        for (rows, cols) in [
+            (1, 1),
+            (1, 7),
+            (7, 1),
+            (2, 3),
+            (3, 2),
+            (5, 5),
+            (17, 33),
+            (64, 48),
+        ] {
+            let src = pseudo_random_bits(rows * cols, (rows * 131 + cols) as u64);
+            assert_same(&src, rows, cols);
+        }
+    }
+
+    #[test]
+    fn transposed_bytes_match_on_edge_values() {
+        let mut values = edge_values();
+        // A whole number of rows of 13 (odd, so f16 rows end mid-word).
+        while values.len() % 13 != 0 {
+            values.push(-0.0);
+        }
+        let rows = values.len() / 13;
+        assert_same(&values, rows, 13);
+        assert_same(&values, 13, rows);
+        assert_same(&values, 1, values.len());
+    }
+
+    #[test]
+    fn empty_and_odd_sized_uploads_are_padded_like_from_f32_as_f16() {
+        assert_eq!(upload_len(0, DType::FP16), 4);
+        assert_eq!(upload_len(1, DType::FP16), 4);
+        assert_eq!(upload_len(3, DType::FP16), 8);
+        assert_eq!(upload_len(4, DType::FP16), 8);
+        assert_eq!(upload_len(0, DType::FP32), 0);
+        assert_eq!(upload_len(3, DType::FP32), 12);
+        assert_same(&[], 0, 0);
+        assert_same(&[], 0, 5);
+        assert_same(&[1.5], 1, 1);
+        assert_same(&[1.5, -2.0, 3.25], 1, 3);
+    }
+
+    #[test]
+    fn transpose_puts_columns_first() {
+        let src = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let out = new_transposed_bytes(&src, 2, 3, DType::FP32);
+        let values: Vec<f32> = out
+            .chunks_exact(4)
+            .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(values, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+    }
+}

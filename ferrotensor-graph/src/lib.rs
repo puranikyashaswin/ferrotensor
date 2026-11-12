@@ -615,3 +615,6 @@ pub fn create_padding_mask(
 
     UnifiedTensor::new(ctx, &mask_data, &[batch_size, 1, 1, max_seq_len])
 }
+
+#[cfg(test)]
+mod load_tests;

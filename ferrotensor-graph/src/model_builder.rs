@@ -18,7 +18,7 @@
 use crate::lfm::{Lfm2Block, Lfm2Conv, Lfm2LayerOp, Lfm2Model};
 use crate::{Attention, Linear, LoRAAdapter, RMSNorm, MLP};
 use ferrotensor_autograd::Tensor;
-use ferrotensor_backend::{ComputeEngine, UnifiedTensor, WgpuContext};
+use ferrotensor_backend::{ComputeEngine, DType, UnifiedTensor, WgpuContext};
 use ferrotensor_loader::{Lfm2Config, WeightsContext};
 use std::sync::Arc;
 
@@ -150,6 +150,15 @@ impl<'a> Lfm2ModelBuilder<'a> {
             UnifiedTensor::from_f32_as_f16(&self.ctx, data, shape)
         } else {
             UnifiedTensor::new(&self.ctx, data, shape)
+        }
+    }
+
+    /// The element type [`upload_linear`](Self::upload_linear) stores.
+    fn linear_dtype(&self) -> DType {
+        if self.f16_weights && !self.trainable_base {
+            DType::FP16
+        } else {
+            DType::FP32
         }
     }
 
@@ -392,8 +401,15 @@ impl<'a> Lfm2ModelBuilder<'a> {
                     "model.embed_tokens.weight must be 2-D, got {shape:?}"
                 )));
             };
-            let weight = Self::transpose_2d(&data, vocab, hidden);
-            let weight = self.wrap(self.upload_linear(&weight, &[hidden, vocab]));
+            // Transposed and converted while it is written to the GPU buffer:
+            // no transposed copy of the table on the host.
+            let weight = self.wrap(UnifiedTensor::from_f32_transposed(
+                &self.ctx,
+                &data,
+                vocab,
+                hidden,
+                self.linear_dtype(),
+            ));
             self.maybe_add_lora(Linear::new(weight), "lm_head", 0)
         };
 

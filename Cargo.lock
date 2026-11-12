@@ -677,8 +677,10 @@ dependencies = [
  "ferrotensor-autograd",
  "ferrotensor-backend",
  "ferrotensor-loader",
+ "half",
  "log",
  "pollster",
+ "safetensors",
  "serde",
  "serde_json",
 ]
