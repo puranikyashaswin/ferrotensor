@@ -10,9 +10,10 @@
 //! unreliable on some drivers).
 
 use ferrotensor_backend::{
-    AdamParams, AttentionOptions, ComputeEngine, UnifiedTensor, WgpuContext, MASKED_CE_SKIP,
-    SUM_SQUARES_CHUNK,
+    q4, AdamParams, AttentionOptions, ComputeEngine, DType, MemoryCategory, UnifiedTensor,
+    WgpuContext, MASKED_CE_SKIP, SUM_SQUARES_CHUNK,
 };
+use std::io::Write as _;
 use std::sync::OnceLock;
 
 struct Gpu {
@@ -307,6 +308,134 @@ fn matmul_with_f16_b_matches_cpu() {
             1e-4,
         );
     }
+}
+
+/// Largest `|got - want|`.
+fn max_abs_diff(got: &[f32], want: &[f32]) -> f32 {
+    got.iter()
+        .zip(want)
+        .map(|(g, w)| (g - w).abs())
+        .fold(0.0, f32::max)
+}
+
+/// `w` through the 4-bit round trip on the host, as the `*_q4b` matmuls
+/// see it.
+fn q4_round(w: &[f32], k: usize, n: usize) -> Vec<f32> {
+    q4::dequantize(&q4::quantize(w, k, n).unwrap(), k, n)
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn matmul_with_q4_b_matches_cpu() {
+    // A frozen weight W[k, n] is used twice: forward `y = x W` (mode 0,
+    // `matmul_q4b`) and the input gradient `dx = dy W^T` (mode 1,
+    // `matmul_bt_q4b`, the same tensor). Both are compared with the same
+    // product on the host-dequantised copy of W, never the original W.
+    // k * n off a multiple of 64 exercises the padded last group; shapes
+    // off the 64x64 tile exercise the edges; (2, 64, 3) has one group per
+    // output column.
+    let g = gpu();
+    let (mut fwd_diff, mut bwd_diff, mut quant_err, mut quant_effect) = (0f32, 0f32, 0f32, 0f32);
+    for (seed, &(m, k, n)) in MATMUL_SHAPES
+        .iter()
+        .chain(&[(3, 5, 7), (65, 33, 129), (2, 64, 3)])
+        .enumerate()
+    {
+        let x = rand_vec(m * k, 500 + seed as u64);
+        let w: Vec<f32> = rand_vec(k * n, 600 + seed as u64)
+            .iter()
+            .map(|v| v * 0.1)
+            .collect();
+        let w_q = UnifiedTensor::from_f32_as_q4(&g.ctx, &w, &[k, n]).unwrap();
+        assert_eq!(w_q.dtype, DType::Q4);
+        assert_eq!(w_q.shape, vec![k, n]);
+        assert_eq!(w_q.size_in_bytes(), 4 * q4::packed_words(k, n) as u64);
+        let w_dq = q4_round(&w, k, n);
+        quant_err = quant_err.max(max_abs_diff(&w_dq, &w));
+
+        let y = zeros(&[m, n]);
+        g.engine.matmul_q4b(&g.ctx, &upload(&x, &[m, k]), &w_q, &y);
+        let want = cpu_matmul(&x, &w_dq, m, k, n);
+        let got = read(&y);
+        assert_close(&format!("matmul_q4b {m}x{k}x{n}"), &got, &want, 1e-4, 1e-4);
+        fwd_diff = fwd_diff.max(max_abs_diff(&got, &want));
+        quant_effect = quant_effect.max(max_abs_diff(&got, &cpu_matmul(&x, &w, m, k, n)));
+
+        let dy = rand_vec(m * n, 700 + seed as u64);
+        let dx = zeros(&[m, k]);
+        g.engine
+            .matmul_bt_q4b(&g.ctx, &upload(&dy, &[m, n]), &w_q, &dx);
+        let want = cpu_matmul(&dy, &transpose(&w_dq, k, n), m, n, k);
+        let got = read(&dx);
+        assert_close(
+            &format!("matmul_bt_q4b {m}x{n}x{k}"),
+            &got,
+            &want,
+            1e-4,
+            1e-4,
+        );
+        bwd_diff = bwd_diff.max(max_abs_diff(&got, &want));
+    }
+    let _ = writeln!(
+        std::io::stderr(),
+        "q4 matmul vs host-dequantised f32: forward x W max |diff| {fwd_diff:.3e}, \
+         input gradient dy W^T max |diff| {bwd_diff:.3e} (tolerance 1e-4 + 1e-4 |want|); \
+         weights in [-0.1, 0.1): max |W - dequant(quant(W))| {quant_err:.3e}, \
+         max |x W_q - x W| {quant_effect:.3e} (quantisation effect, not asserted)"
+    );
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn q4_weights_take_four_and_a_half_bits_each() {
+    // 4-bit codes plus one 32-bit scale/min word per 64 weights, counted by
+    // the memory tracker under the current category, apart from f16.
+    let g = gpu();
+    let (k, n) = (2048, 2048);
+    let w = rand_vec(k * n, 800);
+    let before = *g
+        .ctx
+        .memory()
+        .current()
+        .category(MemoryCategory::BaseWeights);
+    let w_q = {
+        let _tag = g.ctx.memory().scope(MemoryCategory::BaseWeights);
+        UnifiedTensor::from_f32_as_q4(&g.ctx, &w, &[k, n]).unwrap()
+    };
+    let bytes = (k * n / 2 + 4 * (k * n / 64)) as u64;
+    assert_eq!(bytes, 2_359_296);
+    assert_eq!(w_q.size_in_bytes(), bytes);
+    assert_eq!(w_q.memory_category(), MemoryCategory::BaseWeights);
+    let after = *g
+        .ctx
+        .memory()
+        .current()
+        .category(MemoryCategory::BaseWeights);
+    assert_eq!(after.allocated_bytes - before.allocated_bytes, bytes);
+    assert_eq!(after.logical_bytes - before.logical_bytes, bytes);
+    assert_eq!(after.q4_bytes - before.q4_bytes, bytes);
+    assert_eq!(after.f16_bytes, before.f16_bytes);
+    drop(w_q);
+    let freed = *g
+        .ctx
+        .memory()
+        .current()
+        .category(MemoryCategory::BaseWeights);
+    assert_eq!(freed.q4_bytes, before.q4_bytes);
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn q4_upload_rejects_non_finite_weights() {
+    let g = gpu();
+    let live = g.ctx.memory().live_bytes();
+    let err =
+        UnifiedTensor::from_f32_as_q4(&g.ctx, &[0.0, f32::NAN, 1.0, 2.0], &[2, 2]).unwrap_err();
+    assert!(
+        matches!(err, q4::Q4Error::NonFinite { row: 0, col: 1, .. }),
+        "{err:?}"
+    );
+    assert_eq!(g.ctx.memory().live_bytes(), live, "nothing was uploaded");
 }
 
 #[test]
