@@ -150,16 +150,21 @@ impl Tensor {
     }
 
     /// Add `new_grad` to this tensor's gradient.
+    ///
+    /// The first gradient is kept as given: the stored gradient then shares
+    /// its GPU buffer with `new_grad`, so the caller must not write into
+    /// `new_grad` afterwards. A later gradient is summed into a new buffer.
     pub fn accumulate_grad(&self, engine: &ComputeEngine, new_grad: &UnifiedTensor) {
         let mut grad_ref = self.grad.borrow_mut();
         if let Some(existing) = grad_ref.as_ref() {
             let res = UnifiedTensor::empty(&self.ctx, &self.data.shape);
             engine.add(&self.ctx, existing, new_grad, &res);
             *grad_ref = Some(res);
+        } else if new_grad.shape == self.data.shape {
+            *grad_ref = Some(new_grad.clone());
         } else {
-            let res = UnifiedTensor::empty(&self.ctx, &self.data.shape);
-            engine.copy_tensor(&self.ctx, new_grad, &res, 0);
-            *grad_ref = Some(res);
+            // Defensive: every node returns its input's shape today.
+            *grad_ref = Some(new_grad.reshaped(&self.data.shape));
         }
     }
 
