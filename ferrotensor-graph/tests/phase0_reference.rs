@@ -25,10 +25,6 @@ struct Phase0Fixture {
     rms_output: Vec<Vec<Vec<f32>>>,
 }
 
-fn gpu_tests_enabled() -> bool {
-    std::env::var("FERROTENSOR_RUN_GPU_TESTS").as_deref() == Ok("1")
-}
-
 fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/reference/phase0_linear_rmsnorm.json")
 }
@@ -89,12 +85,8 @@ fn assert_close(actual: &[f32], expected: &[f32], tol: f32) {
 }
 
 #[test]
+#[ignore = "needs a GPU"]
 fn linear_and_rmsnorm_match_reference_fixture() {
-    if !gpu_tests_enabled() {
-        eprintln!("skipping phase0 reference test; set FERROTENSOR_RUN_GPU_TESTS=1");
-        return;
-    }
-
     let path = fixture_path();
     ensure_fixture(&path);
 
