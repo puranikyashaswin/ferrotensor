@@ -254,6 +254,8 @@ impl ComputeEngine {
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
+        // Dropped at the end of this function, before the dispatches run.
+        ctx.memory().count_dispatch_buffer(stats.size());
         let (b, h, hkv) = (dims.batch, dims.heads, dims.kv_heads);
         self.run(
             ctx,

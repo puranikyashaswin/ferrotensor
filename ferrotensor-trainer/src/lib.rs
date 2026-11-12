@@ -14,7 +14,7 @@
 
 use ferrotensor_autograd::{AutogradNode, LRScheduler, Optimizer, Tensor};
 use ferrotensor_backend::{
-    ComputeEngine, UnifiedTensor, WgpuContext, MASKED_CE_SKIP, SUM_SQUARES_CHUNK,
+    ComputeEngine, MemoryCategory, UnifiedTensor, WgpuContext, MASKED_CE_SKIP, SUM_SQUARES_CHUNK,
 };
 use ferrotensor_graph::lfm::Lfm2Model;
 use std::sync::Arc;
@@ -24,6 +24,7 @@ pub mod classify;
 pub mod data;
 pub mod demo;
 pub mod distributed;
+pub mod memory;
 pub mod peft;
 pub mod scaler;
 
@@ -244,9 +245,13 @@ impl Trainer {
         mask.resize(padded_len, 0);
 
         let dropout_seed = Some(self.attention_dropout_seed());
-        let logits =
+        let logits = {
+            let _tag = self.ctx.memory().scope(MemoryCategory::Activations);
             self.model
-                .forward_with_dropout(&self.engine, &inputs, 0, None, None, dropout_seed);
+                .forward_with_dropout(&self.engine, &inputs, 0, None, None, dropout_seed)
+        };
+        memory::tag_loss(&logits);
+        let tag = self.ctx.memory().scope(MemoryCategory::Loss);
 
         let mut stats = StepStats {
             loss: 0.0,
@@ -265,8 +270,12 @@ impl Trainer {
                 seed *= scaler.scale_factor();
             }
             *loss.tensor.grad.borrow_mut() = Some(UnifiedTensor::new(&self.ctx, &[seed], &[1]));
+            let _tag = self.ctx.memory().scope(MemoryCategory::BackwardScratch);
             loss.tensor.backward(&self.engine);
+            memory::tag_gradients(train_params);
+            memory::tag_loss(&logits);
         }
+        drop(tag);
 
         self.step_in_accum += 1;
         if self.step_in_accum >= self.grad_accum_steps {
@@ -336,7 +345,10 @@ impl Trainer {
             self.optimizer.set_lr(lr);
             stats.lr = Some(lr);
         }
-        self.optimizer.step(train_params);
+        {
+            let _tag = self.ctx.memory().scope(MemoryCategory::OptimizerState);
+            self.optimizer.step(train_params);
+        }
         self.optimizer_step_count += 1;
         stats.optimizer_step = true;
         Ok(())
@@ -433,9 +445,13 @@ impl Trainer {
         }
         let rows: Vec<&[u32]> = inputs.iter().map(Vec::as_slice).collect();
         let dropout_seed = Some(self.attention_dropout_seed());
-        let logits = self
-            .model
-            .forward_batch_with_dropout(&self.engine, &rows, dropout_seed);
+        let logits = {
+            let _tag = self.ctx.memory().scope(MemoryCategory::Activations);
+            self.model
+                .forward_batch_with_dropout(&self.engine, &rows, dropout_seed)
+        };
+        memory::tag_loss(&logits);
+        let tag = self.ctx.memory().scope(MemoryCategory::Loss);
 
         let mut out: Vec<StepStats> = Vec::with_capacity(chunk.len());
         if let Some(loss) =
@@ -455,8 +471,12 @@ impl Trainer {
                 seed *= scaler.scale_factor();
             }
             *loss.tensor.grad.borrow_mut() = Some(UnifiedTensor::new(&self.ctx, &[seed], &[1]));
+            let _tag = self.ctx.memory().scope(MemoryCategory::BackwardScratch);
             loss.tensor.backward(&self.engine);
+            memory::tag_gradients(train_params);
+            memory::tag_loss(&logits);
         }
+        drop(tag);
 
         self.step_in_accum += chunk.len();
         if self.step_in_accum >= self.grad_accum_steps {
@@ -537,6 +557,7 @@ impl AutogradNode for MaskedCrossEntropyNode {
             .copied()
             .unwrap_or(1.0);
         let scaled = UnifiedTensor::empty(ctx, &self.grad_logits.shape);
+        scaled.set_memory_category(MemoryCategory::Loss);
         engine.copy_tensor(ctx, &self.grad_logits, &scaled, 0);
         if (upstream - 1.0).abs() > f32::EPSILON {
             engine.gradient_scale(ctx, &scaled, upstream);

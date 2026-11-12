@@ -182,6 +182,9 @@ impl WgpuContext {
         loop {
             self.device.poll(wgpu::Maintain::Poll);
             if done() {
+                // Callers wait for the last submitted work, so that poll let
+                // wgpu destroy every buffer dropped before it.
+                self.memory().gpu_reclaimed();
                 return;
             }
             if polls < 100 {
@@ -198,6 +201,12 @@ impl WgpuContext {
         if let Some(encoder) = pending.encoder.take() {
             self.queue.submit(Some(encoder.finish()));
         }
+    }
+
+    /// Byte counters of this context's tensors: live, peak, idle in the
+    /// pool, and by [`MemoryCategory`](crate::MemoryCategory).
+    pub fn memory(&self) -> &Arc<crate::MemoryTracker> {
+        self.pool.tracker()
     }
 
     /// Adapter name and backend, e.g. `"Apple M2 (Metal)"`.

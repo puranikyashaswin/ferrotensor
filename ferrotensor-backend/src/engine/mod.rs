@@ -85,8 +85,10 @@ fn groups64(n: usize) -> (u32, u32, u32) {
     grid((n as u32).div_ceil(64))
 }
 
-/// Creates a uniform buffer holding `bytes`.
+/// Creates a uniform buffer holding `bytes`. Callers drop it once the
+/// dispatch is recorded, so it is counted as awaiting GPU from the start.
 fn uniform(ctx: &WgpuContext, bytes: &[u8]) -> Buffer {
+    ctx.memory().count_dispatch_buffer(bytes.len() as u64);
     ctx.device
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Uniform"),
@@ -251,7 +253,9 @@ impl ComputeEngine {
 }
 
 /// A 4-byte storage buffer bound where a kernel needs a buffer that is unused.
+/// Counted like [`uniform`].
 fn dummy_storage(ctx: &WgpuContext) -> Buffer {
+    ctx.memory().count_dispatch_buffer(4);
     ctx.device
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Dummy Storage"),
