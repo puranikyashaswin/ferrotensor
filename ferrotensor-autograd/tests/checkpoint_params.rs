@@ -77,9 +77,14 @@ fn checkpoint_with_params_trains_captured_weights() {
     let forward = |w: Tensor| {
         move |i: &[Tensor], e: &ComputeEngine| vec![Tensor::silu(&Tensor::matmul(&i[0], &w, e), e)]
     };
-    let out = checkpoint_with_params(vec![x.clone()], &[w.clone()], forward(w.clone()), &engine)
-        .pop()
-        .expect("one output");
+    let out = checkpoint_with_params(
+        vec![x.clone()],
+        std::slice::from_ref(&w),
+        forward(w.clone()),
+        &engine,
+    )
+    .pop()
+    .expect("one output");
     assert!(out.requires_grad);
     out.backward(&engine);
     assert_close(&grad_of(&ctx, &w), &g_ref, "w.grad");
@@ -87,9 +92,14 @@ fn checkpoint_with_params_trains_captured_weights() {
 
     // A second micro-step without clearing adds a second copy, as without
     // checkpointing (gradient accumulation).
-    let out = checkpoint_with_params(vec![x.clone()], &[w.clone()], forward(w.clone()), &engine)
-        .pop()
-        .expect("one output");
+    let out = checkpoint_with_params(
+        vec![x.clone()],
+        std::slice::from_ref(&w),
+        forward(w.clone()),
+        &engine,
+    )
+    .pop()
+    .expect("one output");
     out.backward(&engine);
     let doubled: Vec<f32> = g_ref.iter().map(|v| 2.0 * v).collect();
     assert_close(
@@ -140,7 +150,7 @@ fn checkpointed_replay_releases_its_intermediates() {
     };
     let h = checkpoint_with_params(
         vec![x.clone()],
-        &[w1.clone()],
+        std::slice::from_ref(&w1),
         block(w1.clone(), created.clone()),
         &engine,
     )
@@ -148,7 +158,7 @@ fn checkpointed_replay_releases_its_intermediates() {
     .expect("one output");
     let y = checkpoint_with_params(
         vec![h.clone()],
-        &[w2.clone()],
+        std::slice::from_ref(&w2),
         block(w2.clone(), created.clone()),
         &engine,
     )

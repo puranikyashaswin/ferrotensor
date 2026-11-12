@@ -221,12 +221,12 @@ fn block_checkpointing_matches_plain_backward_batch_3() {
     write_tiny_llama(dir.path());
     let gpu = gpu();
     let seq = pattern_sequence();
-    let rows = vec![
+    let rows = [
         seq[0..16].to_vec(),
         seq[3..19].to_vec(),
         seq[6..22].to_vec(),
     ];
-    let targets = vec![
+    let targets = [
         seq[1..17].to_vec(),
         seq[4..20].to_vec(),
         seq[7..23].to_vec(),
