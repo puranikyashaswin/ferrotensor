@@ -21,6 +21,7 @@ Measured on a MacBook Air (Apple M2, 8 GB): LoRA fine-tuning of SmolLM2-135M too
 - [Architecture](https://ferrotensor.dev/docs/architecture.html): how a tensor op reaches a WGSL kernel
 - [Writing a kernel](https://ferrotensor.dev/docs/writing-a-kernel.html): adding a GPU op
 - [Benchmarks](https://ferrotensor.dev/docs/benchmarks.html): kernel and tensor-API timings with method
+- [About](https://ferrotensor.dev/about/): who builds Ferrotensor, what is measured, and how to get in touch
 
 ## Reference
 

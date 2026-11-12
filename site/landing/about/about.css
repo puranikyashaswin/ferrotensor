@@ -1,0 +1,42 @@
+/* About page. Uses ../style.css for colours, type, the header and .eyebrow. */
+
+.about { max-width: 46rem; padding-block: clamp(2.5rem, 7vw, 5rem); }
+.about h1 {
+  font-size: clamp(2.1rem, 5.4vw, 3.4rem);
+  font-weight: 750;
+  letter-spacing: -0.03em;
+}
+.about .lede { max-width: none; margin: 1.25rem 0 0; }
+.about h2 {
+  margin: clamp(2.5rem, 6vw, 3.5rem) 0 0.9rem;
+  font-size: clamp(1.35rem, 2.8vw, 1.7rem);
+  font-weight: 700;
+}
+.about p, .about ul { margin: 0 0 1rem; color: var(--ink-2); font-size: 1.05rem; }
+.about ul { padding-left: 1.2rem; }
+.about li { margin-bottom: 0.45rem; }
+.about strong { color: var(--ink); }
+.about code { font-family: var(--mono); font-size: 0.9em; color: var(--ink); }
+.about .facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(12.5rem, 1fr));
+  gap: 0.9rem;
+  margin: 1.5rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+.about .facts li {
+  margin: 0;
+  padding: 1rem 1.1rem;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  font-size: 0.95rem;
+}
+.about .facts b {
+  display: block;
+  margin-bottom: 0.3rem;
+  font: 700 1.35rem/1.1 var(--mono);
+  color: var(--ink);
+}
+.about .after-facts { margin-top: 1.25rem; }
