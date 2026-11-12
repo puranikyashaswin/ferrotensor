@@ -8,7 +8,7 @@ use pyo3::prelude::*;
 
 use crate::device::resolve_device;
 use crate::error::{guard, index_error, value_error};
-use crate::tensor::{parse_data, PyTensor};
+use crate::tensor::{check_same_device, parse_data, PyTensor};
 
 /// What `forward` checks before calling into Rust.
 enum Expect {
@@ -151,6 +151,9 @@ impl PyLayer {
             return self.forward_ids(x, vocab);
         }
         let x = x.cast::<PyTensor>()?.borrow().inner.clone();
+        if let Some(param) = self.inner.parameters().first() {
+            check_same_device(&x, param)?;
+        }
         let shape = &x.shape;
         let ok = match &self.expect {
             Expect::Features(n) => shape.last() == Some(n),

@@ -136,8 +136,11 @@ naming the shapes involved; the Rust code never panics across the boundary.
 
 ```bash
 pytest                              # CPU
-FERROTENSOR_GPU_TESTS=1 pytest      # also GPU parity tests
+FERROTENSOR_RUN_GPU_TESTS=1 pytest  # also GPU parity tests
 ```
+
+`FERROTENSOR_GPU_TESTS=1` still works as the older name. CI runs the GPU
+tests on software Vulkan (Mesa lavapipe).
 
 ## License
 

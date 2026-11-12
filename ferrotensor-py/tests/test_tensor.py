@@ -1,4 +1,5 @@
 import array
+import math
 
 import pytest
 
@@ -241,3 +242,127 @@ def test_manual_seed_makes_random_tensors_and_init_reproducible():
     assert draw() == first
     ft.manual_seed(124)
     assert draw()[0] != first[0]
+
+
+def test_named_comparison_methods():
+    a = ft.tensor([1.0, 2.0, 3.0])
+    b = ft.tensor([2.0, 2.0, 2.0])
+    assert a.lt(b).tolist() == [1.0, 0.0, 0.0]
+    assert a.le(b).tolist() == [1.0, 1.0, 0.0]
+    assert a.ge(b).tolist() == [0.0, 1.0, 1.0]
+    assert a.gt(b).tolist() == [0.0, 0.0, 1.0]
+    assert a.eq(b).tolist() == [0.0, 1.0, 0.0]
+    assert a.lt(2.5).tolist() == [1.0, 1.0, 0.0]
+    assert a.ge(ft.tensor([[1.0], [3.0]])).tolist() == [[1.0, 1.0, 1.0], [0.0, 0.0, 1.0]]
+
+
+def test_power_and_leaky_relu_defaults():
+    x = ft.tensor([2.0, 3.0])
+    close((x**0.5).tolist(), [2**0.5, 3**0.5])
+    assert (x**3).tolist() == [8.0, 27.0]
+    close((x**-1).tolist(), [0.5, 1 / 3])
+    close(ft.tensor([-2.0, 3.0]).leaky_relu().tolist(), [-0.02, 3.0])
+
+
+def test_where_with_tensor_branches():
+    cond = ft.tensor([[1.0, 0.0], [0.0, 1.0]])
+    other = ft.tensor([[1.0, 2.0], [3.0, 4.0]])
+    assert ft.where(cond, other, ft.tensor([10.0, 20.0])).tolist() == [[1.0, 20.0], [10.0, 4.0]]
+    assert ft.where(cond, 5.0, other).tolist() == [[5.0, 2.0], [3.0, 5.0]]
+
+
+def test_multi_dim_reductions():
+    x = ft.arange(24).reshape(2, 3, 4)
+    assert x.sum((0, 2)).tolist() == [60.0, 92.0, 124.0]
+    assert x.mean((0, 2)).tolist() == [7.5, 11.5, 15.5]
+    assert x.max((0, 2)).tolist() == [15.0, 19.0, 23.0]
+    assert x.min((0, 2)).tolist() == [0.0, 4.0, 8.0]
+    assert x.sum((0, 2), keepdim=True).shape == (1, 3, 1)
+    assert x.sum([-1, 0]).tolist() == [60.0, 92.0, 124.0]
+    close(x.var(-1).tolist(), [[1.25] * 3] * 2)
+    assert x.var(1, keepdim=True).shape == (2, 1, 4)
+
+
+def test_arg_reductions_with_keepdim():
+    x = ft.tensor([[1.0, 5.0, 2.0], [7.0, 0.0, 3.0]])
+    assert x.argmax(1, keepdim=True).tolist() == [[1.0], [0.0]]
+    assert x.argmin(0).tolist() == [0.0, 1.0, 0.0]
+    assert x.argmax(-1).tolist() == [1.0, 0.0]
+    assert x.argmax().item() == 3.0 and x.argmin().item() == 4.0
+
+
+def test_softmax_over_the_first_dim():
+    x = ft.tensor([[1.0, 2.0], [3.0, 4.0]])
+    low, high = 1 / (1 + math.exp(2)), 1 - 1 / (1 + math.exp(2))
+    close(x.softmax(0).tolist(), [[low, low], [high, high]])
+    close(x.log_softmax(0).tolist(), [[math.log(low)] * 2, [math.log(high)] * 2])
+    assert x.softmax(1).sum(1).tolist() == pytest.approx([1.0, 1.0])
+
+
+def test_chunk_split_narrow_and_index_select_along_dims():
+    m = ft.arange(6).reshape(2, 3)
+    assert [p.tolist() for p in m.chunk(3, dim=1)] == [[[0.0], [3.0]], [[1.0], [4.0]], [[2.0], [5.0]]]
+    assert [p.shape for p in m.chunk(2, dim=-1)] == [(2, 2), (2, 1)]
+    assert [p.shape for p in m.split(2, dim=1)] == [(2, 2), (2, 1)]
+    assert m.split(2, 1)[1].tolist() == [[2.0], [5.0]]
+    assert m.narrow(-1, 0, 2).tolist() == [[0.0, 1.0], [3.0, 4.0]]
+    assert m.index_select(1, [-1]).tolist() == [[2.0], [5.0]]
+    assert m.index_select(0, [1, 1, 0]).shape == (3, 3)
+
+
+def test_creation_options():
+    base = ft.ones(2)
+    assert ft.zeros_like(base, requires_grad=True).requires_grad
+    assert ft.ones_like(base, requires_grad=True).requires_grad
+    assert ft.full_like(base, 3.0, requires_grad=True).tolist() == [3.0, 3.0]
+    assert ft.full((2,), 1.0, requires_grad=True).requires_grad
+    assert ft.arange(3, requires_grad=True).requires_grad
+    assert ft.eye(3, requires_grad=True).requires_grad
+    assert ft.randn(2, requires_grad=True).requires_grad
+    assert ft.rand(2, requires_grad=True).requires_grad
+    assert ft.arange(0, 1, 0.25).tolist() == [0.0, 0.25, 0.5, 0.75]
+    assert ft.arange(5, 0).shape == (0,)
+    assert ft.linspace(0, 1, 1).tolist() == [0.0]
+    assert ft.linspace(0, 1, 0).shape == (0,)
+    assert ft.rand((2, 3), device=ft.Device("cpu")).shape == (2, 3)
+    assert ft.randn([4], device="cpu").shape == (4,)
+    assert ft.zeros(0, 3).shape == (0, 3) and ft.zeros(0, 3).tolist() == []
+
+
+def test_scalar_and_one_element_tensors():
+    s = ft.tensor(2.0)
+    assert s.ndim == 0 and s.dim() == 0 and s.numel() == 1 and s.size() == ()
+    assert ft.tensor([[2.5]]).item() == 2.5 and float(ft.tensor([4.0])) == 4.0
+    assert (s + 1).tolist() == 3.0
+    assert ft.tensor([]).numel() == 0 and ft.tensor([]).tolist() == []
+
+
+def test_to_and_cpu_on_the_cpu(cpu):
+    x = ft.tensor([1.0, 2.0], requires_grad=True)
+    y = x.to(cpu).cpu().to("cpu")
+    assert y.device == cpu and y.tolist() == [1.0, 2.0]
+    (y * 3).sum().backward()
+    assert x.grad.tolist() == [3.0, 3.0]
+
+
+def test_grad_fn_names_the_producing_op():
+    w = ft.ones(2, requires_grad=True)
+    assert w.grad_fn is None
+    assert isinstance(((w * 2).sum()).grad_fn, str)
+    assert (w * 2).grad_fn and (w + 1).grad_fn and w.exp().grad_fn
+    assert "grad_fn" not in repr(w)
+    assert ft.ones(2).grad_fn is None
+
+
+def test_operators_do_not_modify_their_inputs():
+    a = ft.tensor([1.0, 2.0])
+    b = ft.tensor([3.0, 4.0])
+    _ = a + b, a * b, a - b, a / b, a @ b, a.relu(), a.softmax(), a.reshape(2, 1), a.T, a.clamp(1.5, 1.6)
+    assert a.tolist() == [1.0, 2.0] and b.tolist() == [3.0, 4.0]
+
+
+def test_tensors_are_not_interned_by_equality():
+    a, b = ft.ones(2), ft.ones(2)
+    assert not (a == b)
+    assert a.eq(b).tolist() == [1.0, 1.0]
+    assert len({a, b}) == 2
