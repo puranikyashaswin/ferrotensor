@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// LFM2 short-convolution operator: projection, depthwise conv, projection.
+#[derive(Clone)]
 pub struct Lfm2Conv {
     /// Input projection.
     pub in_proj: Linear,
@@ -82,6 +83,7 @@ impl Lfm2Conv {
 
 /// The token-mixing operator of an LFM2 block.
 #[allow(clippy::large_enum_variant)]
+#[derive(Clone)]
 pub enum Lfm2LayerOp {
     /// Short convolution.
     Conv(Lfm2Conv),
@@ -90,6 +92,10 @@ pub enum Lfm2LayerOp {
 }
 
 /// LFM2 block: `x + op(norm(x))` then `h + mlp(norm(h))`.
+///
+/// Cloning is cheap and shares every tensor (including gradient slots)
+/// with the original.
+#[derive(Clone)]
 pub struct Lfm2Block {
     /// Norm before the operator.
     pub operator_norm: RMSNorm,
@@ -291,6 +297,9 @@ pub struct Lfm2Model {
     embed_host: OnceCell<Vec<f32>>,
     /// Naming family of [`named_params`](Self::named_params).
     architecture: Architecture,
+    /// Recompute each block in backward instead of keeping its activations
+    /// (see [`with_block_checkpointing`](Self::with_block_checkpointing)).
+    checkpoint_blocks: bool,
 }
 
 impl Lfm2Model {
@@ -311,6 +320,7 @@ impl Lfm2Model {
             lm_head,
             embed_host: OnceCell::new(),
             architecture: Architecture::Lfm2,
+            checkpoint_blocks: false,
         }
     }
 
@@ -327,6 +337,67 @@ impl Lfm2Model {
     /// The naming family set by [`with_architecture`](Self::with_architecture).
     pub fn architecture(&self) -> Architecture {
         self.architecture
+    }
+
+    /// Keep only each block's input during training and recompute the block
+    /// in backward (gradient checkpointing per block). The activations kept
+    /// for backward shrink from every block's internals to one tensor per
+    /// block plus the internals of the one block being recomputed; the cost
+    /// is a second forward pass through every block during backward.
+    /// Results are unchanged. Applies to [`forward`](Self::forward) without a
+    /// KV cache and to [`forward_batch`](Self::forward_batch). Off by default.
+    pub fn with_block_checkpointing(mut self, on: bool) -> Self {
+        self.checkpoint_blocks = on;
+        self
+    }
+
+    /// Whether [`with_block_checkpointing`](Self::with_block_checkpointing) is on.
+    pub fn block_checkpointing(&self) -> bool {
+        self.checkpoint_blocks
+    }
+
+    /// Runs `layer` on `x`, checkpointed when enabled and no cache is used.
+    ///
+    /// The replay in backward runs the same block (a clone sharing every
+    /// weight and gradient slot) on the same input, position and mask, and
+    /// attention dropout uses the same seed: `dropout_seed` is a value
+    /// computed once by the caller before the first pass and moved into the
+    /// replay closure, so the replay draws exactly the first pass's masks and
+    /// recomputes exactly what the first pass computed.
+    #[allow(clippy::too_many_arguments)]
+    fn run_block(
+        &self,
+        layer: &Lfm2Block,
+        engine: &ComputeEngine,
+        x: &Tensor,
+        pos: usize,
+        cache: Option<&KVCacheLayer>,
+        mask: Option<&UnifiedTensor>,
+        dropout_seed: Option<u64>,
+    ) -> Tensor {
+        if !self.checkpoint_blocks || cache.is_some() {
+            return layer.forward_with_dropout(engine, x, pos, cache, mask, dropout_seed);
+        }
+        let block = layer.clone();
+        let params = block.params();
+        let mask = mask.cloned();
+        ferrotensor_autograd::checkpoint_with_params(
+            vec![x.clone()],
+            &params,
+            move |inputs, eng| {
+                vec![block.forward_with_dropout(
+                    eng,
+                    &inputs[0],
+                    pos,
+                    None,
+                    mask.as_ref(),
+                    dropout_seed,
+                )]
+            },
+            engine,
+        )
+        .pop()
+        .expect("a checkpointed block returns one tensor")
     }
 
     /// Whether every block is attention, so incremental decoding with a
@@ -400,7 +471,7 @@ impl Lfm2Model {
         for (i, layer) in self.layers.iter().enumerate() {
             let layer_cache = cache.as_ref().map(|c| &c.layers[i]);
             let seed = dropout_seed.map(|s| crate::dropout::layer_seed(s, i));
-            x = layer.forward_with_dropout(engine, &x, pos, layer_cache, mask, seed);
+            x = self.run_block(layer, engine, &x, pos, layer_cache, mask, seed);
         }
 
         // 3. Final Norm & Head
@@ -450,7 +521,7 @@ impl Lfm2Model {
         }
         for (i, layer) in self.layers.iter().enumerate() {
             let seed = dropout_seed.map(|s| crate::dropout::layer_seed(s, i));
-            x = layer.forward_with_dropout(engine, &x, 0, None, None, seed);
+            x = self.run_block(layer, engine, &x, 0, None, None, seed);
         }
         x = self.norm_f.forward(engine, &x);
         self.lm_head.forward(engine, &x)

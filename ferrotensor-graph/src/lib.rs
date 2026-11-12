@@ -230,6 +230,7 @@ impl Embedding {
 }
 
 /// Root-mean-square layer norm over the last dimension.
+#[derive(Clone)]
 pub struct RMSNorm {
     /// Per-feature scale `[hidden]`.
     pub weight: Tensor,
@@ -263,6 +264,7 @@ impl RMSNorm {
 
 /// Causal grouped-query self-attention with RoPE (Llama style), with the
 /// optional per-head query/key norms of Qwen3.
+#[derive(Clone)]
 pub struct Attention {
     /// Query projection `[hidden, n_heads * head_dim]`.
     pub q_proj: Linear,
@@ -461,6 +463,7 @@ impl Attention {
 }
 
 /// SwiGLU feed-forward: `down(silu(gate(x)) * up(x))`.
+#[derive(Clone)]
 pub struct MLP {
     /// Gate projection (passed through SiLU).
     pub gate_proj: Linear,

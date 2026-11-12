@@ -11,12 +11,13 @@
 # lr 5e-4, 20 warmup steps, 8 sequences per step (--batch-size 1
 # --grad-accum 8). Frozen base weights are f16 (the CLI default);
 # --f32-weights keeps them f32.
+# --checkpoint-blocks recomputes each block in backward (less GPU memory).
 # Everything goes under data/ (gitignored); the summary is
 # data/runs/<model>[-<name>]/summary.json. Needs the `hf` CLI
 # (pip install huggingface_hub). Respects WGPU_BACKEND.
 set -euo pipefail
 
-usage() { sed -n '2,16p' "$0"; exit "${1:-0}"; }
+usage() { sed -n '2,17p' "$0"; exit "${1:-0}"; }
 [ $# -ge 1 ] || usage 2
 case "$1" in
   -h|--help) usage 0 ;;
@@ -28,6 +29,7 @@ seq_len=256
 batch_size=1
 grad_accum=8
 f16_weights=1
+checkpoint_blocks=0
 suffix=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -37,6 +39,7 @@ while [ $# -gt 0 ]; do
     --grad-accum) grad_accum="$2"; shift 2 ;;
     --f16-weights) f16_weights=1; shift ;;
     --f32-weights) f16_weights=0; shift ;;
+    --checkpoint-blocks) checkpoint_blocks=1; shift ;;
     --name) suffix="-$2"; shift 2 ;;
     -h|--help) usage 0 ;;
     *) echo "unknown option: $1" >&2; usage 2 ;;
@@ -50,6 +53,8 @@ model_dir="data/models/$name"
 run_dir="data/runs/$name$suffix"
 model_flags=()
 [ "$f16_weights" = 0 ] && model_flags=(--f32-weights)
+train_flags=()
+[ "$checkpoint_blocks" = 1 ] && train_flags=(--checkpoint-blocks)
 mkdir -p "$run_dir" data/alpaca
 
 command -v hf >/dev/null || { echo "needs the hf CLI: pip install huggingface_hub" >&2; exit 1; }
@@ -89,7 +94,7 @@ if [ "$(uname)" = Darwin ]; then time_args=(-l); else time_args=(-v); fi
 
 echo "== train ($steps steps, seq-len $seq_len, batch $batch_size x accum $grad_accum)"
 /usr/bin/time "${time_args[@]}" "$bin" train \
-  --model "$model_dir" ${model_flags[@]+"${model_flags[@]}"} \
+  --model "$model_dir" ${model_flags[@]+"${model_flags[@]}"} ${train_flags[@]+"${train_flags[@]}"} \
   --data data/alpaca/train.jsonl --eval-data data/alpaca/val.jsonl \
   --out "$run_dir" --seq-len "$seq_len" \
   --lr 5e-4 --warmup-steps 20 --batch-size "$batch_size" --grad-accum "$grad_accum" \
