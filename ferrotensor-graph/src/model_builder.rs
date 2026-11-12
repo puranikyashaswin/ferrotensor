@@ -13,7 +13,11 @@
 //!
 //! Base weights are frozen ([`Tensor::frozen`]) unless
 //! [`Lfm2ModelBuilder::with_trainable_base`] is set, so LoRA training skips
-//! their gradients.
+//! their gradients. Frozen linear-layer weights can be stored as f16
+//! ([`Lfm2ModelBuilder::with_f16_weights`]), and those of the decoder blocks
+//! at 4 bits ([`Lfm2ModelBuilder::with_q4_weights`], which changes the
+//! model's outputs). Pre-quantized checkpoints (`<name>.scales` tensors) are
+//! rejected.
 
 use crate::lfm::{Lfm2Block, Lfm2Conv, Lfm2LayerOp, Lfm2Model};
 use crate::{Attention, Linear, LoRAAdapter, RMSNorm, MLP};
@@ -91,12 +95,15 @@ impl Architecture {
 /// Builds an [`Lfm2Model`] from loaded weights.
 pub struct Lfm2ModelBuilder<'a> {
     ctx: Arc<WgpuContext>,
+    // Kept for API compatibility; unused since pre-quantized loading was removed.
+    #[allow(dead_code)]
     engine: Arc<ComputeEngine>,
     weights: &'a WeightsContext,
     config: Lfm2Config,
     lora_config: Option<LoRaConfig>,
     trainable_base: bool,
     f16_weights: bool,
+    q4_weights: bool,
 }
 
 impl<'a> Lfm2ModelBuilder<'a> {
@@ -125,6 +132,7 @@ impl<'a> Lfm2ModelBuilder<'a> {
             lora_config: None,
             trainable_base: false,
             f16_weights: false,
+            q4_weights: false,
         }
     }
 
@@ -143,14 +151,49 @@ impl<'a> Lfm2ModelBuilder<'a> {
         self
     }
 
-    /// Uploads a linear-layer weight, as f16 when
-    /// [`with_f16_weights`](Self::with_f16_weights) applies.
-    fn upload_linear(&self, data: &[f32], shape: &[usize]) -> UnifiedTensor {
-        if self.f16_weights && !self.trainable_base {
+    /// Store the frozen weights of every decoder-block projection
+    /// (`q/k/v/o_proj`, `gate/up/down_proj`, LFM2 `in_proj`/`out_proj` and
+    /// `w1`/`w2`/`w3`) at 4 bits ([`UnifiedTensor::from_f32_as_q4`]: affine
+    /// codes in groups of 64 along the input dimension, with an f16 scale
+    /// and minimum per group, about 4.5 bits per weight). The matmul decodes
+    /// them and computes in f32.
+    ///
+    /// Unlike f16 storage, this changes the model: it computes with the
+    /// decoded weights, which differ from the checkpoint's. `lm_head` is not
+    /// quantised (it follows [`with_f16_weights`](Self::with_f16_weights));
+    /// embeddings, norms and LoRA adapters stay f32. Quantisation runs on
+    /// the host while the model is built.
+    ///
+    /// [`build`](Self::build) fails when this is combined with
+    /// [`with_trainable_base`](Self::with_trainable_base) (4-bit weights
+    /// cannot train) and when a weight cannot be quantised (NaN, infinite or
+    /// beyond the f16 range). Off by default.
+    pub fn with_q4_weights(mut self, q4: bool) -> Self {
+        self.q4_weights = q4;
+        self
+    }
+
+    /// Uploads the linear-layer weight `name`: f32 when the base trains,
+    /// 4-bit when [`with_q4_weights`](Self::with_q4_weights) applies and the
+    /// weight is `quantisable` (a 2-D decoder-block projection), else f16
+    /// when [`with_f16_weights`](Self::with_f16_weights) applies, else f32.
+    fn upload_linear(
+        &self,
+        name: &str,
+        data: &[f32],
+        shape: &[usize],
+        quantisable: bool,
+    ) -> Result<UnifiedTensor> {
+        Ok(if self.trainable_base {
+            UnifiedTensor::new(&self.ctx, data, shape)
+        } else if self.q4_weights && quantisable && shape.len() == 2 {
+            UnifiedTensor::from_f32_as_q4(&self.ctx, data, shape)
+                .map_err(|e| BuildError(format!("{name}: {e}")))?
+        } else if self.f16_weights {
             UnifiedTensor::from_f32_as_f16(&self.ctx, data, shape)
         } else {
             UnifiedTensor::new(&self.ctx, data, shape)
-        }
+        })
     }
 
     /// Let the base weights receive gradients (full or partial fine-tuning).
@@ -178,17 +221,20 @@ impl<'a> Lfm2ModelBuilder<'a> {
             .map_err(|e| BuildError(format!("failed to load weight {name}: {e}")))
     }
 
-    /// Load a tensor from weights, dequantizing if needed
-    fn load_tensor(&self, name: &str) -> Result<Tensor> {
+    /// Fails if `name` is stored pre-quantized (a `<name>.scales` tensor).
+    fn reject_pre_quantized(&self, name: &str) -> Result<()> {
         if self.has(&format!("{name}.scales")) {
-            let ut = self
-                .weights
-                .upload_quantized(name, &self.ctx, &self.engine)
-                .map_err(|e| BuildError(format!("failed to load quantized weight {name}: {e}")))?;
-            Ok(self.wrap(ut))
-        } else {
-            self.load_raw_tensor(&format!("{name}.weight"))
+            return Err(BuildError(format!(
+                "{name} is pre-quantized ({name}.scales found); pre-quantized checkpoints are not supported. Load the f16/f32 checkpoint and use 4-bit base weights (with_q4_weights / --q4-weights) instead"
+            )));
         }
+        Ok(())
+    }
+
+    /// Load `<name>.weight` unchanged.
+    fn load_tensor(&self, name: &str) -> Result<Tensor> {
+        self.reject_pre_quantized(name)?;
+        self.load_raw_tensor(&format!("{name}.weight"))
     }
 
     fn load_raw_tensor(&self, name: &str) -> Result<Tensor> {
@@ -196,15 +242,18 @@ impl<'a> Lfm2ModelBuilder<'a> {
         Ok(self.wrap(UnifiedTensor::new(&self.ctx, &data, &shape)))
     }
 
-    /// Load a PyTorch `[out, in]` weight transposed to `[in, out]`.
+    /// Load a PyTorch `[out, in]` weight transposed to `[in, out]`. Every
+    /// linear weight but `lm_head` may be stored at 4 bits.
     fn load_linear_weight_tensor(&self, prefix: &str) -> Result<Tensor> {
-        let (data, shape) = self.read(&format!("{prefix}.weight"))?;
+        let name = format!("{prefix}.weight");
+        let (data, shape) = self.read(&name)?;
         let (data, shape) = if let [rows, cols] = shape[..] {
             (Self::transpose_2d(&data, rows, cols), vec![cols, rows])
         } else {
             (data, shape)
         };
-        Ok(self.wrap(self.upload_linear(&data, &shape)))
+        let quantisable = prefix != "lm_head";
+        Ok(self.wrap(self.upload_linear(&name, &data, &shape, quantisable)?))
     }
 
     fn maybe_add_lora(&self, linear: Linear, module_name: &str, seed: u64) -> Linear {
@@ -232,11 +281,8 @@ impl<'a> Lfm2ModelBuilder<'a> {
     /// `module_name` is matched against the LoRA target modules; `seed`
     /// keeps adapters of equal shape distinct.
     fn build_linear(&self, prefix: &str, module_name: &str, seed: u64) -> Result<Linear> {
-        let weight = if self.has(&format!("{prefix}.scales")) {
-            self.load_tensor(prefix)?
-        } else {
-            self.load_linear_weight_tensor(prefix)?
-        };
+        self.reject_pre_quantized(prefix)?;
+        let weight = self.load_linear_weight_tensor(prefix)?;
         Ok(self.maybe_add_lora(Linear::new(weight), module_name, seed))
     }
 
@@ -361,6 +407,13 @@ impl<'a> Lfm2ModelBuilder<'a> {
     /// Build the complete model, or explain which weight or setting is
     /// missing or unsupported.
     pub fn build(self) -> Result<Lfm2Model> {
+        if self.q4_weights && self.trainable_base {
+            return Err(BuildError(
+                "4-bit base weights (with_q4_weights / --q4-weights) cannot train: \
+                 use them with LoRA adapters only, or load the base weights without 4-bit storage"
+                    .into(),
+            ));
+        }
         let arch = Architecture::detect(&self.config);
         let n_layers = self.config.num_hidden_layers;
         log::info!("building {arch:?} model with {n_layers} layers");
@@ -393,7 +446,12 @@ impl<'a> Lfm2ModelBuilder<'a> {
                 )));
             };
             let weight = Self::transpose_2d(&data, vocab, hidden);
-            let weight = self.wrap(self.upload_linear(&weight, &[hidden, vocab]));
+            let weight = self.wrap(self.upload_linear(
+                "model.embed_tokens.weight",
+                &weight,
+                &[hidden, vocab],
+                false,
+            )?);
             self.maybe_add_lora(Linear::new(weight), "lm_head", 0)
         };
 
