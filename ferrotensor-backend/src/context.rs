@@ -25,6 +25,11 @@ pub const UPLOAD_RELEASE_BYTES: u64 = 256 << 20;
 /// `queue`, so it runs after the recorded ops, and
 /// [`synchronize`](Self::synchronize) to wait for the GPU.
 ///
+/// After each submission, and whenever it waits for the GPU, the context
+/// drops pooled buffers above the pool's cap that the GPU has finished with
+/// and polls the device without blocking, so wgpu destroys them at once (see
+/// [`BufferPool`] on overflow).
+///
 /// Uploads (creating a tensor from host data, or writing one) go through a
 /// host-side staging buffer that wgpu frees only after a later submission
 /// completes. The context counts uploaded bytes and, every
@@ -111,6 +116,11 @@ impl WgpuContext {
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
         ));
+        pool.set_overflow(crate::pool::pool_overflow_from_env_value(
+            std::env::var(crate::pool::POOL_OVERFLOW_ENV)
+                .ok()
+                .as_deref(),
+        ));
         Self {
             instance,
             adapter,
@@ -182,6 +192,10 @@ impl WgpuContext {
         loop {
             self.device.poll(wgpu::Maintain::Poll);
             if done() {
+                // Callers wait for the last submitted work, so that poll let
+                // wgpu destroy every buffer dropped before it.
+                self.memory().gpu_reclaimed();
+                self.release_idle_buffers();
                 return;
             }
             if polls < 100 {
@@ -196,8 +210,31 @@ impl WgpuContext {
     fn submit(&self, pending: &mut Pending) {
         pending.ops = 0;
         if let Some(encoder) = pending.encoder.take() {
+            let memory = self.memory();
+            let serial = memory.begin_submission();
+            // wgpu maintains the device here: it destroys buffers whose work
+            // has finished and runs the callbacks of finished submissions.
             self.queue.submit(Some(encoder.finish()));
+            let tracker = memory.clone();
+            self.queue
+                .on_submitted_work_done(move || tracker.gpu_completed(serial));
+            self.release_idle_buffers();
         }
+    }
+
+    /// Drops pooled buffers above the cap that the GPU has finished with and,
+    /// if any, polls once without blocking so wgpu destroys them now rather
+    /// than at the next submission.
+    fn release_idle_buffers(&self) {
+        if self.pool.trim() > 0 {
+            self.device.poll(wgpu::Maintain::Poll);
+        }
+    }
+
+    /// Byte counters of this context's tensors: live, peak, idle in the
+    /// pool, and by [`MemoryCategory`](crate::MemoryCategory).
+    pub fn memory(&self) -> &Arc<crate::MemoryTracker> {
+        self.pool.tracker()
     }
 
     /// Adapter name and backend, e.g. `"Apple M2 (Metal)"`.

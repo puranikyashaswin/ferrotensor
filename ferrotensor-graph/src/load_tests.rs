@@ -12,7 +12,7 @@
 
 use crate::lfm::{Lfm2LayerOp, Lfm2Model};
 use crate::model_builder::Lfm2ModelBuilder;
-use ferrotensor_backend::{ComputeEngine, UnifiedTensor, WgpuContext};
+use ferrotensor_backend::{ComputeEngine, DType, UnifiedTensor, WgpuContext};
 use ferrotensor_loader::{ModelLoader, WeightsContext};
 use safetensors::Dtype;
 use std::collections::HashMap;
@@ -108,6 +108,16 @@ fn tensor_bytes(dtype: Dtype, n: usize, seed: u64) -> Vec<u8> {
 /// model whose weights are stored as `dtype`; `lm_head.weight` is written
 /// only when `tied` is false.
 fn write_checkpoint(dir: &Path, dtype: Dtype, tied: bool) {
+    write_checkpoint_with(dir, dtype, tied, |n, seed| tensor_bytes(dtype, n, seed));
+}
+
+/// [`write_checkpoint`] with each tensor's bytes made by `bytes(n, seed)`.
+fn write_checkpoint_with(
+    dir: &Path,
+    dtype: Dtype,
+    tied: bool,
+    bytes: impl Fn(usize, u64) -> Vec<u8>,
+) {
     let config = serde_json::json!({
         "model_type": "llama",
         "hidden_size": HIDDEN,
@@ -157,8 +167,7 @@ fn write_checkpoint(dir: &Path, dtype: Dtype, tied: bool) {
         .enumerate()
         .map(|(i, (name, shape))| {
             let n = shape.iter().product();
-            let bytes = tensor_bytes(dtype, n, i as u64 + 7);
-            (name, shape, bytes)
+            (name, shape, bytes(n, i as u64 + 7))
         })
         .collect();
     let views: HashMap<String, safetensors::tensor::TensorView<'_>> = data
@@ -171,6 +180,15 @@ fn write_checkpoint(dir: &Path, dtype: Dtype, tied: bool) {
         .collect();
     let file = safetensors::tensor::serialize(views, &None).expect("serialize");
     std::fs::write(dir.join("model.safetensors"), file).expect("write weights");
+}
+
+/// Little-endian f32 bytes of `n` finite values in `[-0.5, 0.5)`: 4-bit
+/// storage rejects NaN and infinities.
+fn finite_f32_bytes(n: usize, seed: u64) -> Vec<u8> {
+    random_bits(n, seed)
+        .into_iter()
+        .flat_map(|b| ((b >> 40) as f32 / (1u64 << 24) as f32 - 0.5).to_le_bytes())
+        .collect()
 }
 
 /// The bytes the builder uploaded for a `[rows, cols]` linear weight before
@@ -306,4 +324,55 @@ fn models_assembled_by_hand_still_read_the_table_back_on_first_use() {
     let host_bytes: Vec<u8> = host.iter().flat_map(|v| v.to_ne_bytes()).collect();
     let gpu_table = gpu_bytes(&gpu.ctx, &model.embed_tokens.data);
     assert_bytes_eq("embed_host (read back)", &host_bytes, &gpu_table);
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn q4_load_keeps_the_tied_head_and_host_table_unquantised_without_the_file() {
+    let gpu = gpu();
+    let dir = TempDir::new("q4-tied");
+    write_checkpoint_with(&dir.0, Dtype::F32, true, finite_f32_bytes);
+    let config = ModelLoader::load_config(dir.0.join("config.json")).expect("config");
+    let mut weights = WeightsContext::new();
+    weights.load_model_dir(&dir.0).expect("weights");
+    // Read before the build too: the build then reads pages that were
+    // released after this read, which must fault them in unchanged.
+    let (table, shape) = weights
+        .read_f32_tensor("model.embed_tokens.weight")
+        .expect("read");
+    let model = Lfm2ModelBuilder::new(gpu.ctx.clone(), gpu.engine.clone(), &weights, config)
+        .with_f16_weights(true)
+        .with_q4_weights(true)
+        .build()
+        .expect("build");
+    // Unmapped and deleted, as the CLI drops the checkpoint once the model
+    // is built: nothing below may read the file.
+    drop(weights);
+    std::fs::remove_file(dir.0.join("model.safetensors")).expect("delete weights");
+
+    let table_bytes: Vec<u8> = table.iter().flat_map(|v| v.to_ne_bytes()).collect();
+    assert_eq!(model.embed_tokens.data.dtype, DType::FP32);
+    let gpu_table = gpu_bytes(&gpu.ctx, &model.embed_tokens.data);
+    assert_bytes_eq("embed_tokens (q4)", &gpu_table, &table_bytes);
+    let host = model
+        .host_embeddings()
+        .expect("the builder fills the host table");
+    let host_bytes: Vec<u8> = host.iter().flat_map(|v| v.to_ne_bytes()).collect();
+    assert_bytes_eq("embed_host (q4)", &host_bytes, &table_bytes);
+
+    // The tied head follows the f16 setting, never 4-bit.
+    assert_eq!(model.lm_head.weight.data.dtype, DType::FP16);
+    let want = old_upload_bytes(&table, shape[0], shape[1], true);
+    let got = gpu_bytes(&gpu.ctx, &model.lm_head.weight.data);
+    assert_bytes_eq("lm_head (q4)", &got, &want);
+
+    let Lfm2LayerOp::Attention(attn) = &model.layers[0].op else {
+        panic!("layer 0 is not attention");
+    };
+    assert_eq!(attn.q_proj.weight.data.dtype, DType::Q4);
+
+    let logits = model.forward(&gpu.engine, &[1, 2, 3], 0, None, None);
+    let values = pollster::block_on(logits.data.to_vec(&gpu.ctx));
+    assert!(!values.is_empty() && values.len().is_multiple_of(VOCAB));
+    assert!(values.iter().all(|v| v.is_finite()), "non-finite logits");
 }

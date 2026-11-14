@@ -9,7 +9,7 @@ description = "PyTorch-style tensors, autograd and nn on wgpu (Metal, Vulkan, DX
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT OR Apache-2.0"
-authors = [{ name = "Yashaswin Puranik", email = "puranikyashaswinsharma@gmail.com" }]
+authors = [{ name = "Puranik Yashaswin Sharma", email = "puranikyashaswinsharma@gmail.com" }]
 keywords = ["machine-learning", "deep-learning", "gpu", "autograd", "wgpu"]
 classifiers = [
     "Programming Language :: Rust",

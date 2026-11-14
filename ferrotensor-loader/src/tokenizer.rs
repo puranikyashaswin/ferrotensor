@@ -4,7 +4,6 @@
 
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -25,6 +24,9 @@ pub struct Tokenizer {
     pub hf_tokenizer: Option<Arc<tokenizers::Tokenizer>>,
 }
 
+/// Largest `tokenizer.json` the loader will read (real ones are well under 100 MB).
+const MAX_TOKENIZER_FILE_BYTES: u64 = 256 * 1024 * 1024;
+
 #[derive(Deserialize)]
 struct TokenizerJson {
     model: TokenizerModel,
@@ -37,9 +39,22 @@ struct TokenizerModel {
 
 impl Tokenizer {
     /// Load tokenizer from tokenizer.json
+    ///
+    /// Fails, with a message naming the file, if it is missing, is not a
+    /// regular file, is too large, is not valid, or has an empty vocabulary.
+    /// In the fallback reader (a plain `model.vocab` map) two tokens sharing
+    /// one id are rejected; gaps between ids are fine.
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, String> {
-        if let Ok(hf_tokenizer) = tokenizers::Tokenizer::from_file(path.as_ref()) {
+        let path = path.as_ref();
+        let file = crate::open_regular_file(path, Some(MAX_TOKENIZER_FILE_BYTES))
+            .map_err(|e| format!("Failed to read tokenizer.json: {e}"))?;
+
+        if let Ok(hf_tokenizer) = tokenizers::Tokenizer::from_file(path) {
+            drop(file);
             let vocab = hf_tokenizer.get_vocab(true);
+            if vocab.is_empty() {
+                return Err(format!("{}: tokenizer vocabulary is empty", path.display()));
+            }
             let id_to_token: HashMap<u32, String> =
                 vocab.iter().map(|(k, v)| (*v, k.clone())).collect();
             let bos_token_id = hf_tokenizer
@@ -62,15 +77,26 @@ impl Tokenizer {
             });
         }
 
-        let content = fs::read_to_string(path)
-            .map_err(|e| format!("Failed to read tokenizer.json: {}", e))?;
+        let mut content = String::new();
+        std::io::Read::read_to_string(&mut std::io::BufReader::new(file), &mut content)
+            .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
 
         let parsed: TokenizerJson = serde_json::from_str(&content)
-            .map_err(|e| format!("Failed to parse tokenizer.json: {}", e))?;
+            .map_err(|e| format!("Failed to parse {}: {}", path.display(), e))?;
 
         let vocab = parsed.model.vocab;
-        let id_to_token: HashMap<u32, String> =
-            vocab.iter().map(|(k, v)| (*v, k.clone())).collect();
+        if vocab.is_empty() {
+            return Err(format!("{}: tokenizer vocabulary is empty", path.display()));
+        }
+        let mut id_to_token: HashMap<u32, String> = HashMap::with_capacity(vocab.len());
+        for (token, &id) in &vocab {
+            if id_to_token.insert(id, token.clone()).is_some() {
+                return Err(format!(
+                    "{}: token id {id} is used by more than one token",
+                    path.display()
+                ));
+            }
+        }
 
         // Find special tokens
         let bos_token_id = *vocab

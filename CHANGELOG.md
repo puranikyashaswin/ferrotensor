@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-12
+
 ### Added
 - `benchmarks/baselines/pytorch_lora.py`: the LoRA walkthrough's recipe in PyTorch + PEFT (same split, chat template, response-only loss, truncation, LoRA init, optimizer, schedule, clipping and held-out metric), as a reference point for Ferrotensor's numbers on the same GPU.
 - `scripts/lora-run.sh` takes `--batch-size`, `--grad-accum`, `--f32-weights` and `--name` (a suffix for the run directory), and records them in `summary.json`. `--help`, or an option given where the model belongs, now prints the usage instead of starting a run.
@@ -21,6 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ferrotensor-backend`: uploading tensors no longer keeps a host-side staging copy of every upload until the next GPU submission. `WgpuContext::note_upload` counts uploaded bytes and every 256 MiB (`UPLOAD_RELEASE_BYTES`) waits for the copies so wgpu frees them; `synchronize` now also submits pending uploads. Loading a model held a staging copy of all its weights (6.8 GB for SmolLM2-1.7B in fp32); in the CI test, uploading 768 MiB grew peak memory by 1536 MiB before and is bounded at under 1.6x now.
 - The README, CONTRIBUTING, the GPU testing guide, the architecture notes and the website's benchmarks and LoRA pages describe the NVIDIA results, the software-Vulkan CI job and op fusion; the README no longer says the Python package is missing from PyPI.
 - The LoRA walkthrough, the README and the how-to guide show the 0.6 results on an NVIDIA A10G: SmolLM2-135M with `--batch-size 8` at 0.57 s per step against 1.28 s one sequence at a time, the same held-out loss 1.6521; SmolLM2-1.7B with f16 base weights at held-out loss 1.0640, 2.38 s per step, 11.9 GiB of GPU memory and 5.33 GB of host memory (20.01 GB in 0.5).
+
+### Fixed
+- `ferrotensor` CLI: when the GPU runs out of memory, wgpu panics with "Parent device is lost" and no mention of memory. The CLI now adds a hint after such a panic: lower `--batch-size` (raising `--grad-accum`), shorten `--seq-len`, use `--lite`, keep the default f16 base weights.
 
 ## [0.5.0] - 2026-11-02
 
@@ -126,7 +131,8 @@ First public version.
 - Renamed the project from Rusty to Ferrotensor; crates are now `ferrotensor-*` and the CLI binary is `ferrotensor`.
 - Licensed under MIT OR Apache-2.0 (previously MIT only).
 
-[Unreleased]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.2.1...v0.3.0

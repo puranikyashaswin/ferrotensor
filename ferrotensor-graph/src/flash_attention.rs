@@ -305,6 +305,9 @@ pub struct GroupedQueryAttention {
     scale: f32,
     /// Dropout probability (0.0 = no dropout)
     pub dropout_prob: f32,
+    /// Dropout seed (default 0). The mask is a pure function of the seed,
+    /// so callers that train with dropout should set a new one per step.
+    pub seed: u64,
 }
 
 impl GroupedQueryAttention {
@@ -346,6 +349,7 @@ impl GroupedQueryAttention {
             causal,
             scale,
             dropout_prob,
+            seed: 0,
         }
     }
 
@@ -394,17 +398,11 @@ impl GroupedQueryAttention {
 
         let output = UnifiedTensor::empty(ctx, &[batch_size, seq_q, self.num_heads, self.head_dim]);
 
-        // Use time-based seed for stochastic dropout
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
-
         let opts = AttentionOptions {
             causal: self.causal,
             causal_offset: pos as u32,
             dropout_prob: self.dropout_prob,
-            seed,
+            seed: self.seed,
             ..AttentionOptions::default()
         };
         engine.flash_attention_v2_with(ctx, q, k, v, &output, &opts, mask);

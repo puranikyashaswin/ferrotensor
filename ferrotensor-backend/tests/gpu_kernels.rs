@@ -10,9 +10,10 @@
 //! unreliable on some drivers).
 
 use ferrotensor_backend::{
-    AdamParams, AttentionOptions, ComputeEngine, UnifiedTensor, WgpuContext, MASKED_CE_SKIP,
-    SUM_SQUARES_CHUNK,
+    q4, AdamParams, AttentionOptions, ComputeEngine, DType, MemoryCategory, UnifiedTensor,
+    WgpuContext, MASKED_CE_SKIP, SUM_SQUARES_CHUNK,
 };
+use std::io::Write as _;
 use std::sync::OnceLock;
 
 struct Gpu {
@@ -307,6 +308,134 @@ fn matmul_with_f16_b_matches_cpu() {
             1e-4,
         );
     }
+}
+
+/// Largest `|got - want|`.
+fn max_abs_diff(got: &[f32], want: &[f32]) -> f32 {
+    got.iter()
+        .zip(want)
+        .map(|(g, w)| (g - w).abs())
+        .fold(0.0, f32::max)
+}
+
+/// `w` through the 4-bit round trip on the host, as the `*_q4b` matmuls
+/// see it.
+fn q4_round(w: &[f32], k: usize, n: usize) -> Vec<f32> {
+    q4::dequantize(&q4::quantize(w, k, n).unwrap(), k, n)
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn matmul_with_q4_b_matches_cpu() {
+    // A frozen weight W[k, n] is used twice: forward `y = x W` (mode 0,
+    // `matmul_q4b`) and the input gradient `dx = dy W^T` (mode 1,
+    // `matmul_bt_q4b`, the same tensor). Both are compared with the same
+    // product on the host-dequantised copy of W, never the original W.
+    // k * n off a multiple of 64 exercises the padded last group; shapes
+    // off the 64x64 tile exercise the edges; (2, 64, 3) has one group per
+    // output column.
+    let g = gpu();
+    let (mut fwd_diff, mut bwd_diff, mut quant_err, mut quant_effect) = (0f32, 0f32, 0f32, 0f32);
+    for (seed, &(m, k, n)) in MATMUL_SHAPES
+        .iter()
+        .chain(&[(3, 5, 7), (65, 33, 129), (2, 64, 3)])
+        .enumerate()
+    {
+        let x = rand_vec(m * k, 500 + seed as u64);
+        let w: Vec<f32> = rand_vec(k * n, 600 + seed as u64)
+            .iter()
+            .map(|v| v * 0.1)
+            .collect();
+        let w_q = UnifiedTensor::from_f32_as_q4(&g.ctx, &w, &[k, n]).unwrap();
+        assert_eq!(w_q.dtype, DType::Q4);
+        assert_eq!(w_q.shape, vec![k, n]);
+        assert_eq!(w_q.size_in_bytes(), 4 * q4::packed_words(k, n) as u64);
+        let w_dq = q4_round(&w, k, n);
+        quant_err = quant_err.max(max_abs_diff(&w_dq, &w));
+
+        let y = zeros(&[m, n]);
+        g.engine.matmul_q4b(&g.ctx, &upload(&x, &[m, k]), &w_q, &y);
+        let want = cpu_matmul(&x, &w_dq, m, k, n);
+        let got = read(&y);
+        assert_close(&format!("matmul_q4b {m}x{k}x{n}"), &got, &want, 1e-4, 1e-4);
+        fwd_diff = fwd_diff.max(max_abs_diff(&got, &want));
+        quant_effect = quant_effect.max(max_abs_diff(&got, &cpu_matmul(&x, &w, m, k, n)));
+
+        let dy = rand_vec(m * n, 700 + seed as u64);
+        let dx = zeros(&[m, k]);
+        g.engine
+            .matmul_bt_q4b(&g.ctx, &upload(&dy, &[m, n]), &w_q, &dx);
+        let want = cpu_matmul(&dy, &transpose(&w_dq, k, n), m, n, k);
+        let got = read(&dx);
+        assert_close(
+            &format!("matmul_bt_q4b {m}x{n}x{k}"),
+            &got,
+            &want,
+            1e-4,
+            1e-4,
+        );
+        bwd_diff = bwd_diff.max(max_abs_diff(&got, &want));
+    }
+    let _ = writeln!(
+        std::io::stderr(),
+        "q4 matmul vs host-dequantised f32: forward x W max |diff| {fwd_diff:.3e}, \
+         input gradient dy W^T max |diff| {bwd_diff:.3e} (tolerance 1e-4 + 1e-4 |want|); \
+         weights in [-0.1, 0.1): max |W - dequant(quant(W))| {quant_err:.3e}, \
+         max |x W_q - x W| {quant_effect:.3e} (quantisation effect, not asserted)"
+    );
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn q4_weights_take_four_and_a_half_bits_each() {
+    // 4-bit codes plus one 32-bit scale/min word per 64 weights, counted by
+    // the memory tracker under the current category, apart from f16.
+    let g = gpu();
+    let (k, n) = (2048, 2048);
+    let w = rand_vec(k * n, 800);
+    let before = *g
+        .ctx
+        .memory()
+        .current()
+        .category(MemoryCategory::BaseWeights);
+    let w_q = {
+        let _tag = g.ctx.memory().scope(MemoryCategory::BaseWeights);
+        UnifiedTensor::from_f32_as_q4(&g.ctx, &w, &[k, n]).unwrap()
+    };
+    let bytes = (k * n / 2 + 4 * (k * n / 64)) as u64;
+    assert_eq!(bytes, 2_359_296);
+    assert_eq!(w_q.size_in_bytes(), bytes);
+    assert_eq!(w_q.memory_category(), MemoryCategory::BaseWeights);
+    let after = *g
+        .ctx
+        .memory()
+        .current()
+        .category(MemoryCategory::BaseWeights);
+    assert_eq!(after.allocated_bytes - before.allocated_bytes, bytes);
+    assert_eq!(after.logical_bytes - before.logical_bytes, bytes);
+    assert_eq!(after.q4_bytes - before.q4_bytes, bytes);
+    assert_eq!(after.f16_bytes, before.f16_bytes);
+    drop(w_q);
+    let freed = *g
+        .ctx
+        .memory()
+        .current()
+        .category(MemoryCategory::BaseWeights);
+    assert_eq!(freed.q4_bytes, before.q4_bytes);
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn q4_upload_rejects_non_finite_weights() {
+    let g = gpu();
+    let live = g.ctx.memory().live_bytes();
+    let err =
+        UnifiedTensor::from_f32_as_q4(&g.ctx, &[0.0, f32::NAN, 1.0, 2.0], &[2, 2]).unwrap_err();
+    assert!(
+        matches!(err, q4::Q4Error::NonFinite { row: 0, col: 1, .. }),
+        "{err:?}"
+    );
+    assert_eq!(g.ctx.memory().live_bytes(), live, "nothing was uploaded");
 }
 
 #[test]
@@ -1314,12 +1443,100 @@ fn hash3(x: u32, y: u32, z: u32) -> f32 {
     a.wrapping_add(b).wrapping_add(c) as f32 * 2.328_306_4e-10
 }
 
+/// CPU copy of the WGSL `fmix32` (Murmur3 finalizer).
+fn fmix32(mut h: u32) -> u32 {
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x85eb_ca6b);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0xc2b2_ae35);
+    h ^ (h >> 16)
+}
+
+/// CPU copy of the WGSL `dropout_scale` keep decision.
+fn dropout_keep(prob: f32, seed: u64, bh: u32, q: u32, k: u32) -> bool {
+    let key = fmix32(seed as u32 ^ fmix32((seed >> 32) as u32 ^ 0x9e37_79b9));
+    hash3(bh ^ key, q, k) >= prob
+}
+
+/// The `[seq_q, seq_k]` keep mask the forward kernel draws for `seed`,
+/// read back through the output: zero scores give uniform weights, and
+/// one-hot values (`head_dim == seq_k`) put weight j of row i in out[i, j].
+fn dropout_mask(prob: f32, seed: u64, sq: usize, sk: usize) -> Vec<bool> {
+    let g = gpu();
+    let q = vec![0.0f32; sq * sk];
+    let k = vec![0.0f32; sk * sk];
+    let v: Vec<f32> = (0..sk * sk)
+        .map(|i| if i / sk == i % sk { 1.0 } else { 0.0 })
+        .collect();
+    let out = zeros(&[1, sq, 1, sk]);
+    g.engine.flash_attention_v2(
+        &g.ctx,
+        &upload(&q, &[1, sq, 1, sk]),
+        &upload(&k, &[1, sk, 1, sk]),
+        &upload(&v, &[1, sk, 1, sk]),
+        &out,
+        false,
+        prob,
+        seed,
+        None,
+    );
+    read(&out).iter().map(|&x| x > 0.0).collect()
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn flash_attention_v2_dropout_masks_of_nearby_seeds_are_unrelated() {
+    // Masks used to hash (bh, q, k + seed): seed + 1 gave the mask of seed
+    // shifted by one key, and seeds equal in their low 32 bits gave the same
+    // mask. At p = 0.5 two unrelated masks agree at about half the positions.
+    let (prob, sq, sk) = (0.5f32, 64, 32);
+    let seed = 1000u64;
+    let a = dropout_mask(prob, seed, sq, sk);
+    for (idx, &kept) in a.iter().enumerate() {
+        let want = dropout_keep(prob, seed, 0, (idx / sk) as u32, (idx % sk) as u32);
+        assert_eq!(kept, want, "mask differs from the CPU reference at {idx}");
+    }
+    let kept = a.iter().filter(|&&x| x).count() as f32 / a.len() as f32;
+    assert!((kept - 0.5).abs() < 0.1, "kept fraction {kept}");
+
+    let agree = |pairs: &mut dyn Iterator<Item = (bool, bool)>| {
+        let (mut same, mut n) = (0usize, 0usize);
+        for (x, y) in pairs {
+            same += (x == y) as usize;
+            n += 1;
+        }
+        same as f32 / n as f32
+    };
+    let b = dropout_mask(prob, seed + 1, sq, sk);
+    let shifted = agree(
+        &mut (0..sq)
+            .flat_map(|i| (1..sk).map(move |j| (i, j)))
+            .map(|(i, j)| (a[i * sk + j], b[i * sk + j - 1])),
+    );
+    assert!(
+        (shifted - 0.5).abs() < 0.1,
+        "mask(seed + 1) is a shifted copy of mask(seed): agreement {shifted}"
+    );
+    let same_pos = agree(&mut a.iter().copied().zip(b.iter().copied()));
+    assert!(
+        (same_pos - 0.5).abs() < 0.1,
+        "seed + 1 agreement {same_pos}"
+    );
+    let high = dropout_mask(prob, seed + (1 << 32), sq, sk);
+    let high_agree = agree(&mut a.iter().copied().zip(high.iter().copied()));
+    assert!(
+        (high_agree - 0.5).abs() < 0.1,
+        "high seed bits ignored: agreement {high_agree}"
+    );
+}
+
 #[test]
 #[ignore = "needs a GPU; run with --ignored --test-threads=1"]
 fn flash_attention_v2_mask_and_dropout_forward_backward_match_cpu() {
     let g = gpu();
     let (b, sq, sk, h, hkv, d) = (2, 21, 21, 4, 2, 32);
-    let (prob, seed) = (0.2f32, 77u64);
+    // Both seed halves non-zero, so the kernels must read all 64 bits.
+    let (prob, seed) = (0.2f32, 0x9E37_79B9_0000_004Du64);
     let q = rand_vec(b * sq * h * d, 44);
     let k = rand_vec(b * sk * hkv * d, 45);
     let v = rand_vec(b * sk * hkv * d, 46);
@@ -1348,7 +1565,7 @@ fn flash_attention_v2_mask_and_dropout_forward_backward_match_cpu() {
     );
     let scale = 1.0 / (d as f32).sqrt();
     let keep = |bh: usize, i: usize, j: usize| {
-        if hash3(bh as u32, i as u32, j as u32 + seed as u32) >= prob {
+        if dropout_keep(prob, seed, bh as u32, i as u32, j as u32) {
             1.0 / (1.0 - prob)
         } else {
             0.0

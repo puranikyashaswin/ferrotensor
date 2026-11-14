@@ -1,8 +1,11 @@
 # Website
 
-Source of <https://puranikyashaswin.github.io/ferrotensor/>.
+Source of <https://ferrotensor.dev/>, served by GitHub Pages with ferrotensor.dev as
+the repository's custom domain (Settings > Pages). The old address,
+<https://puranikyashaswin.github.io/ferrotensor/>, redirects there.
 
 - `landing/`: the static landing page (HTML, one CSS file, a little JS). No build step.
+  `landing/guide/` is the how-to guide and `landing/about/` the about page.
 - `book/`: the mdBook guide, served under `/docs/`. Its chapters `{{#include}}`
   the files in `docs/`, `benchmarks/RESULTS.md`, `CHANGELOG.md` and
   `ferrotensor-py/`, so edit those files, not the book. `repolinks.py` rewrites
@@ -24,15 +27,13 @@ Source of <https://puranikyashaswin.github.io/ferrotensor/>.
 
 ```bash
 site/build.sh                     # needs mdbook 0.5.4 and python3
-mkdir -p /tmp/ftsite && ln -sfn "$PWD/site/dist" /tmp/ftsite/ferrotensor
-python3 -m http.server -d /tmp/ftsite 8000   # open http://localhost:8000/ferrotensor/
+python3 -m http.server -d site/dist 8000   # open http://localhost:8000/
 ```
 
 `.github/workflows/pages.yml` builds and deploys the site on pushes to `main`.
 `landing/og.svg` is the source of the social preview image `landing/og.png`.
 
-Crawlers only read `robots.txt` at a host's root, so
-`/ferrotensor/robots.txt` takes effect only with a custom domain (or from the
-`puranikyashaswin.github.io` user-site repository). Submit
-`https://puranikyashaswin.github.io/ferrotensor/sitemap.xml` in Google Search
-Console and Bing Webmaster Tools directly.
+The site is served at the domain root, so `robots.txt` and
+`https://ferrotensor.dev/sitemap.xml` are where crawlers expect them. Add the
+domain in Google Search Console and Bing Webmaster Tools and submit the
+sitemap there.

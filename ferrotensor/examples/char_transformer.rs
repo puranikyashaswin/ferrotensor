@@ -9,6 +9,11 @@
 //! Run with: cargo run --release -p ferrotensor --example char_transformer
 //! Set FERROTENSOR_DEVICE=gpu to run on the GPU (the default is the CPU, which is
 //! faster for a model this small).
+//! Set FERROTENSOR_STEPS=<n> to train for n steps instead of 600 (CI uses this
+//! to keep the run short).
+//!
+//! The example exits with an error unless the loss fell during training and
+//! the cached forward pass matches the full one.
 
 use std::collections::BTreeMap;
 
@@ -23,7 +28,7 @@ const BATCH: usize = 16;
 const DIM: usize = 64;
 const HEADS: usize = 4;
 const LAYERS: usize = 2;
-const STEPS: usize = 600;
+const DEFAULT_STEPS: usize = 600;
 
 /// Pre-norm transformer block: `x + attn(ln(x))`, then `x + mlp(ln(x))`.
 struct Block {
@@ -221,6 +226,15 @@ fn main() {
         vocab.len()
     );
 
+    let steps = match std::env::var("FERROTENSOR_STEPS") {
+        Ok(s) => s
+            .parse::<usize>()
+            .ok()
+            .filter(|&n| n > 0)
+            .expect("FERROTENSOR_STEPS must be a positive integer"),
+        Err(_) => DEFAULT_STEPS,
+    };
+
     let model = CharLm::new(vocab.len(), &device);
     let n_params: usize = model.parameters().iter().map(|p| p.numel()).sum();
     println!("model: {LAYERS} layers, dim {DIM}, {HEADS} heads, {n_params} parameters");
@@ -228,11 +242,13 @@ fn main() {
     let mut opt = optim::AdamW::new(model.parameters(), 3e-3)
         .weight_decay(0.01)
         .clip_grad_norm(1.0);
-    let schedule = WarmupCosineLr::new(3e-3, 3e-4, 30, STEPS);
+    let schedule = WarmupCosineLr::new(3e-3, 3e-4, 30, steps);
     let mut rng = StdRng::seed_from_u64(42);
 
     let start = std::time::Instant::now();
-    for step in 0..STEPS {
+    let mut first_loss = f32::NAN;
+    let mut last_loss = f32::NAN;
+    for step in 0..steps {
         schedule.apply(&mut opt, step);
         let (mut xs, mut ys) = (Vec::new(), Vec::new());
         for _ in 0..BATCH {
@@ -246,20 +262,33 @@ fn main() {
         let loss = F::cross_entropy(&logits.reshape(&[BATCH * CONTEXT, vocab.len()]), &targets);
         loss.backward();
         opt.step();
-        if step % 100 == 0 || step == STEPS - 1 {
-            println!("step {step:>3}  loss {:.3}", loss.item());
+        last_loss = loss.item();
+        if step == 0 {
+            first_loss = last_loss;
+        }
+        if step % 100 == 0 || step == steps - 1 {
+            println!("step {step:>3}  loss {last_loss:.3}");
         }
     }
     println!(
-        "trained {STEPS} steps in {:.1}s",
+        "trained {steps} steps in {:.1}s",
         start.elapsed().as_secs_f32()
+    );
+    // Losses are from single random batches, so compare with a wide margin.
+    assert!(
+        last_loss < 0.8 * first_loss,
+        "the loss did not fall: {first_loss} at step 0, {last_loss} at the end"
     );
 
     let prompt = "Shall I compare";
     let ids: Vec<usize> = prompt.chars().map(|c| vocab[&c]).collect();
+    let cache_error = model.cache_error(&data[..CONTEXT]);
     println!(
-        "KV cache vs full forward on {CONTEXT} characters: max logit difference {:.1e}",
-        model.cache_error(&data[..CONTEXT])
+        "KV cache vs full forward on {CONTEXT} characters: max logit difference {cache_error:.1e}"
+    );
+    assert!(
+        cache_error < 1e-3,
+        "the KV cache changes the logits by {cache_error}"
     );
     let start = std::time::Instant::now();
     let out = model.generate(&ids, 200, 0.8, &mut rng);

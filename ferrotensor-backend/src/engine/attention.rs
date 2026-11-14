@@ -254,6 +254,8 @@ impl ComputeEngine {
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
+        // Dropped at the end of this function, before the dispatches run.
+        ctx.memory().count_dispatch_buffer(stats.size());
         let (b, h, hkv) = (dims.batch, dims.heads, dims.kv_heads);
         self.run(
             ctx,
@@ -366,7 +368,7 @@ impl AttentionDims {
             s[2],
             s[3],
             opts.window,
-            0,
+            (opts.seed >> 32) as u32,
             0,
             0,
         ];
@@ -399,7 +401,7 @@ impl AttentionDims {
             s[2],
             s[3],
             opts.window,
-            0,
+            (opts.seed >> 32) as u32,
             0,
             0,
         ];
@@ -424,7 +426,7 @@ pub struct AttentionOptions {
     pub window: u32,
     /// Attention dropout probability; 0.0 disables dropout.
     pub dropout_prob: f32,
-    /// Seed for the dropout pattern (only the low 32 bits are used).
+    /// Seed for the dropout pattern (all 64 bits are used).
     pub seed: u64,
 }
 

@@ -1,0 +1,1002 @@
+//! Accounting of the GPU memory held by tensors, split by what it is for.
+//!
+//! Every [tensor](crate::UnifiedTensor) buffer is counted while it
+//! is alive, under a [`MemoryCategory`]: the category current on the
+//! context's [`MemoryTracker`] when the tensor was created (see
+//! [`MemoryTracker::scope`]), or the one set later with
+//! [`set_memory_category`](crate::UnifiedTensor::set_memory_category).
+//! Buffers returned to the [`BufferPool`](crate::pool::BufferPool) and kept
+//! for reuse are counted separately as idle pool bytes.
+//!
+//! A buffer Ferrotensor drops is not freed on the GPU at once: wgpu destroys
+//! it only once the work that uses it has finished and the device is
+//! maintained, which wgpu does on every queue submission and device poll.
+//! Recorded work is submitted in numbered batches; dropped buffers (tensors
+//! the pool does not keep, and the uniform and scratch buffers each kernel
+//! dispatch creates) are counted as *awaiting GPU* from the drop until the
+//! batch being recorded at the drop is known to have finished. That is
+//! learned at a later submission or poll, and at the latest when the context
+//! waits for the GPU ([`WgpuContext::synchronize`](crate::WgpuContext::synchronize)
+//! or a read back to the host).
+//!
+//! The current category is one value per tracker, not per thread: tag
+//! from one thread at a time and drop scopes in reverse order (checked in
+//! debug builds).
+//!
+//! The counters are relaxed atomics and always on. The breakdown at the
+//! peak and the list of the largest buffers need a lock per allocation, so
+//! they are only kept after [`MemoryTracker::set_detailed`]`(true)`.
+//!
+//! Sizes are what Ferrotensor asked wgpu for, after wgpu rounds every buffer
+//! up to a multiple of 4 bytes (see [`memory::wgpu_buffer_size`](crate::memory::wgpu_buffer_size)).
+//! The driver and its allocator add their own alignment and block overhead,
+//! and pipelines, bind groups and wgpu's own upload staging copies are not
+//! counted, so the totals are lower than what `nvidia-smi` or Activity
+//! Monitor show.
+
+use crate::DType;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering::Relaxed};
+use std::sync::{Arc, Mutex};
+
+/// What a GPU buffer is used for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum MemoryCategory {
+    /// Frozen model weights (f32, f16 or 4-bit), uploaded when the model is built.
+    BaseWeights = 0,
+    /// Parameters the optimizer updates: LoRA adapters or trainable base weights.
+    Trainable = 1,
+    /// Optimizer state, e.g. the AdamW moments.
+    OptimizerState = 2,
+    /// Forward-pass outputs and intermediates (including those the autograd
+    /// graph keeps for backward).
+    Activations = 3,
+    /// Accumulated gradients of the trainable parameters.
+    Gradients = 4,
+    /// Other buffers made during backward: gradients of activations and
+    /// kernel temporaries.
+    BackwardScratch = 5,
+    /// Vocabulary-sized loss buffers: logits, `d loss / d logits`, per-row losses.
+    Loss = 6,
+    /// Readback buffers that copy results to the host.
+    Staging = 7,
+    /// Anything created outside a tagged scope.
+    Other = 8,
+}
+
+impl MemoryCategory {
+    /// Number of categories.
+    pub const COUNT: usize = 9;
+
+    /// Every category, in report order (the index of each is `c as usize`).
+    pub const ALL: [MemoryCategory; Self::COUNT] = [
+        Self::BaseWeights,
+        Self::Trainable,
+        Self::OptimizerState,
+        Self::Activations,
+        Self::Gradients,
+        Self::BackwardScratch,
+        Self::Loss,
+        Self::Staging,
+        Self::Other,
+    ];
+
+    /// Snake-case name, used as a JSON key.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::BaseWeights => "base_weights",
+            Self::Trainable => "trainable",
+            Self::OptimizerState => "optimizer_state",
+            Self::Activations => "activations",
+            Self::Gradients => "gradients",
+            Self::BackwardScratch => "backward_scratch",
+            Self::Loss => "loss",
+            Self::Staging => "staging",
+            Self::Other => "other",
+        }
+    }
+
+    /// Human-readable label for tables.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::BaseWeights => "base weights (frozen)",
+            Self::Trainable => "trainable parameters",
+            Self::OptimizerState => "optimizer state",
+            Self::Activations => "activations",
+            Self::Gradients => "parameter gradients",
+            Self::BackwardScratch => "backward scratch",
+            Self::Loss => "loss (vocab-sized)",
+            Self::Staging => "readback staging",
+            Self::Other => "other",
+        }
+    }
+
+    fn from_index(i: u8) -> Self {
+        Self::ALL[i as usize]
+    }
+}
+
+/// Bytes wgpu allocates for a buffer of `requested` bytes: rounded up to a
+/// multiple of 4 (`COPY_BUFFER_ALIGNMENT`), and 4 for an empty buffer.
+pub fn wgpu_buffer_size(requested: u64) -> u64 {
+    requested.max(1).next_multiple_of(4)
+}
+
+/// Bytes held by one category.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CategoryBytes {
+    /// Bytes allocated (after wgpu's rounding).
+    pub allocated_bytes: u64,
+    /// Bytes the tensors' shapes and dtypes need.
+    pub logical_bytes: u64,
+    /// Part of `allocated_bytes` in f16 tensors.
+    pub f16_bytes: u64,
+    /// Part of `allocated_bytes` in 4-bit ([`DType::Q4`]) tensors.
+    pub q4_bytes: u64,
+    /// Number of live buffers.
+    pub buffers: u64,
+}
+
+/// One live buffer, as listed in [`MemorySnapshot::largest`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BufferRecord {
+    /// Its category.
+    pub category: MemoryCategory,
+    /// Element type of the tensor.
+    pub dtype: DType,
+    /// Shape of the tensor when it was created.
+    pub shape: Vec<usize>,
+    /// Bytes the shape and dtype need.
+    pub logical_bytes: u64,
+    /// Bytes allocated.
+    pub allocated_bytes: u64,
+    id: u64,
+}
+
+/// Bytes held at one moment.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemorySnapshot {
+    /// Bytes allocated to live tensors (the sum over `categories`).
+    pub live_bytes: u64,
+    /// Bytes the live tensors' shapes and dtypes need.
+    pub logical_bytes: u64,
+    /// Bytes of freed buffers the pool keeps for reuse.
+    pub pool_idle_bytes: u64,
+    /// Bytes of buffers dropped but possibly not yet destroyed by wgpu
+    /// (see the [module docs](self)).
+    pub awaiting_gpu_bytes: u64,
+    /// Per category, indexed by `MemoryCategory as usize`.
+    pub categories: [CategoryBytes; MemoryCategory::COUNT],
+    /// The largest live buffers, largest first (at most
+    /// [`LARGEST_BUFFERS`]); empty unless detailed tracking is on.
+    pub largest: Vec<BufferRecord>,
+}
+
+impl MemorySnapshot {
+    /// Bytes of `category`.
+    pub fn category(&self, category: MemoryCategory) -> &CategoryBytes {
+        &self.categories[category as usize]
+    }
+}
+
+/// How many buffers [`MemorySnapshot::largest`] lists.
+pub const LARGEST_BUFFERS: usize = 10;
+
+#[derive(Default)]
+struct Counters {
+    allocated: AtomicU64,
+    logical: AtomicU64,
+    f16: AtomicU64,
+    q4: AtomicU64,
+    buffers: AtomicU64,
+}
+
+#[derive(Default)]
+struct Registry {
+    next_id: u64,
+    live: HashMap<u64, BufferRecord>,
+    /// The detailed snapshot at the peak, and the last buffer id issued
+    /// when it was taken: a buffer alive now with an id up to that (or with
+    /// no id) was alive then.
+    peak: Option<(u64, MemorySnapshot)>,
+}
+
+/// Live, peak and pooled byte counters of one context's tensors.
+///
+/// Reach it through [`WgpuContext::memory`](crate::WgpuContext::memory).
+pub struct MemoryTracker {
+    current: AtomicU8,
+    categories: [Counters; MemoryCategory::COUNT],
+    live: AtomicU64,
+    peak_live: AtomicU64,
+    pool_idle: AtomicU64,
+    peak_held: AtomicU64,
+    awaiting_gpu: AtomicU64,
+    peak_awaiting_gpu: AtomicU64,
+    peak_total: AtomicU64,
+    /// Bytes counted in `awaiting_gpu` by the submission being recorded
+    /// when they were dropped, oldest first.
+    awaiting_by_submission: Mutex<VecDeque<(u64, u64)>>,
+    /// Number of the submission being recorded (the first is 1).
+    recording: AtomicU64,
+    /// Highest submission known to have finished on the GPU.
+    completed: AtomicU64,
+    detailed: AtomicBool,
+    registry: Mutex<Registry>,
+}
+
+impl Default for MemoryTracker {
+    fn default() -> Self {
+        Self {
+            current: AtomicU8::new(MemoryCategory::Other as u8),
+            categories: Default::default(),
+            live: AtomicU64::new(0),
+            peak_live: AtomicU64::new(0),
+            pool_idle: AtomicU64::new(0),
+            peak_held: AtomicU64::new(0),
+            awaiting_gpu: AtomicU64::new(0),
+            peak_awaiting_gpu: AtomicU64::new(0),
+            peak_total: AtomicU64::new(0),
+            awaiting_by_submission: Mutex::new(VecDeque::new()),
+            recording: AtomicU64::new(1),
+            completed: AtomicU64::new(0),
+            detailed: AtomicBool::new(false),
+            registry: Mutex::new(Registry::default()),
+        }
+    }
+}
+
+impl std::fmt::Debug for MemoryTracker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoryTracker")
+            .field("live_bytes", &self.live_bytes())
+            .field("peak_live_bytes", &self.peak_live_bytes())
+            .field("pool_idle_bytes", &self.pool_idle_bytes())
+            .field("awaiting_gpu_bytes", &self.awaiting_gpu_bytes())
+            .finish()
+    }
+}
+
+/// Restores the previous category when dropped; see [`MemoryTracker::scope`].
+#[must_use = "the category applies only while the guard is alive"]
+pub struct MemoryScope<'a> {
+    tracker: &'a MemoryTracker,
+    previous: u8,
+    set: u8,
+}
+
+impl Drop for MemoryScope<'_> {
+    fn drop(&mut self) {
+        let current = self.tracker.current.swap(self.previous, Relaxed);
+        debug_assert!(
+            current == self.set || std::thread::panicking(),
+            "memory scopes must be dropped in reverse order, from one thread"
+        );
+    }
+}
+
+/// A counted buffer; releases its bytes when dropped.
+pub(crate) struct Allocation {
+    tracker: Arc<MemoryTracker>,
+    id: u64,
+    category: AtomicU8,
+    dtype: DType,
+    logical: u64,
+    allocated: u64,
+    /// Count the bytes as awaiting GPU once released (the buffer is
+    /// dropped rather than kept by the pool).
+    awaits_gpu: bool,
+}
+
+impl std::fmt::Debug for Allocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Allocation")
+            .field("category", &self.category())
+            .field("allocated", &self.allocated)
+            .finish()
+    }
+}
+
+impl Allocation {
+    pub(crate) fn category(&self) -> MemoryCategory {
+        MemoryCategory::from_index(self.category.load(Relaxed))
+    }
+
+    pub(crate) fn set_category(&self, category: MemoryCategory) {
+        self.tracker.retag(self, category);
+    }
+}
+
+impl Drop for Allocation {
+    fn drop(&mut self) {
+        self.tracker.release(self);
+    }
+}
+
+impl MemoryTracker {
+    /// A tracker with all counters at zero.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Tag tensors created until the guard drops with `category`.
+    ///
+    /// Single-threaded use only: the category is one value per tracker,
+    /// shared by every thread, so tag from one thread at a time and drop
+    /// nested scopes in reverse order (debug builds assert this).
+    pub fn scope(&self, category: MemoryCategory) -> MemoryScope<'_> {
+        let previous = self.current.swap(category as u8, Relaxed);
+        MemoryScope {
+            tracker: self,
+            previous,
+            set: category as u8,
+        }
+    }
+
+    /// The category new tensors get.
+    pub fn category(&self) -> MemoryCategory {
+        MemoryCategory::from_index(self.current.load(Relaxed))
+    }
+
+    /// Keep the per-category breakdown at the peak and the largest live
+    /// buffers (costs a lock per allocation). Buffers created while this
+    /// was off are counted but not listed in
+    /// [`largest`](MemorySnapshot::largest).
+    pub fn set_detailed(&self, on: bool) {
+        self.detailed.store(on, Relaxed);
+        if on {
+            self.reset_peak();
+        }
+    }
+
+    /// Whether detailed tracking is on.
+    pub fn is_detailed(&self) -> bool {
+        self.detailed.load(Relaxed)
+    }
+
+    /// Bytes allocated to live tensors.
+    pub fn live_bytes(&self) -> u64 {
+        self.live.load(Relaxed)
+    }
+
+    /// Highest [`live_bytes`](Self::live_bytes) since the last
+    /// [`reset_peak`](Self::reset_peak).
+    pub fn peak_live_bytes(&self) -> u64 {
+        self.peak_live.load(Relaxed)
+    }
+
+    /// Bytes of freed buffers the pool keeps for reuse.
+    pub fn pool_idle_bytes(&self) -> u64 {
+        self.pool_idle.load(Relaxed)
+    }
+
+    /// Highest live plus idle pool bytes since the last
+    /// [`reset_peak`](Self::reset_peak).
+    pub fn peak_held_bytes(&self) -> u64 {
+        self.peak_held.load(Relaxed)
+    }
+
+    /// Bytes of buffers dropped while recording work not yet known to have
+    /// finished on the GPU; wgpu may not have destroyed them yet (see the
+    /// [module docs](self)).
+    pub fn awaiting_gpu_bytes(&self) -> u64 {
+        self.awaiting_gpu.load(Relaxed)
+    }
+
+    /// Highest [`awaiting_gpu_bytes`](Self::awaiting_gpu_bytes) since the
+    /// last [`reset_peak`](Self::reset_peak).
+    pub fn peak_awaiting_gpu_bytes(&self) -> u64 {
+        self.peak_awaiting_gpu.load(Relaxed)
+    }
+
+    /// Highest live plus idle pool plus awaiting-GPU bytes since the last
+    /// [`reset_peak`](Self::reset_peak).
+    pub fn peak_total_bytes(&self) -> u64 {
+        self.peak_total.load(Relaxed)
+    }
+
+    /// Start a new peak from the current state.
+    pub fn reset_peak(&self) {
+        let live = self.live_bytes();
+        let held = live + self.pool_idle_bytes();
+        let awaiting = self.awaiting_gpu_bytes();
+        self.peak_live.store(live, Relaxed);
+        self.peak_held.store(held, Relaxed);
+        self.peak_awaiting_gpu.store(awaiting, Relaxed);
+        self.peak_total.store(held + awaiting, Relaxed);
+        if self.is_detailed() {
+            let mut reg = self.registry.lock().unwrap();
+            let snap = self.snapshot(&reg);
+            reg.peak = Some((reg.next_id, snap));
+        }
+    }
+
+    /// The bytes held now (with the largest buffers when detailed).
+    pub fn current(&self) -> MemorySnapshot {
+        if self.is_detailed() {
+            let reg = self.registry.lock().unwrap();
+            self.snapshot(&reg)
+        } else {
+            self.snapshot(&Registry::default())
+        }
+    }
+
+    /// The bytes held when [`peak_live_bytes`](Self::peak_live_bytes) was
+    /// reached, if detailed tracking was on since the last reset.
+    pub fn peak(&self) -> Option<MemorySnapshot> {
+        let reg = self.registry.lock().unwrap();
+        reg.peak.as_ref().map(|(_, s)| s.clone())
+    }
+
+    fn snapshot(&self, reg: &Registry) -> MemorySnapshot {
+        let mut snap = MemorySnapshot {
+            pool_idle_bytes: self.pool_idle_bytes(),
+            awaiting_gpu_bytes: self.awaiting_gpu_bytes(),
+            ..MemorySnapshot::default()
+        };
+        for (out, c) in snap.categories.iter_mut().zip(&self.categories) {
+            *out = CategoryBytes {
+                allocated_bytes: c.allocated.load(Relaxed),
+                logical_bytes: c.logical.load(Relaxed),
+                f16_bytes: c.f16.load(Relaxed),
+                q4_bytes: c.q4.load(Relaxed),
+                buffers: c.buffers.load(Relaxed),
+            };
+            snap.live_bytes += out.allocated_bytes;
+            snap.logical_bytes += out.logical_bytes;
+        }
+        let mut largest: Vec<&BufferRecord> = Vec::with_capacity(LARGEST_BUFFERS + 1);
+        for rec in reg.live.values() {
+            let pos = largest.partition_point(|r| {
+                (r.allocated_bytes, std::cmp::Reverse(r.id))
+                    >= (rec.allocated_bytes, std::cmp::Reverse(rec.id))
+            });
+            if pos < LARGEST_BUFFERS {
+                largest.insert(pos, rec);
+                largest.truncate(LARGEST_BUFFERS);
+            }
+        }
+        snap.largest = largest.into_iter().cloned().collect();
+        snap
+    }
+
+    fn adjust(&self, category: u8, dtype: DType, logical: u64, allocated: u64, add: bool) {
+        let c = &self.categories[category as usize];
+        let op = |a: &AtomicU64, v: u64| {
+            if add {
+                a.fetch_add(v, Relaxed);
+            } else {
+                a.fetch_sub(v, Relaxed);
+            }
+        };
+        op(&c.allocated, allocated);
+        op(&c.logical, logical);
+        match dtype {
+            DType::FP16 => op(&c.f16, allocated),
+            DType::Q4 => op(&c.q4, allocated),
+            DType::FP32 => {}
+        }
+        op(&c.buffers, 1);
+    }
+
+    /// Raise the held and total peaks to the current counters.
+    fn note_peaks(&self, live: u64) {
+        let held = live + self.pool_idle_bytes();
+        self.peak_held.fetch_max(held, Relaxed);
+        self.peak_total
+            .fetch_max(held + self.awaiting_gpu_bytes(), Relaxed);
+    }
+
+    /// Count a new buffer of `requested` bytes (before wgpu's rounding)
+    /// holding a tensor of `shape` and `dtype` that needs `logical` bytes.
+    /// If `awaits_gpu`, its bytes move to awaiting GPU when it is released.
+    pub(crate) fn allocate(
+        self: &Arc<Self>,
+        dtype: DType,
+        shape: &[usize],
+        logical: u64,
+        requested: u64,
+        awaits_gpu: bool,
+    ) -> Allocation {
+        let category = self.current.load(Relaxed);
+        self.allocate_in(category, dtype, shape, logical, requested, awaits_gpu)
+    }
+
+    fn allocate_in(
+        self: &Arc<Self>,
+        category: u8,
+        dtype: DType,
+        shape: &[usize],
+        logical: u64,
+        requested: u64,
+        awaits_gpu: bool,
+    ) -> Allocation {
+        let allocated = wgpu_buffer_size(requested);
+        self.adjust(category, dtype, logical, allocated, true);
+        let live = self.live.fetch_add(allocated, Relaxed) + allocated;
+        self.note_peaks(live);
+        let previous_peak = self.peak_live.fetch_max(live, Relaxed);
+        let mut id = 0;
+        if self.is_detailed() {
+            let mut reg = self.registry.lock().unwrap();
+            reg.next_id += 1;
+            id = reg.next_id;
+            reg.live.insert(
+                id,
+                BufferRecord {
+                    category: MemoryCategory::from_index(category),
+                    dtype,
+                    shape: shape.to_vec(),
+                    logical_bytes: logical,
+                    allocated_bytes: allocated,
+                    id,
+                },
+            );
+            if live > previous_peak || reg.peak.is_none() {
+                let snap = self.snapshot(&reg);
+                reg.peak = Some((id, snap));
+            }
+        }
+        Allocation {
+            tracker: self.clone(),
+            id,
+            category: AtomicU8::new(category),
+            dtype,
+            logical,
+            allocated,
+            awaits_gpu,
+        }
+    }
+
+    /// Count a buffer of `requested` bytes that is not a tensor (e.g. a
+    /// readback copy) under `category` until the returned value drops, and
+    /// then as awaiting GPU until the context next waits for the GPU.
+    pub(crate) fn allocate_raw(
+        self: &Arc<Self>,
+        category: MemoryCategory,
+        requested: u64,
+    ) -> Allocation {
+        self.allocate_in(
+            category as u8,
+            DType::FP32,
+            &[requested as usize],
+            requested,
+            requested,
+            true,
+        )
+    }
+
+    /// Count a buffer of `requested` bytes that is dropped as soon as the
+    /// work using it is recorded: a kernel's uniform or scratch buffer, or
+    /// an upload read by one dispatch. wgpu can destroy it only after that
+    /// work has run, so it is counted as awaiting GPU from now until the
+    /// context next waits for the GPU.
+    pub fn count_dispatch_buffer(&self, requested: u64) {
+        self.gpu_dropped(requested);
+    }
+
+    /// A buffer of `requested` bytes was dropped; wgpu destroys it once the
+    /// work using it has finished and the device is polled. Counted against
+    /// the submission being recorded now.
+    pub(crate) fn gpu_dropped(&self, requested: u64) {
+        let size = wgpu_buffer_size(requested);
+        {
+            let mut by_submission = self.awaiting_by_submission.lock().unwrap();
+            let serial = self.recording.load(Relaxed);
+            match by_submission.back_mut() {
+                Some((s, bytes)) if *s == serial => *bytes += size,
+                _ => by_submission.push_back((serial, size)),
+            }
+            let awaiting = self.awaiting_gpu.fetch_add(size, Relaxed) + size;
+            self.peak_awaiting_gpu.fetch_max(awaiting, Relaxed);
+        }
+        self.note_peaks(self.live_bytes());
+    }
+
+    /// Number of the submission being recorded.
+    pub(crate) fn recording_serial(&self) -> u64 {
+        self.recording.load(Relaxed)
+    }
+
+    /// Highest submission known to have finished on the GPU.
+    pub(crate) fn completed_serial(&self) -> u64 {
+        self.completed.load(Relaxed)
+    }
+
+    /// The submission being recorded is about to be submitted: returns its
+    /// number; buffers dropped from now on count against the next one.
+    pub(crate) fn begin_submission(&self) -> u64 {
+        let _by_submission = self.awaiting_by_submission.lock().unwrap();
+        self.recording.fetch_add(1, Relaxed)
+    }
+
+    /// Submission `serial` (and every one before it) finished on the GPU,
+    /// and the device was maintained, so wgpu has destroyed the buffers
+    /// dropped while it was being recorded.
+    pub(crate) fn gpu_completed(&self, serial: u64) {
+        let mut by_submission = self.awaiting_by_submission.lock().unwrap();
+        self.completed.fetch_max(serial, Relaxed);
+        while let Some(&(s, bytes)) = by_submission.front() {
+            if s > serial {
+                break;
+            }
+            by_submission.pop_front();
+            self.awaiting_gpu.fetch_sub(bytes, Relaxed);
+        }
+    }
+
+    /// The context submitted all recorded work, waited for it and polled
+    /// the device, so wgpu has destroyed the buffers dropped before.
+    pub(crate) fn gpu_reclaimed(&self) {
+        let mut by_submission = self.awaiting_by_submission.lock().unwrap();
+        by_submission.clear();
+        self.awaiting_gpu.store(0, Relaxed);
+        // Everything recorded so far was submitted and has finished, so
+        // close the current batch number: buffers returned under it are
+        // free, and buffers dropped from now on count against the next.
+        let finished = self.recording.fetch_add(1, Relaxed);
+        self.completed.fetch_max(finished, Relaxed);
+    }
+
+    fn release(&self, a: &Allocation) {
+        self.adjust(
+            a.category.load(Relaxed),
+            a.dtype,
+            a.logical,
+            a.allocated,
+            false,
+        );
+        self.live.fetch_sub(a.allocated, Relaxed);
+        if a.id != 0 {
+            self.registry.lock().unwrap().live.remove(&a.id);
+        }
+        if a.awaits_gpu {
+            self.gpu_dropped(a.allocated);
+        }
+    }
+
+    fn retag(&self, a: &Allocation, category: MemoryCategory) {
+        let old = a.category.swap(category as u8, Relaxed);
+        if old == category as u8 {
+            return;
+        }
+        self.adjust(old, a.dtype, a.logical, a.allocated, false);
+        self.adjust(category as u8, a.dtype, a.logical, a.allocated, true);
+        if a.id == 0 && !self.is_detailed() {
+            return;
+        }
+        let mut reg = self.registry.lock().unwrap();
+        if let Some(rec) = reg.live.get_mut(&a.id) {
+            rec.category = category;
+        }
+        // The buffer is alive now; if it already existed when the peak was
+        // taken, it was alive then too, so move it in the peak breakdown.
+        if let Some((last_id, snap)) = reg.peak.as_mut() {
+            if a.id <= *last_id {
+                let from = &mut snap.categories[old as usize];
+                from.allocated_bytes -= a.allocated;
+                from.logical_bytes -= a.logical;
+                from.buffers -= 1;
+                match a.dtype {
+                    DType::FP16 => from.f16_bytes -= a.allocated,
+                    DType::Q4 => from.q4_bytes -= a.allocated,
+                    DType::FP32 => {}
+                }
+                let to = &mut snap.categories[category as usize];
+                to.allocated_bytes += a.allocated;
+                to.logical_bytes += a.logical;
+                to.buffers += 1;
+                match a.dtype {
+                    DType::FP16 => to.f16_bytes += a.allocated,
+                    DType::Q4 => to.q4_bytes += a.allocated,
+                    DType::FP32 => {}
+                }
+                if a.id != 0 {
+                    for rec in snap.largest.iter_mut().filter(|r| r.id == a.id) {
+                        rec.category = category;
+                    }
+                }
+            }
+        }
+    }
+
+    /// A pooled buffer of `requested` bytes was handed out again.
+    pub(crate) fn pool_take(&self, requested: u64) {
+        self.pool_idle
+            .fetch_sub(wgpu_buffer_size(requested), Relaxed);
+    }
+
+    /// A buffer of `requested` bytes was kept in the pool for reuse.
+    pub(crate) fn pool_put(&self, requested: u64) {
+        self.pool_idle
+            .fetch_add(wgpu_buffer_size(requested), Relaxed);
+        self.note_peaks(self.live_bytes());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tracker() -> Arc<MemoryTracker> {
+        Arc::new(MemoryTracker::new())
+    }
+
+    fn sum(s: &MemorySnapshot) -> u64 {
+        s.categories.iter().map(|c| c.allocated_bytes).sum()
+    }
+
+    #[test]
+    fn wgpu_rounds_to_four_bytes() {
+        assert_eq!(wgpu_buffer_size(0), 4);
+        assert_eq!(wgpu_buffer_size(1), 4);
+        assert_eq!(wgpu_buffer_size(4), 4);
+        assert_eq!(wgpu_buffer_size(6), 8);
+        assert_eq!(wgpu_buffer_size(4096), 4096);
+    }
+
+    #[test]
+    fn allocate_and_release_update_live_and_peak() {
+        let t = tracker();
+        let a = t.allocate(DType::FP32, &[4], 16, 16, false);
+        let b = t.allocate(DType::FP16, &[3], 6, 6, false);
+        assert_eq!(t.live_bytes(), 16 + 8);
+        assert_eq!(t.peak_live_bytes(), 24);
+        drop(a);
+        assert_eq!(t.live_bytes(), 8);
+        assert_eq!(t.peak_live_bytes(), 24);
+        assert!(t.peak_live_bytes() >= t.live_bytes());
+        let snap = t.current();
+        assert_eq!(snap.logical_bytes, 6);
+        assert_eq!(snap.category(MemoryCategory::Other).f16_bytes, 8);
+        drop(b);
+        assert_eq!(t.live_bytes(), 0);
+        assert_eq!(t.current(), MemorySnapshot::default());
+    }
+
+    #[test]
+    fn pool_reuse_moves_bytes_between_live_and_idle() {
+        let t = tracker();
+        let a = t.allocate(DType::FP32, &[256], 1024, 1024, false);
+        // A tensor drop releases the allocation, then the pool keeps it.
+        drop(a);
+        t.pool_put(1024);
+        assert_eq!((t.live_bytes(), t.pool_idle_bytes()), (0, 1024));
+        assert_eq!(t.peak_held_bytes(), 1024);
+        // Reuse: taken from the pool, counted live again.
+        t.pool_take(1024);
+        let b = t.allocate(DType::FP32, &[256], 1024, 1024, false);
+        assert_eq!((t.live_bytes(), t.pool_idle_bytes()), (1024, 0));
+        assert_eq!(t.peak_held_bytes(), 1024, "reuse holds no extra bytes");
+        drop(b);
+    }
+
+    #[test]
+    fn scopes_tag_and_categories_sum_to_live() {
+        let t = tracker();
+        t.set_detailed(true);
+        let w = {
+            let _s = t.scope(MemoryCategory::BaseWeights);
+            let w = t.allocate(DType::FP16, &[10], 20, 20, false);
+            {
+                let _inner = t.scope(MemoryCategory::Trainable);
+                assert_eq!(t.category(), MemoryCategory::Trainable);
+            }
+            assert_eq!(t.category(), MemoryCategory::BaseWeights);
+            w
+        };
+        assert_eq!(t.category(), MemoryCategory::Other);
+        let act = {
+            let _s = t.scope(MemoryCategory::Activations);
+            t.allocate(DType::FP32, &[100], 400, 400, false)
+        };
+        let snap = t.current();
+        assert_eq!(
+            snap.category(MemoryCategory::BaseWeights).allocated_bytes,
+            20
+        );
+        assert_eq!(snap.category(MemoryCategory::BaseWeights).f16_bytes, 20);
+        assert_eq!(
+            snap.category(MemoryCategory::Activations).allocated_bytes,
+            400
+        );
+        assert_eq!(sum(&snap), snap.live_bytes);
+        assert_eq!(snap.live_bytes, t.live_bytes());
+        assert_eq!(snap.largest.len(), 2);
+        assert_eq!(snap.largest[0].allocated_bytes, 400);
+        drop((w, act));
+    }
+
+    #[test]
+    fn four_bit_weights_are_counted_apart_and_follow_retags() {
+        let t = tracker();
+        t.set_detailed(true);
+        let (h, q) = {
+            let _s = t.scope(MemoryCategory::BaseWeights);
+            let h = t.allocate(DType::FP16, &[10], 20, 20, false);
+            // A [64, 2] Q4 weight: 16 code words and 2 scale words.
+            let q = t.allocate(DType::Q4, &[64, 2], 72, 72, false);
+            (h, q)
+        };
+        let base = *t.current().category(MemoryCategory::BaseWeights);
+        assert_eq!(base.allocated_bytes, 92);
+        assert_eq!(base.logical_bytes, 92);
+        assert_eq!(base.f16_bytes, 20);
+        assert_eq!(base.q4_bytes, 72);
+        assert_eq!(base.buffers, 2);
+
+        q.set_category(MemoryCategory::Other);
+        let snap = t.current();
+        assert_eq!(snap.category(MemoryCategory::BaseWeights).q4_bytes, 0);
+        assert_eq!(snap.category(MemoryCategory::Other).q4_bytes, 72);
+        let peak = t.peak().unwrap();
+        assert_eq!(peak.category(MemoryCategory::BaseWeights).q4_bytes, 0);
+        assert_eq!(peak.category(MemoryCategory::Other).q4_bytes, 72);
+
+        drop((h, q));
+        let snap = t.current();
+        assert_eq!(snap.category(MemoryCategory::Other).q4_bytes, 0);
+        assert_eq!(snap.live_bytes, 0);
+    }
+
+    #[test]
+    fn peak_snapshot_is_kept_and_follows_retags() {
+        let t = tracker();
+        t.set_detailed(true);
+        let logits = t.allocate(DType::FP32, &[2, 8], 64, 64, false);
+        let tmp = t.allocate(DType::FP32, &[32], 128, 128, false);
+        drop(tmp);
+        let peak = t.peak().expect("peak");
+        assert_eq!(peak.live_bytes, 192);
+        assert_eq!(sum(&peak), 192);
+        assert!(t.peak_live_bytes() >= t.live_bytes());
+
+        logits.set_category(MemoryCategory::Loss);
+        let peak = t.peak().expect("peak");
+        assert_eq!(peak.category(MemoryCategory::Loss).allocated_bytes, 64);
+        assert_eq!(peak.category(MemoryCategory::Other).allocated_bytes, 128);
+        assert_eq!(sum(&peak), peak.live_bytes);
+        assert_eq!(
+            peak.largest
+                .iter()
+                .find(|r| r.allocated_bytes == 64)
+                .map(|r| r.category),
+            Some(MemoryCategory::Loss)
+        );
+
+        // A new peak window starts from what is live now.
+        t.reset_peak();
+        assert_eq!(t.peak_live_bytes(), 64);
+        assert_eq!(t.peak().expect("peak").live_bytes, 64);
+        drop(logits);
+        assert_eq!(t.live_bytes(), 0);
+    }
+
+    #[test]
+    fn largest_buffers_are_capped_and_ordered() {
+        let t = tracker();
+        t.set_detailed(true);
+        let held: Vec<_> = (1..=15u64)
+            .map(|i| t.allocate(DType::FP32, &[i as usize], i * 4, i * 4, false))
+            .collect();
+        let snap = t.current();
+        assert_eq!(snap.largest.len(), LARGEST_BUFFERS);
+        assert_eq!(snap.largest[0].allocated_bytes, 60);
+        assert!(snap
+            .largest
+            .windows(2)
+            .all(|w| w[0].allocated_bytes >= w[1].allocated_bytes));
+        drop(held);
+        assert!(t.current().largest.is_empty());
+    }
+
+    #[test]
+    fn dropped_buffers_await_the_gpu_until_reclaimed() {
+        let t = tracker();
+        t.set_detailed(true);
+        // Dropped outside the pool: counted until the context next waits.
+        let a = t.allocate(DType::FP32, &[256], 1024, 1024, true);
+        drop(a);
+        assert_eq!((t.live_bytes(), t.awaiting_gpu_bytes()), (0, 1024));
+        // Per-dispatch buffers and readback copies are counted the same way.
+        t.count_dispatch_buffer(6);
+        let staging = t.allocate_raw(MemoryCategory::Staging, 64);
+        assert_eq!(
+            t.current()
+                .category(MemoryCategory::Staging)
+                .allocated_bytes,
+            64
+        );
+        assert_eq!(t.awaiting_gpu_bytes(), 1024 + 8);
+        drop(staging);
+        assert_eq!(t.awaiting_gpu_bytes(), 1024 + 8 + 64);
+        assert_eq!(t.current().awaiting_gpu_bytes, 1024 + 8 + 64);
+        assert_eq!(t.peak_awaiting_gpu_bytes(), 1024 + 8 + 64);
+        assert_eq!(t.peak_total_bytes(), 1024 + 8 + 64);
+        // A kept buffer moves to the pool instead.
+        let b = t.allocate(DType::FP32, &[4], 16, 16, false);
+        drop(b);
+        t.pool_put(16);
+        assert_eq!(t.awaiting_gpu_bytes(), 1024 + 8 + 64);
+        assert_eq!(t.peak_total_bytes(), 1024 + 8 + 64 + 16);
+        assert_eq!(t.peak_held_bytes(), 1024, "a was live once");
+
+        t.gpu_reclaimed();
+        assert_eq!(t.awaiting_gpu_bytes(), 0);
+        assert_eq!(t.peak_awaiting_gpu_bytes(), 1024 + 8 + 64, "peak kept");
+        t.reset_peak();
+        assert_eq!(t.peak_awaiting_gpu_bytes(), 0);
+        assert_eq!(t.peak_total_bytes(), 16);
+        let snap = t.current();
+        assert_eq!(sum(&snap), snap.live_bytes);
+    }
+
+    #[test]
+    fn awaiting_gpu_drops_as_submissions_finish() {
+        let t = tracker();
+        // Submission 1: two buffers and a dispatch's uniform dropped.
+        let a = t.allocate(DType::FP32, &[256], 1024, 1024, true);
+        let b = t.allocate(DType::FP32, &[128], 512, 512, true);
+        drop((a, b));
+        t.count_dispatch_buffer(16);
+        assert_eq!(t.begin_submission(), 1);
+        // Submission 2 is being recorded.
+        t.count_dispatch_buffer(16);
+        let c = t.allocate(DType::FP32, &[64], 256, 256, true);
+        drop(c);
+        assert_eq!(t.awaiting_gpu_bytes(), 1024 + 512 + 16 + 16 + 256);
+        assert_eq!(t.begin_submission(), 2);
+        assert_eq!(t.recording_serial(), 3);
+
+        // Only what was dropped while recording unfinished work is counted.
+        t.gpu_completed(1);
+        assert_eq!(t.completed_serial(), 1);
+        assert_eq!(t.awaiting_gpu_bytes(), 16 + 256);
+        // Callbacks may run late or twice; the counter never goes below zero.
+        t.gpu_completed(1);
+        assert_eq!(t.awaiting_gpu_bytes(), 16 + 256);
+        t.count_dispatch_buffer(8);
+        t.gpu_completed(2);
+        assert_eq!(t.awaiting_gpu_bytes(), 8, "submission 3 still recording");
+        assert_eq!(t.peak_awaiting_gpu_bytes(), 1024 + 512 + 16 + 16 + 256);
+
+        // Waiting for the GPU clears the rest and closes batch 3, which
+        // had nothing left to submit.
+        t.gpu_reclaimed();
+        assert_eq!(t.awaiting_gpu_bytes(), 0);
+        assert_eq!(t.completed_serial(), 3);
+        assert_eq!(t.recording_serial(), 4);
+    }
+
+    #[test]
+    fn awaiting_gpu_stays_within_unfinished_submissions() {
+        // Many batches, each dropping the same bytes, with the GPU two
+        // batches behind: the count stays at the unfinished batches' drops.
+        let t = tracker();
+        let per_batch = 4096u64;
+        for batch in 1..=50u64 {
+            for _ in 0..4 {
+                drop(t.allocate(DType::FP32, &[256], 1024, 1024, true));
+            }
+            assert_eq!(t.begin_submission(), batch);
+            if batch > 2 {
+                t.gpu_completed(batch - 2);
+            }
+            assert!(t.awaiting_gpu_bytes() <= 2 * per_batch);
+        }
+        assert_eq!(t.peak_awaiting_gpu_bytes(), 3 * per_batch);
+        assert!(t.peak_total_bytes() <= 3 * per_batch + 1024);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "reverse order")]
+    fn scopes_dropped_out_of_order_panic_in_debug() {
+        let t = tracker();
+        let outer = t.scope(MemoryCategory::Activations);
+        let inner = t.scope(MemoryCategory::Loss);
+        drop(outer);
+        drop(inner);
+    }
+}

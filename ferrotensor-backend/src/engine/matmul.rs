@@ -81,6 +81,37 @@ impl ComputeEngine {
         self.matmul_run(ctx, &self.matmul_h, Layout::TransposedB, dims, a, b, out);
     }
 
+    /// [`matmul`](Self::matmul) with `b[K, N]` stored in the 4-bit format
+    /// ([`UnifiedTensor::from_f32_as_q4`]). Products and sums are f32. This
+    /// is the forward product `x · W` of a frozen 4-bit weight `W[K, N]`.
+    pub fn matmul_q4b(
+        &self,
+        ctx: &WgpuContext,
+        a: &UnifiedTensor,
+        b: &UnifiedTensor,
+        out: &UnifiedTensor,
+    ) {
+        assert_eq!(b.dtype, DType::Q4, "matmul_q4b: b must be Q4");
+        let dims = (a.shape[0] as u32, a.shape[1] as u32, b.shape[1] as u32);
+        self.matmul_run(ctx, &self.matmul_q4, Layout::Plain, dims, a, b, out);
+    }
+
+    /// [`matmul_bt`](Self::matmul_bt) with `b[N, K]` stored in the 4-bit
+    /// format. With `b` a frozen 4-bit weight `W` of shape `[K', N']` and
+    /// `a = dY[M, N']`, this is the input gradient `dX = dY · Wᵀ` of
+    /// `Y = X · W`, read from the same tensor as [`matmul_q4b`](Self::matmul_q4b).
+    pub fn matmul_bt_q4b(
+        &self,
+        ctx: &WgpuContext,
+        a: &UnifiedTensor,
+        b: &UnifiedTensor,
+        out: &UnifiedTensor,
+    ) {
+        assert_eq!(b.dtype, DType::Q4, "matmul_bt_q4b: b must be Q4");
+        let dims = (a.shape[0] as u32, a.shape[1] as u32, b.shape[0] as u32);
+        self.matmul_run(ctx, &self.matmul_q4, Layout::TransposedB, dims, a, b, out);
+    }
+
     fn matmul_dispatch(
         &self,
         ctx: &WgpuContext,

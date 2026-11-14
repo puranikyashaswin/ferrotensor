@@ -1,0 +1,240 @@
+//! Shared by the trainer examples: a tiny randomly initialised Llama-style
+//! model written to a temporary directory, so no download is needed, and a
+//! few helpers to build, train and score it.
+
+#![allow(dead_code)]
+
+use ferrotensor_autograd::{AdamW, Tensor};
+use ferrotensor_backend::{ComputeEngine, WgpuContext};
+use ferrotensor_graph::lfm::Lfm2Model;
+use ferrotensor_graph::model_builder::{Lfm2ModelBuilder, LoRaConfig};
+use ferrotensor_loader::{ModelLoader, WeightsContext};
+use ferrotensor_trainer::checkpoint::LoraMetadata;
+use ferrotensor_trainer::{masked_cross_entropy_from_logits, Trainer};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+pub const VOCAB: usize = 64;
+pub const HIDDEN: usize = 32;
+pub const HEADS: usize = 4;
+pub const KV_HEADS: usize = 2;
+pub const LAYERS: usize = 2;
+pub const FFN: usize = 64;
+/// Tokens in the training sequence.
+pub const SEQ: usize = 16;
+
+/// A fresh directory under the system temp dir, removed on drop.
+pub struct TempDir(PathBuf);
+
+impl TempDir {
+    pub fn new(tag: &str) -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "ferrotensor-example-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        Self(dir)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Deterministic values in `[-scale, scale)`.
+fn pseudo_random(n: usize, seed: u64, scale: f32) -> Vec<f32> {
+    let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    (0..n)
+        .map(|_| {
+            s ^= s >> 12;
+            s ^= s << 25;
+            s ^= s >> 27;
+            let u = (s.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 40) as f32 / (1u64 << 24) as f32;
+            (u * 2.0 - 1.0) * scale
+        })
+        .collect()
+}
+
+/// Write `config.json` and `model.safetensors` of a tiny Llama-style model
+/// (64-token vocabulary, 2 layers, hidden size 32, tied embeddings) into
+/// `dir`. The weights are random but fixed, so every run sees the same model.
+pub fn write_tiny_llama(dir: &Path) {
+    let config = serde_json::json!({
+        "model_type": "llama",
+        "hidden_size": HIDDEN,
+        "intermediate_size": FFN,
+        "num_attention_heads": HEADS,
+        "num_key_value_heads": KV_HEADS,
+        "num_hidden_layers": LAYERS,
+        "vocab_size": VOCAB,
+        "rms_norm_eps": 1e-5,
+        "rope_theta": 10000.0,
+        "tie_word_embeddings": true,
+    });
+    std::fs::write(dir.join("config.json"), config.to_string()).expect("write config");
+
+    let kv = HIDDEN / HEADS * KV_HEADS;
+    let mut tensors: Vec<(String, Vec<usize>, Vec<f32>)> = Vec::new();
+    let mut seed = 1;
+    // A scale of 0 means "all ones" (norm weights).
+    let mut add = |name: String, shape: Vec<usize>, scale: f32| {
+        let n = shape.iter().product();
+        seed += 1;
+        let values = if scale == 0.0 {
+            vec![1.0; n]
+        } else {
+            pseudo_random(n, seed, scale)
+        };
+        tensors.push((name, shape, values));
+    };
+    add("model.embed_tokens.weight".into(), vec![VOCAB, HIDDEN], 0.5);
+    for l in 0..LAYERS {
+        let p = format!("model.layers.{l}");
+        add(
+            format!("{p}.self_attn.q_proj.weight"),
+            vec![HIDDEN, HIDDEN],
+            0.2,
+        );
+        add(
+            format!("{p}.self_attn.k_proj.weight"),
+            vec![kv, HIDDEN],
+            0.2,
+        );
+        add(
+            format!("{p}.self_attn.v_proj.weight"),
+            vec![kv, HIDDEN],
+            0.2,
+        );
+        add(
+            format!("{p}.self_attn.o_proj.weight"),
+            vec![HIDDEN, HIDDEN],
+            0.2,
+        );
+        add(format!("{p}.mlp.gate_proj.weight"), vec![FFN, HIDDEN], 0.2);
+        add(format!("{p}.mlp.up_proj.weight"), vec![FFN, HIDDEN], 0.2);
+        add(format!("{p}.mlp.down_proj.weight"), vec![HIDDEN, FFN], 0.2);
+        add(format!("{p}.input_layernorm.weight"), vec![HIDDEN], 0.0);
+        add(
+            format!("{p}.post_attention_layernorm.weight"),
+            vec![HIDDEN],
+            0.0,
+        );
+    }
+    add("model.norm.weight".into(), vec![HIDDEN], 0.0);
+
+    let bytes: Vec<(String, Vec<usize>, Vec<u8>)> = tensors
+        .into_iter()
+        .map(|(n, s, v)| (n, s, v.iter().flat_map(|x| x.to_le_bytes()).collect()))
+        .collect();
+    let views: HashMap<String, safetensors::tensor::TensorView<'_>> = bytes
+        .iter()
+        .map(|(n, s, b)| {
+            (
+                n.clone(),
+                safetensors::tensor::TensorView::new(safetensors::Dtype::F32, s.clone(), b)
+                    .expect("tensor view"),
+            )
+        })
+        .collect();
+    let data = safetensors::tensor::serialize(views, &None).expect("serialize");
+    std::fs::write(dir.join("model.safetensors"), data).expect("write weights");
+}
+
+pub struct Gpu {
+    pub ctx: Arc<WgpuContext>,
+    pub engine: Arc<ComputeEngine>,
+}
+
+/// Open the default GPU adapter and print its name.
+pub fn gpu() -> Gpu {
+    let ctx = Arc::new(pollster::block_on(WgpuContext::new()));
+    println!("device: {}", ctx.adapter_info());
+    let engine = Arc::new(ComputeEngine::new(&ctx));
+    Gpu { ctx, engine }
+}
+
+/// Rank-4 LoRA on the four attention projections.
+pub fn lora_config() -> LoRaConfig {
+    LoRaConfig {
+        rank: 4,
+        alpha: 8.0,
+        target_modules: vec![
+            "q_proj".into(),
+            "k_proj".into(),
+            "v_proj".into(),
+            "o_proj".into(),
+        ],
+    }
+}
+
+/// The same settings, stored in the adapter file header.
+pub fn lora_metadata() -> LoraMetadata {
+    let c = lora_config();
+    LoraMetadata {
+        rank: c.rank,
+        alpha: c.alpha,
+        target_modules: c.target_modules,
+        trained_modules: None,
+    }
+}
+
+/// Load the model in `dir` and attach fresh LoRA adapters (B starts at zero,
+/// so the adapters do not change the output until they are trained).
+pub fn build_model(gpu: &Gpu, dir: &Path) -> Lfm2Model {
+    let config = ModelLoader::load_config(dir.join("config.json")).expect("config");
+    let mut weights = WeightsContext::new();
+    weights.load_model_dir(dir).expect("weights");
+    Lfm2ModelBuilder::new(gpu.ctx.clone(), gpu.engine.clone(), &weights, config)
+        .with_lora(lora_config())
+        .build()
+        .expect("build")
+}
+
+/// LoRA parameters in a stable (name-sorted) order.
+pub fn sorted_lora_params(model: &Lfm2Model) -> Vec<Tensor> {
+    let named = model.named_lora_params();
+    let mut names: Vec<&String> = named.keys().collect();
+    names.sort();
+    names.iter().map(|n| named[*n].clone()).collect()
+}
+
+/// A trainer with AdamW at `lr`. Sequences are padded to `SEQ` tokens
+/// instead of the default 32, to keep the work small.
+pub fn trainer(gpu: &Gpu, model: Lfm2Model, optimizer: AdamW) -> Trainer {
+    Trainer::new(
+        model,
+        Box::new(optimizer),
+        gpu.ctx.clone(),
+        gpu.engine.clone(),
+    )
+    .with_length_bucket(SEQ)
+}
+
+/// The synthetic task: a fixed sequence that counts up in steps of 7
+/// (mod 64), starting at 3. The model learns to continue it.
+pub fn pattern() -> Vec<u32> {
+    (0..SEQ).map(|i| ((i * 7 + 3) % VOCAB) as u32).collect()
+}
+
+/// Mean next-token cross-entropy of `model` on `seq`, computed from the
+/// logits on the host (no gradient, no parameter change).
+pub fn eval_loss(gpu: &Gpu, model: &Lfm2Model, seq: &[u32]) -> f32 {
+    let (input, target) = (&seq[..seq.len() - 1], &seq[1..]);
+    let logits = model.forward(&gpu.engine, input, 0, None, None);
+    let host = pollster::block_on(logits.data.to_vec(&gpu.ctx));
+    let mask = vec![1u8; target.len()];
+    masked_cross_entropy_from_logits(&host, VOCAB, target, &mask)
+        .expect("loss")
+        .0
+}

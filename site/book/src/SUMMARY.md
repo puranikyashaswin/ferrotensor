@@ -11,9 +11,11 @@
 # Guides
 
 - [LoRA fine-tuning on a laptop](examples/lora-sft.md)
+- [Text classification with LoRA](examples/classify.md)
 - [Architecture](architecture.md)
 - [Writing a kernel](writing-a-kernel.md)
 - [Testing on your GPU](testing-on-your-gpu.md)
+- [Comparing stacks on a Mac](benchmarks-mac.md)
 
 # Reference
 

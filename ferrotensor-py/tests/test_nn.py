@@ -1,6 +1,10 @@
+import math
+
 import pytest
 
 import ferrotensor as ft
+import ferrotensor.nn.functional as F
+from conftest import close
 from ferrotensor import nn
 
 
@@ -142,3 +146,137 @@ def test_custom_module_discovery():
 def test_module_without_forward():
     with pytest.raises(NotImplementedError):
         nn.Module()(ft.ones(1))
+
+
+def test_linear_with_known_weights():
+    layer = nn.Linear(3, 2)
+    layer.weight.copy_(ft.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]))
+    layer.bias.copy_(ft.tensor([1.0, -1.0]))
+    x = ft.tensor([[1.0, 0.0, 1.0]])
+    assert layer(x).tolist() == [[7.0, 7.0]]
+    assert layer(ft.tensor([1.0, 1.0, 1.0])).tolist() == [10.0, 11.0]
+    layer(x).sum().backward()
+    assert layer.weight.grad.tolist() == [[1.0, 1.0], [0.0, 0.0], [1.0, 1.0]]
+    assert layer.bias.grad.tolist() == [1.0, 1.0]
+    assert nn.Linear(3, 2, bias=False)(ft.ones(1, 3)).shape == (1, 2)
+
+
+def test_embedding_with_known_weights():
+    emb = nn.Embedding(4, 2)
+    emb.weight.copy_(ft.arange(8).reshape(4, 2))
+    assert emb([3, 0]).tolist() == [[6.0, 7.0], [0.0, 1.0]]
+    assert emb(ft.tensor([[1, 1]])).tolist() == [[[2.0, 3.0], [2.0, 3.0]]]
+    assert emb([2]).shape == (1, 2)
+
+
+def test_layer_norm_with_scale_and_shift():
+    ln = nn.LayerNorm(3)
+    ln.weight.copy_(ft.tensor([2.0, 2.0, 2.0]))
+    ln.bias.copy_(ft.tensor([1.0, 1.0, 1.0]))
+    unit = 1 / math.sqrt(2 / 3)
+    out = ln(ft.tensor([[1.0, 2.0, 3.0]]))
+    close(out.tolist(), [[1 - 2 * unit, 1.0, 1 + 2 * unit]], tol=1e-4)
+    # Rows are normalized independently of each other.
+    both = ln(ft.tensor([[1.0, 2.0, 3.0], [10.0, 20.0, 30.0]])).tolist()
+    close(both[0], both[1], tol=1e-3)
+
+
+def test_rms_norm_scale():
+    rms = nn.RMSNorm(2)
+    rms.weight.copy_(ft.tensor([1.0, 3.0]))
+    root = math.sqrt(12.5)
+    close(rms(ft.tensor([[3.0, 4.0]])).tolist(), [[3 / root, 12 / root]], tol=1e-4)
+
+
+def test_causal_attention_ignores_the_future():
+    ft.manual_seed(3)
+    x = ft.randn(4, 8)
+    changed = ft.cat([x[:3], ft.randn(1, 8)])
+    causal = nn.MultiHeadAttention(8, 2, causal=True)
+    close(causal(x)[:3].tolist(), causal(changed)[:3].tolist(), tol=1e-5)
+    full = nn.MultiHeadAttention(8, 2)
+    assert (full(x)[:3] - full(changed)[:3]).abs().max().item() > 1e-4
+    assert causal.num_parameters() == 4 * 8 * 8
+
+
+def test_attention_batches_do_not_mix():
+    ft.manual_seed(4)
+    mha = nn.MultiHeadAttention(8, 2)
+    a, b = ft.randn(5, 8), ft.randn(5, 8)
+    together = mha(ft.stack([a, b]))
+    close(together[0].tolist(), mha(a).tolist(), tol=1e-4)
+    close(together[1].tolist(), mha(b).tolist(), tol=1e-4)
+
+
+def test_dropout_probability_zero_is_the_identity():
+    assert nn.Dropout(0.0)(ft.ones(5)).tolist() == [1.0] * 5
+
+
+def test_parameter_helper():
+    source = ft.tensor([1.0, 2.0])
+    p = nn.Parameter(source)
+    assert p.requires_grad and p.is_leaf and p.tolist() == [1.0, 2.0]
+    assert not source.requires_grad
+
+
+def test_train_and_eval_return_the_module():
+    model = nn.Sequential(nn.Linear(2, 2), nn.Dropout(0.5))
+    assert model.eval() is model and not model.training and not model[1].training
+    assert model.train() is model and model.training and model[1].training
+    assert model.train(False) is model and not model[1].training
+
+
+def test_state_dict_shares_storage_with_the_module():
+    layer = nn.Linear(2, 1)
+    state = layer.state_dict()
+    layer.weight.copy_(ft.tensor([[3.0], [4.0]]))
+    assert state["weight"].tolist() == [[3.0], [4.0]]
+    assert list(state) == ["weight", "bias"]
+    assert not state["weight"].requires_grad
+
+
+def test_load_state_dict_copies_values_not_references():
+    src, dst = nn.Linear(2, 2), nn.Linear(2, 2)
+    dst.load_state_dict(src.state_dict())
+    src.weight.copy_(ft.zeros(2, 2))
+    assert dst.weight.tolist() != [[0.0, 0.0], [0.0, 0.0]]
+
+
+def test_module_containers():
+    ml = nn.ModuleList([nn.Linear(1, 1), nn.ReLU()])
+    assert len(ml) == 2 and isinstance(ml[1], nn.ReLU)
+    assert isinstance(ml[:1], nn.ModuleList) and len(ml[:1]) == 1
+    assert [type(m).__name__ for m in ml] == ["Linear", "ReLU"]
+    seq = nn.Sequential()
+    assert seq.append(nn.Identity()) is seq
+    assert seq(ft.ones(2)).tolist() == [1.0, 1.0]
+    assert nn.Sequential().parameters() == []
+
+
+def test_reprs():
+    assert repr(nn.Embedding(10, 4)) == "Embedding(10, 4)"
+    assert repr(nn.Dropout(0.1)) == "Dropout(p=0.1)"
+    assert repr(nn.ReLU()) == "ReLU()"
+    assert repr(nn.LeakyReLU(0.5)) == "LeakyReLU(negative_slope=0.5)"
+    assert repr(nn.Softmax(dim=1)) == "Softmax(dim=1)"
+    assert repr(nn.RMSNorm(4)) == "RMSNorm(4, eps=1e-05)"
+    assert repr(nn.LayerNorm(4)) == "LayerNorm((4,), eps=1e-05)"
+    assert repr(nn.MultiHeadAttention(8, 2)) == "MultiHeadAttention(embed_dim=8, num_heads=2, causal=False)"
+    assert repr(nn.Sequential(nn.ReLU())) == "Sequential(\n  (0): ReLU()\n)"
+
+
+def test_activation_modules_match_functional():
+    x = ft.tensor([-1.5, 0.5, 2.0])
+    pairs = [
+        (nn.ReLU(), F.relu),
+        (nn.GELU(), F.gelu),
+        (nn.SiLU(), F.silu),
+        (nn.Sigmoid(), F.sigmoid),
+        (nn.Tanh(), F.tanh),
+        (nn.Softmax(), F.softmax),
+        (nn.LeakyReLU(0.2), lambda t: F.leaky_relu(t, 0.2)),
+    ]
+    for module, fn in pairs:
+        assert module(x).tolist() == fn(x).tolist(), module
+    assert nn.Flatten(0)(ft.ones(2, 3)).shape == (6,)
+    assert nn.Flatten(1, 2)(ft.ones(2, 3, 4, 5)).shape == (2, 12, 5)

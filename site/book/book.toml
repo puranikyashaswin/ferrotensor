@@ -1,7 +1,7 @@
 [book]
 title = "Ferrotensor"
 description = "Guide to Ferrotensor, a pure-Rust GPU ML framework on wgpu and WGSL."
-authors = ["Yashaswin Puranik"]
+authors = ["Puranik Yashaswin Sharma"]
 language = "en"
 src = "src"
 
@@ -20,13 +20,14 @@ after = ["links"]
 "architecture.md" = "docs/architecture.md"
 "writing-a-kernel.md" = "docs/writing-a-kernel.md"
 "testing-on-your-gpu.md" = "docs/testing-on-your-gpu.md"
+"benchmarks-mac.md" = "docs/benchmarks-mac.md"
 "benchmarks.md" = "benchmarks/RESULTS.md"
 "python-reference.md" = "ferrotensor-py/README.md"
 "good-first-issues.md" = "docs/good-first-issues.md"
 "changelog.md" = "CHANGELOG.md"
 
 [output.html]
-site-url = "/ferrotensor/docs/"
+site-url = "/docs/"
 default-theme = "light"
 preferred-dark-theme = "navy"
 additional-css = ["theme/ferrotensor.css"]

@@ -3,10 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Ferrotensor (Ferro Tensor): a pure-Rust GPU ML framework</title>
-<meta name="description" content="Tensors, autograd, nn and LoRA fine-tuning in pure Rust on Metal, Vulkan or DX12, with hand-written WGSL kernels and Python bindings. No CUDA needed.">
+<title>Ferrotensor: fine-tune LLMs on any GPU, in pure Rust</title>
+<meta name="description" content="LoRA fine-tuning up to 1.7B parameters in pure Rust on WebGPU (Metal, Vulkan, DX12) with hand-written WGSL kernels and the same loss as PyTorch.">
 <meta name="google-site-verification" content="l0rdpJ2u3IDZ3tYvyRXBufrQao6aw862u_PVg9fvwkE">
-<link rel="canonical" href="https://puranikyashaswin.github.io/ferrotensor/">
+<link rel="canonical" href="https://ferrotensor.dev/">
 <meta name="color-scheme" content="light dark">
 <script>document.documentElement.classList.add("js");</script>
 <meta name="theme-color" content="#f6f3ee" media="(prefers-color-scheme: light)">
@@ -14,25 +14,25 @@
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="Ferrotensor">
-<meta property="og:title" content="Ferrotensor (Ferro Tensor): a pure-Rust GPU ML framework">
-<meta property="og:description" content="Tensors, autograd and LoRA fine-tuning on Metal, Vulkan or DX12 through hand-written WGSL kernels. No CUDA, no C++ toolchain.">
-<meta property="og:url" content="https://puranikyashaswin.github.io/ferrotensor/">
-<meta property="og:image" content="https://puranikyashaswin.github.io/ferrotensor/og.png">
+<meta property="og:title" content="Ferrotensor: fine-tune LLMs on any GPU, in pure Rust">
+<meta property="og:description" content="LoRA fine-tuning up to 1.7B parameters in pure Rust on WebGPU (Metal, Vulkan, DX12) with hand-written WGSL kernels and the same loss as PyTorch.">
+<meta property="og:url" content="https://ferrotensor.dev/">
+<meta property="og:image" content="https://ferrotensor.dev/og.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
-<meta property="og:image:alt" content="Ferrotensor: a pure-Rust GPU ML framework. LoRA fine-tuning on an 8 GB laptop, 611 GFLOPS matmul in WGSL, every kernel checked against a CPU reference.">
+<meta property="og:image:alt" content="Ferrotensor: fine-tune language models on any GPU in pure Rust, with the same held-out loss as PyTorch on CUDA.">
 <meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="Ferrotensor (Ferro Tensor): a pure-Rust GPU ML framework">
-<meta name="twitter:description" content="Tensors, autograd and LoRA fine-tuning on Metal, Vulkan or DX12 through hand-written WGSL kernels. No CUDA, no C++ toolchain.">
-<meta name="twitter:image" content="https://puranikyashaswin.github.io/ferrotensor/og.png">
-<meta name="twitter:image:alt" content="Ferrotensor: a pure-Rust GPU ML framework.">
+<meta name="twitter:title" content="Ferrotensor: fine-tune LLMs on any GPU, in pure Rust">
+<meta name="twitter:description" content="LoRA fine-tuning up to 1.7B parameters in pure Rust on WebGPU (Metal, Vulkan, DX12) with hand-written WGSL kernels and the same loss as PyTorch.">
+<meta name="twitter:image" content="https://ferrotensor.dev/og.png">
+<meta name="twitter:image:alt" content="Ferrotensor: fine-tune language models on any GPU, in pure Rust.">
 <script type="application/ld+json">
 {
  "@context": "https://schema.org",
  "@graph": [
   {
    "@type": "SoftwareSourceCode",
-   "@id": "https://puranikyashaswin.github.io/ferrotensor/#code",
+   "@id": "https://ferrotensor.dev/#code",
    "name": "Ferrotensor",
    "alternateName": [
     "Ferro Tensor",
@@ -45,7 +45,7 @@
     "https://pypi.org/project/ferrotensor/"
    ],
    "description": "A pure-Rust GPU ML framework: tensors, autograd, nn and LoRA fine-tuning on Metal, Vulkan or DX12 through wgpu and hand-written WGSL kernels, with Python bindings.",
-   "url": "https://puranikyashaswin.github.io/ferrotensor/",
+   "url": "https://ferrotensor.dev/",
    "codeRepository": "https://github.com/puranikyashaswin/ferrotensor",
    "programmingLanguage": [
     "Rust",
@@ -59,13 +59,13 @@
    "version": "{{ft_version}}",
    "author": {
     "@type": "Person",
-    "name": "Yashaswin Puranik Sharma",
+    "name": "Puranik Yashaswin Sharma",
     "url": "https://github.com/puranikyashaswin"
    }
   },
   {
    "@type": "SoftwareApplication",
-   "@id": "https://puranikyashaswin.github.io/ferrotensor/#cli",
+   "@id": "https://ferrotensor.dev/#cli",
    "name": "ferrotensor-cli",
    "description": "The ferrotensor command: LoRA fine-tuning (train), evaluation (eval) and text generation (generate) for small Llama-style models.",
    "applicationCategory": "DeveloperApplication",
@@ -80,13 +80,13 @@
    },
    "author": {
     "@type": "Person",
-    "name": "Yashaswin Puranik Sharma",
+    "name": "Puranik Yashaswin Sharma",
     "url": "https://github.com/puranikyashaswin"
    }
   },
   {
    "@type": "FAQPage",
-   "@id": "https://puranikyashaswin.github.io/ferrotensor/#faq",
+   "@id": "https://ferrotensor.dev/#faq",
    "mainEntity": [
     {
      "@type": "Question",
@@ -130,10 +130,18 @@
     },
     {
      "@type": "Question",
+     "name": "How close is Ferrotensor to PyTorch?",
+     "acceptedAnswer": {
+      "@type": "Answer",
+      "text": "On the same NVIDIA A10G with the same LoRA recipe, Ferrotensor and PyTorch + PEFT on CUDA give the same held-out loss before training to four decimals, and after 250 steps Ferrotensor is within 0.005 (1.0640 against 1.0608 for SmolLM2-1.7B). It runs at 84% of PyTorch's speed for SmolLM2-135M and 37% for SmolLM2-1.7B, where large matrix multiplications dominate. The LoRA walkthrough has the full table."
+     }
+    },
+    {
+     "@type": "Question",
      "name": "What are Ferrotensor’s limits?",
      "acceptedAnswer": {
       "@type": "Answer",
-      "text": "It is pre-1.0 and f32 only, runs on a single GPU, and has no convolutions, sort or top-k in the tensor API yet. Chains of tiny ops are still faster on the CPU. LoRA fine-tuning is experimental and tested on small Llama-style models. The limits section above has the details."
+      "text": "It is pre-1.0 and runs on a single GPU. Arithmetic, activations, gradients and the tensor API are f32 (the CLI stores frozen LoRA base weights as f16 by default), and the tensor API has no convolutions, sort or top-k yet. Chains of tiny ops are still faster on the CPU. LoRA fine-tuning is tested on Llama-style models from 135M to 1.7B parameters. The limits section above has the details."
      }
     }
    ]
@@ -170,9 +178,9 @@
 <section class="hero" aria-labelledby="hero-title">
   <div class="wrap hero-in">
     <div class="hero-copy">
-      <p class="kicker"><span>v{{ft_version}}</span><span>pre-1.0</span><span>MIT OR Apache-2.0</span></p>
-      <h1 id="hero-title">Ferrotensor</h1>
-      <p class="lede">A pure-Rust GPU ML framework: tensors, autograd, <code>nn</code> and LoRA fine-tuning on Metal, Vulkan or DX12 through hand-written WGSL kernels. No CUDA, no C++ toolchain.</p>
+      <p class="kicker"><span>v{{ft_version}}</span><span>Rust · WebGPU</span><span>MIT OR Apache-2.0</span></p>
+      <h1 id="hero-title"><span class="h1-kick">Ferrotensor</span>Fine-tune language models on any&nbsp;GPU.</h1>
+      <p class="lede">LoRA fine-tuning up to 1.7B parameters, written in Rust on WebGPU. The same hand-written WGSL kernels run on Apple GPUs through Metal and on NVIDIA and other GPUs through Vulkan or DX12. No CUDA toolchain, and the same held-out loss as PyTorch.</p>
 
       <div class="install" data-tabs>
         <div class="tablist" role="tablist" aria-label="Install with">
@@ -195,23 +203,38 @@
       </div>
 
       <div class="actions">
-        <a class="btn btn-primary" href="docs/">Read the docs</a>
-        <a class="btn" href="https://github.com/puranikyashaswin/ferrotensor">View on GitHub</a>
+        <a class="btn btn-primary" href="guide/#lora-train">Fine-tune a model</a>
+        <a class="btn" href="docs/">Read the docs</a>
+        <a class="btn btn-ghost" href="https://github.com/puranikyashaswin/ferrotensor">GitHub</a>
       </div>
     </div>
 
-    <aside class="sheet" aria-labelledby="sheet-title">
-      <h2 id="sheet-title" class="sheet-h"><span>Datasheet</span><span aria-hidden="true">Ft-{{ft_version}}</span></h2>
-      <dl>
-        <div><dt>GPU</dt><dd>Metal, Vulkan, DX12 via wgpu</dd></div>
-        <div><dt>Kernels</dt><dd>Hand-written WGSL</dd></div>
-        <div><dt>Devices</dt><dd>GPU, plus a CPU reference device</dd></div>
-        <div><dt>Precision</dt><dd>f32</dd></div>
-        <div><dt>Autograd</dt><dd>Reverse mode, checked against finite differences</dd></div>
-        <div><dt>Bindings</dt><dd>Python 3.10+ (abi3 wheels)</dd></div>
-        <div><dt>Needs</dt><dd>Rust 1.88+. No CUDA, cuDNN or libtorch</dd></div>
+    <aside class="proof" aria-labelledby="proof-title">
+      <p class="proof-h"><span>Measured</span><span>NVIDIA A10G · 250 steps</span></p>
+      <h2 id="proof-title" class="proof-t">SmolLM2-1.7B with LoRA: the same loss as PyTorch on CUDA</h2>
+      <ul class="pbars" aria-label="Held-out loss, lower is better">
+        <li><span class="pb-l">Before training</span><span class="pb-v">2.6474</span><span class="pb-bar"><i style="--w:100%"></i></span></li>
+        <li class="pb-us"><span class="pb-l">Ferrotensor, WebGPU on Vulkan</span><span class="pb-v">1.0640</span><span class="pb-bar"><i style="--w:40.2%"></i></span></li>
+        <li><span class="pb-l">PyTorch + PEFT, CUDA</span><span class="pb-v">1.0608</span><span class="pb-bar"><i style="--w:40.1%"></i></span></li>
+      </ul>
+      <p class="pb-cap">Held-out loss on 2,744 Alpaca tokens, lower is better. Same GPU, same data, same recipe.</p>
+      <dl class="pstats">
+        <div><dt>GPU memory</dt><dd>11.9&nbsp;GiB</dd></div>
+        <div><dt>Host memory</dt><dd>5.3&nbsp;GB</dd></div>
+        <div><dt>Per step</dt><dd>2.38&nbsp;s</dd></div>
+        <div><dt>Adapter</dt><dd>12.6&nbsp;MB</dd></div>
       </dl>
+      <a class="proof-src" href="docs/examples/lora-sft.html#against-pytorch--peft-on-cuda-same-gpu">Method and every number</a>
     </aside>
+  </div>
+  <div class="wrap">
+    <ul class="runs" aria-label="Hardware with published results">
+      <li class="run-k">Measured on</li>
+      <li><b>Apple M2</b> Metal, 8&nbsp;GB laptop</li>
+      <li><b>NVIDIA A10G</b> Vulkan</li>
+      <li><b>NVIDIA Tesla T4</b> Vulkan</li>
+      <li><b>Software Vulkan</b> every pull request</li>
+    </ul>
   </div>
 </section>
 
@@ -221,15 +244,72 @@
   <div class="wrap">
     <header class="sec-head">
       <p class="eyebrow">01 · Measured</p>
-      <h2 id="measured-title">Numbers from one 8&nbsp;GB laptop</h2>
-      <p>MacBook Air, Apple M2, 8&nbsp;GB unified memory, through Metal. Every figure links to the file that records how it was measured.</p>
+      <h2 id="measured-title">Real GPUs, real models, checked against PyTorch</h2>
+      <p>Every figure comes from a run you can repeat with one script, and links to the file that records how it was measured.</p>
     </header>
 
-    <div class="cards">
+    <div class="cards cards-2">
       <article class="card">
-        <p class="card-k">LoRA on a laptop</p>
+        <p class="card-k">Scale</p>
+        <p class="figure"><a href="docs/examples/lora-sft.html#batching-f16-base-weights-and-lower-host-memory-06">1.7B</a> <span class="unit">params</span></p>
+        <p class="figure-cap">LoRA fine-tuning on one 24&nbsp;GB GPU</p>
+        <svg class="bars" viewBox="0 0 260 74" role="img" aria-labelledby="mem-t">
+          <title id="mem-t">Peak host memory for SmolLM2-1.7B: 20.01 GB in 0.5, 5.33 GB in 0.6.</title>
+          <rect class="bar-old" x="0" y="8" width="260" height="20" rx="2"/>
+          <text class="bar-in-old" x="8" y="23">0.5 · 20.0 GB host memory</text>
+          <rect class="bar-new" x="0" y="42" width="69" height="20" rx="2"/>
+          <text x="76" y="57">0.6 · 5.3 GB</text>
+        </svg>
+        <ul class="facts">
+          <li>Held-out loss <a href="docs/examples/lora-sft.html#batching-f16-base-weights-and-lower-host-memory-06">2.6474 → 1.0640</a> in 250 steps</li>
+          <li>Frozen weights stored as f16 by default: <a href="docs/examples/lora-sft.html#batching-f16-base-weights-and-lower-host-memory-06">11.9&nbsp;GiB</a> of GPU memory instead of 14.7</li>
+          <li>SmolLM2-135M, 360M and 1.7B <a href="docs/examples/lora-sft.html#on-an-nvidia-gpu-three-model-sizes">measured with one script</a></li>
+        </ul>
+        <a class="card-src" href="docs/examples/lora-sft.html#on-an-nvidia-gpu-three-model-sizes">Results for three model sizes</a>
+      </article>
+
+      <article class="card">
+        <p class="card-k">Speed</p>
+        <p class="figure"><a href="docs/examples/lora-sft.html#batching-f16-base-weights-and-lower-host-memory-06">35×</a> <span class="unit">faster</span></p>
+        <p class="figure-cap">LoRA step since 0.4, SmolLM2-135M on an A10G</p>
+        <svg class="bars" viewBox="0 0 260 92" role="img" aria-labelledby="speed-t">
+          <title id="speed-t">Seconds per LoRA step for SmolLM2-135M on an NVIDIA A10G: 20.2 in 0.4, 1.33 in 0.5, 0.57 in 0.6 with batch 8.</title>
+          <rect class="bar-old" x="0" y="4" width="260" height="20" rx="2"/>
+          <text class="bar-in-old" x="8" y="19">0.4 · 20.2 s</text>
+          <rect class="bar-old" x="0" y="36" width="17" height="20" rx="2"/>
+          <text x="24" y="51">0.5 · 1.33 s</text>
+          <rect class="bar-new" x="0" y="68" width="7.5" height="20" rx="2"/>
+          <text x="15" y="83">0.6, batch 8 · 0.57 s</text>
+        </svg>
+        <ul class="facts">
+          <li>84% of <a href="docs/examples/lora-sft.html#against-pytorch--peft-on-cuda-same-gpu">PyTorch's speed on CUDA</a> for SmolLM2-135M</li>
+          <li><code>--batch-size 8</code> trains eight sequences in <a href="docs/examples/lora-sft.html#batching-f16-base-weights-and-lower-host-memory-06">one GPU pass</a>, same loss</li>
+          <li>Matmul in WGSL: <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/benchmarks/RESULTS.md">9.1&nbsp;TFLOPS</a> on the A10G at 4096³</li>
+        </ul>
+        <a class="card-src" href="docs/benchmarks.html">Benchmarks and method</a>
+      </article>
+
+      <article class="card">
+        <p class="card-k">Checked correctness</p>
+        <p class="figure"><a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/docs/examples/lora-sft.md#correctness-checks">240<span class="slash">/</span>240</a></p>
+        <p class="figure-cap">LoRA adapter gradients matched PyTorch autograd</p>
+        <svg class="checks" viewBox="0 0 260 58" aria-hidden="true">
+          <g><rect class="cell" x="0" y="0" width="5" height="5" rx="1"/><rect class="cell" x="6.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="13" y="0" width="5" height="5" rx="1"/><rect class="cell" x="19.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="26" y="0" width="5" height="5" rx="1"/><rect class="cell" x="32.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="39" y="0" width="5" height="5" rx="1"/><rect class="cell" x="45.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="52" y="0" width="5" height="5" rx="1"/><rect class="cell" x="58.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="65" y="0" width="5" height="5" rx="1"/><rect class="cell" x="71.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="78" y="0" width="5" height="5" rx="1"/><rect class="cell" x="84.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="91" y="0" width="5" height="5" rx="1"/><rect class="cell" x="97.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="104" y="0" width="5" height="5" rx="1"/><rect class="cell" x="110.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="117" y="0" width="5" height="5" rx="1"/><rect class="cell" x="123.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="130" y="0" width="5" height="5" rx="1"/><rect class="cell" x="136.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="143" y="0" width="5" height="5" rx="1"/><rect class="cell" x="149.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="156" y="0" width="5" height="5" rx="1"/><rect class="cell" x="162.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="169" y="0" width="5" height="5" rx="1"/><rect class="cell" x="175.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="182" y="0" width="5" height="5" rx="1"/><rect class="cell" x="188.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="195" y="0" width="5" height="5" rx="1"/><rect class="cell" x="201.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="208" y="0" width="5" height="5" rx="1"/><rect class="cell" x="214.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="221" y="0" width="5" height="5" rx="1"/><rect class="cell" x="227.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="234" y="0" width="5" height="5" rx="1"/><rect class="cell" x="240.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="247" y="0" width="5" height="5" rx="1"/><rect class="cell" x="253.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="0" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="6.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="13" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="19.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="26" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="32.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="39" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="45.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="52" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="58.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="65" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="71.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="78" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="84.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="91" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="97.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="104" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="110.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="117" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="123.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="130" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="136.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="143" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="149.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="156" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="162.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="169" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="175.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="182" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="188.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="195" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="201.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="208" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="214.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="221" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="227.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="234" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="240.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="247" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="253.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="0" y="13" width="5" height="5" rx="1"/><rect class="cell" x="6.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="13" y="13" width="5" height="5" rx="1"/><rect class="cell" x="19.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="26" y="13" width="5" height="5" rx="1"/><rect class="cell" x="32.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="39" y="13" width="5" height="5" rx="1"/><rect class="cell" x="45.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="52" y="13" width="5" height="5" rx="1"/><rect class="cell" x="58.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="65" y="13" width="5" height="5" rx="1"/><rect class="cell" x="71.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="78" y="13" width="5" height="5" rx="1"/><rect class="cell" x="84.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="91" y="13" width="5" height="5" rx="1"/><rect class="cell" x="97.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="104" y="13" width="5" height="5" rx="1"/><rect class="cell" x="110.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="117" y="13" width="5" height="5" rx="1"/><rect class="cell" x="123.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="130" y="13" width="5" height="5" rx="1"/><rect class="cell" x="136.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="143" y="13" width="5" height="5" rx="1"/><rect class="cell" x="149.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="156" y="13" width="5" height="5" rx="1"/><rect class="cell" x="162.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="169" y="13" width="5" height="5" rx="1"/><rect class="cell" x="175.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="182" y="13" width="5" height="5" rx="1"/><rect class="cell" x="188.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="195" y="13" width="5" height="5" rx="1"/><rect class="cell" x="201.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="208" y="13" width="5" height="5" rx="1"/><rect class="cell" x="214.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="221" y="13" width="5" height="5" rx="1"/><rect class="cell" x="227.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="234" y="13" width="5" height="5" rx="1"/><rect class="cell" x="240.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="247" y="13" width="5" height="5" rx="1"/><rect class="cell" x="253.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="0" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="6.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="13" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="19.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="26" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="32.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="39" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="45.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="52" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="58.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="65" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="71.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="78" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="84.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="91" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="97.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="104" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="110.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="117" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="123.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="130" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="136.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="143" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="149.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="156" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="162.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="169" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="175.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="182" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="188.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="195" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="201.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="208" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="214.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="221" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="227.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="234" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="240.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="247" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="253.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="0" y="26" width="5" height="5" rx="1"/><rect class="cell" x="6.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="13" y="26" width="5" height="5" rx="1"/><rect class="cell" x="19.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="26" y="26" width="5" height="5" rx="1"/><rect class="cell" x="32.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="39" y="26" width="5" height="5" rx="1"/><rect class="cell" x="45.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="52" y="26" width="5" height="5" rx="1"/><rect class="cell" x="58.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="65" y="26" width="5" height="5" rx="1"/><rect class="cell" x="71.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="78" y="26" width="5" height="5" rx="1"/><rect class="cell" x="84.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="91" y="26" width="5" height="5" rx="1"/><rect class="cell" x="97.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="104" y="26" width="5" height="5" rx="1"/><rect class="cell" x="110.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="117" y="26" width="5" height="5" rx="1"/><rect class="cell" x="123.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="130" y="26" width="5" height="5" rx="1"/><rect class="cell" x="136.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="143" y="26" width="5" height="5" rx="1"/><rect class="cell" x="149.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="156" y="26" width="5" height="5" rx="1"/><rect class="cell" x="162.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="169" y="26" width="5" height="5" rx="1"/><rect class="cell" x="175.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="182" y="26" width="5" height="5" rx="1"/><rect class="cell" x="188.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="195" y="26" width="5" height="5" rx="1"/><rect class="cell" x="201.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="208" y="26" width="5" height="5" rx="1"/><rect class="cell" x="214.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="221" y="26" width="5" height="5" rx="1"/><rect class="cell" x="227.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="234" y="26" width="5" height="5" rx="1"/><rect class="cell" x="240.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="247" y="26" width="5" height="5" rx="1"/><rect class="cell" x="253.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="0" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="6.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="13" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="19.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="26" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="32.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="39" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="45.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="52" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="58.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="65" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="71.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="78" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="84.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="91" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="97.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="104" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="110.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="117" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="123.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="130" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="136.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="143" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="149.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="156" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="162.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="169" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="175.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="182" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="188.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="195" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="201.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="208" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="214.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="221" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="227.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="234" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="240.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="247" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="253.5" y="32.5" width="5" height="5" rx="1"/></g>
+          <text x="0" y="54">one square per adapter gradient</text>
+        </svg>
+        <ul class="facts">
+          <li>Held-out loss before training <a href="docs/examples/lora-sft.html#against-pytorch--peft-on-cuda-same-gpu">identical to PyTorch</a> to four decimals, for 135M and 1.7B</li>
+          <li>Every differentiable op <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/README.md#highlights">tested against finite differences</a> on the CPU</li>
+          <li>Every GPU kernel <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/README.md#highlights">tested against a CPU reference</a></li>
+          <li>Model logits matched <code>transformers</code> to <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/docs/examples/lora-sft.md#correctness-checks">about 1e-5</a>; worst gradient error 0.2%</li>
+        </ul>
+        <a class="card-src" href="docs/examples/lora-sft.html#correctness-checks">How it was checked</a>
+      </article>
+
+      <article class="card">
+        <p class="card-k">Also on an 8&nbsp;GB laptop</p>
         <p class="figure"><a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/docs/examples/lora-sft.md#result">2.43 <span aria-label="to">→</span> 1.65</a></p>
-        <p class="figure-cap">held-out loss, SmolLM2-135M on Alpaca</p>
+        <p class="figure-cap">held-out loss, SmolLM2-135M on Alpaca, Apple M2</p>
         <svg class="spark" viewBox="0 0 260 74" role="img" aria-labelledby="spark-t">
           <title id="spark-t">Held-out loss by step: 2.425 at 0, 1.815 at 50, 1.698 at 100, 1.670 at 150, 1.658 at 200, 1.652 at 250.</title>
           <line class="spark-base" x1="0" y1="70" x2="260" y2="70"/>
@@ -245,42 +325,6 @@
           <li>A <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/docs/examples/lora-sft.md#result">3.7&nbsp;MB adapter</a> that reloads to the same loss</li>
         </ul>
         <a class="card-src" href="docs/examples/lora-sft.html">Walkthrough with every command</a>
-      </article>
-
-      <article class="card">
-        <p class="card-k">Kernel speed</p>
-        <p class="figure"><a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/benchmarks/RESULTS.md#before--after">611</a> <span class="unit">GFLOPS</span></p>
-        <p class="figure-cap">f32 matmul at 4096³, hand-written WGSL</p>
-        <svg class="bars" viewBox="0 0 260 74" role="img" aria-labelledby="bars-t">
-          <title id="bars-t">Matmul at 4096 cubed: 123 GFLOPS for the first kernel, 611 GFLOPS now.</title>
-          <rect class="bar-old" x="0" y="8" width="52" height="20" rx="2"/>
-          <text x="58" y="23">123 first kernel</text>
-          <rect class="bar-new" x="0" y="42" width="260" height="20" rx="2"/>
-          <text class="bar-in" x="8" y="57">611 now · 5.0×</text>
-        </svg>
-        <ul class="facts">
-          <li>Causal flash attention forward <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/benchmarks/RESULTS.md#before--after">4.0× faster</a> at sequence 2048</li>
-          <li>100 small ops: <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/benchmarks/RESULTS.md#before--after-1">10.6 → 0.82&nbsp;ms</a> with batched dispatch</li>
-          <li>MLP training step: <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/benchmarks/RESULTS.md#index-backward-passes-cat-and-cross_entropy-on-the-gpu">2.13&nbsp;ms on the GPU</a>, 12.26&nbsp;ms on the CPU</li>
-          <li><code>cross_entropy</code> over a 32,000-token vocabulary: <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/benchmarks/RESULTS.md#index-backward-passes-cat-and-cross_entropy-on-the-gpu">749.6 → 64.6&nbsp;ms</a> on the GPU</li>
-        </ul>
-        <a class="card-src" href="docs/benchmarks.html">Benchmarks and method</a>
-      </article>
-
-      <article class="card">
-        <p class="card-k">Checked correctness</p>
-        <p class="figure"><a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/docs/examples/lora-sft.md#correctness-checks">240<span class="slash">/</span>240</a></p>
-        <p class="figure-cap">LoRA adapter gradients matched PyTorch autograd</p>
-        <svg class="checks" viewBox="0 0 260 58" aria-hidden="true">
-          <g><rect class="cell" x="0" y="0" width="5" height="5" rx="1"/><rect class="cell" x="6.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="13" y="0" width="5" height="5" rx="1"/><rect class="cell" x="19.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="26" y="0" width="5" height="5" rx="1"/><rect class="cell" x="32.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="39" y="0" width="5" height="5" rx="1"/><rect class="cell" x="45.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="52" y="0" width="5" height="5" rx="1"/><rect class="cell" x="58.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="65" y="0" width="5" height="5" rx="1"/><rect class="cell" x="71.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="78" y="0" width="5" height="5" rx="1"/><rect class="cell" x="84.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="91" y="0" width="5" height="5" rx="1"/><rect class="cell" x="97.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="104" y="0" width="5" height="5" rx="1"/><rect class="cell" x="110.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="117" y="0" width="5" height="5" rx="1"/><rect class="cell" x="123.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="130" y="0" width="5" height="5" rx="1"/><rect class="cell" x="136.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="143" y="0" width="5" height="5" rx="1"/><rect class="cell" x="149.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="156" y="0" width="5" height="5" rx="1"/><rect class="cell" x="162.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="169" y="0" width="5" height="5" rx="1"/><rect class="cell" x="175.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="182" y="0" width="5" height="5" rx="1"/><rect class="cell" x="188.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="195" y="0" width="5" height="5" rx="1"/><rect class="cell" x="201.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="208" y="0" width="5" height="5" rx="1"/><rect class="cell" x="214.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="221" y="0" width="5" height="5" rx="1"/><rect class="cell" x="227.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="234" y="0" width="5" height="5" rx="1"/><rect class="cell" x="240.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="247" y="0" width="5" height="5" rx="1"/><rect class="cell" x="253.5" y="0" width="5" height="5" rx="1"/><rect class="cell" x="0" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="6.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="13" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="19.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="26" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="32.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="39" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="45.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="52" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="58.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="65" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="71.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="78" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="84.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="91" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="97.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="104" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="110.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="117" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="123.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="130" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="136.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="143" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="149.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="156" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="162.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="169" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="175.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="182" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="188.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="195" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="201.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="208" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="214.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="221" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="227.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="234" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="240.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="247" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="253.5" y="6.5" width="5" height="5" rx="1"/><rect class="cell" x="0" y="13" width="5" height="5" rx="1"/><rect class="cell" x="6.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="13" y="13" width="5" height="5" rx="1"/><rect class="cell" x="19.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="26" y="13" width="5" height="5" rx="1"/><rect class="cell" x="32.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="39" y="13" width="5" height="5" rx="1"/><rect class="cell" x="45.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="52" y="13" width="5" height="5" rx="1"/><rect class="cell" x="58.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="65" y="13" width="5" height="5" rx="1"/><rect class="cell" x="71.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="78" y="13" width="5" height="5" rx="1"/><rect class="cell" x="84.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="91" y="13" width="5" height="5" rx="1"/><rect class="cell" x="97.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="104" y="13" width="5" height="5" rx="1"/><rect class="cell" x="110.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="117" y="13" width="5" height="5" rx="1"/><rect class="cell" x="123.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="130" y="13" width="5" height="5" rx="1"/><rect class="cell" x="136.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="143" y="13" width="5" height="5" rx="1"/><rect class="cell" x="149.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="156" y="13" width="5" height="5" rx="1"/><rect class="cell" x="162.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="169" y="13" width="5" height="5" rx="1"/><rect class="cell" x="175.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="182" y="13" width="5" height="5" rx="1"/><rect class="cell" x="188.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="195" y="13" width="5" height="5" rx="1"/><rect class="cell" x="201.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="208" y="13" width="5" height="5" rx="1"/><rect class="cell" x="214.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="221" y="13" width="5" height="5" rx="1"/><rect class="cell" x="227.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="234" y="13" width="5" height="5" rx="1"/><rect class="cell" x="240.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="247" y="13" width="5" height="5" rx="1"/><rect class="cell" x="253.5" y="13" width="5" height="5" rx="1"/><rect class="cell" x="0" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="6.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="13" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="19.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="26" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="32.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="39" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="45.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="52" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="58.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="65" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="71.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="78" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="84.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="91" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="97.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="104" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="110.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="117" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="123.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="130" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="136.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="143" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="149.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="156" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="162.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="169" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="175.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="182" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="188.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="195" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="201.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="208" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="214.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="221" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="227.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="234" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="240.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="247" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="253.5" y="19.5" width="5" height="5" rx="1"/><rect class="cell" x="0" y="26" width="5" height="5" rx="1"/><rect class="cell" x="6.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="13" y="26" width="5" height="5" rx="1"/><rect class="cell" x="19.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="26" y="26" width="5" height="5" rx="1"/><rect class="cell" x="32.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="39" y="26" width="5" height="5" rx="1"/><rect class="cell" x="45.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="52" y="26" width="5" height="5" rx="1"/><rect class="cell" x="58.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="65" y="26" width="5" height="5" rx="1"/><rect class="cell" x="71.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="78" y="26" width="5" height="5" rx="1"/><rect class="cell" x="84.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="91" y="26" width="5" height="5" rx="1"/><rect class="cell" x="97.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="104" y="26" width="5" height="5" rx="1"/><rect class="cell" x="110.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="117" y="26" width="5" height="5" rx="1"/><rect class="cell" x="123.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="130" y="26" width="5" height="5" rx="1"/><rect class="cell" x="136.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="143" y="26" width="5" height="5" rx="1"/><rect class="cell" x="149.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="156" y="26" width="5" height="5" rx="1"/><rect class="cell" x="162.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="169" y="26" width="5" height="5" rx="1"/><rect class="cell" x="175.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="182" y="26" width="5" height="5" rx="1"/><rect class="cell" x="188.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="195" y="26" width="5" height="5" rx="1"/><rect class="cell" x="201.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="208" y="26" width="5" height="5" rx="1"/><rect class="cell" x="214.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="221" y="26" width="5" height="5" rx="1"/><rect class="cell" x="227.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="234" y="26" width="5" height="5" rx="1"/><rect class="cell" x="240.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="247" y="26" width="5" height="5" rx="1"/><rect class="cell" x="253.5" y="26" width="5" height="5" rx="1"/><rect class="cell" x="0" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="6.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="13" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="19.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="26" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="32.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="39" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="45.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="52" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="58.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="65" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="71.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="78" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="84.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="91" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="97.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="104" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="110.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="117" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="123.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="130" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="136.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="143" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="149.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="156" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="162.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="169" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="175.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="182" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="188.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="195" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="201.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="208" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="214.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="221" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="227.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="234" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="240.5" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="247" y="32.5" width="5" height="5" rx="1"/><rect class="cell" x="253.5" y="32.5" width="5" height="5" rx="1"/></g>
-          <text x="0" y="54">one square per adapter gradient</text>
-        </svg>
-        <ul class="facts">
-          <li>Every differentiable op <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/README.md#highlights">tested against finite differences</a> on the CPU</li>
-          <li>Every GPU kernel <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/README.md#highlights">tested against a CPU reference</a></li>
-          <li>Model logits matched <code>transformers</code> to <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/docs/examples/lora-sft.md#correctness-checks">about 1e-5</a>; worst gradient error 0.2%</li>
-        </ul>
-        <a class="card-src" href="docs/examples/lora-sft.html#correctness-checks">How it was checked</a>
       </article>
     </div>
   </div>
@@ -378,7 +422,7 @@ x = ft.<span class="f">tensor</span>([[<span class="n">0</span>, <span class="n"
 <text class="a-s" x="532" y="75.9" font-size="13">train · eval · generate  (+ ferrotensor-monitor)</text>
 <rect class="a-box" x="520" y="106" width="440" height="58" rx="6"/>
 <text class="a-t" x="532" y="130.3" font-size="16">ferrotensor-trainer</text>
-<text class="a-s" x="532" y="151.9" font-size="13">LoRA, loss scaling, checkpoints</text>
+<text class="a-s" x="532" y="151.9" font-size="13">LoRA, checkpoints</text>
 <line class="a-line" x1="740.0" y1="88" x2="740.0" y2="105" marker-end="url(#ah-wide)"/>
 <rect class="a-box" x="520" y="182" width="440" height="58" rx="6"/>
 <text class="a-t" x="532" y="206.3" font-size="16">ferrotensor-graph</text>
@@ -463,10 +507,30 @@ x = ft.<span class="f">tensor</span>([[<span class="n">0</span>, <span class="n"
   </div>
 </section>
 
+<section class="section" id="direction" aria-labelledby="direction-title">
+  <div class="wrap">
+    <header class="sec-head">
+      <p class="eyebrow">04 · Direction</p>
+      <h2 id="direction-title">Train anywhere: every GPU, data that stays on the device</h2>
+      <p>One Rust codebase that fine-tunes models on whatever GPU you have, with no vendor toolchain to install. What is measured, and what comes next:</p>
+    </header>
+    <ol class="road">
+      <li class="road-done"><span class="pill">Measured</span><h3>Apple and NVIDIA GPUs</h3><p>The same LoRA recipe reaches the same held-out loss on an Apple M2 through Metal and an NVIDIA A10G through Vulkan.</p></li>
+      <li class="road-done"><span class="pill">Measured</span><h3>Parity with PyTorch</h3><p>Same GPU and recipe as PyTorch + PEFT on CUDA: identical loss before training, within 0.005 after.</p></li>
+      <li><span class="pill">Next</span><h3>AMD and Intel GPUs</h3><p>The same Vulkan and DX12 path, waiting for its first published results. <a href="docs/testing-on-your-gpu.html">Test it on your GPU</a>.</p></li>
+      <li><span class="pill">Next</span><h3>Faster large matmuls</h3><p>Matmul tiles tuned per GPU, to close the gap with cuBLAS on billion-parameter models.</p></li>
+      <li><span class="pill">Planned</span><h3>Fine-tuning in a browser tab</h3><p>wgpu also targets WebGPU in the browser: LoRA on the visitor's own GPU, with the training data never uploaded.</p></li>
+      <li><span class="pill">Planned</span><h3>At the edge</h3><p>Boards such as NVIDIA Jetson run Vulkan: fine-tune in the field, with no CUDA toolchain on the device.</p></li>
+      <li><span class="pill">Planned</span><h3>Bigger models on one card</h3><p>f16 activations and a loss computed in chunks over the vocabulary, toward 7B LoRA on a single 24&nbsp;GB GPU.</p></li>
+      <li><span class="pill">Planned</span><h3>Many GPUs together</h3><p>Data-parallel LoRA across mixed consumer machines, grown from the file-based prototype behind <code>--world-size</code>.</p></li>
+    </ol>
+  </div>
+</section>
+
 <section class="section section-alt" id="compare" aria-labelledby="compare-title">
   <div class="wrap">
     <header class="sec-head">
-      <p class="eyebrow">04 · Context</p>
+      <p class="eyebrow">05 · Context</p>
       <h2 id="compare-title">Compared with candle, burn and tch-rs</h2>
       <p>These are good projects; Ferrotensor is not trying to replace them. The honest picture, <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/README.md#compared-with-candle-burn-and-tch">from the README</a>:</p>
     </header>
@@ -512,7 +576,7 @@ x = ft.<span class="f">tensor</span>([[<span class="n">0</span>, <span class="n"
           </tr>
           <tr>
             <th scope="row">Model zoo / ecosystem</th>
-            <td class="us" data-label="Ferrotensor">Tiny</td>
+            <td class="us" data-label="Ferrotensor">Llama-style models; SmolLM2 135M to 1.7B measured</td>
             <td data-label="candle">Large</td>
             <td data-label="burn">Growing</td>
             <td data-label="tch-rs">The whole PyTorch ecosystem via TorchScript/weights</td>
@@ -522,7 +586,7 @@ x = ft.<span class="f">tensor</span>([[<span class="n">0</span>, <span class="n"
     </div>
     <div class="choose">
       <p>Choose <strong>candle</strong> for inference of popular models, <strong>burn</strong> for a mature all-Rust training framework, <strong>tch-rs</strong> when you need exact PyTorch semantics and CUDA.</p>
-      <p>Choose <strong>Ferrotensor</strong> to learn how the stack works end to end, when you want a dependency-light wgpu-only codebase you can read and modify, or to experiment on a consumer GPU without installing CUDA. It does not match their op coverage, model support or hardening, and it has not been benchmarked against them.</p>
+      <p>Choose <strong>Ferrotensor</strong> to fine-tune language models on whatever GPU you have, Apple or NVIDIA or other Vulkan and DX12 hardware, without installing CUDA, with results checked against PyTorch, in a codebase small enough to read and change end to end. It has a smaller op set and model zoo than these projects and has not been benchmarked against them.</p>
     </div>
   </div>
 </section>
@@ -530,17 +594,17 @@ x = ft.<span class="f">tensor</span>([[<span class="n">0</span>, <span class="n"
 <section class="section" id="limits" aria-labelledby="limits-title">
   <div class="wrap limits-in">
     <header class="sec-head">
-      <p class="eyebrow">05 · Limits</p>
+      <p class="eyebrow">06 · Limits</p>
       <h2 id="limits-title">What it can't do yet</h2>
-      <p>Small-scale by design, and young. Before you pick it up, know this:</p>
+      <p>Pre-1.0 and moving release by release. Before you pick it up, know this:</p>
     </header>
     <ul class="limits">
-      <li><strong>f32 only.</strong> No <code>f16</code> or <code>bf16</code> tensors in the tensor API yet.</li>
+      <li><strong>Mostly f32.</strong> The LoRA command stores frozen weights as f16; activations, gradients and the tensor API are f32, with no <code>f16</code> or <code>bf16</code> tensors yet.</li>
       <li><strong>One GPU.</strong> No multi-GPU or distributed training; the CLI's <code>--world-size</code> flag is a prototype.</li>
-      <li><strong>Small models.</strong> LoRA fine-tuning is experimental and aimed at small Llama-style models; the measured run is SmolLM2-135M. Released LFM2 checkpoints are not supported.</li>
+      <li><strong>Up to 1.7B measured.</strong> LoRA fine-tuning is tested on Llama-style models from SmolLM2-135M to 1.7B; larger models are untested, and SmolLM2-1.7B at batch 8 does not fit in 24&nbsp;GB. Released LFM2 checkpoints are not supported.</li>
       <li><strong>Tiny workloads are faster on the CPU.</strong> A chain of 100 tiny ops still takes <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/benchmarks/RESULTS.md#what-is-still-slow">about 17× as long on the GPU</a> as on the CPU; op fusion is the next step.</li>
       <li><strong>Not every op.</strong> No convolutions, sort, top-k or cumsum in the tensor API.</li>
-      <li><strong>Far from peak.</strong> Matmul reaches <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/benchmarks/RESULTS.md#context">about 17% of the M2's FP32 peak</a>; WGSL does not expose the matrix instructions that close that gap.</li>
+      <li><strong>Behind cuBLAS on big matmuls.</strong> SmolLM2-1.7B trains at <a href="docs/examples/lora-sft.html#against-pytorch--peft-on-cuda-same-gpu">37% of PyTorch's speed</a> on the same NVIDIA GPU, and matmul reaches <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/benchmarks/RESULTS.md#context">about 17% of the M2's FP32 peak</a>; WGSL does not expose the matrix instructions that close that gap.</li>
       <li><strong>Pre-1.0.</strong> The API can still change, and Python wheels exist for macOS arm64 and Linux x86_64 only (other platforms build from source).</li>
     </ul>
   </div>
@@ -549,7 +613,7 @@ x = ft.<span class="f">tensor</span>([[<span class="n">0</span>, <span class="n"
 <section class="section section-alt" id="faq" aria-labelledby="faq-title">
   <div class="wrap">
     <header class="sec-head">
-      <p class="eyebrow">06 · FAQ</p>
+      <p class="eyebrow">07 · FAQ</p>
       <h2 id="faq-title">Questions, answered plainly</h2>
     </header>
     <div class="faq">
@@ -574,8 +638,12 @@ x = ft.<span class="f">tensor</span>([[<span class="n">0</span>, <span class="n"
         <p>candle is a minimalist Rust framework from Hugging Face, a good choice for inference of popular models; burn is a mature all-Rust training framework with swappable backends. Ferrotensor is smaller and younger: it targets wgpu only, needs no C++ or CUDA toolchain, and is written to be read and modified end to end. It does not match their op coverage, model support or hardening, and it has not been benchmarked against them.</p>
       </div>
       <div class="faq-item">
+        <h3 id="faq-pytorch">How close is Ferrotensor to PyTorch?</h3>
+        <p>On the same NVIDIA A10G with the same LoRA recipe, Ferrotensor and PyTorch + PEFT on CUDA give the same held-out loss before training to four decimals, and after 250 steps Ferrotensor is within 0.005 (1.0640 against 1.0608 for SmolLM2-1.7B). It runs at 84% of PyTorch's speed for SmolLM2-135M and 37% for SmolLM2-1.7B, where large matrix multiplications dominate. The <a href="docs/examples/lora-sft.html#against-pytorch--peft-on-cuda-same-gpu">LoRA walkthrough</a> has the full table.</p>
+      </div>
+      <div class="faq-item">
         <h3 id="faq-limits">What are Ferrotensor’s limits?</h3>
-        <p>It is pre-1.0 and f32 only, runs on a single GPU, and has no convolutions, sort or top-k in the tensor API yet. Chains of tiny ops are still faster on the CPU. LoRA fine-tuning is experimental and tested on small Llama-style models. The <a href="#limits">limits section</a> above has the details.</p>
+        <p>It is pre-1.0 and runs on a single GPU. Arithmetic, activations, gradients and the tensor API are f32 (the CLI stores frozen LoRA base weights as f16 by default), and the tensor API has no convolutions, sort or top-k yet. Chains of tiny ops are still faster on the CPU. LoRA fine-tuning is tested on Llama-style models from 135M to 1.7B parameters. The <a href="#limits">limits section</a> above has the details.</p>
       </div>
     </div>
   </div>
@@ -597,6 +665,7 @@ x = ft.<span class="f">tensor</span>([[<span class="n">0</span>, <span class="n"
         <li><a href="https://docs.rs/ferrotensor">docs.rs</a></li>
         <li><a href="guide/">How-to guide</a></li>
         <li><a href="docs/">Docs</a></li>
+        <li><a href="about/">About</a></li>
         <li><a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/CHANGELOG.md">Changelog</a></li>
       </ul>
     </nav>

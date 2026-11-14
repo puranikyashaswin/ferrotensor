@@ -58,7 +58,8 @@ jobs:
             3.10
             3.14
       # One abi3 wheel serves every CPython >= 3.10: test the oldest and newest.
-      # Hosted runners have no GPU, so the GPU tests skip themselves.
+      # Hosted runners have no GPU, so the GPU tests skip themselves here; the
+      # next step runs them on software Vulkan. The MLP example runs on the CPU.
       - name: Test the wheel
         shell: bash
         run: |
@@ -69,7 +70,42 @@ jobs:
             "$venv/pip" install --quiet pytest
             "$venv/pip" install --quiet --no-index --find-links ferrotensor-py/dist ferrotensor
             (cd "$RUNNER_TEMP/tests" && "$venv/python" -m pytest -q)
+            # The example checks its own result and exits non-zero when it is wrong.
+            "$venv/python" ferrotensor-py/examples/mlp.py
           done
+      # Mesa's lavapipe implements Vulkan on the CPU, so the GPU tests run here
+      # through the real wgpu Vulkan path (the same setup as the GPU job in ci.yml,
+      # including its cached .deb files; see the comment there).
+      # It checks correctness, not speed. -rs lists any skipped test with its reason.
+      - name: Runner image id
+        if: runner.os == 'Linux'
+        id: image
+        run: echo "id=${ImageOS}-${ImageVersion}" >> "$GITHUB_OUTPUT"
+      - name: Cache lavapipe packages
+        if: runner.os == 'Linux'
+        uses: actions/cache@v4.3.0
+        with:
+          path: ~/.cache/lavapipe-debs
+          # Same key as ci.yml, so both workflows share one cache entry per image.
+          key: lavapipe-debs-v1-${{ steps.image.outputs.id }}
+      - name: Install Mesa lavapipe
+        if: runner.os == 'Linux'
+        run: scripts/ci/install-lavapipe.sh "$HOME/.cache/lavapipe-debs"
+      - name: Test the wheel on software Vulkan
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          WGPU_BACKEND: vulkan
+          FERROTENSOR_RUN_GPU_TESTS: "1"
+        run: |
+          if command -v vulkaninfo >/dev/null; then
+            vulkaninfo --summary
+          else
+            echo "vulkaninfo is not installed; skipping the summary"
+          fi
+          venv="$RUNNER_TEMP/venv-3.14/bin"
+          (cd "$RUNNER_TEMP/tests" && "$venv/python" -m pytest -v -rs)
+          "$venv/python" ferrotensor-py/examples/mlp.py --device gpu
       - uses: actions/upload-artifact@v4.4.3
         with:
           name: python-wheel-${{ matrix.target }}

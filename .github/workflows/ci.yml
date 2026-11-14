@@ -54,6 +54,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.2
       # Hosted runners have no GPU: GPU tests are #[ignore]d and skipped here.
       - run: cargo test --workspace
+      # Run the examples that need no GPU. They check their own results.
+      - name: Examples (CPU)
+        if: matrix.os == 'ubuntu-latest'
+        run: scripts/run-examples.sh --cpu
 
   gpu-vulkan:
     name: GPU tests (software Vulkan)
@@ -67,17 +71,60 @@ jobs:
       FERROTENSOR_RUN_GPU_TESTS: "1"
     steps:
       - uses: actions/checkout@v4.2.2
+      # Lavapipe comes from apt, and the runner has no route to the Ubuntu
+      # package hosts during an outage (every one of them failed to resolve for
+      # about three hours once). So the .deb files, dependencies included, are
+      # cached per runner image: a run with a cache hit installs them with dpkg
+      # and downloads nothing. On a miss, scripts/ci/apt-install.sh retries and
+      # falls back from the Azure mirror to archive.ubuntu.com, which covers one
+      # bad mirror but not an outage of every host; a miss during such an outage
+      # still fails. A cache saved on a PR branch is visible only to that PR, so
+      # other PRs are protected once this workflow has run on main.
+      - name: Runner image id
+        id: image
+        run: echo "id=${ImageOS}-${ImageVersion}" >> "$GITHUB_OUTPUT"
+      - name: Cache lavapipe packages
+        uses: actions/cache@v4.3.0
+        with:
+          path: ~/.cache/lavapipe-debs
+          # Bump the v1 suffix to discard a bad cache entry.
+          key: lavapipe-debs-v1-${{ steps.image.outputs.id }}
       - name: Install Mesa lavapipe
+        run: scripts/ci/install-lavapipe.sh "$HOME/.cache/lavapipe-debs"
+      # Diagnostic only; the self-check below decides whether an adapter works.
+      - name: Vulkan devices
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q mesa-vulkan-drivers vulkan-tools
-      - run: vulkaninfo --summary
+          if command -v vulkaninfo >/dev/null; then
+            vulkaninfo --summary
+          else
+            echo "vulkaninfo is not installed; skipping the summary"
+          fi
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2.9.2
       - name: Adapter and kernel self-check
         run: cargo run --release -p ferrotensor-cli -- info --check
+      - name: Trainer examples (tiny model, no download)
+        run: |
+          cargo run --release -p ferrotensor-trainer --example lora_finetune_tiny
+          cargo run --release -p ferrotensor-trainer --example resume_training
+          cargo run --release -p ferrotensor-trainer --example generate_with_kv_cache
       - name: GPU suites (ignored tests)
         run: cargo test --release --workspace -- --ignored --test-threads=1
+      # A LoRA adapter trained here, exported with `export-adapter --format
+      # peft`, must give the same logits in PyTorch + PEFT (CPU wheels).
+      - name: PEFT export against PyTorch + PEFT
+        run: |
+          out="$RUNNER_TEMP/peft-check"
+          venv="$RUNNER_TEMP/peft-venv"
+          python3 -m venv "$venv"
+          "$venv/bin/pip" install -q --index-url https://download.pytorch.org/whl/cpu torch==2.14.1
+          "$venv/bin/pip" install -q transformers==5.20.2 peft==0.21.2 safetensors==0.8.0
+          cargo run --release -p ferrotensor-trainer --example peft_fixture -- "$out"
+          cargo run --release -p ferrotensor-cli -- export-adapter \
+            --lora "$out/adapter.safetensors" --model "$out/model" \
+            --output "$out/peft" --format peft
+          "$venv/bin/python" scripts/check_peft_export.py \
+            --model "$out/model" --adapter "$out/peft" --logits "$out/logits.json"
       - name: Autograd finite-difference checks
         run: cargo test --release -p ferrotensor-autograd --test grad_check -- --test-threads=1
       - name: Tensor API GPU parity
@@ -86,6 +133,8 @@ jobs:
         run: cargo test --release -p ferrotensor --lib -- --test-threads=1
         env:
           FERROTENSOR_FUSION: "1"
+      - name: Examples (GPU)
+        run: scripts/run-examples.sh --gpu
       - name: Hardware report (quick)
         run: scripts/hardware-report.sh --quick
       - uses: actions/upload-artifact@v4.4.3

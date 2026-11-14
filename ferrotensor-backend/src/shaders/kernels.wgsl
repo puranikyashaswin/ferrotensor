@@ -735,7 +735,12 @@ fn gradient_scale(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_wo
     scale_grad[i] = scale_grad[i] * scale_factor;
 }
 // ============================================================================
-// MIXED PRECISION (FP16) KERNELS
+// F32 <-> F16 CAST KERNELS (NOT USED)
+//
+// Nothing calls fp32_to_fp16 or fp16_to_fp32: the engine builds no pipeline
+// for either. f16 weights are rounded and packed on the CPU by
+// UnifiedTensor::from_f32_as_f16 and read by matmul_blocked_h. These kernels
+// are not part of any mixed-precision training path; there is none.
 // ============================================================================
 
 // --- 22. FP32 to FP16 Cast ---

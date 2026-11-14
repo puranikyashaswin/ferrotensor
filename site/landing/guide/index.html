@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>How-to guide: Ferrotensor step by step</title>
 <meta name="description" content="Step-by-step Ferrotensor guides: install it, check your GPU, fine-tune a model with LoRA, train in Rust or Python, and fix common problems.">
-<link rel="canonical" href="https://puranikyashaswin.github.io/ferrotensor/guide/">
+<link rel="canonical" href="https://ferrotensor.dev/guide/">
 <meta name="color-scheme" content="light dark">
 <script>document.documentElement.classList.add("js");</script>
 <meta name="theme-color" content="#f6f3ee" media="(prefers-color-scheme: light)">
@@ -15,8 +15,8 @@
 <meta property="og:site_name" content="Ferrotensor">
 <meta property="og:title" content="How-to guide: Ferrotensor step by step">
 <meta property="og:description" content="Install Ferrotensor, check your GPU, fine-tune a model with LoRA and train in Rust or Python, with real output at every step.">
-<meta property="og:url" content="https://puranikyashaswin.github.io/ferrotensor/guide/">
-<meta property="og:image" content="https://puranikyashaswin.github.io/ferrotensor/og.png">
+<meta property="og:url" content="https://ferrotensor.dev/guide/">
+<meta property="og:image" content="https://ferrotensor.dev/og.png">
 <meta name="twitter:card" content="summary_large_image">
 <link rel="stylesheet" href="../style.css">
 <link rel="stylesheet" href="guide.css">
@@ -280,7 +280,7 @@ EOF</pre></figure></div></li></ol>
 <ul>
 <li><code>--lora-rank</code>, <code>--lora-alpha</code> and <code>--lora-targets</code> change the adapter.</li>
 <li><code>--lite</code> is a preset for small machines: sequence length 128, rank 4 and grad-accum 8, unless you set them.</li>
-<li><code>--train-modules all|attn|mlp|norm|lm_head</code> trains base weights instead of LoRA.</li>
+<li><code>--train-modules all|attn|mlp|norm|lm_head</code> trains base weights instead of LoRA and saves the trained tensors, in f32, to <code>trained_weights.safetensors</code>. Pass that file to <code>--lora</code> in <code>eval</code> and <code>generate</code>, or to <code>--resume</code> with the same <code>--train-modules</code>.</li>
 <li><code>ferrotensor monitor</code> follows a run's <code>training_state.json</code> in a terminal dashboard.</li>
 </ul>
 <p>The same recipe on three model sizes on an NVIDIA A10G:</p>
@@ -545,6 +545,7 @@ scripts/hardware-report.sh">Copy</button></figcaption><pre tabindex="0"><span cl
         <li><a href="https://pypi.org/project/ferrotensor/">PyPI</a></li>
         <li><a href="https://docs.rs/ferrotensor">docs.rs</a></li>
         <li><a href="../docs/">Docs</a></li>
+        <li><a href="../about/">About</a></li>
         <li><a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/CHANGELOG.md">Changelog</a></li>
       </ul>
     </nav>
