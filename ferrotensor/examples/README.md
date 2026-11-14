@@ -23,14 +23,35 @@ The low-level examples for the LLM stack live next to the crates they use:
   creation, tensor upload, and individual kernels through `ComputeEngine`
 - [`ferrotensor-graph/examples`](../../ferrotensor-graph/examples): a Llama
   block and causal flash attention checked against a CPU reference
+- [`ferrotensor-trainer/examples`](../../ferrotensor-trainer/examples): the
+  training stack on a tiny random model built in a temporary directory, so
+  nothing is downloaded. Each needs a GPU, checks its own results and runs
+  in CI:
+
+  | Example | What it shows |
+  |---------|---------------|
+  | `lora_finetune_tiny` | LoRA training; the loss falls, and a saved adapter reloads into a fresh model with the same loss |
+  | `resume_training` | A run stopped halfway, saved with its optimizer state and resumed, matches an unbroken run |
+  | `generate_with_kv_cache` | Greedy generation gives the same tokens with and without the KV cache |
+
+  Run one with `cargo run --release -p ferrotensor-trainer --example <name>`.
 
 For fine-tuning a real model, see the
 [LoRA walkthrough](../../docs/examples/lora-sft.md).
 
+## Running every example
+
+CI runs every example, on the CPU or on software Vulkan, and fails when one
+fails: the examples check their own results with `assert!`. To do the same
+locally, run `scripts/run-examples.sh` (all of them, needs a GPU adapter),
+`scripts/run-examples.sh --cpu` or `scripts/run-examples.sh --gpu`.
+
 ## Adding an example
 
 Create a `.rs` file in this directory; Cargo finds it. Put a doc comment at
-the top with the command to run it and its real output.
+the top with the command to run it and its real output, check the result with
+`assert!`, and add it to the list in `scripts/run-examples.sh` (the script
+fails when an example is missing from it).
 
 ## Troubleshooting
 

@@ -3,26 +3,33 @@
 //! [`Trainer`] runs forward, a response-masked cross-entropy loss
 //! ([`masked_cross_entropy`]), backward and an optimizer step on an
 //! [`Lfm2Model`] (Llama-style or LFM2), with gradient accumulation, global
-//! gradient-norm clipping, an optional learning-rate schedule, a loss scaler
-//! and file-based multi-process gradient averaging. [`data`] builds SFT and
+//! gradient-norm clipping, an optional learning-rate schedule, an optional loss
+//! scaler (not used by the CLI) and a prototype of file-based gradient
+//! averaging. [`data`] builds SFT and
 //! pretraining datasets, [`checkpoint`] saves and restores LoRA adapters and
-//! optimizer state.
+//! optimizer state, [`peft`] converts adapters to and from the Hugging Face
+//! PEFT format, and [`classify`] fine-tunes a decoder with LoRA as a sequence
+//! classifier ([`ClassifierTrainer`]).
 
 #![warn(missing_docs)]
 
 use ferrotensor_autograd::{AutogradNode, LRScheduler, Optimizer, Tensor};
 use ferrotensor_backend::{
-    ComputeEngine, UnifiedTensor, WgpuContext, MASKED_CE_SKIP, SUM_SQUARES_CHUNK,
+    ComputeEngine, MemoryCategory, UnifiedTensor, WgpuContext, MASKED_CE_SKIP, SUM_SQUARES_CHUNK,
 };
 use ferrotensor_graph::lfm::Lfm2Model;
 use std::sync::Arc;
 
 pub mod checkpoint;
+pub mod classify;
 pub mod data;
 pub mod demo;
 pub mod distributed;
+pub mod memory;
+pub mod peft;
 pub mod scaler;
 
+pub use classify::{ClassifierStepStats, ClassifierTrainer};
 pub use data::{build_sft_example, Batch, DataLoader, Dataset, TextDataset, TrainingExample};
 pub use demo::{print_banner, run_demo, DemoConfig};
 pub use scaler::{GradScaler, GradScalerStats};
@@ -37,7 +44,8 @@ pub struct StepStats {
     /// Number of supervised (unmasked) target tokens.
     pub tokens: usize,
     /// Whether this call completed an accumulation window and updated the
-    /// parameters (`false` while accumulating or after an fp16 overflow).
+    /// parameters (`false` while accumulating or when a loss scaler found
+    /// non-finite gradients).
     pub optimizer_step: bool,
     /// Global L2 norm of the gradients before clipping, when the optimizer
     /// stepped.
@@ -74,7 +82,7 @@ pub struct Trainer {
     pub grad_accum_steps: usize,
     /// Micro-batches accumulated so far in the current window.
     pub step_in_accum: usize,
-    /// Dynamic loss scaler (fp16-style overflow protection).
+    /// Optional dynamic loss scaler. Not set by the CLI.
     pub scaler: Option<GradScaler>,
     /// Multi-process gradient averaging through a shared directory.
     pub distributed_grad_sync: Option<FileGradSyncConfig>,
@@ -86,6 +94,15 @@ pub struct Trainer {
     /// tokens from seeing the padding, so results are unchanged, but GPU
     /// buffer sizes repeat and can be reused. 1 disables padding.
     pub length_bucket: usize,
+    /// Run seed for attention dropout. Each forward pass draws its masks
+    /// from this seed, the rank, the optimizer step and the position in the
+    /// accumulation window (see
+    /// [`attention_dropout_seed`](Self::attention_dropout_seed)), so a run is
+    /// reproducible and a resumed run (with
+    /// [`set_optimizer_steps`](Self::set_optimizer_steps)) draws the same
+    /// masks as an uninterrupted one. Has no effect when the model's
+    /// attention dropout is 0.
+    pub dropout_seed: u64,
     optimizer_step_count: usize,
 }
 
@@ -109,6 +126,7 @@ impl Trainer {
             distributed_grad_sync: None,
             lr_scheduler: None,
             length_bucket: 32,
+            dropout_seed: 0,
             optimizer_step_count: 0,
         }
     }
@@ -135,6 +153,7 @@ impl Trainer {
     }
 
     /// Scale the loss before backward and skip steps whose gradients overflow.
+    /// The CLI does not call this.
     pub fn with_grad_scaler(mut self, scaler: GradScaler) -> Self {
         self.scaler = Some(scaler);
         self
@@ -150,6 +169,27 @@ impl Trainer {
     pub fn with_lr_scheduler(mut self, scheduler: Box<dyn LRScheduler>) -> Self {
         self.lr_scheduler = Some(scheduler);
         self
+    }
+
+    /// Seed the attention-dropout masks with `seed` (see
+    /// [`dropout_seed`](Self::dropout_seed)).
+    pub fn with_dropout_seed(mut self, seed: u64) -> Self {
+        self.dropout_seed = seed;
+        self
+    }
+
+    /// The attention-dropout step seed for the next forward pass:
+    /// [`derive_seed`](ferrotensor_graph::dropout::derive_seed) of the run
+    /// seed, this process's rank, the optimizer step and the position in the
+    /// accumulation window. Layers derive their own seeds from it.
+    pub fn attention_dropout_seed(&self) -> u64 {
+        let rank = self.distributed_grad_sync.as_ref().map_or(0, |c| c.rank);
+        ferrotensor_graph::dropout::derive_seed(&[
+            self.dropout_seed,
+            rank as u64,
+            self.optimizer_step_count as u64,
+            self.step_in_accum as u64,
+        ])
     }
 
     /// Optimizer steps taken so far.
@@ -205,7 +245,14 @@ impl Trainer {
         targets.resize(padded_len, pad);
         mask.resize(padded_len, 0);
 
-        let logits = self.model.forward(&self.engine, &inputs, 0, None, None);
+        let dropout_seed = Some(self.attention_dropout_seed());
+        let logits = {
+            let _tag = self.ctx.memory().scope(MemoryCategory::Activations);
+            self.model
+                .forward_with_dropout(&self.engine, &inputs, 0, None, None, dropout_seed)
+        };
+        memory::tag_loss(&logits);
+        let tag = self.ctx.memory().scope(MemoryCategory::Loss);
 
         let mut stats = StepStats {
             loss: 0.0,
@@ -224,8 +271,12 @@ impl Trainer {
                 seed *= scaler.scale_factor();
             }
             *loss.tensor.grad.borrow_mut() = Some(UnifiedTensor::new(&self.ctx, &[seed], &[1]));
+            let _tag = self.ctx.memory().scope(MemoryCategory::BackwardScratch);
             loss.tensor.backward(&self.engine);
+            memory::tag_gradients(train_params);
+            memory::tag_loss(&logits);
         }
+        drop(tag);
 
         self.step_in_accum += 1;
         if self.step_in_accum >= self.grad_accum_steps {
@@ -295,7 +346,10 @@ impl Trainer {
             self.optimizer.set_lr(lr);
             stats.lr = Some(lr);
         }
-        self.optimizer.step(train_params);
+        {
+            let _tag = self.ctx.memory().scope(MemoryCategory::OptimizerState);
+            self.optimizer.step(train_params);
+        }
         self.optimizer_step_count += 1;
         stats.optimizer_step = true;
         Ok(())
@@ -308,7 +362,8 @@ impl Trainer {
     /// sequences run through the model together, one forward and backward
     /// per accumulation chunk; otherwise one at a time. Both give the same
     /// result: each sequence contributes its own mean-loss gradient, and
-    /// optimizer steps fall after the same sequences.
+    /// optimizer steps fall after the same sequences. With attention dropout
+    /// on, the two paths draw different (identically distributed) masks.
     pub fn train_batch(
         &mut self,
         batch: &Batch,
@@ -390,7 +445,14 @@ impl Trainer {
             masks.resize(masks.len() + padded_len - len, 0);
         }
         let rows: Vec<&[u32]> = inputs.iter().map(Vec::as_slice).collect();
-        let logits = self.model.forward_batch(&self.engine, &rows);
+        let dropout_seed = Some(self.attention_dropout_seed());
+        let logits = {
+            let _tag = self.ctx.memory().scope(MemoryCategory::Activations);
+            self.model
+                .forward_batch_with_dropout(&self.engine, &rows, dropout_seed)
+        };
+        memory::tag_loss(&logits);
+        let tag = self.ctx.memory().scope(MemoryCategory::Loss);
 
         let mut out: Vec<StepStats> = Vec::with_capacity(chunk.len());
         if let Some(loss) =
@@ -410,8 +472,12 @@ impl Trainer {
                 seed *= scaler.scale_factor();
             }
             *loss.tensor.grad.borrow_mut() = Some(UnifiedTensor::new(&self.ctx, &[seed], &[1]));
+            let _tag = self.ctx.memory().scope(MemoryCategory::BackwardScratch);
             loss.tensor.backward(&self.engine);
+            memory::tag_gradients(train_params);
+            memory::tag_loss(&logits);
         }
+        drop(tag);
 
         self.step_in_accum += chunk.len();
         if self.step_in_accum >= self.grad_accum_steps {
@@ -434,7 +500,11 @@ impl Trainer {
 
 /// L2 norm over all gradient tensors: partial sums of squares on the GPU,
 /// read back once and added up on the host in f64.
-fn global_grad_norm(grads: &[UnifiedTensor], ctx: &WgpuContext, engine: &ComputeEngine) -> f32 {
+pub(crate) fn global_grad_norm(
+    grads: &[UnifiedTensor],
+    ctx: &WgpuContext,
+    engine: &ComputeEngine,
+) -> f32 {
     let chunks: usize = grads
         .iter()
         .map(|g| {
@@ -488,6 +558,7 @@ impl AutogradNode for MaskedCrossEntropyNode {
             .copied()
             .unwrap_or(1.0);
         let scaled = UnifiedTensor::empty(ctx, &self.grad_logits.shape);
+        scaled.set_memory_category(MemoryCategory::Loss);
         engine.copy_tensor(ctx, &self.grad_logits, &scaled, 0);
         if (upstream - 1.0).abs() > f32::EPSILON {
             engine.gradient_scale(ctx, &scaled, upstream);
@@ -557,6 +628,27 @@ pub fn masked_cross_entropy(
         value,
         tokens,
     })
+}
+
+/// Mean cross-entropy of class `logits` (`[batch, classes]`, e.g. from
+/// `ferrotensor_graph::ClassifierHead`) against one label per row, as a
+/// differentiable scalar computed on the GPU.
+///
+/// Returns `None` when the number of labels differs from the batch size or
+/// a label is not below `classes`, so a bad label cannot be skipped silently.
+pub fn classification_loss(
+    logits: &Tensor,
+    labels: &[u32],
+    engine: &ComputeEngine,
+) -> Option<MaskedLoss> {
+    let (batch, classes) = match logits.data.shape.as_slice() {
+        [batch, classes] => (*batch, *classes),
+        _ => return None,
+    };
+    if labels.len() != batch || labels.iter().any(|&l| l as usize >= classes) {
+        return None;
+    }
+    masked_cross_entropy(logits, labels, &vec![1u8; batch], engine)
 }
 
 /// The loss of a batch of sequences, see [`masked_cross_entropy_batch`].

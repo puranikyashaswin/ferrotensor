@@ -19,6 +19,11 @@ should match exactly.
     python benchmarks/baselines/pytorch_lora.py HuggingFaceTB/SmolLM2-135M --batch-size 8 --grad-accum 1
 
 Writes data/runs/<model>-pytorch-<dtype>-b<batch>/summary.json.
+
+On an Apple-silicon Mac pass --device mps (float32 only). That path is driven
+by scripts/bench_mac.py, which also uses --data-root, --summary, --warmup-steps
+and --record-steps; see docs/benchmarks-mac.md. Without those options and with
+the default --device cuda, behaviour is as described above.
 """
 
 import argparse
@@ -97,7 +102,7 @@ def batch_tensors(examples, device):
 def per_sequence_loss(model, examples, device, dtype):
     """Sum over sequences of each sequence's mean response-token loss, and token stats."""
     ids, tgt, msk = batch_tensors(examples, device)
-    with torch.autocast("cuda", dtype=dtype, enabled=dtype != torch.float32):
+    with torch.autocast(device, dtype=dtype, enabled=dtype != torch.float32):
         logits = model(input_ids=ids).logits.float()
     nll = torch.nn.functional.cross_entropy(logits.transpose(1, 2), tgt, reduction="none")
     tokens = msk.sum(dim=1)
@@ -115,7 +120,26 @@ def heldout(model, examples, device, dtype):
     return total / tokens, int(tokens)
 
 
+def synchronize(device):
+    """Wait for queued GPU work, so a wall-clock reading covers it."""
+    if device == "cuda":
+        torch.cuda.synchronize()
+    elif device == "mps":
+        torch.mps.synchronize()
+
+
+def mps_memory_gb():
+    """(driver-allocated, tensor-allocated) bytes of the MPS device, in GB.
+
+    PyTorch exposes no peak counter for MPS, so callers sample these after each step.
+    """
+    return torch.mps.driver_allocated_memory() / 1e9, torch.mps.current_allocated_memory() / 1e9
+
+
 def gpu_name():
+    if torch.backends.mps.is_available() and not torch.cuda.is_available():
+        return subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"],
+                              capture_output=True, text=True).stdout.strip() + " (MPS)"
     try:
         return subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
                               capture_output=True, text=True).stdout.strip()
@@ -132,13 +156,22 @@ def main():
     ap.add_argument("--grad-accum", type=int, default=8)
     ap.add_argument("--dtype", choices=["f32", "bf16"], default="f32")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--device", choices=["cuda", "mps"], default="cuda",
+                    help="cuda (the default) or mps on Apple silicon, which supports f32 only")
+    ap.add_argument("--warmup-steps", type=int, default=20, help="linear learning-rate warmup steps")
+    ap.add_argument("--data-root", default="data", help="where models and data are cached")
+    ap.add_argument("--summary", help="write the summary here instead of under <data-root>/runs")
+    ap.add_argument("--record-steps", action="store_true",
+                    help="add every step's seconds and mean loss to the summary")
     args = ap.parse_args()
+    if args.device == "mps" and args.dtype != "f32":
+        ap.error("--device mps supports --dtype f32 only")
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
     dtype = {"f32": torch.float32, "bf16": torch.bfloat16}[args.dtype]
-    device = "cuda"
-    root = Path("data")
+    device = args.device
+    root = Path(args.data_root)
     name = args.model.split("/")[-1]
     run = root / "runs" / f"{name}-pytorch-{args.dtype}-b{args.batch_size}"
     run.mkdir(parents=True, exist_ok=True)
@@ -151,7 +184,11 @@ def main():
     train = [e for r in train_rows if (e := build_example(tok, eos, r["prompt"], r["response"], args.seq_len))]
     val = [e for r in val_rows if (e := build_example(tok, eos, r["prompt"], r["response"], args.seq_len))]
 
-    model = AutoModelForCausalLM.from_pretrained(model_dir, torch_dtype=torch.float32).to(device)
+    try:
+        model = AutoModelForCausalLM.from_pretrained(model_dir, dtype=torch.float32)
+    except TypeError:  # older transformers spell it torch_dtype
+        model = AutoModelForCausalLM.from_pretrained(model_dir, torch_dtype=torch.float32)
+    model = model.to(device)
     model = get_peft_model(model, LoraConfig(r=8, lora_alpha=16, lora_dropout=0.0,
                                              target_modules=["q_proj", "k_proj", "v_proj", "o_proj"]))
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -164,11 +201,13 @@ def main():
     order = list(range(len(train)))
     random.Random(args.seed).shuffle(order)
     per_step = args.batch_size * args.grad_accum
-    torch.cuda.reset_peak_memory_stats()
-    step_times, curve, cursor = [], [], 0
+    if device == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+    step_times, step_losses, curve, cursor = [], [], [], 0
+    mps_driver_gb = mps_current_gb = 0.0
     model.train()
     for step in range(1, args.steps + 1):
-        torch.cuda.synchronize()
+        synchronize(device)
         t0 = time.perf_counter()
         losses = []
         for _ in range(args.grad_accum):
@@ -178,21 +217,30 @@ def main():
             (seq_loss.sum() / per_step).backward()
             losses.extend(seq_loss.detach().tolist())
         for g in opt.param_groups:
-            g["lr"] = lr_at(step, 5e-4, 20, args.steps)
+            g["lr"] = lr_at(step, 5e-4, args.warmup_steps, args.steps)
         torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
         opt.step()
         opt.zero_grad(set_to_none=True)
-        torch.cuda.synchronize()
+        synchronize(device)
         step_times.append(time.perf_counter() - t0)
+        step_losses.append(statistics.fmean(losses))
+        if device == "mps":
+            driver_gb, current_gb = mps_memory_gb()
+            mps_driver_gb, mps_current_gb = max(mps_driver_gb, driver_gb), max(mps_current_gb, current_gb)
         if step % 10 == 0:
             curve.append({"step": step, "loss": statistics.fmean(losses)})
             print(f"{step:6d} | {statistics.fmean(losses):.4f} | {step_times[-1]:.2f} s", flush=True)
     model.eval()
     after, _ = heldout(model, val, device, dtype)
     print(f"eval after: loss {after:.4f}", flush=True)
+    if device == "mps":
+        driver_gb, current_gb = mps_memory_gb()
+        mps_driver_gb, mps_current_gb = max(mps_driver_gb, driver_gb), max(mps_current_gb, current_gb)
 
     summary = {
-        "framework": f"pytorch {torch.__version__} + peft, CUDA {torch.version.cuda}",
+        "framework": (f"pytorch {torch.__version__} + peft, CUDA {torch.version.cuda}" if device == "cuda"
+                      else f"pytorch {torch.__version__} + peft, MPS"),
+        "device_kind": device,
         "model": args.model, "device": gpu_name(), "dtype": args.dtype,
         "steps": args.steps, "seq_len": args.seq_len,
         "batch_size": args.batch_size, "grad_accum": args.grad_accum,
@@ -200,13 +248,24 @@ def main():
         "heldout_loss_before": round(before, 4), "heldout_loss_after": round(after, 4),
         "heldout_ppl_after": round(math.exp(after), 3), "heldout_tokens": held_tokens,
         "seconds_per_step_median": statistics.median(step_times),
-        "peak_gpu_memory_gb": round(torch.cuda.max_memory_allocated() / 1e9, 2),
         "train_loss_curve": curve,
     }
-    (run / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
-    print(f"summary: {run / 'summary.json'}")
-    print(f"held-out loss {before:.4f} -> {after:.4f}, {summary['seconds_per_step_median']:.3f} s/step, "
-          f"peak GPU {summary['peak_gpu_memory_gb']} GB")
+    if device == "cuda":
+        summary["peak_gpu_memory_gb"] = round(torch.cuda.max_memory_allocated() / 1e9, 2)
+    else:
+        # Sampled after every step and after the final evaluation, not a true peak.
+        summary["mps_driver_allocated_max_gb"] = round(mps_driver_gb, 4)
+        summary["mps_current_allocated_max_gb"] = round(mps_current_gb, 4)
+    if args.record_steps:
+        summary["step_seconds"] = step_times
+        summary["step_losses"] = step_losses
+    summary_path = Path(args.summary) if args.summary else run / "summary.json"
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text(json.dumps(summary, indent=2) + "\n")
+    print(f"summary: {summary_path}")
+    memory = (f"peak GPU {summary['peak_gpu_memory_gb']} GB" if device == "cuda"
+              else f"MPS driver memory {summary['mps_driver_allocated_max_gb']} GB (sampled max)")
+    print(f"held-out loss {before:.4f} -> {after:.4f}, {summary['seconds_per_step_median']:.3f} s/step, {memory}")
 
 
 if __name__ == "__main__":

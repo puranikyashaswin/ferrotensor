@@ -44,9 +44,19 @@ PAGES = {
         "character-level transformer, GPU matmul and attention, similarity search.",
     ),
     "examples/lora-sft.html": (
-        "LoRA fine-tuning on a MacBook or NVIDIA GPU | Ferrotensor",
-        "Fine-tune SmolLM2 with LoRA: 135M on an 8 GB Apple M2 (held-out loss 2.43 to 1.65), and "
-        "135M to 1.7B on an NVIDIA A10G, every command shown.",
+        "LoRA fine-tuning walkthrough: SmolLM2 | Ferrotensor",
+        "Fine-tune SmolLM2 with LoRA on an NVIDIA A10G and an Apple M2: every command, the "
+        "PyTorch + PEFT comparison, gradient checks and GPU memory.",
+    ),
+    "examples/classify.html": (
+        "Text classification with LoRA | Ferrotensor",
+        "Fine-tune a Llama-style decoder as a text classifier with ferrotensor classify-train, "
+        "and write per-line class probabilities with classify-predict.",
+    ),
+    "benchmarks-mac.html": (
+        "Ferrotensor, mlx-lm and PyTorch on a Mac",
+        "scripts/bench_mac.sh trains the same LoRA recipe with Ferrotensor, mlx-lm and PyTorch + "
+        "PEFT on an Apple-silicon Mac and prints one table.",
     ),
     "architecture.html": (
         "Ferrotensor architecture: from tensor op to WGSL kernel",
@@ -229,8 +239,18 @@ def check_guide(site, problems):
     return len(re.findall(r'<article class="g"', text))
 
 
+def check_about(site, problems):
+    """The about page: title and description lengths, one <h1>."""
+    text = open(os.path.join(site, "about", "index.html"), encoding="utf-8").read()
+    title = re.search(r"<title>(.*?)</title>", text, re.S).group(1)
+    desc = re.search(r'<meta name="description" content="([^"]*)">', text).group(1)
+    check_lengths("about/index.html", html.unescape(title), html.unescape(desc), problems)
+    if count_h1(text) != 1:
+        problems.append(f"about/index.html: {count_h1(text)} <h1> elements")
+
+
 def write_sitemap(site):
-    urls = [BASE, BASE + "guide/"] + [page_url(rel) for rel in PAGES]
+    urls = [BASE, BASE + "guide/", BASE + "about/"] + [page_url(rel) for rel in PAGES]
     entries = "\n".join(f"  <url><loc>{html.escape(u)}</loc></url>" for u in urls)
     with open(os.path.join(site, "sitemap.xml"), "w", encoding="utf-8") as f:
         f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
@@ -251,6 +271,7 @@ def main():
     fix_docs(site, problems)
     faqs = check_landing(site, problems)
     guides = check_guide(site, problems)
+    check_about(site, problems)
     urls = write_sitemap(site)
     for p in problems:
         print(f"seo: {p}", file=sys.stderr)

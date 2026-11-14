@@ -9,25 +9,16 @@ mod tests {
     use ferrotensor_graph::FlashAttention;
     use std::sync::Arc;
 
-    fn gpu_tests_enabled() -> bool {
-        std::env::var("FERROTENSOR_RUN_GPU_TESTS").as_deref() == Ok("1")
-    }
-
-    fn setup() -> Option<(Arc<WgpuContext>, ComputeEngine)> {
-        if !gpu_tests_enabled() {
-            eprintln!(
-                "skipping flash attention correctness tests; set FERROTENSOR_RUN_GPU_TESTS=1"
-            );
-            return None;
-        }
+    fn setup() -> (Arc<WgpuContext>, ComputeEngine) {
         let ctx = Arc::new(pollster::block_on(async { WgpuContext::new().await }));
         let engine = ComputeEngine::new(&ctx);
-        Some((ctx, engine))
+        (ctx, engine)
     }
 
     #[test]
+    #[ignore = "needs a GPU"]
     fn test_flash_attention_shape() {
-        let Some((ctx, engine)) = setup() else { return };
+        let (ctx, engine) = setup();
         let flash_attn = FlashAttention::new(768, 12, true);
 
         let seq_len = 128;
@@ -47,8 +38,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs a GPU"]
     fn test_causal_masking() {
-        let Some((ctx, engine)) = setup() else { return };
+        let (ctx, engine) = setup();
         let flash_attn = FlashAttention::new(64, 1, true); // Causal
 
         let seq_len = 8;
@@ -83,8 +75,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs a GPU"]
     fn test_attention_normalization() {
-        let Some((ctx, engine)) = setup() else { return };
+        let (ctx, engine) = setup();
         let flash_attn = FlashAttention::new(64, 1, false);
 
         let seq_len = 16;
@@ -112,8 +105,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs a GPU"]
     fn test_backward_pass_shapes() {
-        let Some((ctx, engine)) = setup() else { return };
+        let (ctx, engine) = setup();
         let flash_attn = FlashAttention::new(64, 1, true);
 
         let seq_len = 64;
@@ -153,8 +147,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs a GPU"]
     fn test_different_sequence_lengths() {
-        let Some((ctx, engine)) = setup() else { return };
+        let (ctx, engine) = setup();
         let flash_attn = FlashAttention::new(256, 4, true);
 
         let test_lengths = vec![16, 32, 64, 128, 256];

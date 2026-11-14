@@ -1,27 +1,44 @@
 //! GPU-resident tensors.
 
+use crate::memory::{Allocation, MemoryCategory};
 use crate::pool::BufferPool;
 use crate::WgpuContext;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use wgpu::{util::DeviceExt, Buffer};
 
-/// Data type for tensors - supports mixed precision training
+/// Element type of a tensor buffer.
+///
+/// Arithmetic is f32. [`DType::FP16`] is only a storage format for frozen
+/// weights (see [`UnifiedTensor::from_f32_as_f16`]); there is no f16
+/// activation, gradient or mixed-precision training path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DType {
     /// 32-bit float (the default).
     #[default]
     FP32,
-    /// 16-bit float (half precision, for memory savings).
+    /// 16-bit float storage, two values per 32-bit word. Only the `*_f16b`
+    /// matmuls read it, and they accumulate in f32.
     FP16,
+    /// 4-bit affine codes with per-group f16 scale and minimum (see
+    /// [`crate::q4`]); built only with [`UnifiedTensor::from_f32_as_q4`].
+    Q4,
 }
 
 impl DType {
-    /// Size of a single element in bytes
+    /// Size of a single element in bytes.
+    ///
+    /// # Panics
+    ///
+    /// For [`DType::Q4`], which has no per-element size (codes and group
+    /// scales share one buffer, see [`crate::q4::packed_words`]).
     pub fn size_bytes(&self) -> usize {
         match self {
             DType::FP32 => 4,
             DType::FP16 => 2,
+            DType::Q4 => panic!(
+                "DType::Q4 has no per-element size; build Q4 tensors with UnifiedTensor::from_f32_as_q4"
+            ),
         }
     }
 }
@@ -36,7 +53,7 @@ pub struct UnifiedTensor {
     /// Dimensions, outermost first.
     pub shape: Vec<usize>,
     /// Element type of the buffer.
-    pub dtype: DType, // Track tensor data type for mixed precision
+    pub dtype: DType,
 }
 
 #[derive(Debug)]
@@ -44,10 +61,45 @@ struct TensorData {
     buffer: Arc<Buffer>,
     size_in_bytes: u64,
     pool: Option<Arc<BufferPool>>,
+    /// Counted in the context's memory tracker; `None` only while dropping.
+    memory: Option<Allocation>,
+}
+
+impl TensorData {
+    fn new(
+        context: &WgpuContext,
+        buffer: Arc<Buffer>,
+        size_in_bytes: u64,
+        pool: Option<Arc<BufferPool>>,
+        shape: &[usize],
+        dtype: DType,
+    ) -> Self {
+        let numel = shape.iter().product::<usize>() as u64;
+        let logical = match dtype {
+            // Codes and group scales: the packed buffer is what the shape needs.
+            DType::Q4 => size_in_bytes,
+            _ => (numel * dtype.size_bytes() as u64).min(size_in_bytes),
+        };
+        // A buffer without a pool is dropped with the tensor; a pooled one
+        // is kept or dropped by the pool, which counts it either way.
+        let memory =
+            context
+                .memory()
+                .allocate(dtype, shape, logical, size_in_bytes, pool.is_none());
+        Self {
+            buffer,
+            size_in_bytes,
+            pool,
+            memory: Some(memory),
+        }
+    }
 }
 
 impl Drop for TensorData {
     fn drop(&mut self) {
+        // Stop counting the bytes as live before the pool counts them idle
+        // (or, past its cap, as awaiting GPU).
+        drop(self.memory.take());
         if let Some(pool) = &self.pool {
             pool.return_buffer(self.size_in_bytes, self.buffer.clone());
         }
@@ -63,6 +115,23 @@ impl UnifiedTensor {
     /// Size of the tensor's data in bytes.
     pub fn size_in_bytes(&self) -> u64 {
         self.data.size_in_bytes
+    }
+
+    /// What the buffer is counted as in the context's
+    /// [`MemoryTracker`](crate::MemoryTracker).
+    pub fn memory_category(&self) -> MemoryCategory {
+        self.data
+            .memory
+            .as_ref()
+            .map_or(MemoryCategory::Other, Allocation::category)
+    }
+
+    /// Count the buffer (shared by clones and reshaped views) as `category`
+    /// from now on. Changes no data.
+    pub fn set_memory_category(&self, category: MemoryCategory) {
+        if let Some(memory) = &self.data.memory {
+            memory.set_category(category);
+        }
     }
 
     /// Uploads `data` to the start of the buffer, after all recorded work.
@@ -90,11 +159,14 @@ impl UnifiedTensor {
             });
         context.note_upload(size_in_bytes);
         Self {
-            data: Arc::new(TensorData {
-                buffer: Arc::new(buffer),
+            data: Arc::new(TensorData::new(
+                context,
+                Arc::new(buffer),
                 size_in_bytes,
-                pool: None,
-            }),
+                None,
+                shape,
+                DType::FP32,
+            )),
             shape: shape.to_vec(),
             dtype: DType::FP32,
         }
@@ -107,14 +179,21 @@ impl UnifiedTensor {
 
     /// An uninitialised tensor of `dtype` drawn from the buffer pool.
     pub fn empty_with_dtype(context: &WgpuContext, shape: &[usize], dtype: DType) -> Self {
+        assert!(
+            dtype != DType::Q4,
+            "empty_with_dtype: Q4 tensors are built with from_f32_as_q4"
+        );
         let size_in_bytes = (shape.iter().product::<usize>() * dtype.size_bytes()) as u64;
         let buffer = context.pool.get(&context.device, size_in_bytes);
         Self {
-            data: Arc::new(TensorData {
+            data: Arc::new(TensorData::new(
+                context,
                 buffer,
                 size_in_bytes,
-                pool: Some(context.pool.clone()),
-            }),
+                Some(context.pool.clone()),
+                shape,
+                dtype,
+            )),
             shape: shape.to_vec(),
             dtype,
         }
@@ -151,11 +230,14 @@ impl UnifiedTensor {
             });
         context.note_upload(size_in_bytes);
         Self {
-            data: Arc::new(TensorData {
-                buffer: Arc::new(buffer),
+            data: Arc::new(TensorData::new(
+                context,
+                Arc::new(buffer),
                 size_in_bytes,
-                pool: None,
-            }),
+                None,
+                shape,
+                dtype,
+            )),
             shape: shape.to_vec(),
             dtype,
         }
@@ -175,7 +257,29 @@ impl UnifiedTensor {
         Self::from_bytes_with_dtype(context, &bytes, shape, DType::FP16)
     }
 
-    /// Create an FP16 tensor (half precision for memory savings)
+    /// Quantises row-major `data` of 2-D `shape` `[k, n]` to the 4-bit
+    /// format of [`crate::q4`] as a [`DType::Q4`] tensor of logical shape
+    /// `shape`: about 4.5 bits per weight. Read it with the `*_q4b`
+    /// matmuls, not [`to_vec`](Self::to_vec). Fails, uploading nothing, on
+    /// NaN or infinite values and on values beyond the f16 range.
+    pub fn from_f32_as_q4(
+        context: &WgpuContext,
+        data: &[f32],
+        shape: &[usize],
+    ) -> Result<Self, crate::q4::Q4Error> {
+        let [k, n] = shape[..] else {
+            panic!("from_f32_as_q4 expects a 2-D shape, got {shape:?}");
+        };
+        let words = crate::q4::quantize(data, k, n)?;
+        Ok(Self::from_bytes_with_dtype(
+            context,
+            bytemuck::cast_slice(&words),
+            shape,
+            DType::Q4,
+        ))
+    }
+
+    /// Create an empty FP16 tensor. No code in this workspace calls it.
     pub fn empty_fp16(context: &WgpuContext, shape: &[usize]) -> Self {
         Self::empty_with_dtype(context, shape, DType::FP16)
     }
@@ -189,6 +293,13 @@ impl UnifiedTensor {
             current_elements, new_elements,
             "Cannot reshape tensor of size {} to {:?}",
             current_elements, new_shape
+        );
+        // The 4-bit storage order and grouping depend on the 2-D shape.
+        assert!(
+            self.dtype != DType::Q4 || new_shape == self.shape.as_slice(),
+            "Cannot reshape a Q4 tensor of shape {:?} to {:?}",
+            self.shape,
+            new_shape
         );
 
         Self {
@@ -207,6 +318,9 @@ impl UnifiedTensor {
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // Counted as staging while the copy runs, then as awaiting GPU until
+        // the next wait polls the device and wgpu destroys it.
+        let _counted = context.memory().allocate_raw(MemoryCategory::Staging, size);
         context.record(|encoder| {
             encoder.copy_buffer_to_buffer(&self.data.buffer, 0, &staging, 0, size);
         });

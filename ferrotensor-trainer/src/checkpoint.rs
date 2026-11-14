@@ -1,13 +1,17 @@
-//! Saving and restoring LoRA adapters and training state.
+//! Saving and restoring LoRA adapters, trained base weights and training state.
 //!
 //! Adapters are written as safetensors (F32) with their LoRA settings in
 //! the file's metadata, so `ferrotensor-cli generate --lora` can rebuild the same
-//! adapter shapes. [`TrainingCheckpoint`] holds the step counter, optimizer
+//! adapter shapes. A run that trains base weights instead of adapters writes
+//! those weights the same way, by their model names, and records which
+//! modules were trained in [`LoraMetadata::trained_modules`].
+//! [`TrainingCheckpoint`] holds the step counter, optimizer
 //! moments and loss-scaler state for resuming: settings as JSON, the moments
 //! as F32 safetensors next to it.
 
 use ferrotensor_autograd::{AdamWCheckpoint, OptimizerCheckpoint, OptimizerTensorState, Tensor};
-use ferrotensor_backend::WgpuContext;
+use ferrotensor_backend::{DType, WgpuContext};
+use ferrotensor_graph::lfm::legacy_llama_name;
 use ferrotensor_loader::{LoaderError, WeightsContext};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -32,25 +36,51 @@ pub fn load_weights(
     Ok(())
 }
 
-/// LoRA settings stored in an adapter file's metadata.
+/// Settings stored in the metadata of an adapter file, or of a file of
+/// trained base weights.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LoraMetadata {
-    /// Adapter rank.
+    /// Adapter rank (0 for trained base weights).
     pub rank: usize,
     /// Scale numerator (the update is scaled by `alpha / rank`).
     pub alpha: f32,
     /// Projection names that carry adapters.
     pub target_modules: Vec<String>,
+    /// Which base weights the file holds, when it holds trained base weights
+    /// (full or partial fine-tuning) instead of adapters: the
+    /// `--train-modules` value (`all`, `attn`, `mlp`, ...). `None` for a LoRA
+    /// adapter.
+    pub trained_modules: Option<String>,
 }
 
 impl LoraMetadata {
+    /// Metadata of a file holding the base weights selected by
+    /// `trained_modules`. Rank, alpha and targets are empty: the model that
+    /// loads the file has no adapters.
+    pub fn trained_weights(trained_modules: &str) -> Self {
+        Self {
+            rank: 0,
+            alpha: 0.0,
+            target_modules: Vec::new(),
+            trained_modules: Some(trained_modules.to_string()),
+        }
+    }
+
     fn to_map(&self) -> HashMap<String, String> {
-        HashMap::from([
-            ("format".to_string(), "ferrotensor-lora".to_string()),
+        let format = match self.trained_modules {
+            Some(_) => "ferrotensor-weights",
+            None => "ferrotensor-lora",
+        };
+        let mut map = HashMap::from([
+            ("format".to_string(), format.to_string()),
             ("rank".to_string(), self.rank.to_string()),
             ("alpha".to_string(), self.alpha.to_string()),
             ("target_modules".to_string(), self.target_modules.join(",")),
-        ])
+        ]);
+        if let Some(modules) = &self.trained_modules {
+            map.insert("trained_modules".to_string(), modules.clone());
+        }
+        map
     }
 
     fn from_map(map: &HashMap<String, String>) -> Option<Self> {
@@ -63,6 +93,10 @@ impl LoraMetadata {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
                 .collect(),
+            trained_modules: map
+                .get("trained_modules")
+                .filter(|m| !m.is_empty())
+                .cloned(),
         })
     }
 }
@@ -88,9 +122,12 @@ impl LoraCheckpoint {
     }
 }
 
-/// Save LoRA adapter weights (F32 safetensors) to `path`, with `metadata`
-/// in the header. The file is written to a temporary name and renamed, so a
-/// crash never leaves a truncated adapter behind.
+/// Save LoRA adapter weights, or trained base weights, as F32 safetensors to
+/// `path`, with `metadata` in the header. The file is written to a temporary
+/// name and renamed, so a crash never leaves a truncated file behind.
+///
+/// Every tensor must be stored as f32 on the device; a tensor kept as f16
+/// (frozen base weights are by default) is an error, not a garbled file.
 pub async fn save_lora_checkpoint<P: AsRef<Path>>(
     ctx: &Arc<WgpuContext>,
     path: P,
@@ -99,6 +136,13 @@ pub async fn save_lora_checkpoint<P: AsRef<Path>>(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut data_to_save = Vec::with_capacity(tensors.len());
     for (name, tensor) in tensors {
+        if tensor.data.dtype != DType::FP32 {
+            return Err(format!(
+                "tensor {name} is stored as {:?}; only f32 tensors can be saved",
+                tensor.data.dtype
+            )
+            .into());
+        }
         let values = tensor.data.to_vec(ctx).await;
         let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
         data_to_save.push((name.clone(), tensor.data.shape.clone(), bytes));
@@ -169,9 +213,17 @@ pub fn load_lora_checkpoint<P: AsRef<Path>>(
 /// Copy checkpoint values into the matching `tensors`.
 ///
 /// Every tensor in `tensors` must be present in the checkpoint with the
-/// same shape; otherwise nothing is written and the error names the first
-/// problem (a different rank or target set usually causes it). Returns the
-/// number of tensors restored.
+/// same shape, and every tensor of the checkpoint must be used; otherwise
+/// nothing is written and the error names the first problem (a different
+/// rank or target set usually causes it). Every tensor must also be stored
+/// as f32 on the device, since the checkpoint holds f32: a model built with
+/// f16 base weights cannot take trained base weights, and the error says so.
+/// Returns the number of tensors restored.
+///
+/// Adapters for Llama-style models written before Ferrotensor used Hugging
+/// Face names for Llama blocks (`feed_forward.*`, `operator_norm`,
+/// `ffn_norm`) load too: a name the checkpoint lacks is looked up under its
+/// old form ([`legacy_llama_name`]).
 pub fn apply_checkpoint(
     ctx: &Arc<WgpuContext>,
     checkpoint: &LoraCheckpoint,
@@ -179,26 +231,79 @@ pub fn apply_checkpoint(
 ) -> Result<usize, String> {
     let mut names: Vec<&String> = tensors.keys().collect();
     names.sort();
-    for name in &names {
-        let tensor = &tensors[*name];
-        match checkpoint.tensors.get(*name) {
-            None => return Err(format!("adapter file has no tensor {name}")),
-            Some((shape, _)) if *shape != tensor.data.shape => {
-                return Err(format!(
-                    "tensor {name}: adapter file has shape {shape:?}, model expects {:?}",
-                    tensor.data.shape
-                ))
-            }
-            Some(_) => {}
-        }
-    }
+    let mut sources: Vec<(&String, String)> = Vec::with_capacity(names.len());
     for name in names {
-        if let Some((_, values)) = checkpoint.tensors.get(name) {
-            let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-            tensors[name].data.write_data(ctx, &bytes);
+        let tensor = &tensors[name];
+        if tensor.data.dtype != DType::FP32 {
+            return Err(format!(
+                "tensor {name} is stored as {:?} in the model, but the checkpoint holds f32 values; build the model with f32 weights",
+                tensor.data.dtype
+            ));
         }
+        let legacy = legacy_llama_name(name).filter(|old| checkpoint.tensors.contains_key(old));
+        let key = match (checkpoint.tensors.contains_key(name), legacy) {
+            (true, Some(old)) => {
+                return Err(format!("checkpoint has both {name} and its old name {old}"))
+            }
+            (true, None) => name.clone(),
+            (false, Some(old)) => old,
+            (false, None) => return Err(format!("checkpoint has no tensor {name}")),
+        };
+        let (shape, _) = &checkpoint.tensors[&key];
+        if *shape != tensor.data.shape {
+            return Err(format!(
+                "tensor {key}: checkpoint has shape {shape:?}, model expects {:?}",
+                tensor.data.shape
+            ));
+        }
+        sources.push((name, key));
+    }
+    let used: std::collections::HashSet<&str> = sources.iter().map(|(_, k)| k.as_str()).collect();
+    let mut unused: Vec<&String> = checkpoint
+        .tensors
+        .keys()
+        .filter(|k| !used.contains(k.as_str()))
+        .collect();
+    if !unused.is_empty() {
+        unused.sort();
+        return Err(format!(
+            "checkpoint has {} tensor(s) the model does not have, e.g. {} (a different rank, LoRA targets or --train-modules?)",
+            unused.len(),
+            unused[0]
+        ));
+    }
+    for (name, key) in &sources {
+        let (_, values) = &checkpoint.tensors[key];
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        tensors[*name].data.write_data(ctx, &bytes);
     }
     Ok(tensors.len())
+}
+
+/// Rename optimizer moments stored under old Llama-block names
+/// ([`legacy_llama_name`]) to the names in `params`, so a run started before
+/// the rename resumes with its moments. Returns how many were renamed.
+pub fn upgrade_optimizer_names(
+    state: &mut OptimizerCheckpoint,
+    params: &HashMap<String, Tensor>,
+) -> usize {
+    let OptimizerCheckpoint::AdamW(adam) = state;
+    let mut renamed = 0;
+    for states in [&mut adam.m_states, &mut adam.v_states] {
+        for name in params.keys() {
+            if states.contains_key(name) {
+                continue;
+            }
+            let Some(old) = legacy_llama_name(name) else {
+                continue;
+            };
+            if let Some(moment) = states.remove(&old) {
+                states.insert(name.clone(), moment);
+                renamed += 1;
+            }
+        }
+    }
+    renamed
 }
 
 /// Progress and settings of a training run (also read by `ferrotensor-monitor`
@@ -499,7 +604,7 @@ fn read_moments(
 
 #[cfg(test)]
 mod tests {
-    use super::{moments_path, TrainingCheckpoint, TrainingState};
+    use super::{moments_path, LoraMetadata, TrainingCheckpoint, TrainingState};
     use crate::scaler::GradScalerCheckpoint;
     use ferrotensor_autograd::{AdamWCheckpoint, OptimizerCheckpoint, OptimizerTensorState};
     use std::collections::HashMap;
@@ -537,6 +642,35 @@ mod tests {
             .validate_resume("lora", "sft", 128, "/models/b")
             .unwrap_err()
             .contains("model_path"));
+    }
+
+    #[test]
+    fn metadata_keeps_lora_settings_and_trained_modules_apart() {
+        let lora = LoraMetadata {
+            rank: 8,
+            alpha: 16.0,
+            target_modules: vec!["q_proj".into(), "v_proj".into()],
+            trained_modules: None,
+        };
+        let map = lora.to_map();
+        assert_eq!(map["format"], "ferrotensor-lora");
+        assert!(!map.contains_key("trained_modules"));
+        assert_eq!(LoraMetadata::from_map(&map), Some(lora));
+
+        let weights = LoraMetadata::trained_weights("attn");
+        let map = weights.to_map();
+        assert_eq!(map["format"], "ferrotensor-weights");
+        assert_eq!(map["trained_modules"], "attn");
+        assert_eq!(LoraMetadata::from_map(&map), Some(weights));
+
+        // Files written before trained_modules existed have no such key.
+        let old = HashMap::from([
+            ("format".to_string(), "ferrotensor-lora".to_string()),
+            ("rank".to_string(), "4".to_string()),
+            ("alpha".to_string(), "8".to_string()),
+            ("target_modules".to_string(), "q_proj".to_string()),
+        ]);
+        assert_eq!(LoraMetadata::from_map(&old).unwrap().trained_modules, None);
     }
 
     #[test]

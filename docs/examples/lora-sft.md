@@ -1,20 +1,26 @@
-# LoRA SFT on an 8 GB MacBook: SmolLM2-135M on Alpaca
+# LoRA SFT: SmolLM2 on Alpaca
 
 This walkthrough fine-tunes a real Hugging Face checkpoint with LoRA,
 evaluates it on held-out data, saves the adapter, reloads it and generates
-text. Every number below was measured on the machine listed here, with the
-exact commands shown.
+text. Every number below was measured with the exact commands shown. The
+first run is SmolLM2-135M on an Apple M2 (8 GB) with a 0.4 build; the
+sections after it are on an NVIDIA A10G (24 GB), each labelled with the
+build it was measured on.
 
 | | |
 |---|---|
 | Machine | MacBook Air, Apple M2, 8 GB unified memory, macOS 27.2 |
 | GPU backend | Metal through wgpu |
-| Toolchain | rustc 1.99.1, release build |
+| Toolchain | rustc 1.99.1, release build of Ferrotensor 0.4 |
 | Model | [`HuggingFaceTB/SmolLM2-135M`](https://huggingface.co/HuggingFaceTB/SmolLM2-135M) (base model, Llama architecture, 30 layers, hidden 576, 9 query / 3 KV heads, vocab 49152, tied embeddings) |
 | Data | [`yahma/alpaca-cleaned`](https://huggingface.co/datasets/yahma/alpaca-cleaned): 2,000 training and 64 held-out examples, as prepared below |
 | Adapter | LoRA rank 8, alpha 16, on `q_proj`, `k_proj`, `v_proj`, `o_proj` of every layer (921,600 trainable parameters, 240 tensors) |
 
 ## Result
+
+Measured on 0.4; later builds moved more of the backward pass and the loss
+to the GPU, so the speed and memory figures in this section are not
+current.
 
 | | Before | After 250 steps |
 |---|---|---|
@@ -133,17 +139,20 @@ weights stored as f16 (`--f16-weights`, the default since 0.6):
 - Peak host memory for SmolLM2-1.7B dropped from 20.01 GB to 5.33 GB.
 - GPU memory is the peak reported by `nvidia-smi` during training
   (3,861, 16,708, 15,028 and 12,199 MiB).
-- SmolLM2-1.7B with `--batch-size 8` does not fit on the 24 GB A10G (22.5 GiB
-  usable): it stopped at 22,590 MiB. Batch 1 fits in 11.9 GiB; batch sizes
-  between 1 and 8 are not measured yet.
+- On this 0.6 build, SmolLM2-1.7B with `--batch-size 8` did not fit on the
+  24 GB A10G (22.5 GiB usable): it stopped at 22,590 MiB. This was not
+  re-measured after the memory work in 0.7 ([below](#less-gpu-memory-07)).
+- The GPU memory figures in this table are from 0.6; for 0.7 see
+  [Less GPU memory (0.7)](#less-gpu-memory-07).
 
 ### Against PyTorch + PEFT on CUDA, same GPU
 
 [`benchmarks/baselines/pytorch_lora.py`](../../benchmarks/baselines/pytorch_lora.py)
 runs the same recipe in PyTorch 2.15 + PEFT (CUDA 13.2): the same split,
 ChatML formatting, response-only loss, LoRA initialization, optimizer,
-schedule and clipping. Both ran on the same NVIDIA A10G; GPU memory is the
-`nvidia-smi` peak for both.
+schedule and clipping. Both ran on the same NVIDIA A10G, Ferrotensor with
+the 0.6 build above (before the memory work in 0.7), one seed per run; GPU
+memory is the `nvidia-smi` peak for both.
 
 | Model | Run | Held-out loss | Time per step | GPU memory (MiB) |
 |---|---|---|---:|---:|
@@ -158,29 +167,85 @@ schedule and clipping. Both ran on the same NVIDIA A10G; GPU memory is the
 
 - The held-out loss before training is identical to four decimals for both
   models, so the forward passes and the loss agree.
-- After 250 steps Ferrotensor is within 0.005 of PyTorch (0.0027 for 135M,
-  0.0032 for 1.7B with f16 base weights). Each framework shuffles the data
+- After 250 steps Ferrotensor is within 0.005 of PyTorch: 0.0027 (135M,
+  batch 1), 0.0028 (135M, batch 8), 0.0049 for 1.7B with f32 base weights
+  (the same weights as PyTorch) and 0.0032 with f16. Each framework shuffles the data
   with its own generator, so this number can only match approximately;
   PyTorch's own batch-1 and batch-8 runs differ by 0.0012 on 1.7B.
-- Speed: Ferrotensor runs at 84% of PyTorch's speed for SmolLM2-135M at
-  batch 1, and 37% for SmolLM2-1.7B. The gap grows with the size of the
-  matrix multiplications, where PyTorch uses cuBLAS and Ferrotensor one
-  portable WGSL kernel for every GPU; tuning that kernel is the next step.
-- PyTorch needs less GPU memory and fits SmolLM2-1.7B at batch 8, which
-  Ferrotensor does not yet on a 24 GB card.
+- Speed: Ferrotensor is slower. It runs at 0.84× of PyTorch's speed for
+  SmolLM2-135M at batch 1, 0.32× at batch 8, and 0.37× for SmolLM2-1.7B
+  (f32 base weights), so it takes 1.2 to 3.1 times PyTorch's time per step.
+  I think most of the gap is in the large matrix multiplications, where
+  PyTorch uses cuBLAS and Ferrotensor one portable WGSL kernel; I have not
+  profiled it kernel by kernel.
+- PyTorch used less GPU memory in every configuration and fit SmolLM2-1.7B
+  at batch 8, which this 0.6 build did not on a 24 GB card. There is no
+  matched comparison with PyTorch after the memory work in 0.7.
+
+## Less GPU memory (0.7)
+
+0.7 lowers the GPU memory of LoRA training in three steps: backward hands
+each intermediate gradient back to the buffer pool once it is used (on by
+default), freed buffers above the pool's cap stay reusable until the GPU has
+finished the work that freed them (on by default), and `--checkpoint-blocks`
+recomputes each decoder block's forward pass during backward instead of
+keeping its activations (opt-in). Peak GPU memory (`nvidia-smi`, sampled
+every 200 ms, driver context included) on the same A10G with f16 base
+weights, sequence length 256, 8-step gradient accumulation and 30 optimizer
+steps; each column includes the ones before it:
+
+| Model | 0.6 | + release gradients | + reuse freed buffers (0.7 default) | + `--checkpoint-blocks` |
+|---|---:|---:|---:|---:|
+| SmolLM2-135M, batch 1 | 3,451 MiB | 2,635 MiB | 2,362 MiB | 1,890 MiB |
+| SmolLM2-360M, batch 1 | 5,411 MiB | 4,259 MiB | 3,595 MiB | 2,719 MiB |
+| SmolLM2-1.7B, batch 1 | 11,607 MiB | 9,438 MiB | 8,222 MiB | 5,245 MiB |
+| SmolLM2-135M, batch 8 | 15,758 MiB | 10,669 MiB | 9,401 MiB | 2,879 MiB |
+
+<!-- Maintainer: this 0.6 column was measured at 364490b with 30 steps; the 0.6 table above (b319ce7, 250 steps) has 12,199 MiB for SmolLM2-1.7B with f16 weights. The difference is not explained yet. -->
+
+- Losses are identical at every stage: the training loss and gradient norm
+  as printed at all 30 steps, and the held-out loss after them (1.9882,
+  1.6168, 1.4561 and 1.9030 for the four rows).
+- `--checkpoint-blocks` costs time: 19% (135M, batch 8) to 39% (1.7B) more
+  per step ([per model](../../ferrotensor-cli/README.md#less-gpu-memory---checkpoint-blocks)).
+  Releasing gradients and reusing buffers did not slow the 1.7B run (2.375,
+  2.31 and 2.275 s per step).
+- The same setting measured in separate sessions differed by up to 192 MiB.
+- `train --memory-report` shows where the memory goes. For SmolLM2-1.7B,
+  the frozen base weights hold 3,648 MiB throughout; the adapters,
+  their gradients and the AdamW state together stay under 50 MiB.
+  [What each row means](../../ferrotensor-cli/README.md#where-gpu-memory-goes---memory-report).
 
 ## Correctness checks
 
-Besides the full PyTorch run above, two checks were run against PyTorch with
-`transformers` before trusting the loss numbers. These two scripts are not
-part of the repository.
+Besides the full PyTorch run above, the LoRA training path is checked
+against PyTorch autograd by
+[`ferrotensor-trainer/tests/gradient_parity.rs`](../../ferrotensor-trainer/tests/gradient_parity.rs).
+[`scripts/gen_gradient_fixtures.py`](../../scripts/gen_gradient_fixtures.py)
+builds a tiny Llama-style model (2 layers, hidden 32, 4 query and 2 KV
+heads) in plain PyTorch with LoRA (rank 4) on every linear layer, and stores
+its logits, loss and the gradient of every trainable tensor. The test runs
+the same batches on the GPU and compares every element within
+1e-4 + 1e-3 × |expected|:
 
-- Forward pass: logits for a 20-token input matched
-  `AutoModelForCausalLM` (float32) to about 1e-5 at every position, with the
-  same argmax at all 20.
-- Backward pass: with LoRA on q/k/v/o (rank 4) and a response mask, the
-  loss matched (7.58104 vs 7.58115). Every one of the 240 adapter
-  gradients matched autograd, with a worst relative error of 0.2%.
+| Case | Gradient tensors | Loss difference | Largest logit difference | Largest gradient difference |
+|---|---:|---:|---:|---:|
+| One sequence | 30 | 4.77e-7 | 1.55e-6 | 5.66e-7 |
+| Batch | 30 | 9.54e-7 | 1.31e-6 | 9.54e-7 |
+| Loss mask | 30 | 4.77e-7 | 1.31e-6 | 9.24e-7 |
+| Trainable base weights | 50 | 4.77e-7 | 1.31e-6 | 9.24e-7 |
+
+Those differences were measured on the A10G. The test also runs on every
+pull request on software Vulkan:
+
+```bash
+python3 scripts/gen_gradient_fixtures.py   # optional: the fixtures are committed
+cargo test --release -p ferrotensor-trainer --test gradient_parity -- --ignored --test-threads=1
+```
+
+The fixture model is tiny, so this does not catch effects that only appear
+at scale, such as accumulation error in long reductions; at SmolLM2 scale
+the evidence is the held-out loss against PyTorch above.
 
 ## Reproduce it
 
@@ -315,15 +380,30 @@ training normally (losses 1.4960 and 1.6540).
 
 ## Known limits
 
+- Ferrotensor is slower than PyTorch on CUDA: 0.84×, 0.32× and 0.37× of its
+  speed in the three measured runs.
+- Every NVIDIA number here is from one GPU, an A10G. AMD, Intel and DX12 are
+  untested, and the only Apple run is the 0.4 build above.
 - The M2 run above predates moving the RMSNorm and RoPE backward passes and
-  the loss to the GPU and batching kernel submissions; its 8.8 s per step is
-  not current.
-- Peak host memory for SmolLM2-1.7B is 5.3 GB in 0.6 (20 GB in 0.5).
-  Models above 1.7B are untested.
+  the loss to the GPU and batching kernel submissions; its speed and memory
+  are not current.
+- Peak host memory for SmolLM2-1.7B is 5.33 GB with every option measured
+  (f16 or 4-bit base weights, with or without `--checkpoint-blocks`): the
+  GPU memory work does not change it. Models above 1.7B are untested.
+- The logits and their gradient are still materialised: 1,008 MiB at the
+  peak for SmolLM2-135M at batch 8 with `--checkpoint-blocks`.
+- 4-bit base weights (`--q4-weights`) are experimental and give a worse
+  held-out loss than f16 after 250 steps: 1.8000 vs 1.6521 (135M), 1.4087
+  vs 1.3228 (360M), 1.1198 vs 1.0640 (1.7B)
+  ([details](../../ferrotensor-cli/README.md#frozen-base-weights-f16-f32-or-4-bit-experimental)).
 - `--batch-size 1` is the default. `--batch-size N` runs N sequences through
   a Llama-style model in one pass, padded to the longest, with the same
   result as one at a time; the logits and their gradient grow with N (about
   50 MB each per SmolLM2 sequence of 256 tokens), so GPU memory grows with N.
-- The tested architecture is Llama-style. Released LFM2 checkpoints are
-  rejected because per-head q/k layernorm is not implemented. LFM2 conv
-  blocks also lack the B/C gating and a backward pass.
+- The tested architecture is Llama-style. Qwen3-style attention (per-head
+  RMSNorm of queries and keys before RoPE, `q_norm`/`k_norm`) is implemented
+  and checked on a small synthetic model against a CPU reference of the
+  forward pass; real Qwen3 checkpoints are not measured yet. Released LFM2
+  checkpoints are rejected because their per-head q/k layernorm
+  (`q_layernorm`) is not wired up, and LFM2 conv blocks also lack the B/C
+  gating and a backward pass.

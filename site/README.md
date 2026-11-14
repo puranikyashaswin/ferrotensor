@@ -3,6 +3,7 @@
 Source of <https://puranikyashaswin.github.io/ferrotensor/>.
 
 - `landing/`: the static landing page (HTML, one CSS file, a little JS). No build step.
+  `landing/guide/` is the how-to guide and `landing/about/` the about page.
 - `book/`: the mdBook guide, served under `/docs/`. Its chapters `{{#include}}`
   the files in `docs/`, `benchmarks/RESULTS.md`, `CHANGELOG.md` and
   `ferrotensor-py/`, so edit those files, not the book. `repolinks.py` rewrites

@@ -1,15 +1,18 @@
-//! Dynamic Loss Scaling for Mixed Precision Training
+//! Dynamic loss scaling.
 //!
-//! Prevents gradient underflow/overflow during FP16 training by dynamically
-//! adjusting the loss scale factor.
+//! Scales the loss before the backward pass and unscales the gradients before
+//! the optimizer step, adjusting the scale when gradients overflow. Nothing in
+//! the CLI uses it, and training runs in f32 (only frozen weights can be f16),
+//! so there is no f16 gradient underflow for it to guard against today.
 
 use ferrotensor_backend::{ComputeEngine, UnifiedTensor, WgpuContext};
 
-/// Dynamic gradient scaler for FP16 mixed precision training.
+/// Dynamic gradient scaler.
 ///
-/// Scales the loss to prevent gradient underflow in FP16, then unscales
-/// gradients before the optimizer step. Automatically adjusts the scale
-/// based on whether gradients contain inf/nan.
+/// Scales the loss, then unscales gradients before the optimizer step, and
+/// adjusts the scale based on whether gradients contain inf/nan. This is the
+/// technique used to keep f16 gradients from underflowing, but Ferrotensor has
+/// no f16 gradient path, so the CLI does not use it.
 ///
 /// # Example
 /// ```no_run

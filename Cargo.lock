@@ -664,6 +664,7 @@ dependencies = [
  "ferrotensor-trainer",
  "log",
  "pollster",
+ "safetensors",
  "serde",
  "serde_json",
 ]
@@ -679,6 +680,7 @@ dependencies = [
  "ferrotensor-loader",
  "log",
  "pollster",
+ "safetensors",
  "serde",
  "serde_json",
 ]

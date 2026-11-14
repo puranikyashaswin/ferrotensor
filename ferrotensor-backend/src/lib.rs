@@ -28,10 +28,13 @@ pub use wgpu; // Re-export wgpu for downstream crates
 pub mod adapters;
 mod context;
 mod engine;
+pub mod memory;
 /// Size-keyed reuse of GPU buffers.
 pub mod pool;
+pub mod q4;
 mod tensor;
 
 pub use context::{WgpuContext, UPLOAD_RELEASE_BYTES};
 pub use engine::{AdamParams, AttentionOptions, ComputeEngine, MASKED_CE_SKIP, SUM_SQUARES_CHUNK};
+pub use memory::{MemoryCategory, MemorySnapshot, MemoryTracker};
 pub use tensor::{DType, UnifiedTensor};

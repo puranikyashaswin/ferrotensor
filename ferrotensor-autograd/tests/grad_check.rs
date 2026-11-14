@@ -56,6 +56,16 @@ fn cases() -> Vec<Case> {
         case("add", vec![input(&[6], 1), input(&[6], 2)], |x, e| {
             Tensor::add(&x[0], &x[1], e)
         }),
+        // One leaf used twice: its first gradient is kept, the second is added.
+        case("shared_input", vec![input(&[6], 1)], |x, e| {
+            Tensor::add(&x[0], &x[0], e)
+        }),
+        // A leaf reached once directly and once through a reshape.
+        case("reshape_and_direct", vec![input(&[2, 3], 1)], |x, e| {
+            let flat = Tensor::reshape(&x[0], &[6]);
+            let back = Tensor::reshape(&flat, &[2, 3]);
+            Tensor::mul(&x[0], &back, e)
+        }),
         case("sub", vec![input(&[6], 1), input(&[6], 2)], |x, e| {
             Tensor::sub(&x[0], &x[1], e)
         }),
@@ -134,6 +144,28 @@ fn cases() -> Vec<Case> {
                 input(&[1, 4, 2, 8], 24),
             ],
             |x, e| Tensor::flash_attention(&x[0], &x[1], &x[2], None, false, 0.3, 7, e),
+        ),
+        case(
+            // A full-width seed, as the trainer derives per step and layer:
+            // forward and backward must regenerate the same mask from it.
+            "flash_attention_dropout_causal_mixed_seed",
+            vec![
+                input(&[2, 4, 2, 8], 25),
+                input(&[2, 4, 1, 8], 26),
+                input(&[2, 4, 1, 8], 27),
+            ],
+            |x, e| {
+                Tensor::flash_attention(
+                    &x[0],
+                    &x[1],
+                    &x[2],
+                    None,
+                    true,
+                    0.4,
+                    0xD1B5_4A32_D192_ED03,
+                    e,
+                )
+            },
         ),
         case("checkpoint", vec![input(&[6], 15)], |x, e| {
             checkpoint_single(
@@ -227,5 +259,96 @@ fn gpu_gradients_match_finite_differences() {
         failures.is_empty(),
         "gradient mismatches:\n{}",
         failures.join("\n")
+    );
+}
+
+#[test]
+fn scaling_one_gradient_in_place_leaves_others_alone() {
+    if std::env::var("FERROTENSOR_RUN_GPU_TESTS").as_deref() != Ok("1") {
+        eprintln!("skipping GPU in-place gradient test; set FERROTENSOR_RUN_GPU_TESTS=1 to enable");
+        return;
+    }
+    let ctx = Arc::new(pollster::block_on(WgpuContext::new()));
+    let engine = ComputeEngine::new(&ctx);
+    let p = Tensor::new(
+        ctx.clone(),
+        UnifiedTensor::new(&ctx, &values(6, 1, true), &[2, 3]),
+    );
+    let q = Tensor::new(
+        ctx.clone(),
+        UnifiedTensor::new(&ctx, &values(6, 2, true), &[6]),
+    );
+    let out = Tensor::add(&Tensor::reshape(&p, &[6]), &q, &engine);
+    out.backward(&engine);
+
+    let grad_of = |t: &Tensor| read(&ctx, t.grad.borrow().as_ref().expect("grad"));
+    for g in grad_of(&p).iter().chain(grad_of(&q).iter()) {
+        assert!(
+            (g - 1.0).abs() < 1e-6,
+            "expected a gradient of ones, got {g}"
+        );
+    }
+
+    engine.gradient_scale(&ctx, p.grad.borrow().as_ref().expect("grad"), 0.5);
+
+    for g in grad_of(&p) {
+        assert!(
+            (g - 0.5).abs() < 1e-6,
+            "p's gradient should be scaled to 0.5, got {g}"
+        );
+    }
+    for g in grad_of(&q) {
+        assert!(
+            (g - 1.0).abs() < 1e-6,
+            "q's gradient should stay 1.0, got {g}"
+        );
+    }
+}
+
+#[test]
+fn backward_releases_intermediate_gradients() {
+    if std::env::var("FERROTENSOR_RUN_GPU_TESTS").as_deref() != Ok("1") {
+        eprintln!("skipping GPU gradient release test; set FERROTENSOR_RUN_GPU_TESTS=1 to enable");
+        return;
+    }
+    let ctx = Arc::new(pollster::block_on(WgpuContext::new()));
+    let engine = ComputeEngine::new(&ctx);
+    let a = Tensor::new(
+        ctx.clone(),
+        UnifiedTensor::new(&ctx, &values(6, 1, true), &[2, 3]),
+    );
+    let b = Tensor::new(
+        ctx.clone(),
+        UnifiedTensor::new(&ctx, &values(6, 2, true), &[3, 2]),
+    );
+    let mid = Tensor::matmul(&a, &b, &engine);
+    let out = Tensor::silu(&mid, &engine);
+    out.backward(&engine);
+
+    assert!(
+        mid.grad.borrow().is_none(),
+        "the intermediate gradient should be released"
+    );
+    assert!(
+        out.grad.borrow().is_none(),
+        "the root gradient should be released"
+    );
+    let grad_of = |t: &Tensor| read(&ctx, t.grad.borrow().as_ref().expect("leaf grad"));
+    let g1a = grad_of(&a);
+    let g1b = grad_of(&b);
+
+    out.backward(&engine);
+    let g2a = grad_of(&a);
+    let g2b = grad_of(&b);
+
+    for (g1, g2) in g1a.iter().zip(&g2a).chain(g1b.iter().zip(&g2b)) {
+        assert!(
+            (g2 - 2.0 * g1).abs() <= 1e-5 + 1e-5 * g1.abs(),
+            "a second backward should add exactly one more gradient: {g1} then {g2}"
+        );
+    }
+    assert!(
+        g1a.iter().any(|g| *g != 0.0),
+        "a's gradient should not be all zeros"
     );
 }

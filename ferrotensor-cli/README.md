@@ -2,8 +2,11 @@
 
 The `ferrotensor-cli` command line for [Ferrotensor](../README.md): LoRA fine-tuning
 (`train`), evaluation (`eval`) and sampling (`generate`, alias `infer`) for
-small Llama-style models such as SmolLM2 and TinyLlama, on any GPU wgpu
-supports (Metal, Vulkan, DX12).
+small Llama-style models such as SmolLM2 and TinyLlama, on the GPU through
+wgpu (Vulkan, Metal or DX12). It has been tested on an NVIDIA A10G (24 GB)
+through Vulkan, an Apple M2 (8 GB) through Metal, and software Vulkan (Mesa
+lavapipe) in CI; other GPUs are untested, and
+[reports are welcome](../docs/testing-on-your-gpu.md).
 
 Install it from crates.io (the binary is called `ferrotensor`), or run it from
 a checkout with `cargo run -p ferrotensor-cli --release --`:
@@ -43,7 +46,169 @@ A full walkthrough with measured numbers is in
 - Pretraining data (`--task pretrain`): `.txt` lines, a `.json` array of
   strings or token ids, or packed little-endian `u32` tokens in `.bin`.
 - Outputs in `--out`: `lora_adapters.safetensors` (+ `.state.json` for
-  `--resume`), `metrics.jsonl` (one line per logged step / eval) and
+  `--resume`; with `--train-modules` other than `lora` the file is
+  `trained_weights.safetensors` and holds the f32 base weights that
+  trained, which `eval --lora`, `generate --lora` and `--resume` load),
+  `metrics.jsonl` (one line per logged step / eval) and
   `training_state.json` (read by `ferrotensor-cli monitor`).
+- `classify-train` fine-tunes the model with LoRA as a text classifier from
+  JSONL `{"text", "label"}` lines and `classify-predict` writes per-line
+  class probabilities; see
+  [docs/examples/classify.md](../docs/examples/classify.md).
 - `ferrotensor-cli demo` (or `--demo`) plays a simulated training UI; it does not
   train anything.
+
+## Frozen base weights: f16, f32 or 4-bit (experimental)
+
+By default the frozen linear-layer weights (attention, MLP and `lm_head`)
+are stored as f16 and every product is computed in f32; `--f32-weights`
+keeps them f32. Both compute the same model up to f16 rounding of the
+weights.
+
+`--q4-weights` (on `train`, `eval` and `generate`, off by default) is
+experimental and changes the model's outputs. It stores
+the frozen weights of every decoder-block projection (`q/k/v/o_proj`,
+`gate/up/down_proj`) at 4 bits: affine codes in groups of 64 along the
+input dimension, one f16 scale and one f16 minimum per group, about 4.5
+bits per weight. They are quantised on the host while the model loads,
+from the f16/f32/bf16 safetensors, and the matmul decodes them and
+computes in f32. `lm_head` stays f16; the embedding, the norms and the
+LoRA adapters stay f32.
+
+This is not the same model. It computes with the decoded weights, so its
+logits, loss and gradients differ from the f16 or f32 base, and from
+PyTorch on the original checkpoint. The tests check that the 4-bit model
+equals, to f32 tolerance, the same model loaded in f32 from weights that
+were quantised and decoded on the host.
+
+Measured on an NVIDIA A10G (24 GB) with the
+[walkthrough recipe](../docs/examples/lora-sft.md) (250 steps, batch 1 × 8-step
+accumulation), the held-out loss after training is worse than with f16 base
+weights, and peak GPU memory (`nvidia-smi`, with `--checkpoint-blocks`) is lower:
+
+| Model | Held-out loss after 250 steps, f16 | 4-bit | Peak GPU memory, f16 | 4-bit |
+|---|---:|---:|---:|---:|
+| SmolLM2-135M | 1.6521 | 1.8000 | 1,890 MiB | 1,698 MiB |
+| SmolLM2-360M | 1.3228 | 1.4087 | 2,783 MiB | 1,998 MiB |
+| SmolLM2-1.7B | 1.0640 | 1.1198 | 5,281 MiB | 3,741 MiB |
+
+These are 250-step runs in separate sessions; the 30-step stage table gives 2,719 and 5,245 MiB for the same setting.
+
+The format is plain round-to-nearest in groups of 64, not the NF4 format
+of QLoRA.
+
+- `--q4-weights` conflicts with `--f32-weights`, and is an error when base
+  weights train (`--train-modules` other than `lora`): 4-bit weights are
+  never trainable.
+- An adapter trained with `--q4-weights` learned to work with the 4-bit
+  weights, quantisation error included. Evaluate and sample it with
+  `--q4-weights` too. Loading it on the f16 or f32 base works (the shapes
+  are the same) but gives a different model from the one that was
+  trained, usually close to it; nothing checks or warns about this.
+- Checkpoints that are already quantised (MLX-style `<name>.scales`
+  tensors) are rejected with an error; load the f16/f32/bf16 checkpoint and
+  pass `--q4-weights` instead.
+- With `--memory-report`, the 4-bit weights appear under base weights as
+  "of which 4-bit".
+
+## Less GPU memory: `--checkpoint-blocks`
+
+`train --checkpoint-blocks` (off by default) keeps only each decoder
+block's input during the forward pass and recomputes the block's forward
+during backward, instead of keeping all its activations. It trades time for
+memory. Measured on an NVIDIA A10G (24 GB) with SmolLM2, f16 base weights,
+sequence length 256 and 30 optimizer steps (peak from `nvidia-smi`, median
+seconds per step):
+
+| Model | Peak GPU memory, off → on | Seconds per step, off → on |
+|---|---:|---:|
+| SmolLM2-135M, batch 1 × accum 8 | 2,362 → 1,890 MiB | 1.17 → 1.47 (+26%) |
+| SmolLM2-360M, batch 1 × accum 8 | 3,595 → 2,719 MiB | 1.56 → 2.04 (+31%) |
+| SmolLM2-1.7B, batch 1 × accum 8 | 8,222 → 5,245 MiB | 2.275 → 3.16 (+39%) |
+| SmolLM2-135M, batch 8 × accum 8 | 9,401 → 2,879 MiB | 2.63 → 3.13 (+19%) |
+
+The training loss and gradient norm, as printed at every step, and the
+held-out loss were identical with the flag on and off. The unit tests in
+`ferrotensor-trainer/tests/block_checkpointing.rs` compare the loss (to a
+relative 1e-5) and the gradients (to 1e-6 plus a relative 1e-4) with and
+without checkpointing.
+
+## Where GPU memory goes: `--memory-report`
+
+`train --memory-report` prints a table of GPU memory by category after the
+model loads and after each of the first 3 optimizer steps
+(`--memory-report=N` for N steps), and writes the same numbers in bytes to
+`OUT/memory_report.json`. Without the flag nothing is printed and training
+is unchanged.
+
+```bash
+cargo run -p ferrotensor-cli --release -- train \
+  --model ./data/models/SmolLM2-135M --data ./data/alpaca/train.jsonl \
+  --out ./data/runs/mem --max-steps 3 --memory-report
+```
+
+Each table has two columns: the bytes at the highest point of that phase
+(the model load, or one optimizer step of `--batch-size` x `--grad-accum`
+sequences) and at the highest point seen so far in the run. The rows:
+
+| Row | What it holds |
+|---|---|
+| base weights (frozen) | Model weights uploaded when the model is built, split into f16 (linear layers with the default f16 weights), 4-bit (decoder-block projections with `--q4-weights`) and f32 (embedding, norms, or every weight with `--f32-weights`) |
+| trainable parameters | The LoRA adapters, or the base weights `--train-modules` selects |
+| optimizer state | The AdamW moments, two f32 tensors per trainable tensor |
+| activations | Forward outputs and intermediates, kept by the autograd graph until the step's backward is done |
+| parameter gradients | Gradients of the trainable parameters |
+| backward scratch | Everything else created during backward: gradients of activations and kernel temporaries |
+| loss (vocab-sized) | The logits, `d loss / d logits` and the logits' gradient |
+| readback staging | Buffers that copy results to the host |
+| other | Buffers created outside these phases (e.g. gradient-norm partial sums) |
+| total (live tensors) | The sum of the rows above |
+| pool idle (cap 512 MiB) | Freed buffers the pool keeps for reuse; still allocated on the GPU. Once the GPU has finished with them the pool keeps at most the cap shown; while it still runs the work recorded before they were freed, the pool keeps them above the cap so later ops can reuse them (see below) |
+| total held (live + pool idle) | The highest live plus pool-idle bytes of the phase, and of the run so far |
+| freed, awaiting GPU | Buffers Ferrotensor has dropped but wgpu may not have destroyed yet (see below); the highest of the phase and of the run |
+| total incl. awaiting GPU | The highest live plus pool-idle plus awaiting-GPU bytes of the phase and of the run: the closest figure to what the GPU holds |
+
+The rows down to pool idle are taken at the moment the live tensors peaked.
+The last three are the highest each value reached, so they can come from
+other moments and need not add up with the rows above.
+
+A buffer Ferrotensor drops stays on the GPU until wgpu destroys it, which
+it does only after the work using it has run and the device is maintained
+(on every batch submission and device poll). Kernels are recorded and
+submitted in batches, and the host usually records well ahead of the GPU.
+Every tensor the pool does not keep (created from host data, or beyond its
+cap with pool overflow off), every per-dispatch uniform, dummy and scratch
+buffer, the readback copy after the read, and the temporary buffer of a
+quantised weight upload stay on the GPU until the batch recorded when they
+were dropped has finished; the report counts them as awaiting GPU until
+that is known (at a later submission, or at the latest the next wait for
+the GPU).
+
+Pool overflow: dropping a buffer frees nothing until the GPU has finished
+the work recorded before the drop, so freed tensor buffers beyond the
+pool's cap are kept for reuse until then, and only then dropped (and
+destroyed at once). A later op that needs a buffer of the same size takes
+one of them instead of allocating a new one. Results are the same either
+way. Set `FERROTENSOR_POOL_OVERFLOW=0` to drop buffers beyond the cap as
+they are freed instead, e.g. to compare the two with `--memory-report`.
+
+With `--memory-report`, every point where the report samples (after the
+model load, before the first step and after each reported step) waits for
+the GPU first, so the numbers are taken with no work in flight. This adds
+waits that a run without the flag does not have: it can change timing,
+never results. Without the flag there is no added wait.
+
+Below the table: how much of the live bytes the tensors' shapes need
+(wgpu rounds every buffer up to 4 bytes), the bytes held right after the
+sample (live, pool idle, awaiting GPU), and the 10 largest live buffers at
+the phase peak with their category, dtype and shape.
+
+The report counts only buffers Ferrotensor allocated through wgpu, so it is
+lower than `nvidia-smi` or Activity Monitor. Not counted: the driver's
+context and its allocator's blocks, alignment and slack, compiled
+pipelines, shaders and bind groups, the staging copies wgpu makes for
+uploads (released every 256 MiB of uploads), and buffers of the
+`ferrotensor` tensor API. A buffer is
+counted under the phase that created it; the logits, the loss gradient and
+the parameter gradients are moved to their own rows when the trainer knows
+what they are, and the phase peak is corrected for that move.

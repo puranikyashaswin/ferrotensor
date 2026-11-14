@@ -1,17 +1,21 @@
 //! Model loading for Ferrotensor: Hugging Face `config.json` parsing
 //! ([`Lfm2Config`]), memory-mapped safetensors weights (single file or
-//! sharded, F32/F16/BF16 read as F32, int-quantized weights dequantized on
-//! the GPU) through [`WeightsContext`], and a [`Tokenizer`] / [`Sampler`]
-//! pair for text in and out.
+//! sharded, F32/F16/BF16 read as F32) through [`WeightsContext`], and a
+//! [`Tokenizer`] / [`Sampler`] pair for text in and out.
+//! [`WeightsContext::upload_quantized`] uploads a `.weight` / `.scales` /
+//! `.biases` triple as one quantized GPU tensor, but the model builder in
+//! `ferrotensor-graph` rejects pre-quantized checkpoints.
 
 #![warn(missing_docs)]
 
 use memmap2::MmapOptions;
 use safetensors::SafeTensors;
+use serde::de::Error as _;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::File;
-use std::path::Path;
+use std::io::BufReader;
+use std::path::{Component, Path};
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -124,6 +128,152 @@ fn default_norm_eps() -> f32 {
     1e-5
 }
 
+/// Largest `config.json` or shard index file the loader will read.
+const MAX_JSON_FILE_BYTES: u64 = 64 * 1024 * 1024;
+/// Upper bounds for config sizes; real models are far below all of them.
+const MAX_HIDDEN_SIZE: usize = 1 << 20;
+const MAX_INTERMEDIATE_SIZE: usize = 1 << 22;
+const MAX_VOCAB_SIZE: usize = 1 << 24;
+const MAX_ATTENTION_HEADS: usize = 1 << 16;
+const MAX_HIDDEN_LAYERS: usize = 1 << 14;
+
+/// Opens `path` for reading after checking that it is a regular file (so a
+/// directory or a named pipe cannot hang or confuse the loader) and, when
+/// `max_len` is set, not larger than that. Errors name the path.
+pub(crate) fn open_regular_file(path: &Path, max_len: Option<u64>) -> Result<File, LoaderError> {
+    let with_path = |e: std::io::Error| {
+        LoaderError::Io(std::io::Error::new(
+            e.kind(),
+            format!("{}: {}", path.display(), e),
+        ))
+    };
+    let meta = std::fs::metadata(path).map_err(with_path)?;
+    if !meta.is_file() {
+        return Err(LoaderError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{}: not a regular file", path.display()),
+        )));
+    }
+    if let Some(max) = max_len {
+        if meta.len() > max {
+            return Err(LoaderError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "{}: file is {} bytes, more than the {} byte limit",
+                    path.display(),
+                    meta.len(),
+                    max
+                ),
+            )));
+        }
+    }
+    File::open(path).map_err(with_path)
+}
+
+/// A JSON error whose message starts with the file it came from.
+fn json_error(path: &Path, detail: impl std::fmt::Display) -> LoaderError {
+    LoaderError::Json(serde_json::Error::custom(format!(
+        "{}: {}",
+        path.display(),
+        detail
+    )))
+}
+
+/// Reads and parses a JSON file; errors name the file.
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, LoaderError> {
+    let file = open_regular_file(path, Some(MAX_JSON_FILE_BYTES))?;
+    serde_json::from_reader(BufReader::new(file)).map_err(|e| json_error(path, e))
+}
+
+fn check_range(
+    path: &Path,
+    field: &str,
+    value: usize,
+    min: usize,
+    max: usize,
+) -> Result<(), LoaderError> {
+    if value < min || value > max {
+        return Err(json_error(
+            path,
+            format!("invalid {field}: {value} (expected {min} to {max})"),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `divisor` divides `n` exactly (false for a zero divisor).
+fn divides(divisor: usize, n: usize) -> bool {
+    n.checked_rem(divisor) == Some(0)
+}
+
+/// Rejects configs whose sizes are zero, absurdly large, or inconsistent.
+fn validate_config(path: &Path, c: &Lfm2Config) -> Result<(), LoaderError> {
+    check_range(path, "hidden_size", c.hidden_size, 1, MAX_HIDDEN_SIZE)?;
+    check_range(
+        path,
+        "intermediate_size",
+        c.intermediate_size,
+        1,
+        MAX_INTERMEDIATE_SIZE,
+    )?;
+    check_range(
+        path,
+        "num_attention_heads",
+        c.num_attention_heads,
+        1,
+        MAX_ATTENTION_HEADS,
+    )?;
+    check_range(
+        path,
+        "num_hidden_layers",
+        c.num_hidden_layers,
+        1,
+        MAX_HIDDEN_LAYERS,
+    )?;
+    check_range(path, "vocab_size", c.vocab_size, 1, MAX_VOCAB_SIZE)?;
+    for (field, value, max) in [
+        ("head_dim", c.head_dim, MAX_HIDDEN_SIZE),
+        ("block_dim", c.block_dim, MAX_HIDDEN_SIZE),
+        ("block_ff_dim", c.block_ff_dim, MAX_INTERMEDIATE_SIZE),
+    ] {
+        if let Some(v) = value {
+            check_range(path, field, v, 1, max)?;
+        }
+    }
+    if c.head_dim.is_none() && !divides(c.num_attention_heads, c.hidden_size) {
+        return Err(json_error(
+            path,
+            format!(
+                "hidden_size ({}) is not divisible by num_attention_heads ({}) and head_dim is not set",
+                c.hidden_size, c.num_attention_heads
+            ),
+        ));
+    }
+    if let Some(kv) = c.num_key_value_heads {
+        check_range(path, "num_key_value_heads", kv, 1, c.num_attention_heads)?;
+        if !divides(kv, c.num_attention_heads) {
+            return Err(json_error(
+                path,
+                format!(
+                    "num_attention_heads ({}) is not a multiple of num_key_value_heads ({kv})",
+                    c.num_attention_heads
+                ),
+            ));
+        }
+    }
+    if let Some(q) = &c.quantization {
+        check_range(
+            path,
+            "quantization.group_size",
+            q.group_size,
+            1,
+            MAX_HIDDEN_SIZE,
+        )?;
+        check_range(path, "quantization.bits", q.bits, 1, 32)?;
+    }
+    Ok(())
+}
+
 // Backwards compat alias
 /// Alias kept for older code that used the Llama-specific config name.
 pub type LlamaConfig = Lfm2Config;
@@ -135,18 +285,26 @@ pub struct ModelLoader {
 }
 
 impl ModelLoader {
-    /// Reads and parses a `config.json` file.
+    /// Reads and parses a `config.json` file, rejecting zero, absurdly large
+    /// or inconsistent sizes. Error messages name the file and the field.
     pub fn load_config<P: AsRef<Path>>(path: P) -> Result<LlamaConfig, LoaderError> {
-        let file = File::open(path)?;
-        let config: LlamaConfig = serde_json::from_reader(file)?;
+        let path = path.as_ref();
+        let config: LlamaConfig = read_json(path)?;
+        validate_config(path, &config)?;
         Ok(config)
     }
 
     // Helper to load a single safetensors file
     /// Memory-maps a single safetensors file.
     pub fn load_safetensors<P: AsRef<Path>>(path: P) -> Result<memmap2::Mmap, LoaderError> {
-        let file = File::open(path)?;
-        let mmap = unsafe { MmapOptions::new().map(&file)? };
+        let path = path.as_ref();
+        let file = open_regular_file(path, None)?;
+        let mmap = unsafe { MmapOptions::new().map(&file) }.map_err(|e| {
+            LoaderError::Io(std::io::Error::new(
+                e.kind(),
+                format!("{}: {}", path.display(), e),
+            ))
+        })?;
         Ok(mmap)
     }
 }
@@ -157,6 +315,20 @@ impl ModelLoader {
 //
 // Solution: "WeightsContext" that holds the Mmaps, and we pass `&WeightsContext`
 // to a function that extracts views on demand.
+
+/// Reinterprets little-endian bytes as `f32` values; the length must be a
+/// multiple of 4.
+fn le_bytes_to_f32(name: &str, bytes: &[u8]) -> Result<Vec<f32>, LoaderError> {
+    let (chunks, rest) = bytes.as_chunks::<4>();
+    if !rest.is_empty() {
+        return Err(LoaderError::InvalidTensorLength {
+            name: name.to_string(),
+            expected: bytes.len().next_multiple_of(4),
+            actual: bytes.len(),
+        });
+    }
+    Ok(chunks.iter().map(|c| f32::from_le_bytes(*c)).collect())
+}
 
 /// Memory-mapped safetensors files and an index from tensor name to file.
 pub struct WeightsContext {
@@ -223,11 +395,31 @@ impl WeightsContext {
         let model_dir = model_dir.as_ref();
         let index_path = model_dir.join("model.safetensors.index.json");
         if index_path.exists() {
-            let file = File::open(&index_path)?;
-            let index: SafetensorIndex = serde_json::from_reader(file)?;
+            let index: SafetensorIndex = read_json(&index_path)?;
             let mut shard_files: Vec<String> = index.weight_map.values().cloned().collect();
             shard_files.sort();
             shard_files.dedup();
+            if shard_files.is_empty() {
+                return Err(json_error(&index_path, "weight_map lists no weights"));
+            }
+
+            // Shard names come from a file the user downloaded: they must stay
+            // inside the model directory.
+            for shard in &shard_files {
+                let relative = Path::new(shard);
+                let inside = relative.components().next().is_some()
+                    && relative
+                        .components()
+                        .all(|c| matches!(c, Component::Normal(_)));
+                if !inside {
+                    return Err(json_error(
+                        &index_path,
+                        format!(
+                            "shard path {shard:?} is not a relative path inside the model directory"
+                        ),
+                    ));
+                }
+            }
 
             for shard in shard_files {
                 self.load_file(model_dir.join(&shard))?;
@@ -305,6 +497,17 @@ impl WeightsContext {
     /// Reads an F32, F16 or BF16 tensor as `f32` values plus its shape.
     pub fn read_f32_tensor(&self, name: &str) -> Result<(Vec<f32>, Vec<usize>), LoaderError> {
         let meta = self.get_tensor_metadata(name)?;
+        // Check the dtype before allocating: a large tensor of an unsupported
+        // dtype must not reserve memory only to be rejected.
+        if !matches!(
+            meta.dtype,
+            safetensors::Dtype::F32 | safetensors::Dtype::F16 | safetensors::Dtype::BF16
+        ) {
+            return Err(LoaderError::UnsupportedDtype {
+                name: name.to_string(),
+                dtype: format!("{:?}", meta.dtype),
+            });
+        }
         let numel: usize = meta.shape.iter().product();
         let mut out = Vec::with_capacity(numel);
         let mut actual_len = 0usize;
@@ -405,8 +608,8 @@ impl WeightsContext {
         // 2. Upload to GPU buffers using UnifiedTensor (or raw create using backend's re-exported wgpu)
         // For simplicity, we'll convert to f32 slices where appropriate
         // Here we assume scales and biases are f32 already in safetensors
-        let s_floats: Vec<f32> = bytemuck::cast_slice(&s_data).to_vec();
-        let b_floats: Vec<f32> = bytemuck::cast_slice(&b_data).to_vec();
+        let s_floats = le_bytes_to_f32(&scales_name, &s_data)?;
+        let b_floats = le_bytes_to_f32(&biases_name, &b_data)?;
 
         let s_tensor = UnifiedTensor::new(ctx, &s_floats, &[s_floats.len()]);
         let b_tensor = UnifiedTensor::new(ctx, &b_floats, &[b_floats.len()]);
@@ -424,6 +627,8 @@ impl WeightsContext {
             });
         ctx.queue.write_buffer(&q_buf, 0, &q_data);
         ctx.note_upload(q_data.len() as u64);
+        // Dropped once the dequantize dispatch below is recorded.
+        ctx.memory().count_dispatch_buffer(q_buf.size());
 
         // 3. Output Tensor (FP32)
         let out_tensor = UnifiedTensor::empty(ctx, &q_shape);
@@ -438,5 +643,27 @@ impl WeightsContext {
         );
 
         Ok(out_tensor)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn le_bytes_to_f32_reads_whole_values() {
+        let bytes: Vec<u8> = [1.5f32, -2.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        assert_eq!(le_bytes_to_f32("s", &bytes).unwrap(), vec![1.5, -2.0]);
+        assert!(le_bytes_to_f32("s", &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn le_bytes_to_f32_rejects_a_partial_value() {
+        let err = le_bytes_to_f32("layer.scales", &[0u8; 6]).unwrap_err();
+        assert!(matches!(err, LoaderError::InvalidTensorLength { .. }));
+        assert!(err.to_string().contains("layer.scales"), "{err}");
     }
 }

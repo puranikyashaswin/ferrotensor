@@ -25,6 +25,7 @@ logs/
 
 # Model weights (too large for git)
 *.safetensors
+!ferrotensor-graph/tests/fixtures/gradient_parity/*.safetensors
 *.bin
 *.pt
 *.pth

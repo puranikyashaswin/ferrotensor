@@ -36,7 +36,9 @@ pub trait AutogradNode {
 pub struct Tensor {
     /// The values (shared between clones).
     pub data: Arc<UnifiedTensor>,
-    /// Accumulated gradient, if backward has reached this tensor.
+    /// Accumulated gradient. After [`Tensor::backward`] only leaves hold one:
+    /// the gradient of a tensor produced by an op is released as soon as it
+    /// has been propagated to that op's inputs.
     pub grad: Arc<RefCell<Option<UnifiedTensor>>>,
     /// GPU context the data lives in.
     pub ctx: Arc<WgpuContext>,
@@ -95,7 +97,11 @@ impl Tensor {
     }
 
     /// Backpropagate from this tensor (seeded with ones unless a gradient is
-    /// already set) and accumulate gradients into every tensor in its graph.
+    /// already set) and accumulate gradients into the leaves of its graph.
+    /// Gradients of intermediate tensors, this one included (when it requires
+    /// a gradient), are released as
+    /// they are used, so calling `backward` again adds one more copy of the
+    /// gradient to each leaf.
     pub fn backward(&self, engine: &ComputeEngine) {
         let mut sorted_tensors = Vec::new();
         let mut visited = std::collections::HashSet::new();
@@ -129,37 +135,47 @@ impl Tensor {
             *self.grad.borrow_mut() = Some(UnifiedTensor::new(&self.ctx, &ones, shape));
         }
 
-        // Iterate backwards
+        // Iterate backwards. A non-leaf's gradient is complete when it is
+        // reached (every consumer came earlier), and is needed only here, so
+        // it is taken out of its slot: its buffer returns to the pool as soon
+        // as this iteration ends instead of living until the graph is dropped.
+        // Leaves keep their gradients for the optimizer.
         for tensor in sorted_tensors.into_iter().rev() {
             if !tensor.requires_grad {
                 continue;
             }
-            let grad_option = tensor.grad.borrow().clone();
-            if let Some(grad) = grad_option {
-                if let Some(creator) = &tensor.creator {
-                    let input_grads = creator.backward(&grad, engine);
-                    let inputs = creator.inputs();
-                    for (input, input_grad) in inputs.iter().zip(input_grads) {
-                        if input.requires_grad {
-                            input.accumulate_grad(engine, &input_grad);
-                        }
-                    }
+            let Some(creator) = &tensor.creator else {
+                continue;
+            };
+            let Some(grad) = tensor.grad.borrow_mut().take() else {
+                continue;
+            };
+            let input_grads = creator.backward(&grad, engine);
+            let inputs = creator.inputs();
+            for (input, input_grad) in inputs.iter().zip(input_grads) {
+                if input.requires_grad {
+                    input.accumulate_grad(engine, &input_grad);
                 }
             }
         }
     }
 
     /// Add `new_grad` to this tensor's gradient.
+    ///
+    /// The first gradient is kept as given: the stored gradient then shares
+    /// its GPU buffer with `new_grad`, so the caller must not write into
+    /// `new_grad` afterwards. A later gradient is summed into a new buffer.
     pub fn accumulate_grad(&self, engine: &ComputeEngine, new_grad: &UnifiedTensor) {
         let mut grad_ref = self.grad.borrow_mut();
         if let Some(existing) = grad_ref.as_ref() {
             let res = UnifiedTensor::empty(&self.ctx, &self.data.shape);
             engine.add(&self.ctx, existing, new_grad, &res);
             *grad_ref = Some(res);
+        } else if new_grad.shape == self.data.shape {
+            *grad_ref = Some(new_grad.clone());
         } else {
-            let res = UnifiedTensor::empty(&self.ctx, &self.data.shape);
-            engine.copy_tensor(&self.ctx, new_grad, &res, 0);
-            *grad_ref = Some(res);
+            // Defensive: every node returns its input's shape today.
+            *grad_ref = Some(new_grad.reshaped(&self.data.shape));
         }
     }
 
@@ -215,10 +231,10 @@ impl AutogradNode for MatMulNode {
         // never reads, which skips a matmul per frozen weight.
         let grad_a = if self.a.requires_grad {
             let g = UnifiedTensor::empty(&self.a.ctx, &self.a.data.shape);
-            if self.b.data.dtype == DType::FP16 {
-                engine.matmul_bt_f16b(&self.a.ctx, grad, &self.b.data, &g);
-            } else {
-                engine.matmul_bt(&self.a.ctx, grad, &self.b.data, &g);
+            match self.b.data.dtype {
+                DType::FP16 => engine.matmul_bt_f16b(&self.a.ctx, grad, &self.b.data, &g),
+                DType::Q4 => engine.matmul_bt_q4b(&self.a.ctx, grad, &self.b.data, &g),
+                DType::FP32 => engine.matmul_bt(&self.a.ctx, grad, &self.b.data, &g),
             }
             g
         } else {
@@ -641,14 +657,17 @@ impl AutogradNode for SiLUGateNode {
 // Key for training large models on limited memory devices.
 
 /// A forward computation that [`checkpoint`] can replay during backward.
-pub trait CheckpointFn: Send + Sync {
+///
+/// The computation may capture `Tensor`s (weights, LoRA adapters); the graph
+/// is single-threaded, so no `Send`/`Sync` bound is needed.
+pub trait CheckpointFn {
     /// Run the forward computation on `inputs`.
     fn forward(&self, inputs: &[Tensor], engine: &ComputeEngine) -> Vec<Tensor>;
 }
 
 impl<F> CheckpointFn for F
 where
-    F: Fn(&[Tensor], &ComputeEngine) -> Vec<Tensor> + Send + Sync,
+    F: Fn(&[Tensor], &ComputeEngine) -> Vec<Tensor>,
 {
     fn forward(&self, inputs: &[Tensor], engine: &ComputeEngine) -> Vec<Tensor> {
         self(inputs, engine)
@@ -676,10 +695,23 @@ impl AutogradNode for CheckpointedNode {
         // Replay the forward pass from fresh leaves that share the input
         // data, backpropagate through the recomputed graph, and read the
         // gradients that reach the leaves.
+        //
+        // `grad` may share its buffer with another gradient, so it is only
+        // read. The nested backward adds the gradients of captured
+        // parameters straight into their own slots, releases the replay's
+        // intermediate gradients as it goes, and everything else the replay
+        // created is dropped when this function returns.
         let leaves: Vec<Tensor> = self
             .inputs
             .iter()
-            .map(|t| Tensor::new(t.ctx.clone(), t.data.as_ref().clone()))
+            .map(|t| {
+                let data = t.data.as_ref().clone();
+                if t.requires_grad {
+                    Tensor::new(t.ctx.clone(), data)
+                } else {
+                    Tensor::frozen(t.ctx.clone(), data)
+                }
+            })
             .collect();
         let outputs = self.checkpoint_fn.forward(&leaves, engine);
         let output = &outputs[self.output_index];
@@ -688,6 +720,10 @@ impl AutogradNode for CheckpointedNode {
         leaves
             .iter()
             .map(|leaf| {
+                if !leaf.requires_grad {
+                    // Never read: backward skips inputs that need no gradient.
+                    return UnifiedTensor::empty(&leaf.ctx, &[1]);
+                }
                 leaf.grad
                     .borrow()
                     .clone()
@@ -702,7 +738,7 @@ impl AutogradNode for CheckpointedNode {
 /// compute for memory.
 pub fn checkpoint<F>(inputs: Vec<Tensor>, forward_fn: F, engine: &ComputeEngine) -> Vec<Tensor>
 where
-    F: Fn(&[Tensor], &ComputeEngine) -> Vec<Tensor> + Send + Sync + 'static,
+    F: Fn(&[Tensor], &ComputeEngine) -> Vec<Tensor> + 'static,
 {
     let outputs = forward_fn(&inputs, engine);
     let checkpoint_fn: Arc<dyn CheckpointFn> = Arc::new(forward_fn);
@@ -723,17 +759,10 @@ where
 
 /// [`checkpoint`] for a single-input, single-output function.
 ///
-/// Checkpointing each transformer block keeps one activation per block
-/// instead of every intermediate:
-/// ```text
-/// let mut x = input;
-/// for layer in &layers {
-///     x = checkpoint_single(x, move |h, eng| layer.forward(h, eng), engine);
-/// }
-/// ```
+/// For a computation that captures weights, use [`checkpoint_with_params`].
 pub fn checkpoint_single<F>(input: Tensor, forward_fn: F, engine: &ComputeEngine) -> Tensor
 where
-    F: Fn(&Tensor, &ComputeEngine) -> Tensor + Send + Sync + 'static,
+    F: Fn(&Tensor, &ComputeEngine) -> Tensor + 'static,
 {
     let wrapper = move |inputs: &[Tensor], eng: &ComputeEngine| -> Vec<Tensor> {
         vec![forward_fn(&inputs[0], eng)]
@@ -741,6 +770,47 @@ where
     checkpoint(vec![input], wrapper, engine)
         .pop()
         .expect("checkpointed function returned one output")
+}
+
+/// [`checkpoint`] for a computation that also reads tensors it captures
+/// (weights, LoRA adapters) rather than receiving them as `inputs`.
+///
+/// Captured tensors that require a gradient receive it during backward,
+/// when the computation is replayed: once per backward pass through the
+/// output, added to whatever their gradient slots already hold. The outer
+/// graph cannot see them, so the outputs are marked as requiring a gradient
+/// whenever any of `params` does; otherwise a computation whose `inputs` are
+/// all frozen (the first decoder block reads the frozen embedding output)
+/// would be skipped by backward. Pass every captured tensor that may require
+/// a gradient in `params`.
+///
+/// The replay costs a second run of `forward_fn` during backward.
+///
+/// Checkpointing each decoder block keeps one activation per block:
+/// ```text
+/// let block = layer.clone(); // shares weights and gradient slots
+/// let params = block.params();
+/// let out = checkpoint_with_params(vec![x], &params, move |i, e| {
+///     vec![block.forward(e, &i[0], 0, None, None)]
+/// }, engine);
+/// ```
+pub fn checkpoint_with_params<F>(
+    inputs: Vec<Tensor>,
+    params: &[Tensor],
+    forward_fn: F,
+    engine: &ComputeEngine,
+) -> Vec<Tensor>
+where
+    F: Fn(&[Tensor], &ComputeEngine) -> Vec<Tensor> + 'static,
+{
+    let params_need_grad = params.iter().any(|p| p.requires_grad);
+    let mut outputs = checkpoint(inputs, forward_fn, engine);
+    if params_need_grad {
+        for output in &mut outputs {
+            output.requires_grad = true;
+        }
+    }
+    outputs
 }
 
 impl Tensor {
@@ -777,18 +847,33 @@ impl Tensor {
     ///
     /// `b` may be stored as f16 ([`UnifiedTensor::from_f32_as_f16`]) when it
     /// does not require a gradient, as for frozen base weights; the product
-    /// is still computed in f32.
+    /// is still computed in f32. `b` may also be 4-bit
+    /// ([`UnifiedTensor::from_f32_as_q4`]) under the same condition; the
+    /// input gradient then reads the same 4-bit tensor.
+    ///
+    /// # Panics
+    ///
+    /// If `b` is f16 or 4-bit and requires a gradient: such weights are
+    /// never trainable.
     pub fn matmul(a: &Tensor, b: &Tensor, engine: &ComputeEngine) -> Tensor {
         let out_shape = vec![a.data.shape[0], b.data.shape[1]];
         let out_data = UnifiedTensor::empty(&a.ctx, &out_shape);
-        if b.data.dtype == DType::FP16 {
-            assert!(
-                !b.requires_grad,
-                "matmul: an f16 right operand must not require a gradient"
-            );
-            engine.matmul_f16b(&a.ctx, &a.data, &b.data, &out_data);
-        } else {
-            engine.matmul(&a.ctx, &a.data, &b.data, &out_data);
+        match b.data.dtype {
+            DType::FP16 => {
+                assert!(
+                    !b.requires_grad,
+                    "matmul: an f16 right operand must not require a gradient"
+                );
+                engine.matmul_f16b(&a.ctx, &a.data, &b.data, &out_data);
+            }
+            DType::Q4 => {
+                assert!(
+                    !b.requires_grad,
+                    "matmul: a 4-bit right operand must not require a gradient"
+                );
+                engine.matmul_q4b(&a.ctx, &a.data, &b.data, &out_data);
+            }
+            DType::FP32 => engine.matmul(&a.ctx, &a.data, &b.data, &out_data),
         }
         let node = Arc::new(MatMulNode {
             a: a.clone(),
@@ -1093,15 +1178,38 @@ pub trait Optimizer: Send + Sync {
     ) -> Option<OptimizerCheckpoint> {
         None
     }
-    /// Restore state saved by [`save_state`](Optimizer::save_state);
-    /// returns whether it was applied.
+    /// Restore state saved by [`save_state`](Optimizer::save_state) into the
+    /// parameters of `named_params`.
+    ///
+    /// The result says how many parameters got their saved state back and
+    /// how many saved entries went unused; an error means the state does not
+    /// fit the parameters (a moment of the wrong shape) and nothing was
+    /// changed. The default reports that the optimizer keeps no state.
     fn load_state(
         &mut self,
         _ctx: &Arc<WgpuContext>,
         _named_params: &HashMap<String, Tensor>,
         _state: &OptimizerCheckpoint,
-    ) -> bool {
-        false
+    ) -> Result<OptimizerLoad, String> {
+        Err("this optimizer cannot restore saved state".to_string())
+    }
+}
+
+/// What [`Optimizer::load_state`] did with a saved state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OptimizerLoad {
+    /// Parameters that got their saved state back.
+    pub matched: usize,
+    /// Parameters that had no saved state and start from zero.
+    pub missing: usize,
+    /// Saved entries (by parameter name) that no parameter took.
+    pub unused: usize,
+}
+
+impl OptimizerLoad {
+    /// Whether every parameter got its state and every saved entry was used.
+    pub fn is_complete(&self) -> bool {
+        self.missing == 0 && self.unused == 0
     }
 }
 
@@ -1284,15 +1392,28 @@ impl Optimizer for AdamW {
             v_states,
         }))
     }
-    /// Restore state saved by [`save_state`](Optimizer::save_state);
-    /// returns whether it was applied.
+    /// Restore state saved by [`save_state`](Optimizer::save_state).
+    ///
+    /// A parameter takes its saved state when `state` has both moments under
+    /// its name; a moment whose shape differs from the parameter's is an
+    /// error and nothing is changed. When no parameter matches, the
+    /// optimizer is left as it was and the result says so; otherwise the
+    /// hyperparameters and step count of the checkpoint are restored too.
     fn load_state(
         &mut self,
         ctx: &Arc<WgpuContext>,
         named_params: &HashMap<String, Tensor>,
         state: &OptimizerCheckpoint,
-    ) -> bool {
+    ) -> Result<OptimizerLoad, String> {
         let OptimizerCheckpoint::AdamW(state) = state;
+        let shapes: HashMap<&str, &[usize]> = named_params
+            .iter()
+            .map(|(name, p)| (name.as_str(), p.data.shape.as_slice()))
+            .collect();
+        let (matched, report) = match_moments(&shapes, state)?;
+        if matched.is_empty() {
+            return Ok(report);
+        }
         self.lr = state.lr;
         self.beta1 = state.beta1;
         self.beta2 = state.beta2;
@@ -1301,27 +1422,56 @@ impl Optimizer for AdamW {
         self.t = state.t;
         self.m_states.clear();
         self.v_states.clear();
-
-        for (name, tensor_state) in &state.m_states {
-            if let Some(param) = named_params.get(name) {
-                let key = Arc::as_ptr(&param.data) as usize;
-                self.m_states.insert(
-                    key,
-                    UnifiedTensor::new(ctx, &tensor_state.data, &tensor_state.shape),
-                );
-            }
+        for name in matched {
+            let key = Arc::as_ptr(&named_params[name].data) as usize;
+            let (m, v) = (&state.m_states[name], &state.v_states[name]);
+            self.m_states
+                .insert(key, UnifiedTensor::new(ctx, &m.data, &m.shape));
+            self.v_states
+                .insert(key, UnifiedTensor::new(ctx, &v.data, &v.shape));
         }
-        for (name, tensor_state) in &state.v_states {
-            if let Some(param) = named_params.get(name) {
-                let key = Arc::as_ptr(&param.data) as usize;
-                self.v_states.insert(
-                    key,
-                    UnifiedTensor::new(ctx, &tensor_state.data, &tensor_state.shape),
-                );
-            }
-        }
-        true
+        Ok(report)
     }
+}
+
+/// Which saved moments belong to which parameters, without touching a
+/// device. `shapes` maps parameter names to their shapes. Returns the names
+/// that take both saved moments, and the counts; fails when a saved moment
+/// does not fit its parameter.
+fn match_moments<'a>(
+    shapes: &HashMap<&str, &[usize]>,
+    state: &'a AdamWCheckpoint,
+) -> Result<(Vec<&'a str>, OptimizerLoad), String> {
+    let mut saved: Vec<&String> = state.m_states.keys().chain(state.v_states.keys()).collect();
+    saved.sort();
+    saved.dedup();
+    let mut matched = Vec::new();
+    for &name in &saved {
+        let (Some(shape), Some(m), Some(v)) = (
+            shapes.get(name.as_str()),
+            state.m_states.get(name),
+            state.v_states.get(name),
+        ) else {
+            continue;
+        };
+        for (kind, moment) in [("first", m), ("second", v)] {
+            if moment.shape != *shape || moment.data.len() != shape.iter().product::<usize>() {
+                return Err(format!(
+                    "saved {kind} moment of {name} has shape {:?} ({} values), the parameter has shape {:?}",
+                    moment.shape,
+                    moment.data.len(),
+                    shape
+                ));
+            }
+        }
+        matched.push(name.as_str());
+    }
+    let report = OptimizerLoad {
+        matched: matched.len(),
+        missing: shapes.len() - matched.len(),
+        unused: saved.len() - matched.len(),
+    };
+    Ok((matched, report))
 }
 
 // --- Learning Rate Schedulers ---
@@ -1557,5 +1707,127 @@ mod tests {
         assert_eq!(&lrs[..5], &[0.0, 0.25, 0.5, 0.75, 1.0]);
         assert!((lrs[9] - 0.55).abs() < 1e-6);
         assert_eq!(lrs[14], 0.1);
+    }
+
+    fn moment(shape: &[usize]) -> OptimizerTensorState {
+        OptimizerTensorState {
+            shape: shape.to_vec(),
+            data: vec![0.5; shape.iter().product()],
+        }
+    }
+
+    /// Parameter shapes by name, as `load_state` sees them.
+    fn param_shapes(list: &[(&str, Vec<usize>)]) -> HashMap<String, Vec<usize>> {
+        list.iter()
+            .map(|(n, s)| (n.to_string(), s.clone()))
+            .collect()
+    }
+
+    fn borrowed(shapes: &HashMap<String, Vec<usize>>) -> HashMap<&str, &[usize]> {
+        shapes
+            .iter()
+            .map(|(n, s)| (n.as_str(), s.as_slice()))
+            .collect()
+    }
+
+    fn saved_state(params: &[(&str, Vec<usize>)]) -> AdamWCheckpoint {
+        let states = || {
+            params
+                .iter()
+                .map(|(n, s)| (n.to_string(), moment(s)))
+                .collect::<HashMap<_, _>>()
+        };
+        AdamWCheckpoint {
+            lr: 1e-3,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+            weight_decay: 0.0,
+            t: 3.0,
+            m_states: states(),
+            v_states: states(),
+        }
+    }
+
+    #[test]
+    fn saved_moments_match_the_same_parameters() {
+        let owned = param_shapes(&[("a.weight", vec![2, 3]), ("b.weight", vec![4])]);
+        let params = borrowed(&owned);
+        let state = saved_state(&[("a.weight", vec![2, 3]), ("b.weight", vec![4])]);
+        let (matched, report) = match_moments(&params, &state).expect("fits");
+        assert_eq!(matched, vec!["a.weight", "b.weight"]);
+        assert_eq!(
+            report,
+            OptimizerLoad {
+                matched: 2,
+                missing: 0,
+                unused: 0
+            }
+        );
+        assert!(report.is_complete());
+    }
+
+    #[test]
+    fn saved_moments_of_other_parameters_match_none() {
+        let owned = param_shapes(&[("x.weight", vec![2, 3]), ("y.weight", vec![4])]);
+        let params = borrowed(&owned);
+        let state = saved_state(&[("a.weight", vec![2, 3]), ("b.weight", vec![4])]);
+        let (matched, report) = match_moments(&params, &state).expect("no shape clash");
+        assert!(matched.is_empty());
+        assert_eq!(
+            report,
+            OptimizerLoad {
+                matched: 0,
+                missing: 2,
+                unused: 2
+            }
+        );
+        assert!(!report.is_complete());
+    }
+
+    #[test]
+    fn partial_overlap_reports_both_sides() {
+        let owned = param_shapes(&[
+            ("a.weight", vec![2]),
+            ("b.weight", vec![2]),
+            ("c.weight", vec![2]),
+        ]);
+        let params = borrowed(&owned);
+        let state = saved_state(&[("a.weight", vec![2]), ("old.weight", vec![2])]);
+        let (matched, report) = match_moments(&params, &state).expect("fits");
+        assert_eq!(matched, vec!["a.weight"]);
+        assert_eq!(
+            report,
+            OptimizerLoad {
+                matched: 1,
+                missing: 2,
+                unused: 1
+            }
+        );
+    }
+
+    #[test]
+    fn a_moment_with_only_one_half_is_not_applied() {
+        let owned = param_shapes(&[("a.weight", vec![2])]);
+        let params = borrowed(&owned);
+        let mut state = saved_state(&[("a.weight", vec![2])]);
+        state.v_states.clear();
+        let (matched, report) = match_moments(&params, &state).expect("fits");
+        assert!(matched.is_empty());
+        assert_eq!((report.missing, report.unused), (1, 1));
+    }
+
+    #[test]
+    fn a_moment_of_the_wrong_shape_is_an_error() {
+        let owned = param_shapes(&[("a.weight", vec![2, 3])]);
+        let params = borrowed(&owned);
+        let state = saved_state(&[("a.weight", vec![3, 2])]);
+        let err = match_moments(&params, &state).unwrap_err();
+        assert!(err.contains("a.weight") && err.contains("shape"), "{err}");
+
+        // A shape that agrees with a value count that does not.
+        let mut state = saved_state(&[("a.weight", vec![2, 3])]);
+        state.v_states.get_mut("a.weight").unwrap().data.pop();
+        assert!(match_moments(&params, &state).is_err());
     }
 }

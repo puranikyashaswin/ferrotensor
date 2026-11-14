@@ -1,10 +1,19 @@
 # Use cases
 
-Four small programs that show where the `ferrotensor` crate fits today. Each lives
+Small programs that show where Ferrotensor fits today. Sections 1 to 4 use
+the `ferrotensor` crate. Each of those lives
 in [`ferrotensor/examples/`](../ferrotensor/examples), runs with one command, and the
 output below was captured from a real run on an Apple M2 (Metal) with Rust
 1.99.1. Numbers that depend on random initialisation vary from run to
 run; timings are single-machine snapshots, not benchmarks.
+
+Sections 5 to 7 use the LLM training stack (`ferrotensor-graph` and
+`ferrotensor-trainer`). They live in
+[`ferrotensor-trainer/examples/`](../ferrotensor-trainer/examples), build a
+tiny random model in a temporary directory so nothing is downloaded, and
+check their own results: a wrong result makes the program exit non-zero.
+CI runs all three on every pull request, and their output below is copied
+from that CI job (Mesa lavapipe, a Vulkan driver that runs on the CPU).
 
 All commands assume you are in the repository root.
 
@@ -14,6 +23,9 @@ All commands assume you are in the repository root.
 | [`char_transformer`](#2-a-character-level-transformer-from-scratch) | attention, LayerNorm, a custom `Module`-style model, sampling | CPU (GPU optional) |
 | [`gpu_matmul_attention`](#3-gpu-matmul-and-attention) | CPU/GPU parity and where the GPU wins | GPU |
 | [`similarity_search`](#4-similarity-search) | embeddings + batched dot-product search | GPU if present |
+| [`lora_finetune_tiny`](#5-lora-fine-tuning-on-a-tiny-model) | LoRA training, saving and reloading an adapter | GPU |
+| [`resume_training`](#6-stop-and-resume-a-training-run) | saving and restoring adapter and optimizer state | GPU |
+| [`generate_with_kv_cache`](#7-greedy-generation-with-the-kv-cache) | greedy decoding with and without the KV cache | GPU |
 
 ## 1. Train an MLP with a DataLoader
 
@@ -172,6 +184,146 @@ query: "lake hiking trails"
 Top results are right for all five queries. Second results are
 sometimes weak (the second hit for "kittens on a ledge" is unrelated: the
 score 0.154 shows it), which is what a lexical embedding gives you.
+
+## 5. LoRA fine-tuning on a tiny model
+
+**Where it fits:** the whole LoRA path of the training stack, with no model to
+download. The example writes a tiny random Llama-style model (64-token
+vocabulary, 2 layers, hidden size 32) to a temporary directory, attaches
+rank-4 LoRA adapters to `q_proj`, `k_proj`, `v_proj` and `o_proj`, and
+trains them for 40 steps on one fixed 16-token pattern. Then it saves the
+adapter, loads it into a fresh copy of the model and scores that copy.
+
+```bash
+cargo run --release -p ferrotensor-trainer --example lora_finetune_tiny
+```
+
+```
+device: llvmpipe (LLVM 20.1.2, 256 bits) (Vulkan)
+task: continue the pattern [3, 10, 17, 24, 31, 38, 45, 52, 59, 2, 9, 16, 23, 30, 37, 44]
+model: 2 layers, vocabulary 64; LoRA rank 4 on q/k/v/o, 1792 trainable values
+loss before training: 5.9385
+step  0  loss 5.9385
+step 10  loss 2.5799
+step 20  loss 0.9200
+step 30  loss 0.4844
+step 39  loss 0.2989
+loss after 40 steps: 0.2841
+saved 16 adapter tensors (8984 bytes)
+fresh copy, no adapter: loss 5.9385
+fresh copy, adapter loaded (16 tensors): loss 0.2841
+|reloaded - trained| = 0.00e0
+```
+
+The key lines:
+
+```rust
+let model = Lfm2ModelBuilder::new(ctx.clone(), engine.clone(), &weights, config)
+    .with_lora(LoRaConfig { rank: 4, alpha: 8.0, target_modules })
+    .build()?;
+let params = model.named_lora_params(); // only these are trained
+let mut trainer = Trainer::new(model, Box::new(AdamW::new(engine.clone(), 1e-2)), ctx, engine);
+trainer.train_step(&seq[..15], &seq[1..], &params)?;
+
+save_lora_checkpoint(&ctx, "adapter.safetensors", &trainer.model.named_lora_params(), Some(&meta)).await?;
+let checkpoint = load_lora_checkpoint("adapter.safetensors")?;
+apply_checkpoint(&ctx, &checkpoint, &fresh.named_lora_params())?;
+```
+
+(Simplified: the example sorts the parameters by name and passes them as a
+list.) The program asserts that the loss at least halves and that the
+reloaded model gives the trained loss within 1e-4. A single fixed pattern is
+memorised, not generalised: this checks that the training stack works, it
+does not measure a model. For a real model and dataset, see the
+[LoRA walkthrough](examples/lora-sft.md).
+
+## 6. Stop and resume a training run
+
+**Where it fits:** long runs that must survive a stop. The example trains the
+same tiny model 12 steps straight; then, separately, 6 steps, saves the
+adapter and the AdamW state, builds a fresh model, loads both and trains 6
+more. For contrast it also resumes from the same adapter with a new, empty
+optimizer.
+
+```bash
+cargo run --release -p ferrotensor-trainer --example resume_training
+```
+
+```
+device: llvmpipe (LLVM 20.1.2, 256 bits) (Vulkan)
+12 steps straight:           5.9385 5.7171 5.4485 5.1535 4.8705 4.6353 4.4604 4.3264 4.2083 4.0905 3.9635 3.8199
+saved adapter and optimizer state after 6 steps
+6 + 6 steps, resumed:        5.9385 5.7171 5.4485 5.1535 4.8705 4.6353 4.4604 4.3264 4.2083 4.0905 3.9635 3.8199
+6 + 6, new optimizer:        5.9385 5.7171 5.4485 5.1535 4.8705 4.6353 4.4604 4.2503 4.0582 3.8699 3.6729 3.4597
+largest relative difference, resumed vs straight: 0.00e0 (allowed 1e-5)
+final loss without the optimizer state differs by 0.3602
+```
+
+The key lines:
+
+```rust
+// Save: the adapter, plus the optimizer moments and step count.
+save_lora_checkpoint(&ctx, &adapter, &named, Some(&meta)).await?;
+let mut state = TrainingState::new(12);
+state.step = trainer.optimizer_steps();
+TrainingCheckpoint {
+    training_state: state,
+    optimizer_state: trainer.optimizer.save_state(&ctx, &named),
+    grad_scaler_state: None,
+}
+.save(&state_path)?;
+
+// Resume: a fresh model, the adapter, then the optimizer state.
+apply_checkpoint(&ctx, &load_lora_checkpoint(&adapter)?, &model.named_lora_params())?;
+let saved = TrainingCheckpoint::load(&state_path)?;
+let mut optimizer = AdamW::new(engine.clone(), 5e-3);
+optimizer.load_state(&ctx, &model.named_lora_params(), saved.optimizer_state.as_ref().unwrap());
+let mut trainer = Trainer::new(model, Box::new(optimizer), ctx, engine);
+trainer.set_optimizer_steps(saved.training_state.step);
+```
+
+The resumed run matches the straight run at every step (the program fails if
+any resumed step differs by more than 1e-5, relative). Without the optimizer
+state the run goes on from the same weights but takes different steps. Its
+loss happens to fall faster here (likely because AdamW's first steps after a
+fresh start are large); the point is that it is a different run, not that it
+is worse.
+
+## 7. Greedy generation with the KV cache
+
+**Where it fits:** text generation. The example trains the tiny model's LoRA
+adapters for 30 steps on the pattern (so each next token is a clear choice),
+then generates 12 tokens from a 4-token prompt twice: once running the whole
+sequence again at every step, once with a KV cache that keeps the keys and
+values of earlier tokens, so each step feeds only the new token.
+
+```bash
+cargo run --release -p ferrotensor-trainer --example generate_with_kv_cache
+```
+
+```
+device: llvmpipe (LLVM 20.1.2, 256 bits) (Vulkan)
+trained LoRA for 30 steps, final loss 0.5063
+prompt:            [3, 10, 17, 24]
+without KV cache:  [31, 38, 45, 52, 59, 2, 9, 16, 23, 30, 37, 44]
+with KV cache:     [31, 38, 45, 52, 59, 2, 9, 16, 23, 30, 37, 44]
+training pattern:  [31, 38, 45, 52, 59, 2, 9, 16, 23, 30, 37, 44]
+largest logit difference between the two: 0.00e0
+tokens that continue the pattern: 12 of 12
+```
+
+The key lines:
+
+```rust
+let mut cache = model.new_kv_cache(prompt.len() + n); // None if the model has conv blocks
+let mut logits = model.forward(&engine, prompt, 0, cache.as_mut(), None);
+// ... pick `next` from the last row of `logits`, push it to `tokens` ...
+logits = model.forward(&engine, &[next], tokens.len() - 1, cache.as_mut(), None);
+```
+
+The program asserts that both runs give the same tokens. The model continues
+the pattern it was trained on; on a model this small that is memorisation,
+not language.
 
 ## What does not fit (yet)
 

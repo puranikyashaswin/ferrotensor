@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>About Ferrotensor: who builds it and how to reach me</title>
+<meta name="description" content="Ferrotensor is an open-source Rust framework that fine-tunes language models through wgpu. Who builds it, what is measured, and how to get in touch.">
+<link rel="canonical" href="https://puranikyashaswin.github.io/ferrotensor/about/">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#f6f3ee" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#141210" media="(prefers-color-scheme: dark)">
+<link rel="icon" href="../favicon.svg" type="image/svg+xml">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Ferrotensor">
+<meta property="og:title" content="About Ferrotensor: who builds it and how to reach me">
+<meta property="og:description" content="Ferrotensor is an open-source Rust framework that fine-tunes language models through wgpu. Who builds it, what is measured, and how to get in touch.">
+<meta property="og:url" content="https://puranikyashaswin.github.io/ferrotensor/about/">
+<meta property="og:image" content="https://puranikyashaswin.github.io/ferrotensor/og.png">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="stylesheet" href="../style.css">
+<link rel="stylesheet" href="about.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to the page</a>
+
+<header class="top">
+  <div class="wrap top-in">
+    <a class="brand" href="../"><svg class="tile" viewBox="0 0 32 32" aria-hidden="true"><rect x="1" y="1" width="30" height="30" rx="4"/><text x="5" y="10">26</text><text class="tile-sym" x="5.5" y="26">Ft</text></svg><span>Ferrotensor</span></a>
+    <nav aria-label="Primary">
+      <ul>
+        <li><a href="../guide/">How-to guide</a></li>
+        <li><a href="../docs/">Docs</a></li>
+        <li class="nav-wide"><a href="../docs/benchmarks.html">Benchmarks</a></li>
+        <li><a href="https://github.com/puranikyashaswin/ferrotensor">GitHub</a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+
+<main id="main" class="wrap">
+<div class="about">
+  <p class="eyebrow">About · Ferrotensor {{ft_version}}</p>
+  <h1>Fine-tuning in Rust, through Vulkan, Metal or DX12</h1>
+  <p class="lede">Ferrotensor is an open-source machine learning framework written in Rust. It fine-tunes language models from one codebase through <a href="https://wgpu.rs">wgpu</a> and hand-written WGSL kernels, which run through Vulkan, Metal or DX12. There is no CUDA toolchain to install. It has been tested on an NVIDIA A10G, an Apple M2 and software Vulkan in CI; other GPUs are untested, and <a href="../docs/testing-on-your-gpu.html">reports are welcome</a>.</p>
+
+  <h2>Why it exists</h2>
+  <p>Most training tools are built for CUDA first. A laptop, a consumer card or an integrated GPU is often left out, and the code between the Python API and the GPU is hard to read.</p>
+  <p>Ferrotensor takes the other route. The same kernels run through Metal on a Mac and through Vulkan or DX12 on Windows and Linux, and <code>cargo build</code> is the whole toolchain. The tests check op gradients against finite differences on the CPU, GPU results against a CPU device, and the LoRA loss and gradients against PyTorch autograd, so a result on one GPU can be compared with a result on another.</p>
+
+  <h2>What is measured so far</h2>
+  <p>Every number on this site comes from a run with its commands, machine and commit written down.</p>
+  <ul class="facts">
+    <li><b>1.7B</b>SmolLM2-1.7B fine-tuned with LoRA on one NVIDIA A10G (24&nbsp;GB): 8,222&nbsp;MiB of GPU memory in 0.7, 5,245&nbsp;MiB with <code>--checkpoint-blocks</code>.</li>
+    <li><b>0.005</b>Largest gap in held-out loss against PyTorch + PEFT on CUDA, same GPU and recipe; Ferrotensor is slower per step.</li>
+    <li><b>M2</b>SmolLM2-135M fine-tuned with LoRA on an Apple M2 (8&nbsp;GB) with a 0.4 build.</li>
+  </ul>
+  <p class="after-facts">The full tables are in the <a href="../docs/examples/lora-sft.html">LoRA walkthrough</a> and the <a href="../docs/benchmarks.html">benchmarks</a>. What it cannot do yet is listed <a href="../#limits">on the home page</a>, including where it is slower than PyTorch.</p>
+
+  <h2>Where it is going</h2>
+  <p>The goal is training that goes wherever a GPU is: AMD and Intel cards, a browser tab through WebGPU, and edge boards such as NVIDIA Jetson, with the training data staying on the device. The steps, and which of them are already measured, are in the <a href="../#direction">roadmap</a>.</p>
+
+  <h2>Who builds it</h2>
+  <p>I'm <strong>Puranik Yashaswin Sharma</strong>, a computer science student at Woxsen University in Hyderabad, India. I design, write and maintain Ferrotensor: the kernels, the autograd, the LoRA trainer, the Python bindings and this site. The code is on <a href="https://github.com/puranikyashaswin/ferrotensor">GitHub</a> and released on <a href="https://crates.io/crates/ferrotensor">crates.io</a> and <a href="https://pypi.org/project/ferrotensor/">PyPI</a>.</p>
+  <p>It is a young project. Reports from GPUs I do not own help the most: <a href="../docs/testing-on-your-gpu.html">testing on your GPU</a> takes one command.</p>
+
+  <h2>Get in touch</h2>
+  <ul>
+    <li><strong>Using Ferrotensor in a product, or want it measured on your hardware?</strong> Write to <a href="mailto:puranikyashaswinsharma@gmail.com">puranikyashaswinsharma@gmail.com</a>.</li>
+    <li><strong>A bug or a missing feature:</strong> open an <a href="https://github.com/puranikyashaswin/ferrotensor/issues">issue on GitHub</a>.</li>
+    <li><strong>A security problem:</strong> follow the <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/SECURITY.md">security policy</a>.</li>
+    <li><strong>Contributing:</strong> start with the <a href="../docs/good-first-issues.html">good first issues</a>.</li>
+  </ul>
+
+  <h2>License and citation</h2>
+  <p>Ferrotensor is free to use under <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/LICENSE-MIT">MIT</a> or <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/LICENSE-APACHE">Apache-2.0</a>, at your option. If you use it in research, the repository's <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/CITATION.cff">CITATION.cff</a> has the reference.</p>
+</div>
+</main>
+
+<footer class="foot">
+  <div class="wrap foot-in">
+    <div class="foot-brand">
+      <svg class="tile" viewBox="0 0 32 32" aria-hidden="true"><rect x="1" y="1" width="30" height="30" rx="4"/><text x="5" y="10">26</text><text class="tile-sym" x="5.5" y="26">Ft</text></svg>
+      <p>Ferrotensor {{ft_version}} · Licensed under <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/LICENSE-MIT">MIT</a> or <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/LICENSE-APACHE">Apache-2.0</a>, at your option.</p>
+    </div>
+    <nav aria-label="Project links">
+      <ul>
+        <li><a href="https://github.com/puranikyashaswin/ferrotensor">GitHub</a></li>
+        <li><a href="https://crates.io/crates/ferrotensor">crates.io</a></li>
+        <li><a href="https://pypi.org/project/ferrotensor/">PyPI</a></li>
+        <li><a href="https://docs.rs/ferrotensor">docs.rs</a></li>
+        <li><a href="../guide/">How-to guide</a></li>
+        <li><a href="../docs/">Docs</a></li>
+        <li><a href="./" aria-current="page">About</a></li>
+        <li><a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/CHANGELOG.md">Changelog</a></li>
+      </ul>
+    </nav>
+  </div>
+</footer>
+</body>
+</html>
