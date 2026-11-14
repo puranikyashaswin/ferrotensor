@@ -6,7 +6,7 @@
 <title>Ferrotensor: LoRA fine-tuning in pure Rust on wgpu</title>
 <meta name="description" content="LoRA fine-tuning up to 1.7B parameters in pure Rust through wgpu (Vulkan, Metal, DX12), with loss and gradients checked against PyTorch.">
 <meta name="google-site-verification" content="l0rdpJ2u3IDZ3tYvyRXBufrQao6aw862u_PVg9fvwkE">
-<link rel="canonical" href="https://ferrotensor.dev/">
+<link rel="canonical" href="https://puranikyashaswin.github.io/ferrotensor/">
 <meta name="color-scheme" content="light dark">
 <script>document.documentElement.classList.add("js");</script>
 <meta name="theme-color" content="#f6f3ee" media="(prefers-color-scheme: light)">
@@ -16,15 +16,15 @@
 <meta property="og:site_name" content="Ferrotensor">
 <meta property="og:title" content="Ferrotensor: LoRA fine-tuning in pure Rust on wgpu">
 <meta property="og:description" content="LoRA fine-tuning up to 1.7B parameters in pure Rust through wgpu (Vulkan, Metal, DX12), with loss and gradients checked against PyTorch.">
-<meta property="og:url" content="https://ferrotensor.dev/">
-<meta property="og:image" content="https://ferrotensor.dev/og.png">
+<meta property="og:url" content="https://puranikyashaswin.github.io/ferrotensor/">
+<meta property="og:image" content="https://puranikyashaswin.github.io/ferrotensor/og.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
 <meta property="og:image:alt" content="Ferrotensor: LoRA fine-tuning in pure Rust through wgpu, with loss and gradients checked against PyTorch.">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="Ferrotensor: LoRA fine-tuning in pure Rust on wgpu">
 <meta name="twitter:description" content="LoRA fine-tuning up to 1.7B parameters in pure Rust through wgpu (Vulkan, Metal, DX12), with loss and gradients checked against PyTorch.">
-<meta name="twitter:image" content="https://ferrotensor.dev/og.png">
+<meta name="twitter:image" content="https://puranikyashaswin.github.io/ferrotensor/og.png">
 <meta name="twitter:image:alt" content="Ferrotensor: LoRA fine-tuning in pure Rust through wgpu.">
 <script type="application/ld+json">
 {
@@ -32,7 +32,7 @@
  "@graph": [
   {
    "@type": "SoftwareSourceCode",
-   "@id": "https://ferrotensor.dev/#code",
+   "@id": "https://puranikyashaswin.github.io/ferrotensor/#code",
    "name": "Ferrotensor",
    "alternateName": [
     "Ferro Tensor",
@@ -45,7 +45,7 @@
     "https://pypi.org/project/ferrotensor/"
    ],
    "description": "A pure-Rust GPU ML framework: tensors, autograd, nn and LoRA fine-tuning on Metal, Vulkan or DX12 through wgpu and hand-written WGSL kernels, with Python bindings.",
-   "url": "https://ferrotensor.dev/",
+   "url": "https://puranikyashaswin.github.io/ferrotensor/",
    "codeRepository": "https://github.com/puranikyashaswin/ferrotensor",
    "programmingLanguage": [
     "Rust",
@@ -65,7 +65,7 @@
   },
   {
    "@type": "SoftwareApplication",
-   "@id": "https://ferrotensor.dev/#cli",
+   "@id": "https://puranikyashaswin.github.io/ferrotensor/#cli",
    "name": "ferrotensor-cli",
    "description": "The ferrotensor command: LoRA fine-tuning (train), evaluation (eval) and text generation (generate) for small Llama-style models.",
    "applicationCategory": "DeveloperApplication",
@@ -86,7 +86,7 @@
   },
   {
    "@type": "FAQPage",
-   "@id": "https://ferrotensor.dev/#faq",
+   "@id": "https://puranikyashaswin.github.io/ferrotensor/#faq",
    "mainEntity": [
     {
      "@type": "Question",
@@ -133,7 +133,7 @@
      "name": "How close is Ferrotensor to PyTorch?",
      "acceptedAnswer": {
       "@type": "Answer",
-      "text": "On the same NVIDIA A10G with the same LoRA recipe, Ferrotensor and PyTorch + PEFT on CUDA give the same held-out loss before training to four decimals, and after 250 steps Ferrotensor is within 0.005 (1.0640 against 1.0608 for SmolLM2-1.7B), one seed per run. Ferrotensor is slower: 0.84 of PyTorch's speed for SmolLM2-135M at batch 1, 0.32 at batch 8 and 0.37 for SmolLM2-1.7B. LoRA loss and gradients are also checked against PyTorch autograd in CI, on a tiny model. The LoRA walkthrough has the full table."
+      "text": "On the same NVIDIA A10G with the same LoRA recipe, Ferrotensor and PyTorch + PEFT on CUDA give the same held-out loss before training to four decimals, and after 250 steps Ferrotensor is within 0.005, one seed per run. For SmolLM2-1.7B, PyTorch ends at 1.0608; Ferrotensor with f16 base weights ends at 1.0640, and with f32 base weights it ends at 1.0657 and runs at 0.37 of PyTorch's speed. Ferrotensor is slower in all three measured runs: 0.84 of PyTorch's speed for SmolLM2-135M at batch 1, 0.32 at batch 8 and 0.37 for SmolLM2-1.7B. LoRA loss and gradients are also checked against PyTorch autograd in CI, on a tiny model. The LoRA walkthrough has the full table."
      }
     },
     {
@@ -217,7 +217,7 @@
         <li class="pb-us"><span class="pb-l">Ferrotensor, WebGPU on Vulkan</span><span class="pb-v">1.0640</span><span class="pb-bar"><i style="--w:40.2%"></i></span></li>
         <li><span class="pb-l">PyTorch + PEFT, CUDA</span><span class="pb-v">1.0608</span><span class="pb-bar"><i style="--w:40.1%"></i></span></li>
       </ul>
-      <p class="pb-cap">Held-out loss on 2,744 Alpaca tokens, lower is better. Same GPU, same data, same recipe, one seed each; Ferrotensor (0.6 build) at 0.37 of PyTorch's speed.</p>
+      <p class="pb-cap">Held-out loss on 2,744 Alpaca tokens, lower is better. Same GPU, recipe and seed setup. Ferrotensor with f16 base weights ends at 1.0640; with f32 base weights it ends at 1.0657 and runs at 0.37 of PyTorch's speed.</p>
       <dl class="pstats">
         <div><dt>GPU memory, 0.7</dt><dd>8,222&nbsp;MiB</dd></div>
         <div><dt>With <code>--checkpoint-blocks</code></dt><dd>5,245&nbsp;MiB</dd></div>
@@ -232,7 +232,7 @@
       <li class="run-k">Measured on</li>
       <li><b>Apple M2</b> Metal, 0.4 build</li>
       <li><b>NVIDIA A10G</b> Vulkan</li>
-      <li><b>NVIDIA Tesla T4</b> Vulkan</li>
+      <li><b>NVIDIA Tesla T4</b> Vulkan, kernel self-check only</li>
       <li><b>Software Vulkan</b> every pull request</li>
     </ul>
   </div>
@@ -322,7 +322,7 @@
         </svg>
         <ul class="facts">
           <li><a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/docs/examples/lora-sft.md#result">Perplexity 11.3 → 5.2</a> in 250 steps</li>
-          <li>A <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/docs/examples/lora-sft.md#result">3.7&nbsp;MB adapter</a> that reloads to the same loss</li>
+          <li>A <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/docs/examples/lora-sft.md#result">3.7&nbsp;MB adapter</a> that reloads to the same loss (0.4 build)</li>
         </ul>
         <a class="card-src" href="docs/examples/lora-sft.html">Walkthrough with every command</a>
       </article>
@@ -517,7 +517,7 @@ x = ft.<span class="f">tensor</span>([[<span class="n">0</span>, <span class="n"
     <ol class="road">
       <li class="road-done"><span class="pill">Measured</span><h3>Apple and NVIDIA GPUs</h3><p>The same LoRA recipe gave SmolLM2-135M the same held-out loss on an Apple M2 through Metal (0.4 build) and an NVIDIA A10G through Vulkan.</p></li>
       <li class="road-done"><span class="pill">Measured</span><h3>Parity with PyTorch</h3><p>Same GPU and recipe as PyTorch + PEFT on CUDA: identical loss before training, within 0.005 after, at 0.32 to 0.84 of its speed. LoRA gradients checked against PyTorch autograd in CI.</p></li>
-      <li class="road-done"><span class="pill">Measured</span><h3>Less GPU memory</h3><p>LoRA on SmolLM2-1.7B: 11,607 MiB in 0.6, 8,222 MiB in 0.7 and 5,245 MiB with <code>--checkpoint-blocks</code>, with identical losses.</p></li>
+      <li class="road-done"><span class="pill">Measured</span><h3>Less GPU memory</h3><p>LoRA on SmolLM2-1.7B: 11,607 MiB in 0.6, 8,222 MiB in 0.7 and 5,245 MiB with <code>--checkpoint-blocks</code>, with the same printed losses.</p></li>
       <li><span class="pill">Next</span><h3>AMD and Intel GPUs</h3><p>The same Vulkan and DX12 path, waiting for its first published results. <a href="docs/testing-on-your-gpu.html">Test it on your GPU</a>.</p></li>
       <li><span class="pill">Next</span><h3>Faster large matmuls</h3><p>Matmul tiles tuned per GPU, to close the gap with cuBLAS on billion-parameter models.</p></li>
       <li><span class="pill">Planned</span><h3>Fine-tuning in a browser tab</h3><p>wgpu also targets WebGPU in the browser: LoRA on the visitor's own GPU, with the training data never uploaded.</p></li>
@@ -603,7 +603,7 @@ x = ft.<span class="f">tensor</span>([[<span class="n">0</span>, <span class="n"
       <li><strong>Mostly f32.</strong> The LoRA command stores frozen weights as f16; activations, gradients and the tensor API are f32, with no <code>f16</code> or <code>bf16</code> tensors yet.</li>
       <li><strong>One GPU.</strong> No multi-GPU or distributed training; the CLI's <code>--world-size</code> flag is a prototype.</li>
       <li><strong>Up to 1.7B measured.</strong> LoRA fine-tuning is tested on Llama-style models from SmolLM2-135M to 1.7B; larger models are untested. Released LFM2 checkpoints are not supported.</li>
-      <li><strong>Tiny workloads are faster on the CPU.</strong> A chain of 100 tiny ops still takes <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/benchmarks/RESULTS.md#what-is-still-slow">about 17× as long on the GPU</a> as on the CPU; op fusion is the next step.</li>
+      <li><strong>Tiny workloads are faster on the CPU.</strong> Chains of tiny ops are still faster on the CPU.</li>
       <li><strong>Not every op.</strong> No convolutions, sort, top-k or cumsum in the tensor API.</li>
       <li><strong>Slower than PyTorch on CUDA.</strong> On the same NVIDIA A10G, a LoRA step takes <a href="docs/examples/lora-sft.html#against-pytorch--peft-on-cuda-same-gpu">1.2 to 3.1 times</a> PyTorch's time (0.84, 0.32 and 0.37 of its speed). Most of the gap is likely in large matmuls, where PyTorch uses cuBLAS; it is not profiled kernel by kernel.</li>
       <li><strong>One NVIDIA GPU measured.</strong> Every training number is from one A10G. AMD, Intel and DX12 are untested; the Apple M2 result is from a 0.4 build. <a href="docs/testing-on-your-gpu.html">Test it on your GPU</a>.</li>
@@ -641,7 +641,7 @@ x = ft.<span class="f">tensor</span>([[<span class="n">0</span>, <span class="n"
       </div>
       <div class="faq-item">
         <h3 id="faq-pytorch">How close is Ferrotensor to PyTorch?</h3>
-        <p>On the same NVIDIA A10G with the same LoRA recipe, Ferrotensor and PyTorch + PEFT on CUDA give the same held-out loss before training to four decimals, and after 250 steps Ferrotensor is within 0.005 (1.0640 against 1.0608 for SmolLM2-1.7B), one seed per run. Ferrotensor is slower: 0.84 of PyTorch's speed for SmolLM2-135M at batch 1, 0.32 at batch 8 and 0.37 for SmolLM2-1.7B. LoRA loss and gradients are also checked against PyTorch autograd in CI, on a tiny model. The <a href="docs/examples/lora-sft.html#against-pytorch--peft-on-cuda-same-gpu">LoRA walkthrough</a> has the full table.</p>
+        <p>On the same NVIDIA A10G with the same LoRA recipe, Ferrotensor and PyTorch + PEFT on CUDA give the same held-out loss before training to four decimals, and after 250 steps Ferrotensor is within 0.005, one seed per run. For SmolLM2-1.7B, PyTorch ends at 1.0608; Ferrotensor with f16 base weights ends at 1.0640, and with f32 base weights it ends at 1.0657 and runs at 0.37 of PyTorch's speed. Ferrotensor is slower in all three measured runs: 0.84 of PyTorch's speed for SmolLM2-135M at batch 1, 0.32 at batch 8 and 0.37 for SmolLM2-1.7B. LoRA loss and gradients are also checked against PyTorch autograd in CI, on a tiny model. The <a href="docs/examples/lora-sft.html#against-pytorch--peft-on-cuda-same-gpu">LoRA walkthrough</a> has the full table.</p>
       </div>
       <div class="faq-item">
         <h3 id="faq-limits">What are Ferrotensor’s limits?</h3>

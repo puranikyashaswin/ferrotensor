@@ -16,7 +16,7 @@ import os
 import re
 import sys
 
-BASE = "https://ferrotensor.dev/"
+BASE = "https://puranikyashaswin.github.io/ferrotensor/"
 OG_IMAGE = BASE + "og.png"
 TITLE_MAX = 60
 DESC_MAX = 155
