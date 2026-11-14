@@ -423,7 +423,8 @@ struct Loaded {
     engine: Arc<ComputeEngine>,
     tokenizer: Tokenizer,
     config: Lfm2Config,
-    weights: WeightsContext,
+    /// The memory-mapped checkpoint, until `build_model` takes it.
+    weights: std::cell::Cell<Option<WeightsContext>>,
     f16_weights: bool,
     q4_weights: bool,
 }
@@ -469,7 +470,7 @@ async fn load_base(args: &ModelArgs) -> Result<Loaded> {
         engine,
         tokenizer,
         config,
-        weights,
+        weights: std::cell::Cell::new(Some(weights)),
         f16_weights: !args.f32_weights,
         q4_weights: args.q4_weights,
     })
@@ -484,11 +485,18 @@ fn build_model(
     saved: Option<&LoraMetadata>,
     trainable_base: bool,
 ) -> Result<Lfm2Model> {
+    // Taken, so the checkpoint is unmapped when the model is built: the
+    // model holds its own copies of the weights, and nothing reads the file
+    // afterwards.
+    let weights = base
+        .weights
+        .take()
+        .ok_or("the checkpoint was already used to build a model")?;
     let weights_file = saved.is_some_and(|m| m.trained_modules.is_some());
     let mut builder = Lfm2ModelBuilder::new(
         base.ctx.clone(),
         base.engine.clone(),
-        &base.weights,
+        &weights,
         base.config.clone(),
     )
     .with_trainable_base(trainable_base)

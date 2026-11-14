@@ -208,3 +208,55 @@ fn generate_emits_tokens() {
     assert!(stderr.contains("[3 prompt + "), "stderr: {stderr}");
     assert!(stderr.contains("new tokens"), "stderr: {stderr}");
 }
+
+/// With 4-bit base weights the checkpoint is unmapped once the model is
+/// built; training (with block recomputation) and generation run on what
+/// the model holds.
+#[test]
+#[ignore = "needs a GPU"]
+fn q4_weights_train_and_generate_without_the_checkpoint() {
+    let model = model_dir("q4-model");
+    let out = common::TempDir::new("q4-out");
+    let data = out.path().join("tokens.bin");
+    common::write_token_bin(&data, 400);
+
+    let run = train(
+        model.path(),
+        &data,
+        out.path(),
+        2,
+        &["--q4-weights", "--checkpoint-blocks"],
+    );
+    assert_success(&run);
+    let metrics = std::fs::read_to_string(out.path().join("metrics.jsonl")).expect("metrics");
+    let losses: Vec<f64> = metrics
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|v| v["loss"].as_f64())
+        .collect();
+    assert!(!losses.is_empty(), "no loss in metrics: {metrics}");
+    assert!(
+        losses.iter().all(|l| l.is_finite() && *l > 0.0),
+        "losses {losses:?}"
+    );
+
+    let adapter = out.path().join("lora_adapters.safetensors");
+    let run = ferrotensor(&[
+        "generate",
+        "--model",
+        s(model.path()),
+        "--lora",
+        s(&adapter),
+        "--q4-weights",
+        "--prompt",
+        "w5 w6 w7",
+        "--raw",
+        "--max-new-tokens",
+        "4",
+        "--seed",
+        "1",
+    ]);
+    assert_success(&run);
+    let stderr = text(&run.stderr);
+    assert!(stderr.contains("new tokens"), "stderr: {stderr}");
+}

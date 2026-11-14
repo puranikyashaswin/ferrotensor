@@ -292,8 +292,9 @@ pub struct Lfm2Model {
     pub norm_f: RMSNorm,
     /// Projection to vocabulary logits.
     pub lm_head: Linear,
-    /// Host copy of `embed_tokens`, read once on first use (the embedding
-    /// lookup runs on the CPU).
+    /// Host copy of `embed_tokens` for the embedding lookup, which runs on
+    /// the CPU: given by the model builder from the checkpoint, or else read
+    /// back from the GPU once on first use.
     embed_host: OnceCell<Vec<f32>>,
     /// Naming family of [`named_params`](Self::named_params).
     architecture: Architecture,
@@ -603,6 +604,25 @@ impl Lfm2Model {
             ctx.clone(),
             UnifiedTensor::new(ctx, &data, &[rows.len(), seq_len, hidden_dim]),
         )
+    }
+
+    /// Use `table`, the values uploaded as `embed_tokens`, as the host copy
+    /// for the embedding lookup instead of reading it back from the GPU on
+    /// first use. Like the copy read on first use, it is a snapshot: later
+    /// writes to `embed_tokens` do not reach it.
+    pub(crate) fn with_host_embeddings(self, table: Vec<f32>) -> Self {
+        debug_assert_eq!(
+            table.len(),
+            self.embed_tokens.data.shape.iter().product::<usize>()
+        );
+        let _ = self.embed_host.set(table);
+        self
+    }
+
+    /// The host copy of the embedding table, if it has been filled.
+    #[cfg(test)]
+    pub(crate) fn host_embeddings(&self) -> Option<&[f32]> {
+        self.embed_host.get().map(Vec::as_slice)
     }
 
     /// Only the LoRA adapter tensors (what LoRA fine-tuning updates).
