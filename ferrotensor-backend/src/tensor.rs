@@ -422,11 +422,14 @@ impl UnifiedTensor {
         };
         context.note_upload(size_in_bytes as u64);
         Self {
-            data: Arc::new(TensorData {
-                buffer: Arc::new(buffer),
-                size_in_bytes: size_in_bytes as u64,
-                pool: None,
-            }),
+            data: Arc::new(TensorData::new(
+                context,
+                Arc::new(buffer),
+                size_in_bytes as u64,
+                None,
+                shape,
+                dtype,
+            )),
             shape: shape.to_vec(),
             dtype,
         }
