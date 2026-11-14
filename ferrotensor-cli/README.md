@@ -92,6 +92,8 @@ weights, and peak GPU memory (`nvidia-smi`, with `--checkpoint-blocks`) is lower
 | SmolLM2-360M | 1.3228 | 1.4087 | 2,783 MiB | 1,998 MiB |
 | SmolLM2-1.7B | 1.0640 | 1.1198 | 5,281 MiB | 3,741 MiB |
 
+These are 250-step runs in separate sessions; the 30-step stage table gives 2,719 and 5,245 MiB for the same setting.
+
 The format is plain round-to-nearest in groups of 64, not the NF4 format
 of QLoRA.
 

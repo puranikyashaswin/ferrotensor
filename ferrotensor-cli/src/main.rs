@@ -251,7 +251,8 @@ struct TrainArgs {
     lite: bool,
     /// Recompute each decoder block during backward instead of keeping its
     /// activations: less GPU memory for a second forward pass through every
-    /// block per step. Results are unchanged.
+    /// block per step. Printed losses and gradient norms are unchanged in the
+    /// measured runs.
     #[arg(long)]
     checkpoint_blocks: bool,
     /// Number of processes in file-based data-parallel training (prototype).

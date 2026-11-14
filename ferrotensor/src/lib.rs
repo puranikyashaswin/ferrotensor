@@ -9,8 +9,8 @@
 //! - **Tensors**: broadcasting element-wise math, reductions over any dim,
 //!   batched matmul, softmax/log-softmax, permute, slicing, concatenation,
 //!   gathers.
-//! - **Automatic differentiation**: every op records its backward pass;
-//!   gradients are checked against finite differences on the CPU and
+//! - **Automatic differentiation**: every op records its backward pass.
+//!   Op gradients are tested against finite differences on the CPU and
 //!   against the CPU on the GPU.
 //! - **`nn`**: Linear, Embedding, LayerNorm, RMSNorm, Dropout, multi-head
 //!   (causal) attention, activations, Sequential.

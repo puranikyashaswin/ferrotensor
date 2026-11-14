@@ -1,6 +1,6 @@
 //! Ferrotensor Hub - HuggingFace Model Hub Integration
 //!
-//! Download and load pre-trained models from HuggingFace with a single line of code.
+//! Find and load models already downloaded to the Hugging Face cache.
 //!
 //! # Example
 //! ```no_run
@@ -9,7 +9,7 @@
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! // Resolve a model already downloaded to the Hugging Face cache
 //! let hub = FerrotensorHub::new();
-//! let model_path = hub.get_model_path("meta-llama/Llama-3.2-1B");
+//! let model_path = hub.get_model_path("HuggingFaceTB/SmolLM2-135M");
 //! let config = ModelConfig::from_model_dir(&model_path)?;
 //! println!("{} layers", config.num_hidden_layers);
 //! # Ok(())
@@ -78,7 +78,7 @@ pub type HubResult<T> = Result<T, HubError>;
 /// # use ferrotensor_hub::FerrotensorHub;
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let hub = FerrotensorHub::new();
-/// let config = hub.load_config("meta-llama/Llama-3.2-1B")?;
+/// let config = hub.load_config("HuggingFaceTB/SmolLM2-135M")?;
 /// println!("Model has {} layers", config.num_hidden_layers);
 /// # Ok(())
 /// # }
