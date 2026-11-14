@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>About Ferrotensor: who builds it and how to reach me</title>
-<meta name="description" content="Ferrotensor is an open-source Rust framework that fine-tunes language models on any GPU. Who builds it, what is measured, and how to get in touch.">
-<link rel="canonical" href="https://ferrotensor.dev/about/">
+<meta name="description" content="Ferrotensor is an open-source Rust framework that fine-tunes language models through wgpu. Who builds it, what is measured, and how to get in touch.">
+<link rel="canonical" href="https://puranikyashaswin.github.io/ferrotensor/about/">
 <meta name="color-scheme" content="light dark">
 <meta name="theme-color" content="#f6f3ee" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#141210" media="(prefers-color-scheme: dark)">
@@ -13,9 +13,9 @@
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="Ferrotensor">
 <meta property="og:title" content="About Ferrotensor: who builds it and how to reach me">
-<meta property="og:description" content="Ferrotensor is an open-source Rust framework that fine-tunes language models on any GPU. Who builds it, what is measured, and how to get in touch.">
-<meta property="og:url" content="https://ferrotensor.dev/about/">
-<meta property="og:image" content="https://ferrotensor.dev/og.png">
+<meta property="og:description" content="Ferrotensor is an open-source Rust framework that fine-tunes language models through wgpu. Who builds it, what is measured, and how to get in touch.">
+<meta property="og:url" content="https://puranikyashaswin.github.io/ferrotensor/about/">
+<meta property="og:image" content="https://puranikyashaswin.github.io/ferrotensor/og.png">
 <meta name="twitter:card" content="summary_large_image">
 <link rel="stylesheet" href="../style.css">
 <link rel="stylesheet" href="about.css">
@@ -40,19 +40,19 @@
 <main id="main" class="wrap">
 <div class="about">
   <p class="eyebrow">About · Ferrotensor {{ft_version}}</p>
-  <h1>Fine-tuning that runs on the GPU you already have</h1>
-  <p class="lede">Ferrotensor is an open-source machine learning framework written in Rust. It fine-tunes language models on Apple, NVIDIA and other GPUs from one codebase, through <a href="https://wgpu.rs">wgpu</a> and hand-written WGSL kernels. There is no CUDA toolchain to install.</p>
+  <h1>Fine-tuning in Rust, through Vulkan, Metal or DX12</h1>
+  <p class="lede">Ferrotensor is an open-source machine learning framework written in Rust. It fine-tunes language models from one codebase through <a href="https://wgpu.rs">wgpu</a> and hand-written WGSL kernels, which run through Vulkan, Metal or DX12. There is no CUDA toolchain to install. It has been tested on an NVIDIA A10G, an Apple M2 and software Vulkan in CI; other GPUs are untested, and <a href="../docs/testing-on-your-gpu.html">reports are welcome</a>.</p>
 
   <h2>Why it exists</h2>
   <p>Most training tools are built for CUDA first. A laptop, a consumer card or an integrated GPU is often left out, and the code between the Python API and the GPU is hard to read.</p>
-  <p>Ferrotensor takes the other route. The same kernels run through Metal on a Mac and through Vulkan or DX12 on Windows and Linux, and <code>cargo build</code> is the whole toolchain. Every differentiable op is checked against finite differences on the CPU, and every GPU kernel against a CPU reference, so a result on one GPU can be compared with a result on another.</p>
+  <p>Ferrotensor takes the other route. The same kernels run through Metal on a Mac and through Vulkan or DX12 on Windows and Linux, and <code>cargo build</code> is the whole toolchain. The tests check op gradients against finite differences on the CPU, GPU results against a CPU device, and the LoRA loss and gradients against PyTorch autograd, so a result on one GPU can be compared with a result on another.</p>
 
   <h2>What is measured so far</h2>
   <p>Every number on this site comes from a run with its commands, machine and commit written down.</p>
   <ul class="facts">
-    <li><b>1.7B</b>SmolLM2-1.7B fine-tuned with LoRA on one NVIDIA A10G, in 11.9&nbsp;GiB of GPU memory.</li>
-    <li><b>0.005</b>Largest gap in held-out loss against PyTorch + PEFT on CUDA, same GPU and recipe.</li>
-    <li><b>8&nbsp;GB</b>A MacBook Air M2 is enough to fine-tune SmolLM2-135M.</li>
+    <li><b>1.7B</b>SmolLM2-1.7B fine-tuned with LoRA on one NVIDIA A10G (24&nbsp;GB): 8,222&nbsp;MiB of GPU memory in 0.7, 5,245&nbsp;MiB with <code>--checkpoint-blocks</code>.</li>
+    <li><b>0.005</b>Largest gap in held-out loss against PyTorch + PEFT on CUDA, same GPU and recipe; Ferrotensor is slower per step.</li>
+    <li><b>M2</b>SmolLM2-135M fine-tuned with LoRA on an Apple M2 (8&nbsp;GB) with a 0.4 build.</li>
   </ul>
   <p class="after-facts">The full tables are in the <a href="../docs/examples/lora-sft.html">LoRA walkthrough</a> and the <a href="../docs/benchmarks.html">benchmarks</a>. What it cannot do yet is listed <a href="../#limits">on the home page</a>, including where it is slower than PyTorch.</p>
 

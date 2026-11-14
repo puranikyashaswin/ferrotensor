@@ -27,7 +27,7 @@ after = ["links"]
 "changelog.md" = "CHANGELOG.md"
 
 [output.html]
-site-url = "/docs/"
+site-url = "/ferrotensor/docs/"
 default-theme = "light"
 preferred-dark-theme = "navy"
 additional-css = ["theme/ferrotensor.css"]

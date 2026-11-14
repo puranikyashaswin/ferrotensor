@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `ferrotensor export-adapter --format peft` and `ferrotensor_trainer::peft` (`export_peft_adapter`, `save_peft_adapter`, `load_peft_adapter`) write and read Hugging Face PEFT adapter directories for Llama-style models. `eval --lora`, `generate --lora` and `train --resume` accept a PEFT directory. CI loads the exported adapter in PyTorch + PEFT and checks its logits against Ferrotensor's within 1e-3. (#74)
+- Tests: the loss and per-parameter gradients of LoRA training (one sequence, batched, masked, trainable base) are checked against PyTorch autograd on a tiny model (`ferrotensor-trainer/tests/gradient_parity.rs`). (#86)
+- `train --memory-report[=N]`: a GPU memory breakdown by category (weights, adapters, optimizer state, activations, gradients, loss) after model load and the first N optimizer steps, with JSON output; `WgpuContext::memory()` exposes the counters. (#90)
+- Opt-in per-block activation checkpointing (`Lfm2Model::with_block_checkpointing`, `ferrotensor train --checkpoint-blocks`). (#94)
+- Experimental: a 4-bit (affine, groups of 64) weight format and a matmul that decodes it in `ferrotensor-backend` (#95), and `--q4-weights`, which stores frozen decoder-block weights at 4 bits; this changes the model's outputs. (#96)
+- `ferrotensor classify-train` and `classify-predict`: LoRA fine-tuning of a decoder as a text classifier from JSONL, with per-line class probabilities. `ClassifierTrainer` and the `ferrotensor_trainer::classify` module (two learning rates, gradient accumulation, clipping, schedule, head save/load, batch planning, balanced accuracy). `ClassifierHead::with_skip_first` leaves the first token out of the mean pooling. (#73)
+- A sequence classification head over decoder hidden states. (#71)
+- Qwen3-style attention, with per-head `q_norm` / `k_norm` RMSNorm before RoPE, loaded from `self_attn.q_norm` / `k_norm` when present. Checked on a synthetic model against a CPU reference; real checkpoints are not measured yet. (#72)
+- `scripts/bench_mac.sh`, a reproducible comparison of Ferrotensor, mlx-lm and PyTorch + PEFT (MPS) LoRA training on Apple silicon, and `--device mps` for `benchmarks/baselines/pytorch_lora.py`. (#87)
+- Examples: LoRA fine-tune, resume and KV-cache generation on a tiny model, run in CI. (#81)
+- Tests: whole-model forward checks against a CPU reference. (#83)
+- CI: every example is executed, on CPU or software Vulkan (#82); the flash attention and reference tests run in the GPU job (#77); the CLI runs end to end on a tiny model (#79); the Python GPU parity tests run, and `FERROTENSOR_RUN_GPU_TESTS` is the one switch (#80).
+
+### Changed
+- Backward keeps the first gradient each tensor receives instead of copying it into a new buffer. (#91)
+- Backward releases each intermediate gradient once it has been used; after `backward` only leaves hold gradients, and a repeated `backward` adds exactly one more gradient per leaf. (#92)
+- The buffer pool keeps buffers freed beyond its cap reusable until the GPU has finished the work recorded before them, then drops them and polls so wgpu destroys them at once (`FERROTENSOR_POOL_OVERFLOW=0` restores the old behaviour); the memory report's awaiting-GPU count now drops as submitted work finishes. (#93)
+- Llama-style models name their block parameters as Hugging Face does (`input_layernorm`, `post_attention_layernorm`, `mlp.*` instead of `operator_norm`, `ffn_norm`, `feed_forward.*`); LFM2 models are unchanged. Adapter files and optimizer state with the old names still load. (#74)
+- `apply_checkpoint` rejects adapter tensors the model does not have, instead of ignoring them. (#74)
+- `Attention` has two new public fields, `q_norm` and `k_norm` (`None` for Llama), so struct literals need them. (#72)
+- `mean_pool_matrix` takes a `skip_first` argument. (#73)
+- `Optimizer::load_state` returns `Result<OptimizerLoad, String>` instead of `bool` (new public type `OptimizerLoad`), and `LoraMetadata` has a new public field `trained_modules: Option<String>`. (#76)
+- A pretraining text line longer than `--seq-len` is now split into windows of at most `--seq-len` tokens instead of becoming one oversized example. (#78)
+- The README, the LoRA walkthrough, the CLI README, the website and `CITATION.cff` state only measured results, with their conditions: the GPUs tested, the PyTorch comparison with its speed ratios, the gradient parity test and the GPU memory by stage.
+
+### Fixed
+- `Architecture::detect` treated any config with `layer_types`, which recent `transformers` versions write for Qwen3, as LFM2. Llama-style layers other than full attention are now rejected. (#72)
+- LoRA adapters of the same shape in one layer (for example `q_proj` and `o_proj`) no longer start from the same A matrix; every adapter's seed now depends on its layer and projection name. Initial adapters, and so LoRA runs, differ from earlier releases. (#75)
+- `ferrotensor-cli train` with `--train-modules` other than `lora` now saves the trained base weights (f32, only the tensors that trained) to `trained_weights.safetensors`; before, it wrote an empty adapter file. `eval --lora`, `generate --lora` and `train --resume` load that file; an empty file from an older run is reported as such. (#76)
+- `Optimizer::load_state` reports how many parameters got their saved state back and how many saved entries went unused. `train --resume` now fails when the saved optimizer state matches none of the trainable parameters and warns when it matches only some. A saved moment of the wrong shape is rejected. (#76)
+- `save_lora_checkpoint` and `apply_checkpoint` report a tensor stored as f16 instead of writing or reading it wrongly. (#76)
+- Model loading returns an error instead of panicking or accepting bad input: invalid config sizes, shard paths that leave the model directory, empty shard indexes, odd-sized quantization scales, empty or duplicate-id tokenizer vocabularies, and non-file or oversized JSON files. Error messages name the file. (#84)
+- Attention dropout (`attention_dropout > 0` in `config.json`) now draws a different mask per training step, micro-batch, rank and layer from the trainer's run seed (`Trainer::with_dropout_seed`, `--seed` in `ferrotensor-cli train`) instead of one fixed mask, and evaluation and generation no longer apply it. New `forward_with_dropout` / `forward_batch_with_dropout` on `Attention`, `Lfm2Block` and `Lfm2Model`, and `ferrotensor_graph::dropout`. No change with dropout 0. (#89)
+- Pre-quantized (MLX `.scales`) checkpoints are rejected instead of loaded wrongly. (#96)
+
 ## [0.6.0] - 2026-11-12
 
 ### Added

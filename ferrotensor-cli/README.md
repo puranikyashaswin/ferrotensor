@@ -2,8 +2,11 @@
 
 The `ferrotensor-cli` command line for [Ferrotensor](../README.md): LoRA fine-tuning
 (`train`), evaluation (`eval`) and sampling (`generate`, alias `infer`) for
-small Llama-style models such as SmolLM2 and TinyLlama, on any GPU wgpu
-supports (Metal, Vulkan, DX12).
+small Llama-style models such as SmolLM2 and TinyLlama, on the GPU through
+wgpu (Vulkan, Metal or DX12). It has been tested on an NVIDIA A10G (24 GB)
+through Vulkan, an Apple M2 (8 GB) through Metal, and software Vulkan (Mesa
+lavapipe) in CI; other GPUs are untested, and
+[reports are welcome](../docs/testing-on-your-gpu.md).
 
 Install it from crates.io (the binary is called `ferrotensor`), or run it from
 a checkout with `cargo run -p ferrotensor-cli --release --`:
@@ -55,14 +58,15 @@ A full walkthrough with measured numbers is in
 - `ferrotensor-cli demo` (or `--demo`) plays a simulated training UI; it does not
   train anything.
 
-## Frozen base weights: f16, f32 or 4-bit
+## Frozen base weights: f16, f32 or 4-bit (experimental)
 
 By default the frozen linear-layer weights (attention, MLP and `lm_head`)
 are stored as f16 and every product is computed in f32; `--f32-weights`
 keeps them f32. Both compute the same model up to f16 rounding of the
 weights.
 
-`--q4-weights` (on `train`, `eval` and `generate`, off by default) stores
+`--q4-weights` (on `train`, `eval` and `generate`, off by default) is
+experimental and changes the model's outputs. It stores
 the frozen weights of every decoder-block projection (`q/k/v/o_proj`,
 `gate/up/down_proj`) at 4 bits: affine codes in groups of 64 along the
 input dimension, one f16 scale and one f16 minimum per group, about 4.5
@@ -75,8 +79,23 @@ This is not the same model. It computes with the decoded weights, so its
 logits, loss and gradients differ from the f16 or f32 base, and from
 PyTorch on the original checkpoint. The tests check that the 4-bit model
 equals, to f32 tolerance, the same model loaded in f32 from weights that
-were quantised and decoded on the host; how much quality, memory and speed
-change on real models has to be measured per model.
+were quantised and decoded on the host.
+
+Measured on an NVIDIA A10G (24 GB) with the
+[walkthrough recipe](../docs/examples/lora-sft.md) (250 steps, batch 1 × 8-step
+accumulation), the held-out loss after training is worse than with f16 base
+weights, and peak GPU memory (`nvidia-smi`, with `--checkpoint-blocks`) is lower:
+
+| Model | Held-out loss after 250 steps, f16 | 4-bit | Peak GPU memory, f16 | 4-bit |
+|---|---:|---:|---:|---:|
+| SmolLM2-135M | 1.6521 | 1.8000 | 1,890 MiB | 1,698 MiB |
+| SmolLM2-360M | 1.3228 | 1.4087 | 2,783 MiB | 1,998 MiB |
+| SmolLM2-1.7B | 1.0640 | 1.1198 | 5,281 MiB | 3,741 MiB |
+
+These are 250-step runs in separate sessions; the 30-step stage table gives 2,719 and 5,245 MiB for the same setting.
+
+The format is plain round-to-nearest in groups of 64, not the NF4 format
+of QLoRA.
 
 - `--q4-weights` conflicts with `--f32-weights`, and is an error when base
   weights train (`--train-modules` other than `lora`): 4-bit weights are
@@ -91,6 +110,28 @@ change on real models has to be measured per model.
   pass `--q4-weights` instead.
 - With `--memory-report`, the 4-bit weights appear under base weights as
   "of which 4-bit".
+
+## Less GPU memory: `--checkpoint-blocks`
+
+`train --checkpoint-blocks` (off by default) keeps only each decoder
+block's input during the forward pass and recomputes the block's forward
+during backward, instead of keeping all its activations. It trades time for
+memory. Measured on an NVIDIA A10G (24 GB) with SmolLM2, f16 base weights,
+sequence length 256 and 30 optimizer steps (peak from `nvidia-smi`, median
+seconds per step):
+
+| Model | Peak GPU memory, off → on | Seconds per step, off → on |
+|---|---:|---:|
+| SmolLM2-135M, batch 1 × accum 8 | 2,362 → 1,890 MiB | 1.17 → 1.47 (+26%) |
+| SmolLM2-360M, batch 1 × accum 8 | 3,595 → 2,719 MiB | 1.56 → 2.04 (+31%) |
+| SmolLM2-1.7B, batch 1 × accum 8 | 8,222 → 5,245 MiB | 2.275 → 3.16 (+39%) |
+| SmolLM2-135M, batch 8 × accum 8 | 9,401 → 2,879 MiB | 2.63 → 3.13 (+19%) |
+
+The training loss and gradient norm, as printed at every step, and the
+held-out loss were identical with the flag on and off. The unit tests in
+`ferrotensor-trainer/tests/block_checkpointing.rs` compare the loss (to a
+relative 1e-5) and the gradients (to 1e-6 plus a relative 1e-4) with and
+without checkpointing.
 
 ## Where GPU memory goes: `--memory-report`
 

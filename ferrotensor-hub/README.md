@@ -8,7 +8,7 @@ resolves a local model directory, `ModelConfig::from_model_dir` reads its
 use ferrotensor_hub::{ModelConfig, FerrotensorHub};
 
 let hub = FerrotensorHub::new();
-let model_path = hub.get_model_path("meta-llama/Llama-3.2-1B");
+let model_path = hub.get_model_path("HuggingFaceTB/SmolLM2-135M");
 let config = ModelConfig::from_model_dir(&model_path)?;
 ```
 

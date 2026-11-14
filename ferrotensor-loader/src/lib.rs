@@ -1,8 +1,10 @@
 //! Model loading for Ferrotensor: Hugging Face `config.json` parsing
 //! ([`Lfm2Config`]), memory-mapped safetensors weights (single file or
-//! sharded, F32/F16/BF16 read as F32, int-quantized weights dequantized on
-//! the GPU) through [`WeightsContext`], and a [`Tokenizer`] / [`Sampler`]
-//! pair for text in and out.
+//! sharded, F32/F16/BF16 read as F32) through [`WeightsContext`], and a
+//! [`Tokenizer`] / [`Sampler`] pair for text in and out.
+//! [`WeightsContext::upload_quantized`] uploads a `.weight` / `.scales` /
+//! `.biases` triple as one quantized GPU tensor, but the model builder in
+//! `ferrotensor-graph` rejects pre-quantized checkpoints.
 
 #![warn(missing_docs)]
 

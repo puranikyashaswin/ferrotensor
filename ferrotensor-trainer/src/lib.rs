@@ -3,8 +3,9 @@
 //! [`Trainer`] runs forward, a response-masked cross-entropy loss
 //! ([`masked_cross_entropy`]), backward and an optimizer step on an
 //! [`Lfm2Model`] (Llama-style or LFM2), with gradient accumulation, global
-//! gradient-norm clipping, an optional learning-rate schedule, a loss scaler
-//! and file-based multi-process gradient averaging. [`data`] builds SFT and
+//! gradient-norm clipping, an optional learning-rate schedule, an optional loss
+//! scaler (not used by the CLI) and a prototype of file-based gradient
+//! averaging. [`data`] builds SFT and
 //! pretraining datasets, [`checkpoint`] saves and restores LoRA adapters and
 //! optimizer state, [`peft`] converts adapters to and from the Hugging Face
 //! PEFT format, and [`classify`] fine-tunes a decoder with LoRA as a sequence

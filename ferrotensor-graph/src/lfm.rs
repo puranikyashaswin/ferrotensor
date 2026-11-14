@@ -345,7 +345,8 @@ impl Lfm2Model {
     /// for backward shrink from every block's internals to one tensor per
     /// block plus the internals of the one block being recomputed; the cost
     /// is a second forward pass through every block during backward.
-    /// Results are unchanged. Applies to [`forward`](Self::forward) without a
+    /// Printed losses and gradient norms are unchanged in the measured runs.
+    /// Applies to [`forward`](Self::forward) without a
     /// KV cache and to [`forward_batch`](Self::forward_batch). Off by default.
     pub fn with_block_checkpointing(mut self, on: bool) -> Self {
         self.checkpoint_blocks = on;

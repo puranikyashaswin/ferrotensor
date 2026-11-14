@@ -1,13 +1,15 @@
 cff-version: 1.2.0
 message: "If you use Ferrotensor in your work, please cite it as below."
 type: software
-title: "Ferrotensor: GPU training in Rust on any GPU through WebGPU"
+title: "Ferrotensor: LoRA fine-tuning in Rust on portable GPU APIs through wgpu"
 abstract: >-
   Ferrotensor is a Rust machine learning framework that trains and fine-tunes
-  models on any GPU through wgpu (Metal, Vulkan, DX12) with hand-written WGSL
-  kernels and no CUDA toolchain. It runs LoRA fine-tuning of Llama-style
-  language models from 135M to 1.7B parameters, with every kernel checked
-  against a CPU reference.
+  models through wgpu (Vulkan, Metal or DX12) with hand-written WGSL kernels
+  and no CUDA toolchain. It runs LoRA fine-tuning of Llama-style language
+  models from 135M to 1.7B parameters. Its LoRA loss and gradients are checked
+  against PyTorch autograd in CI, and it writes adapters in the PEFT format.
+  It has been tested on an NVIDIA A10G, an Apple M2 and software Vulkan;
+  other GPUs are untested.
 authors:
   - given-names: Puranik Yashaswin
     family-names: Sharma
@@ -17,6 +19,7 @@ url: "https://github.com/puranikyashaswin/ferrotensor"
 license:
   - MIT
   - Apache-2.0
+# version, date-released and doi are set by the 0.7.0 release step.
 version: 0.6.0
 date-released: 2026-11-12
 keywords:

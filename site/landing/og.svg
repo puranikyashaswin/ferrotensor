@@ -25,20 +25,20 @@
 
   <g transform="translate(80 400)">
     <rect width="330" height="150" rx="12" fill="#1f1b18" stroke="#544a40"/>
-    <text class="mono" x="24" y="40" font-size="16" font-weight="600" letter-spacing="1.5" fill="#a39889">LORA ON 8 GB</text>
+    <text class="mono" x="24" y="40" font-size="16" font-weight="600" letter-spacing="1.5" fill="#a39889">LORA, APPLE M2</text>
     <text class="mono" x="24" y="92" font-size="40" font-weight="700" letter-spacing="-1" fill="#efe9e1">2.43 → 1.65</text>
-    <text class="sans" x="24" y="127" font-size="18" fill="#c3b9ad">held-out loss, SmolLM2-135M</text>
+    <text class="sans" x="24" y="127" font-size="18" fill="#c3b9ad">held-out loss, SmolLM2-135M, 0.4</text>
   </g>
   <g transform="translate(435 400)">
     <rect width="330" height="150" rx="12" fill="#1f1b18" stroke="#544a40"/>
-    <text class="mono" x="24" y="40" font-size="16" font-weight="600" letter-spacing="1.5" fill="#a39889">KERNEL SPEED</text>
-    <text class="mono" x="24" y="92" font-size="40" font-weight="700" letter-spacing="-1" fill="#efe9e1">611 <tspan font-size="22" fill="#c3b9ad">GFLOPS</tspan></text>
-    <text class="sans" x="24" y="127" font-size="18" fill="#c3b9ad">f32 matmul in WGSL, Apple M2</text>
+    <text class="mono" x="24" y="40" font-size="16" font-weight="600" letter-spacing="1.5" fill="#a39889">GPU MEMORY, 1.7B LORA</text>
+    <text class="mono" x="24" y="92" font-size="40" font-weight="700" letter-spacing="-1" fill="#efe9e1">11.3 → 5.1 <tspan font-size="22" fill="#c3b9ad">GiB</tspan></text>
+    <text class="sans" x="24" y="127" font-size="18" fill="#c3b9ad">0.6 → 0.7, checkpointed blocks</text>
   </g>
   <g transform="translate(790 400)">
     <rect width="330" height="150" rx="12" fill="#1f1b18" stroke="#f37b45" stroke-width="1.5"/>
     <text class="mono" x="24" y="40" font-size="16" font-weight="600" letter-spacing="1.5" fill="#f37b45">CHECKED</text>
-    <text class="mono" x="24" y="92" font-size="40" font-weight="700" letter-spacing="-1" fill="#efe9e1">240/240</text>
-    <text class="sans" x="24" y="127" font-size="18" fill="#c3b9ad">gradients matched PyTorch</text>
+    <text class="mono" x="24" y="92" font-size="40" font-weight="700" letter-spacing="-1" fill="#efe9e1">9.5e-7</text>
+    <text class="sans" x="24" y="127" font-size="18" fill="#c3b9ad">max gradient gap vs PyTorch</text>
   </g>
 </svg>
