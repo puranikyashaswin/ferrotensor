@@ -82,7 +82,7 @@ no `--json`.
 | 101 | A panic, with no JSON on stdout | wgpu panics when the GPU device is lost, most often because it ran out of memory (stderr then ends with a hint). Lower `--batch-size` or `--seq-len`, or use `finetune`. |
 
 Code 2 covers: a missing model directory, `config.json` or data file; a model
-id that is not in the Hugging Face cache (`error` names the cache and
+id that is not in the Hugging Face cache or whose snapshot has no `config.json` (`error` names the cache and
 `hf download <id>`); a flag
 value out of range; a dataset with no usable examples; no GPU adapter;
 `plan` or `finetune` finding no configuration that fits; `chat`

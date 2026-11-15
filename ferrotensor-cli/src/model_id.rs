@@ -4,15 +4,16 @@
 use crate::{unmet, Result};
 use ferrotensor_hub::{FerrotensorHub, HubError};
 use std::path::{Path, PathBuf};
+use std::sync::Once;
 
 /// The directory `--model arg` names. An existing directory wins; otherwise
 /// an id such as `HuggingFaceTB/SmolLM2-135M` resolves to its cached
-/// snapshot. Nothing is downloaded.
+/// snapshot, announced once on stderr. Nothing is downloaded.
 ///
 /// # Errors
 ///
-/// When `arg` is no directory and either not an id or an id that is not
-/// cached.
+/// When `arg` is no directory and either not an id, an id that is not
+/// cached, or an id whose snapshot has no `config.json`.
 pub fn resolve_model(arg: &Path) -> Result<PathBuf> {
     resolve_in(arg, &FerrotensorHub::new())
 }
@@ -28,8 +29,15 @@ fn resolve_in(arg: &Path, hub: &FerrotensorHub) -> Result<PathBuf> {
         )));
     };
     match hub.find_latest_snapshot(id) {
+        Ok(snapshot) if !snapshot.join("config.json").is_file() => Err(unmet(format!(
+            "snapshot {} of {id} has no config.json, so the download looks incomplete; \
+             run `hf download {id}` again",
+            snapshot.display()
+        ))),
         Ok(snapshot) => {
-            eprintln!("model: {id} ({})", snapshot.display());
+            // `finetune` resolves the model to plan and again to load it.
+            static ANNOUNCED: Once = Once::new();
+            ANNOUNCED.call_once(|| eprintln!("model: {id} ({})", snapshot.display()));
             Ok(snapshot)
         }
         Err(HubError::ModelNotFound(_)) => Err(unmet(format!(

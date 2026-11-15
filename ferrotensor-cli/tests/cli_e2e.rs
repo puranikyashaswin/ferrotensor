@@ -461,30 +461,43 @@ fn plan_without_a_model_lists_the_documented_sizes() {
     assert_eq!(models[2]["fits"], true);
 }
 
-/// Run `plan --model model` with `home` as HOME (where the Hugging Face cache
-/// is looked for) and `dir` as the working directory.
-fn plan_model_in(model: &str, home: &Path, dir: &Path) -> Output {
+/// Run the binary with `HF_HUB_CACHE` set to `cache` and `dir` as the working
+/// directory.
+fn ferrotensor_with_cache(args: &[&str], cache: &Path, dir: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_ferrotensor"))
-        .args(["plan", "--model", model, "--memory-mib", "100000", "--json"])
-        .env("HOME", home)
+        .args(args)
+        .env("HF_HUB_CACHE", cache)
         .current_dir(dir)
         .output()
         .expect("run the ferrotensor binary")
 }
 
-/// A snapshot of `org/name` in the Hugging Face cache under `home`.
-fn cached_snapshot(home: &Path) -> std::path::PathBuf {
-    let snapshot = home.join(".cache/huggingface/hub/models--org--name/snapshots/0123abcd");
+/// Run `plan --model model` against the cache `cache`.
+fn plan_model_in(model: &str, cache: &Path) -> Output {
+    let args = ["plan", "--model", model, "--memory-mib", "100000", "--json"];
+    ferrotensor_with_cache(&args, cache, cache)
+}
+
+/// A snapshot of `org/name` in the cache `cache`, pinned by `refs/main`, with a
+/// model in it unless `complete` is false.
+fn cached_snapshot(cache: &Path, complete: bool) -> std::path::PathBuf {
+    let folder = cache.join("models--org--name");
+    let snapshot = folder.join("snapshots/0123abcd");
     std::fs::create_dir_all(&snapshot).expect("create snapshot");
-    common::write_tiny_llama(&snapshot);
+    std::fs::create_dir_all(folder.join("refs")).expect("create refs");
+    std::fs::write(folder.join("refs/main"), "0123abcd\n").expect("write refs/main");
+    if complete {
+        common::write_tiny_llama(&snapshot);
+        common::write_tiny_tokenizer(&snapshot);
+    }
     snapshot
 }
 
 #[test]
 fn a_cached_model_id_resolves_to_its_snapshot() {
-    let home = common::TempDir::new("hf-home");
-    let snapshot = cached_snapshot(home.path());
-    let run = plan_model_in("org/name", home.path(), home.path());
+    let cache = common::TempDir::new("hf-cache");
+    let snapshot = cached_snapshot(cache.path(), true);
+    let run = plan_model_in("org/name", cache.path());
     assert_success(&run);
     let stderr = text(&run.stderr);
     assert!(
@@ -498,27 +511,83 @@ fn a_cached_model_id_resolves_to_its_snapshot() {
 
 #[test]
 fn an_existing_directory_wins_over_the_cache() {
-    let home = common::TempDir::new("hf-home-dir-wins");
-    cached_snapshot(home.path());
-    let local = home.path().join("org/name");
+    let cache = common::TempDir::new("hf-cache-dir-wins");
+    cached_snapshot(cache.path(), true);
+    let local = cache.path().join("org/name");
     std::fs::create_dir_all(&local).expect("create model dir");
     common::write_tiny_llama(&local);
-    let run = plan_model_in("org/name", home.path(), home.path());
+    let run = plan_model_in("org/name", cache.path());
     assert_success(&run);
     assert!(!text(&run.stderr).contains("model: org/name"));
 }
 
 #[test]
 fn an_uncached_model_id_exits_with_2_and_says_how_to_fetch_it() {
-    let home = common::TempDir::new("hf-home-empty");
-    let run = plan_model_in("org/name", home.path(), home.path());
+    let cache = common::TempDir::new("hf-cache-empty");
+    let run = plan_model_in("org/name", cache.path());
     let stdout = text(&run.stdout);
     assert_eq!(run.status.code(), Some(2), "stdout: {stdout}");
     let json: serde_json::Value = serde_json::from_str(&stdout).expect("error json");
     let error = json["error"].as_str().expect("error string");
-    let cache = home.path().join(".cache/huggingface/hub");
     assert!(error.contains("hf download org/name"), "{error}");
-    assert!(error.contains(s(&cache)), "{error}");
+    assert!(error.contains(s(cache.path())), "{error}");
+}
+
+#[test]
+fn a_cached_snapshot_without_config_json_exits_with_2() {
+    let cache = common::TempDir::new("hf-cache-incomplete");
+    let snapshot = cached_snapshot(cache.path(), false);
+    let run = plan_model_in("org/name", cache.path());
+    let stdout = text(&run.stdout);
+    assert_eq!(run.status.code(), Some(2), "stdout: {stdout}");
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("error json");
+    let error = json["error"].as_str().expect("error string");
+    assert!(error.contains(s(&snapshot)), "{error}");
+    assert!(error.contains("download looks incomplete"), "{error}");
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn finetune_on_a_model_id_announces_it_once_and_prints_the_next_commands() {
+    let cache = common::TempDir::new("hf-cache-finetune");
+    cached_snapshot(cache.path(), true);
+    let out = common::TempDir::new("hf-finetune-out");
+    let data = out.path().join("tokens.bin");
+    common::write_token_bin(&data, 400);
+    let run = ferrotensor_with_cache(
+        &[
+            "finetune",
+            "--model",
+            "org/name",
+            "--data",
+            s(&data),
+            "--task",
+            "pretrain",
+            "--seq-len",
+            "16",
+            "--out",
+            s(out.path()),
+            "--max-steps",
+            "2",
+            "--lora-rank",
+            "4",
+            "--memory-mib",
+            "100000",
+        ],
+        cache.path(),
+        out.path(),
+    );
+    assert_success(&run);
+    let stderr = text(&run.stderr);
+    assert_eq!(stderr.matches("model: org/name (").count(), 1, "{stderr}");
+    let adapter = out.path().join("lora_adapters.safetensors");
+    let next = format!(
+        "next:\n  ferrotensor chat --model org/name --lora {adapter}\n  \
+         ferrotensor merge --model org/name --lora {adapter} --out {out}-merged\n",
+        adapter = adapter.display(),
+        out = out.path().display()
+    );
+    assert!(stderr.contains(&next), "stderr: {stderr}");
 }
 
 /// Run `finetune --task pretrain --seq-len 16 --max-steps 2` on `data`,

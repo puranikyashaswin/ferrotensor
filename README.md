@@ -278,7 +278,8 @@ cargo run -p ferrotensor-cli --release -- chat \
 ```
 
 `--model` also takes a Hugging Face model id that is already in the local
-cache (`~/.cache/huggingface/hub`). Ferrotensor does not download anything:
+cache (`HF_HUB_CACHE`, `HF_HOME`, `XDG_CACHE_HOME` or `~/.cache/huggingface/hub`,
+as `hf` uses). Ferrotensor does not download anything:
 
 ```bash
 hf download HuggingFaceTB/SmolLM2-135M
