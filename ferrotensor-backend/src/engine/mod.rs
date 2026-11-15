@@ -304,6 +304,7 @@ fn dummy_storage(ctx: &WgpuContext) -> Buffer {
 }
 
 #[cfg(test)]
+#[allow(clippy::panic)]
 mod shader_tests {
     /// Parses and validates the combined WGSL with naga, so shader errors
     /// fail `cargo test` without needing a GPU.

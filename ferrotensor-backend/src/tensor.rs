@@ -34,6 +34,10 @@ impl DType {
     ///
     /// For [`DType::Q4`], which has no per-element size (codes and group
     /// scales share one buffer, see [`crate::q4::packed_words`]).
+    #[expect(
+        clippy::panic,
+        reason = "documented panic for DType::Q4, which has no per-element size"
+    )]
     pub fn size_bytes(&self) -> usize {
         match self {
             DType::FP32 => 4,
@@ -263,14 +267,15 @@ impl UnifiedTensor {
     /// format of [`crate::q4`] as a [`DType::Q4`] tensor of logical shape
     /// `shape`: about 4.5 bits per weight. Read it with the `*_q4b`
     /// matmuls, not [`to_vec`](Self::to_vec). Fails, uploading nothing, on
-    /// NaN or infinite values and on values beyond the f16 range.
+    /// NaN or infinite values, on values beyond the f16 range and when
+    /// `shape` is not 2-D.
     pub fn from_f32_as_q4(
         context: &WgpuContext,
         data: &[f32],
         shape: &[usize],
     ) -> Result<Self, crate::q4::Q4Error> {
         let [k, n] = shape[..] else {
-            panic!("from_f32_as_q4 expects a 2-D shape, got {shape:?}");
+            return Err(crate::q4::Q4Error::NotMatrix { rank: shape.len() });
         };
         let words = crate::q4::quantize(data, k, n)?;
         Ok(Self::from_bytes_with_dtype(
@@ -464,6 +469,10 @@ fn upload_len(n: usize, dtype: DType) -> usize {
 /// [`UnifiedTensor::from_f32_as_f16`]). Bytes past the values are left as
 /// they are. `out` is filled front to back, so writes to mapped GPU memory
 /// stay sequential.
+#[expect(
+    clippy::expect_used,
+    reason = "out holds one slot per value, see the length contract above"
+)]
 fn write_transposed(src: &[f32], rows: usize, cols: usize, dtype: DType, out: &mut [u8]) {
     debug_assert_eq!(src.len(), rows * cols);
     debug_assert!(out.len() >= src.len() * dtype.size_bytes());
@@ -491,6 +500,7 @@ fn write_transposed(src: &[f32], rows: usize, cols: usize, dtype: DType, out: &m
 }
 
 #[cfg(test)]
+#[allow(clippy::panic)]
 mod tests {
     use super::{upload_len, write_transposed, DType};
 

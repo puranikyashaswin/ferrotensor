@@ -70,6 +70,11 @@ pub enum Q4Error {
         /// The group's largest value.
         max: f32,
     },
+    /// The shape is not a 2-D `[k, n]` matrix.
+    NotMatrix {
+        /// Number of dimensions of the shape.
+        rank: usize,
+    },
 }
 
 impl fmt::Display for Q4Error {
@@ -83,6 +88,10 @@ impl fmt::Display for Q4Error {
                 f,
                 "cannot quantise to 4 bits: group {group} spans {min} ..= {max}, \
                  whose minimum or scale does not fit in f16"
+            ),
+            Self::NotMatrix { rank } => write!(
+                f,
+                "cannot quantise to 4 bits: expected a 2-D shape, got {rank} dimensions"
             ),
         }
     }
@@ -113,6 +122,10 @@ pub fn max_round_trip_error(mn: f32, mx: f32) -> f32 {
 }
 
 /// Checks the shape and returns `k * n`.
+#[expect(
+    clippy::expect_used,
+    reason = "shape precondition: k * n fits in usize"
+)]
 fn numel(k: usize, n: usize) -> usize {
     let numel = k.checked_mul(n).expect("q4: k * n overflows");
     assert!(
@@ -193,6 +206,7 @@ pub fn dequantize(words: &[u32], k: usize, n: usize) -> Vec<f32> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::io::Write as _;

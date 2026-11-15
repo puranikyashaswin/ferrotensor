@@ -9,6 +9,8 @@
 //! The checksum column hashes the bits of a seeded run's results, so two
 //! builds can be checked for bit-identical output.
 
+#![allow(clippy::expect_used)]
+
 use ferrotensor::prelude::*;
 use rand::{rngs::StdRng, SeedableRng};
 use std::time::{Duration, Instant};

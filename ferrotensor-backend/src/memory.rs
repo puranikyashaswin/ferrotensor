@@ -397,6 +397,10 @@ impl MemoryTracker {
     }
 
     /// Start a new peak from the current state.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "lock poisoning means another thread panicked while holding the lock"
+    )]
     pub fn reset_peak(&self) {
         let live = self.live_bytes();
         let held = live + self.pool_idle_bytes();
@@ -413,6 +417,10 @@ impl MemoryTracker {
     }
 
     /// The bytes held now (with the largest buffers when detailed).
+    #[expect(
+        clippy::unwrap_used,
+        reason = "lock poisoning means another thread panicked while holding the lock"
+    )]
     pub fn current(&self) -> MemorySnapshot {
         if self.is_detailed() {
             let reg = self.registry.lock().unwrap();
@@ -424,6 +432,10 @@ impl MemoryTracker {
 
     /// The bytes held when [`peak_live_bytes`](Self::peak_live_bytes) was
     /// reached, if detailed tracking was on since the last reset.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "lock poisoning means another thread panicked while holding the lock"
+    )]
     pub fn peak(&self) -> Option<MemorySnapshot> {
         let reg = self.registry.lock().unwrap();
         reg.peak.as_ref().map(|(_, s)| s.clone())
@@ -503,6 +515,10 @@ impl MemoryTracker {
         self.allocate_in(category, dtype, shape, logical, requested, awaits_gpu)
     }
 
+    #[expect(
+        clippy::unwrap_used,
+        reason = "lock poisoning means another thread panicked while holding the lock"
+    )]
     fn allocate_in(
         self: &Arc<Self>,
         category: u8,
@@ -579,6 +595,10 @@ impl MemoryTracker {
     /// A buffer of `requested` bytes was dropped; wgpu destroys it once the
     /// work using it has finished and the device is polled. Counted against
     /// the submission being recorded now.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "lock poisoning means another thread panicked while holding the lock"
+    )]
     pub(crate) fn gpu_dropped(&self, requested: u64) {
         let size = wgpu_buffer_size(requested);
         {
@@ -606,6 +626,10 @@ impl MemoryTracker {
 
     /// The submission being recorded is about to be submitted: returns its
     /// number; buffers dropped from now on count against the next one.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "lock poisoning means another thread panicked while holding the lock"
+    )]
     pub(crate) fn begin_submission(&self) -> u64 {
         let _by_submission = self.awaiting_by_submission.lock().unwrap();
         self.recording.fetch_add(1, Relaxed)
@@ -614,6 +638,10 @@ impl MemoryTracker {
     /// Submission `serial` (and every one before it) finished on the GPU,
     /// and the device was maintained, so wgpu has destroyed the buffers
     /// dropped while it was being recorded.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "lock poisoning means another thread panicked while holding the lock"
+    )]
     pub(crate) fn gpu_completed(&self, serial: u64) {
         let mut by_submission = self.awaiting_by_submission.lock().unwrap();
         self.completed.fetch_max(serial, Relaxed);
@@ -628,6 +656,10 @@ impl MemoryTracker {
 
     /// The context submitted all recorded work, waited for it and polled
     /// the device, so wgpu has destroyed the buffers dropped before.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "lock poisoning means another thread panicked while holding the lock"
+    )]
     pub(crate) fn gpu_reclaimed(&self) {
         let mut by_submission = self.awaiting_by_submission.lock().unwrap();
         by_submission.clear();
@@ -639,6 +671,10 @@ impl MemoryTracker {
         self.completed.fetch_max(finished, Relaxed);
     }
 
+    #[expect(
+        clippy::unwrap_used,
+        reason = "lock poisoning means another thread panicked while holding the lock"
+    )]
     fn release(&self, a: &Allocation) {
         self.adjust(
             a.category.load(Relaxed),
@@ -656,6 +692,10 @@ impl MemoryTracker {
         }
     }
 
+    #[expect(
+        clippy::unwrap_used,
+        reason = "lock poisoning means another thread panicked while holding the lock"
+    )]
     fn retag(&self, a: &Allocation, category: MemoryCategory) {
         let old = a.category.swap(category as u8, Relaxed);
         if old == category as u8 {
@@ -716,6 +756,7 @@ impl MemoryTracker {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

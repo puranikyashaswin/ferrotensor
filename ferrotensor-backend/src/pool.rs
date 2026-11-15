@@ -98,6 +98,10 @@ impl<B> FreeLists<B> {
     /// Removes the oldest buffers returned while a submission up to `done`
     /// was being recorded, until at most `max` bytes remain. Buffers
     /// returned later are kept even above `max`.
+    #[expect(
+        clippy::expect_used,
+        reason = "the size was just read from the free map, so its list exists and is non-empty"
+    )]
     fn trim(&mut self, max: u64, done: u64) -> Vec<(u64, B)> {
         let mut out = Vec::new();
         while self.pooled_bytes > max {
@@ -129,6 +133,10 @@ impl<B> FreeLists<B> {
 }
 
 impl std::fmt::Debug for BufferPool {
+    #[expect(
+        clippy::unwrap_used,
+        reason = "lock poisoning means another thread panicked while holding the lock"
+    )]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let state = self.buffers.lock().unwrap();
         let counts: HashMap<u64, usize> = state
@@ -178,6 +186,10 @@ impl BufferPool {
     /// Change how many bytes of freed buffers the pool keeps (0 disables
     /// reuse once the GPU has finished with them). Buffers above the new
     /// cap are released immediately.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "lock poisoning means another thread panicked while holding the lock"
+    )]
     pub fn set_max_pooled_bytes(&self, max: u64) {
         let mut state = self.buffers.lock().unwrap();
         state.max_pooled_bytes = max;
@@ -188,6 +200,10 @@ impl BufferPool {
 
     /// The most bytes of freed buffers the pool keeps
     /// ([`DEFAULT_MAX_POOLED_BYTES`] unless changed).
+    #[expect(
+        clippy::unwrap_used,
+        reason = "lock poisoning means another thread panicked while holding the lock"
+    )]
     pub fn max_pooled_bytes(&self) -> u64 {
         self.buffers.lock().unwrap().max_pooled_bytes
     }
@@ -197,16 +213,28 @@ impl BufferPool {
     /// default), or drop them at once (`false`). See the
     /// [type docs](Self). Changes no results, only which buffers tensors
     /// get. The context sets it from [`POOL_OVERFLOW_ENV`] when created.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "lock poisoning means another thread panicked while holding the lock"
+    )]
     pub fn set_overflow(&self, on: bool) {
         self.buffers.lock().unwrap().overflow = on;
     }
 
     /// Whether overflow is on (see [`set_overflow`](Self::set_overflow)).
+    #[expect(
+        clippy::unwrap_used,
+        reason = "lock poisoning means another thread panicked while holding the lock"
+    )]
     pub fn overflow(&self) -> bool {
         self.buffers.lock().unwrap().overflow
     }
 
     /// Bytes currently held for reuse.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "lock poisoning means another thread panicked while holding the lock"
+    )]
     pub fn pooled_bytes(&self) -> u64 {
         self.buffers.lock().unwrap().lists.pooled_bytes
     }
@@ -222,6 +250,10 @@ impl BufferPool {
     }
 
     /// A free buffer of exactly `size` bytes, or a new one.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "lock poisoning means another thread panicked while holding the lock"
+    )]
     pub fn get(&self, device: &Device, size: u64) -> Arc<Buffer> {
         let mut state = self.buffers.lock().unwrap();
         if let Some(buffer) = state.lists.take(size) {
@@ -241,6 +273,10 @@ impl BufferPool {
     }
 
     /// Returns `buffer` (of `size` bytes) to the pool for reuse.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "lock poisoning means another thread panicked while holding the lock"
+    )]
     pub fn return_buffer(&self, size: u64, buffer: Arc<Buffer>) {
         let mut state = self.buffers.lock().unwrap();
         if !state.overflow && state.lists.pooled_bytes + size > state.max_pooled_bytes {
@@ -259,6 +295,10 @@ impl BufferPool {
     /// known to have finished; returns how many were dropped. wgpu destroys
     /// them at the next device poll, so the caller polls right after and
     /// they are not counted as awaiting GPU.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "lock poisoning means another thread panicked while holding the lock"
+    )]
     pub(crate) fn trim(&self) -> usize {
         let dropped = {
             let mut state = self.buffers.lock().unwrap();
@@ -272,6 +312,10 @@ impl BufferPool {
     }
 
     /// Drops every pooled buffer.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "lock poisoning means another thread panicked while holding the lock"
+    )]
     pub fn clear(&self) {
         let mut state = self.buffers.lock().unwrap();
         self.release_all(&mut state);
