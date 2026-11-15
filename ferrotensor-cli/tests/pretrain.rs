@@ -73,11 +73,14 @@ fn invalid_sizes_and_a_missing_corpus_exit_with_2() {
         (&["--hidden", "1032"][..], "is 258"),
         (&["--layers", "0"][..], "must be positive"),
         (
-            &["--seq-len", "65"][..],
-            "--seq-len must be between 2 and --context 64",
+            &["--seq-len", "257"][..],
+            "--seq-len must be between 2 and --context 256",
         ),
     ] {
-        let run = pretrain(&corpus, &out, extra);
+        // The default sizes (hidden 128, 4 heads, context 256) plus `extra`.
+        let mut args = vec!["pretrain", "--data", s(&corpus), "--out", s(&out), "--json"];
+        args.extend_from_slice(extra);
+        let run = ferrotensor(&args);
         assert_eq!(
             run.status.code(),
             Some(2),
@@ -104,7 +107,8 @@ fn invalid_sizes_and_a_missing_corpus_exit_with_2() {
 
 /// The `error` of the JSON object a failed `--json` run prints.
 fn json_error(out: &Output) -> String {
-    let value: Value = serde_json::from_slice(&out.stdout).expect("JSON error on stdout");
+    let value: Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("no JSON on stdout ({e}); stderr: {}", text(&out.stderr)));
     value["error"].as_str().expect("error string").to_string()
 }
 
