@@ -191,6 +191,7 @@ pub fn run(args: FinetuneArgs, user_set: UserSet) -> Result<()> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use crate::{Cli, Command};

@@ -1664,6 +1664,7 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
