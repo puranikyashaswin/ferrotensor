@@ -6,6 +6,8 @@
 //! (randomised) weights into the GPU one, and compares the forward values,
 //! the input gradient and every parameter gradient.
 
+#![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 

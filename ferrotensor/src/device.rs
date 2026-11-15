@@ -131,6 +131,7 @@ pub(crate) struct GpuBuffer {
 impl std::ops::Deref for GpuBuffer {
     type Target = Buffer;
 
+    #[expect(clippy::expect_used, reason = "the buffer is taken out only in drop")]
     fn deref(&self) -> &Buffer {
         self.buffer.as_ref().expect("buffer used after drop")
     }
@@ -309,6 +310,10 @@ impl GpuContext {
 
     /// A tensor buffer of `bytes` bytes: a freed one when available, else a
     /// new one made by `create`.
+    #[expect(
+        clippy::expect_used,
+        reason = "lock poisoning means another thread panicked while holding the lock"
+    )]
     pub(crate) fn buffer(&self, bytes: u64, create: impl FnOnce() -> Buffer) -> GpuBuffer {
         let reused = {
             let mut pool = self.pool.lock().expect("buffer pool lock poisoned");
@@ -329,6 +334,10 @@ impl GpuContext {
         }
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "lock poisoning means another thread panicked while holding the lock"
+    )]
     fn lock(&self) -> MutexGuard<'_, Pending> {
         self.pending.lock().expect("GPU command lock poisoned")
     }
@@ -427,6 +436,10 @@ impl GpuContext {
     /// there after 5 s and then frees the still-running submission's
     /// resources as if it had finished, which crashes drivers that are still
     /// reading them.
+    #[expect(
+        clippy::panic,
+        reason = "the callback sender lives until wgpu fires it, so a dropped one means the device is lost"
+    )]
     pub(crate) fn wait_for<T>(&self, rx: &Receiver<T>) -> T {
         let start = Instant::now();
         loop {
@@ -517,6 +530,10 @@ impl Device {
     /// # Panics
     /// Panics when no GPU adapter is available. Use [`Device::gpu`] to get an
     /// `Option`, or [`Device::best`] to fall back to the CPU.
+    #[expect(
+        clippy::expect_used,
+        reason = "documented panic; Device::gpu and Device::best are the fallible constructors"
+    )]
     pub fn new() -> Self {
         Self::gpu().expect("no GPU adapter available; use Device::best() or Device::cpu()")
     }
@@ -565,6 +582,10 @@ impl Device {
     ///
     /// # Panics
     /// Panics when no GPU is available.
+    #[expect(
+        clippy::expect_used,
+        reason = "documented panic; Device::gpu_async is the fallible constructor"
+    )]
     pub async fn new_async() -> Self {
         Self::gpu_async()
             .await

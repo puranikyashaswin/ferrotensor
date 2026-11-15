@@ -301,6 +301,10 @@ impl Tensor {
     // ========================================================================
 
     /// Copy the values to a `Vec<f32>` (row-major).
+    #[expect(
+        clippy::expect_used,
+        reason = "lock poisoning means another thread panicked while holding the lock; GPU storage always has a GPU context"
+    )]
     pub fn to_vec(&self) -> Vec<f32> {
         match &*self.storage {
             Storage::Cpu(data) => data.read().expect("tensor lock poisoned").clone(),
@@ -312,6 +316,10 @@ impl Tensor {
     }
 
     /// Async version of [`Tensor::to_vec`].
+    #[expect(
+        clippy::expect_used,
+        reason = "lock poisoning means another thread panicked while holding the lock; GPU storage always has a GPU context"
+    )]
     pub async fn to_vec_async(&self) -> Vec<f32> {
         match &*self.storage {
             Storage::Cpu(data) => data.read().expect("tensor lock poisoned").clone(),
@@ -339,6 +347,10 @@ impl Tensor {
     ///
     /// Every tensor sharing this storage (clones, reshaped views) sees the
     /// new values.
+    #[expect(
+        clippy::expect_used,
+        reason = "lock poisoning means another thread panicked while holding the lock"
+    )]
     pub fn copy_from_slice(&self, data: &[f32]) {
         assert_eq!(
             data.len(),
@@ -362,6 +374,7 @@ impl Tensor {
     ///
     /// Used by optimizers to update parameters without breaking the
     /// parameter's identity.
+    #[expect(clippy::expect_used, reason = "GPU storage always has a GPU context")]
     pub fn assign(&self, src: &Tensor) {
         assert_eq!(self.shape, src.shape, "assign needs matching shapes");
         let src = src.to_device(&self.device);
@@ -391,11 +404,19 @@ impl Tensor {
     // ========================================================================
 
     /// The accumulated gradient, if any.
+    #[expect(
+        clippy::expect_used,
+        reason = "lock poisoning means another thread panicked while holding the lock"
+    )]
     pub fn grad(&self) -> Option<Tensor> {
         self.grad.read().expect("grad lock poisoned").clone()
     }
 
     /// Replace the accumulated gradient.
+    #[expect(
+        clippy::expect_used,
+        reason = "lock poisoning means another thread panicked while holding the lock"
+    )]
     pub fn set_grad(&self, grad: Option<Tensor>) {
         if let Some(g) = &grad {
             assert_eq!(g.shape, self.shape, "gradient shape must match tensor");
@@ -448,6 +469,10 @@ const TENSOR_USAGE: BufferUsages = BufferUsages::STORAGE
     .union(BufferUsages::COPY_SRC)
     .union(BufferUsages::COPY_DST);
 
+#[expect(
+    clippy::expect_used,
+    reason = "a failed buffer map means the device is lost, and to_vec returns no Result"
+)]
 async fn download(ctx: &GpuContext, buffer: &Buffer, n: usize) -> Vec<f32> {
     if n == 0 {
         return Vec::new();

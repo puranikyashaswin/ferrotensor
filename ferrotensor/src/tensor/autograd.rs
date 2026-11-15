@@ -137,6 +137,10 @@ impl Tensor {
     ///
     /// # Panics
     /// Panics when `grad` does not have this tensor's shape.
+    #[expect(
+        clippy::expect_used,
+        reason = "lock poisoning means another thread panicked while holding the lock"
+    )]
     pub fn backward_with(&self, grad: &Tensor) {
         assert_eq!(
             grad.shape, self.shape,

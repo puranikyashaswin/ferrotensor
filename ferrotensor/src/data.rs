@@ -322,6 +322,7 @@ fn sample_order(n: usize, shuffle: bool, seed: u64, epoch: u64) -> Vec<usize> {
 }
 
 #[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
 
