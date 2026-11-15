@@ -72,6 +72,9 @@ fn cases() -> Vec<Case> {
         case("mul", vec![input(&[6], 1), input(&[6], 2)], |x, e| {
             Tensor::mul(&x[0], &x[1], e)
         }),
+        case("scale", vec![input(&[6], 1)], |x, e| {
+            Tensor::scale(&x[0], 2.5, e)
+        }),
         case("silu", vec![input(&[6], 3)], |x, e| Tensor::silu(&x[0], e)),
         case("relu", vec![input(&[6], 3)], |x, e| Tensor::relu(&x[0], e)),
         case("softmax_rows", vec![input(&[2, 5], 4)], |x, e| {
