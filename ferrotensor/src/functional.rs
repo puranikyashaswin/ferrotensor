@@ -121,6 +121,9 @@ pub fn dropout(x: &Tensor, p: f32, training: bool) -> Tensor {
 /// equal leading dims. With `causal`, query `i` attends only to keys
 /// `j <= i + (Lk - Lq)` (so a query block at the end of a longer key
 /// sequence still sees its own past).
+///
+/// # Panics
+/// Panics when `q` is 0-dim or the shapes do not fit the layout above.
 #[expect(
     clippy::expect_used,
     reason = "shape precondition of an op that returns no Result"

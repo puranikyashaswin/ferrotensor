@@ -6,8 +6,6 @@
 //! `.biases` triple as one quantized GPU tensor, but the model builder in
 //! `ferrotensor-graph` rejects pre-quantized checkpoints.
 
-#![warn(missing_docs)]
-
 use memmap2::MmapOptions;
 use safetensors::SafeTensors;
 use serde::de::Error as _;
@@ -453,7 +451,11 @@ impl WeightsContext {
         self.weight_map.keys().map(String::as_str)
     }
 
-    /// Returns the shape and dtype name of a tensor, or `None` if it is missing.
+    /// Returns the shape and dtype name of a tensor.
+    ///
+    /// Every failure is reported as `None`: a name no loaded file holds, and
+    /// a mapped file that no longer parses. Use [`WeightsContext::get_tensor_metadata`]
+    /// to tell them apart.
     pub fn get_tensor_info(&self, name: &str) -> Option<(Vec<usize>, String)> {
         // Shape, Dtype(str)
         if let Some(filename) = self.weight_map.get(name) {

@@ -13,8 +13,10 @@ use crate::Device;
 macro_rules! layers {
     ($($variant:ident),* $(,)?) => {
         /// A layer that can be added to [`Sequential`].
-        // Layers are built once per model, so variant size does not matter.
-        #[allow(clippy::large_enum_variant)]
+        #[expect(
+            clippy::large_enum_variant,
+            reason = "layers are built once per model, so variant size does not matter"
+        )]
         pub enum Layer {
             $(
                 #[doc = concat!("A [`", stringify!($variant), "`] layer.")]
@@ -111,21 +113,19 @@ impl Module for Layer {
 /// ```
 pub struct Sequential {
     layers: Vec<Layer>,
-    #[allow(dead_code)]
-    device: Device,
 }
 
 impl Sequential {
     /// Create a new empty Sequential container.
-    pub fn new(device: &Device) -> Self {
-        Self {
-            layers: Vec::new(),
-            device: device.clone(),
-        }
+    pub fn new(_device: &Device) -> Self {
+        Self { layers: Vec::new() }
     }
 
     /// Append a layer.
-    #[allow(clippy::should_implement_trait)]
+    #[expect(
+        clippy::should_implement_trait,
+        reason = "`add` appends a layer to a builder, it is not `Add::add`"
+    )]
     pub fn add(mut self, layer: impl Into<Layer>) -> Self {
         self.layers.push(layer.into());
         self

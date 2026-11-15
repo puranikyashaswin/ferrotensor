@@ -2,8 +2,6 @@
 //! and system stats, loss charts read from a run's `training_state.json`,
 //! and a small model/chat panel.
 
-#![warn(missing_docs)]
-
 use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},

@@ -8,7 +8,6 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 publish = false
-homepage = "https://github.com/puranikyashaswin/ferrotensor"
 documentation = "https://docs.rs/ferrotensor-benchmarks"
 readme = "README.md"
 keywords = ["benchmark", "machine-learning", "gpu", "wgpu", "performance"]

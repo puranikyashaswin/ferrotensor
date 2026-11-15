@@ -34,6 +34,9 @@ impl Tensor {
     // ========================================================================
 
     /// Element-wise `self + other`.
+    ///
+    /// # Panics
+    /// Panics when the shapes cannot be broadcast together.
     pub fn add(&self, other: &Tensor) -> Tensor {
         let out = self.binary_raw(other, binary_op::ADD);
         let (sa, sb) = (self.shape.clone(), other.shape.clone());
@@ -43,6 +46,9 @@ impl Tensor {
     }
 
     /// Element-wise `self - other`.
+    ///
+    /// # Panics
+    /// Panics when the shapes cannot be broadcast together.
     pub fn sub(&self, other: &Tensor) -> Tensor {
         let out = self.binary_raw(other, binary_op::SUB);
         let (sa, sb) = (self.shape.clone(), other.shape.clone());
@@ -55,6 +61,9 @@ impl Tensor {
     }
 
     /// Element-wise `self * other`.
+    ///
+    /// # Panics
+    /// Panics when the shapes cannot be broadcast together.
     pub fn mul(&self, other: &Tensor) -> Tensor {
         let out = self.binary_raw(other, binary_op::MUL);
         let (a, b) = (self.detach(), other.detach());
@@ -68,6 +77,9 @@ impl Tensor {
     }
 
     /// Element-wise `self / other`.
+    ///
+    /// # Panics
+    /// Panics when the shapes cannot be broadcast together.
     pub fn div(&self, other: &Tensor) -> Tensor {
         let out = self.binary_raw(other, binary_op::DIV);
         let (a, b) = (self.detach(), other.detach());
@@ -84,6 +96,9 @@ impl Tensor {
     }
 
     /// Element-wise maximum. Where equal, the gradient goes to `self`.
+    ///
+    /// # Panics
+    /// Panics when the shapes cannot be broadcast together.
     pub fn maximum(&self, other: &Tensor) -> Tensor {
         let out = self.binary_raw(other, binary_op::MAX);
         let (a, b) = (self.detach(), other.detach());
@@ -97,6 +112,9 @@ impl Tensor {
     }
 
     /// Element-wise minimum. Where equal, the gradient goes to `self`.
+    ///
+    /// # Panics
+    /// Panics when the shapes cannot be broadcast together.
     pub fn minimum(&self, other: &Tensor) -> Tensor {
         let out = self.binary_raw(other, binary_op::MIN);
         let (a, b) = (self.detach(), other.detach());
@@ -110,26 +128,41 @@ impl Tensor {
     }
 
     /// `1.0` where `self > other`, else `0.0` (not differentiable).
+    ///
+    /// # Panics
+    /// Panics when the shapes cannot be broadcast together.
     pub fn gt(&self, other: &Tensor) -> Tensor {
         self.binary_raw(other, binary_op::GT)
     }
 
     /// `1.0` where `self < other`, else `0.0` (not differentiable).
+    ///
+    /// # Panics
+    /// Panics when the shapes cannot be broadcast together.
     pub fn lt(&self, other: &Tensor) -> Tensor {
         self.binary_raw(other, binary_op::LT)
     }
 
     /// `1.0` where `self >= other`, else `0.0` (not differentiable).
+    ///
+    /// # Panics
+    /// Panics when the shapes cannot be broadcast together.
     pub fn ge(&self, other: &Tensor) -> Tensor {
         self.binary_raw(other, binary_op::GE)
     }
 
     /// `1.0` where `self <= other`, else `0.0` (not differentiable).
+    ///
+    /// # Panics
+    /// Panics when the shapes cannot be broadcast together.
     pub fn le(&self, other: &Tensor) -> Tensor {
         self.binary_raw(other, binary_op::LE)
     }
 
     /// `1.0` where `self == other`, else `0.0` (not differentiable).
+    ///
+    /// # Panics
+    /// Panics when the shapes cannot be broadcast together.
     pub fn eq_elem(&self, other: &Tensor) -> Tensor {
         self.binary_raw(other, binary_op::EQ)
     }
@@ -143,6 +176,9 @@ impl Tensor {
     ///
     /// `cond` is a 0/1 mask, e.g. from [`Tensor::gt`]. Differentiable in `a`
     /// and `b`.
+    ///
+    /// # Panics
+    /// Panics when the shapes cannot be broadcast together.
     pub fn where_cond(cond: &Tensor, a: &Tensor, b: &Tensor) -> Tensor {
         let zero = Tensor::zeros(&[], &cond.device);
         let keep = cond
@@ -782,6 +818,9 @@ impl Tensor {
     ///
     /// Supports `[.., M, K] @ [K, N]`, `[M, K] @ [.., K, N]` and batched
     /// `[B.., M, K] @ [B.., K, N]` with equal batch dims.
+    ///
+    /// # Panics
+    /// Panics when an operand has fewer than 2 dims, or the inner or batch dims do not match.
     pub fn matmul(&self, other: &Tensor) -> Tensor {
         let out = self.matmul_raw(other);
         let (a, b) = (self.detach(), other.detach());
