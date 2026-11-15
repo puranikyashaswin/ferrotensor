@@ -48,7 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Attention dropout (`attention_dropout > 0` in `config.json`) now draws a different mask per training step, micro-batch, rank and layer from the trainer's run seed (`Trainer::with_dropout_seed`, `--seed` in `ferrotensor-cli train`) instead of one fixed mask, and evaluation and generation no longer apply it. New `forward_with_dropout` / `forward_batch_with_dropout` on `Attention`, `Lfm2Block` and `Lfm2Model`, and `ferrotensor_graph::dropout`. No change with dropout 0. (#89)
 - Pre-quantized (MLX `.scales`) checkpoints are rejected instead of loaded wrongly. (#96)
 - A machine with no usable GPU adapter, or a driver that refuses the device, no longer makes the CLI panic: it prints the reason and exits with code 1. New `WgpuContext::try_new` and `try_new_with_options` return a `ContextError`; `new` and `new_with_options` still panic, now with the same message. (#113)
-- `merge_adapter` removes the partly written `model.safetensors.tmp` when writing the merged weights fails, and returns the write error. (#PR)
+- `merge_adapter` removes the partly written `model.safetensors.tmp` when writing the merged weights fails, and returns the write error. (#119)
 
 ## [0.6.0] - 2026-11-12
 
