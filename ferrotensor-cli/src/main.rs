@@ -14,6 +14,7 @@
 mod classify;
 mod info;
 mod memory_report;
+mod profile_report;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use ferrotensor_autograd::{AdamW, OptimizerLoad, WarmupCosineScheduler};
@@ -274,6 +275,10 @@ struct TrainArgs {
         default_missing_value = "3"
     )]
     memory_report: Option<usize>,
+    /// Count GPU work per optimizer step; after the run, print the step
+    /// with the median wall time and write OUT/profile.json.
+    #[arg(long)]
+    profile: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1309,6 +1314,9 @@ async fn train(mut args: TrainArgs) -> Result<()> {
     if let Some(m) = &memory {
         m.begin_steps();
     }
+    let mut profile = args
+        .profile
+        .then(|| profile_report::ProfileRun::start(&base.ctx));
 
     'outer: for epoch in 0.. {
         loader.set_epoch(epoch as u64);
@@ -1335,6 +1343,9 @@ async fn train(mut args: TrainArgs) -> Result<()> {
                     continue;
                 }
                 step += 1;
+                if let Some(p) = profile.as_mut() {
+                    p.after_step();
+                }
                 if let Some(m) = memory.as_mut() {
                     m.after_step(step, step - start_step)?;
                 }
@@ -1392,6 +1403,10 @@ async fn train(mut args: TrainArgs) -> Result<()> {
     }
 
     let elapsed = run_start.elapsed();
+    if let Some(p) = profile {
+        let json = is_root.then(|| args.out.join(profile_report::FILE_NAME));
+        p.finish(json.as_deref())?;
+    }
     save(&trainer, step, best)?;
     eprintln!(
         "done:   {step} steps in {:.1}s; train loss {} -> {last_loss:.4}",

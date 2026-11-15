@@ -1,9 +1,10 @@
 //! GPU device setup.
 
 use crate::pool::BufferPool;
+use crate::profile::{GpuCounterSnapshot, GpuCounters};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use wgpu::{Adapter, CommandEncoder, Device, Instance, Queue};
 
 /// Recorded GPU work is submitted once this many ops are pending, so the GPU
@@ -50,6 +51,7 @@ pub struct WgpuContext {
     pending: Mutex<Pending>,
     /// Bytes uploaded since staging buffers were last released.
     staged: AtomicU64,
+    pub(crate) counters: GpuCounters,
 }
 
 /// Recorded work not yet submitted.
@@ -129,6 +131,7 @@ impl WgpuContext {
             pool,
             pending: Mutex::new(Pending::default()),
             staged: AtomicU64::new(0),
+            counters: GpuCounters::default(),
         }
     }
 
@@ -157,6 +160,7 @@ impl WgpuContext {
     /// Submits all recorded work and pending uploads and blocks until the
     /// GPU has finished them. Staging buffers of finished uploads are freed.
     pub fn synchronize(&self) {
+        self.counters.synchronizes.fetch_add(1, Ordering::Relaxed);
         self.staged.store(0, Ordering::Relaxed);
         self.flush();
         // An empty submission carries wgpu's pending buffer writes.
@@ -175,8 +179,14 @@ impl WgpuContext {
     /// stays bounded. [`UnifiedTensor`](crate::UnifiedTensor) calls this for
     /// its uploads; call it after uploading through `queue` yourself.
     pub fn note_upload(&self, bytes: u64) {
+        self.counters
+            .upload_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
         let total = self.staged.fetch_add(bytes, Ordering::Relaxed) + bytes;
         if total >= UPLOAD_RELEASE_BYTES {
+            self.counters
+                .forced_synchronizes
+                .fetch_add(1, Ordering::Relaxed);
             self.synchronize();
         }
     }
@@ -188,10 +198,12 @@ impl WgpuContext {
     /// resources as if it had finished, which crashes drivers that are still
     /// reading them (seen with long batches on lavapipe).
     pub(crate) fn poll_until(&self, done: impl Fn() -> bool) {
+        let start = Instant::now();
         let mut polls = 0u32;
         loop {
             self.device.poll(wgpu::Maintain::Poll);
             if done() {
+                GpuCounters::add_elapsed(&self.counters.gpu_wait_nanos, start);
                 // Callers wait for the last submitted work, so that poll let
                 // wgpu destroy every buffer dropped before it.
                 self.memory().gpu_reclaimed();
@@ -212,6 +224,7 @@ impl WgpuContext {
         if let Some(encoder) = pending.encoder.take() {
             let memory = self.memory();
             let serial = memory.begin_submission();
+            self.counters.submits.fetch_add(1, Ordering::Relaxed);
             // wgpu maintains the device here: it destroys buffers whose work
             // has finished and runs the callbacks of finished submissions.
             self.queue.submit(Some(encoder.finish()));
@@ -235,6 +248,11 @@ impl WgpuContext {
     /// pool, and by [`MemoryCategory`](crate::MemoryCategory).
     pub fn memory(&self) -> &Arc<crate::MemoryTracker> {
         self.pool.tracker()
+    }
+
+    /// Totals of the GPU work recorded and waited for on this context.
+    pub fn gpu_counters(&self) -> GpuCounterSnapshot {
+        self.counters.snapshot()
     }
 
     /// Adapter name and backend, e.g. `"Apple M2 (Metal)"`.

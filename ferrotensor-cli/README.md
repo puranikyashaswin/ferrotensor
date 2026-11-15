@@ -217,3 +217,34 @@ uploads (released every 256 MiB of uploads), and buffers of the
 counted under the phase that created it; the logits, the loss gradient and
 the parameter gradients are moved to their own rows when the trainer knows
 what they are, and the phase peak is corrected for that move.
+
+## Where step time goes: `--profile`
+
+`train --profile` counts the GPU work of every optimizer step. After the
+run it prints the step with the median wall time and writes the same
+numbers to `OUT/profile.json` (times in seconds, counts as
+`<name>_per_step`). Counting adds a few atomic adds per op and no waits for
+the GPU, so it does not change results. `--memory-report` waits for the
+GPU in the first steps it reports, so leave it off when profiling.
+
+```text
+profile: median of <steps> optimizer steps by wall time
+  step wall time             <ms> ms
+  waiting on the GPU         <ms> ms
+  in readbacks               <ms> ms
+  dispatches                 <count> /step
+  bind groups                <count> /step
+  uniform buffers            <count> /step
+  uniform bytes              <bytes> /step
+  submits                    <count> /step
+  synchronizes               <count> /step
+  forced synchronizes        <count> /step
+  upload bytes               <bytes> /step
+  readbacks                  <count> /step
+  readback bytes             <bytes> /step
+```
+
+The values in angle brackets are placeholders. Step time minus the time
+waiting on the GPU is roughly the time the host spends recording work;
+waiting includes the wait inside each readback, and forced synchronizes
+are the waits that free upload staging memory every 256 MiB of uploads.
