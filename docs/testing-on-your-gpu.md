@@ -31,6 +31,12 @@ WGPU_BACKEND=vulkan ferrotensor info --check
 Ferrotensor's tests and the CLI respect it too. On Windows this is the way to
 compare Vulkan with DX12 on the same GPU.
 
+If the CLI says `no GPU adapter found for backends ...`, wgpu saw no GPU on
+those backends: update the GPU driver (on Linux, install the Vulkan driver for
+your GPU) or set `WGPU_BACKEND` to another backend. If it says
+`GPU adapter ... refused to create a device`, the driver rejected the request;
+the text after the colon is the driver's reason, and it belongs in your report.
+
 ## 2. Check that the kernels are correct on it
 
 ```bash

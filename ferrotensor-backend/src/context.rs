@@ -2,6 +2,7 @@
 
 use crate::pool::BufferPool;
 use crate::profile::{GpuCounterSnapshot, GpuCounters};
+use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -67,31 +68,118 @@ impl std::fmt::Debug for Pending {
     }
 }
 
+/// Why [`WgpuContext::try_new_with_options`] could not open a GPU.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ContextError {
+    /// wgpu found no adapter on the backends it was allowed to try.
+    NoAdapter {
+        /// The backends that were tried (see [`crate::adapters::backends`]).
+        backends: wgpu::Backends,
+        /// Whether only the software fallback adapter was asked for.
+        force_fallback_adapter: bool,
+    },
+    /// The adapter was found but refused to create a device.
+    DeviceRefused {
+        /// Adapter name reported by the driver.
+        adapter: String,
+        /// The error wgpu returned.
+        source: wgpu::RequestDeviceError,
+    },
+}
+
+impl fmt::Display for ContextError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoAdapter {
+                backends,
+                force_fallback_adapter,
+            } => {
+                let names: Vec<String> = backends
+                    .iter_names()
+                    .map(|(name, _)| name.to_lowercase())
+                    .collect();
+                let kind = if *force_fallback_adapter {
+                    "software fallback"
+                } else {
+                    "GPU"
+                };
+                write!(
+                    f,
+                    "no {kind} adapter found for backends {}; check the GPU drivers, \
+                     or set WGPU_BACKEND to one of vulkan, metal, dx12, gl",
+                    names.join(", ")
+                )
+            }
+            Self::DeviceRefused { adapter, source } => {
+                write!(
+                    f,
+                    "GPU adapter {adapter} refused to create a device: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ContextError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::NoAdapter { .. } => None,
+            Self::DeviceRefused { source, .. } => Some(source),
+        }
+    }
+}
+
 impl WgpuContext {
     /// Opens the high-performance adapter.
     ///
     /// # Panics
-    /// Panics if no adapter or device is available.
+    /// Panics with the [`ContextError`] message if no adapter or device is
+    /// available; [`try_new`](Self::try_new) returns it instead.
     pub async fn new() -> Self {
         Self::new_with_options(wgpu::PowerPreference::HighPerformance, false).await
+    }
+
+    /// Opens an adapter like [`try_new_with_options`](Self::try_new_with_options).
+    ///
+    /// # Panics
+    /// Panics with the [`ContextError`] message if no adapter or device is
+    /// available.
+    #[expect(
+        clippy::panic,
+        reason = "documented panic; try_new_with_options is the fallible constructor"
+    )]
+    pub async fn new_with_options(
+        power_preference: wgpu::PowerPreference,
+        force_fallback_adapter: bool,
+    ) -> Self {
+        Self::try_new_with_options(power_preference, force_fallback_adapter)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// Opens the high-performance adapter.
+    ///
+    /// # Errors
+    /// See [`try_new_with_options`](Self::try_new_with_options).
+    pub async fn try_new() -> Result<Self, ContextError> {
+        Self::try_new_with_options(wgpu::PowerPreference::HighPerformance, false).await
     }
 
     /// Opens an adapter with the given power preference, optionally forcing
     /// the software fallback adapter. The `WGPU_BACKEND` environment variable
     /// (e.g. `vulkan`) restricts which backends are tried.
     ///
-    /// # Panics
-    /// Panics if no adapter or device is available.
-    #[expect(
-        clippy::expect_used,
-        reason = "no adapter or device is a documented panic; no fallible constructor exists yet"
-    )]
-    pub async fn new_with_options(
+    /// # Errors
+    /// [`ContextError::NoAdapter`] if wgpu finds no adapter, and
+    /// [`ContextError::DeviceRefused`] if the adapter will not create a device.
+    pub async fn try_new_with_options(
         power_preference: wgpu::PowerPreference,
         force_fallback_adapter: bool,
-    ) -> Self {
+    ) -> Result<Self, ContextError> {
+        let backends = crate::adapters::backends();
         let instance = Instance::new(wgpu::InstanceDescriptor {
-            backends: crate::adapters::backends(),
+            backends,
             ..Default::default()
         });
         let adapter = instance
@@ -101,7 +189,10 @@ impl WgpuContext {
                 compatible_surface: None,
             })
             .await
-            .expect("Failed to find adapter");
+            .ok_or(ContextError::NoAdapter {
+                backends,
+                force_fallback_adapter,
+            })?;
 
         let (device, queue) = adapter
             .request_device(
@@ -116,7 +207,10 @@ impl WgpuContext {
                 None,
             )
             .await
-            .expect("Failed to create device");
+            .map_err(|source| ContextError::DeviceRefused {
+                adapter: adapter.get_info().name,
+                source,
+            })?;
         let pool = Arc::new(BufferPool::new(
             wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
@@ -127,7 +221,7 @@ impl WgpuContext {
                 .ok()
                 .as_deref(),
         ));
-        Self {
+        Ok(Self {
             instance,
             adapter,
             device: Arc::new(device),
@@ -136,7 +230,7 @@ impl WgpuContext {
             pending: Mutex::new(Pending::default()),
             staged: AtomicU64::new(0),
             counters: GpuCounters::default(),
-        }
+        })
     }
 
     /// Records GPU work into the pending command encoder; it runs after
@@ -271,5 +365,36 @@ impl WgpuContext {
     pub fn adapter_info(&self) -> String {
         let info = self.adapter.get_info();
         format!("{} ({:?})", info.name, info.backend)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_adapter_message_names_backends_and_what_to_do() {
+        let err = ContextError::NoAdapter {
+            backends: wgpu::Backends::VULKAN | wgpu::Backends::METAL,
+            force_fallback_adapter: false,
+        };
+        assert_eq!(
+            err.to_string(),
+            "no GPU adapter found for backends vulkan, metal; check the GPU drivers, \
+             or set WGPU_BACKEND to one of vulkan, metal, dx12, gl"
+        );
+    }
+
+    #[test]
+    fn no_adapter_message_says_fallback_was_forced() {
+        let err = ContextError::NoAdapter {
+            backends: wgpu::Backends::VULKAN,
+            force_fallback_adapter: true,
+        };
+        assert_eq!(
+            err.to_string(),
+            "no software fallback adapter found for backends vulkan; check the GPU drivers, \
+             or set WGPU_BACKEND to one of vulkan, metal, dx12, gl"
+        );
     }
 }
