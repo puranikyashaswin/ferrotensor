@@ -20,6 +20,7 @@ mod finetune;
 mod info;
 mod memory_report;
 mod merge;
+mod model_id;
 mod plan;
 mod profile_report;
 
@@ -38,6 +39,7 @@ use ferrotensor_trainer::{
     build_sft_example, masked_cross_entropy_from_logits, DataLoader, Dataset, FileGradSyncConfig,
     TextDataset, Trainer,
 };
+use model_id::resolve_model;
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write as _;
@@ -199,8 +201,9 @@ enum Device {
 
 #[derive(Args, Debug, Clone)]
 struct ModelArgs {
-    /// Model directory (config.json, tokenizer.json, *.safetensors).
-    #[arg(long, value_name = "DIR")]
+    /// Model directory (config.json, tokenizer.json, *.safetensors), or a
+    /// Hugging Face model id already in the local cache.
+    #[arg(long, value_name = "DIR_OR_ID")]
     model: PathBuf,
     /// Compute device.
     #[arg(long, value_enum, default_value_t = Device::Auto)]
@@ -399,8 +402,9 @@ struct ExportAdapterArgs {
     /// Adapter written by `train`.
     #[arg(long, alias = "adapter", value_name = "FILE")]
     lora: PathBuf,
-    /// Base model directory the adapter was trained on (only config.json is read).
-    #[arg(long, value_name = "DIR")]
+    /// Base model directory or cached Hugging Face model id the adapter was
+    /// trained on (only config.json is read).
+    #[arg(long, value_name = "DIR_OR_ID")]
     model: PathBuf,
     /// Output directory.
     #[arg(long, alias = "out", value_name = "DIR")]
@@ -595,13 +599,7 @@ struct Loaded {
 }
 
 async fn load_base(args: &ModelArgs) -> Result<Loaded> {
-    let dir = &args.model;
-    if !dir.is_dir() {
-        return Err(unmet(format!(
-            "model directory {} does not exist",
-            dir.display()
-        )));
-    }
+    let dir = &resolve_model(&args.model)?;
     let config_path = dir.join("config.json");
     let config = ModelLoader::load_config(&config_path)
         .map_err(|e| unmet(format!("cannot read {}: {e}", config_path.display())))?;
@@ -818,7 +816,7 @@ fn adapter_metadata(path: &Path) -> Result<LoraMetadata> {
 
 /// Convert an adapter file without loading the model's weights or a GPU.
 fn export_adapter(args: ExportAdapterArgs) -> Result<()> {
-    let config_path = args.model.join("config.json");
+    let config_path = resolve_model(&args.model)?.join("config.json");
     let config = ModelLoader::load_config(&config_path)
         .map_err(|e| unmet(format!("cannot read {}: {e}", config_path.display())))?;
     let ckpt = load_lora_checkpoint(&args.lora)?;
@@ -1700,6 +1698,16 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
         })
         .await;
         stream_text("\n", args.json);
+    }
+    if is_root && lora_on && !args.json {
+        let model = args.model.model.display();
+        let adapter = adapter_path.display();
+        eprintln!("next:");
+        eprintln!("  ferrotensor chat --model {model} --lora {adapter}");
+        eprintln!(
+            "  ferrotensor merge --model {model} --lora {adapter} --out {}-merged",
+            args.out.display()
+        );
     }
     Ok(TrainSummary {
         steps: step,

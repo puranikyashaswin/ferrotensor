@@ -1,7 +1,7 @@
 //! `ferrotensor merge`: write a model directory with a LoRA adapter folded
 //! into the base weights.
 
-use crate::{print_json, unmet, Result};
+use crate::{print_json, resolve_model, unmet, Result};
 use clap::Args;
 use ferrotensor_trainer::merge::merge_adapter;
 use std::path::PathBuf;
@@ -9,8 +9,9 @@ use std::path::PathBuf;
 /// Options for `ferrotensor merge`.
 #[derive(Args, Debug)]
 pub struct MergeArgs {
-    /// Base model directory the adapter was trained on.
-    #[arg(long, value_name = "DIR")]
+    /// Base model directory or cached Hugging Face model id the adapter was
+    /// trained on.
+    #[arg(long, value_name = "DIR_OR_ID")]
     model: PathBuf,
     /// LoRA adapter: a Ferrotensor file or a PEFT adapter directory.
     #[arg(long, alias = "adapter", value_name = "FILE")]
@@ -25,10 +26,11 @@ pub struct MergeArgs {
 
 /// Runs the merge on the host; no GPU is opened.
 pub fn run(args: MergeArgs, json: bool) -> Result<()> {
+    let model_dir = resolve_model(&args.model)?;
     let adapter = crate::read_adapter(&args.lora).map_err(|e| unmet(e.to_string()))?;
     // I/O failures while writing stay runtime errors; everything else
     // `merge_adapter` reports is about its input.
-    let report = merge_adapter(&args.model, &adapter, &args.out).map_err(|e| {
+    let report = merge_adapter(&model_dir, &adapter, &args.out).map_err(|e| {
         if e.is::<std::io::Error>() {
             e
         } else {

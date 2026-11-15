@@ -7,7 +7,6 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-homepage = "https://github.com/puranikyashaswin/ferrotensor"
 documentation = "https://docs.rs/ferrotensor-cli"
 readme = "README.md"
 keywords = ["machine-learning", "cli", "lora", "llm", "gpu"]
@@ -25,6 +24,7 @@ ferrotensor-loader = { path = "../ferrotensor-loader", version = "0.6.0" }
 ferrotensor-autograd = { path = "../ferrotensor-autograd", version = "0.6.0" }
 ferrotensor-trainer = { path = "../ferrotensor-trainer", version = "0.6.0" }
 ferrotensor-monitor = { path = "../ferrotensor-monitor", version = "0.6.0" }
+ferrotensor-hub = { path = "../ferrotensor-hub", version = "0.6.0" }
 clap = { version = "4.5", features = ["derive"] }
 pollster = "0.3"
 env_logger = "0.11"

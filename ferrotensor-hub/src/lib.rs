@@ -17,7 +17,7 @@
 //! ```
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub mod config;
 pub mod models;
@@ -98,6 +98,11 @@ impl FerrotensorHub {
     /// Create a FerrotensorHub with a custom cache directory.
     pub fn with_cache_dir(cache_dir: PathBuf) -> Self {
         Self { cache_dir }
+    }
+
+    /// The directory that holds the `models--{org}--{model}` folders.
+    pub fn cache_dir(&self) -> &Path {
+        &self.cache_dir
     }
 
     /// Get the path to a cached model.

@@ -461,6 +461,66 @@ fn plan_without_a_model_lists_the_documented_sizes() {
     assert_eq!(models[2]["fits"], true);
 }
 
+/// Run `plan --model model` with `home` as HOME (where the Hugging Face cache
+/// is looked for) and `dir` as the working directory.
+fn plan_model_in(model: &str, home: &Path, dir: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_ferrotensor"))
+        .args(["plan", "--model", model, "--memory-mib", "100000", "--json"])
+        .env("HOME", home)
+        .current_dir(dir)
+        .output()
+        .expect("run the ferrotensor binary")
+}
+
+/// A snapshot of `org/name` in the Hugging Face cache under `home`.
+fn cached_snapshot(home: &Path) -> std::path::PathBuf {
+    let snapshot = home.join(".cache/huggingface/hub/models--org--name/snapshots/0123abcd");
+    std::fs::create_dir_all(&snapshot).expect("create snapshot");
+    common::write_tiny_llama(&snapshot);
+    snapshot
+}
+
+#[test]
+fn a_cached_model_id_resolves_to_its_snapshot() {
+    let home = common::TempDir::new("hf-home");
+    let snapshot = cached_snapshot(home.path());
+    let run = plan_model_in("org/name", home.path(), home.path());
+    assert_success(&run);
+    let stderr = text(&run.stderr);
+    assert!(
+        stderr.contains(&format!("model: org/name ({})\n", snapshot.display())),
+        "stderr: {stderr}"
+    );
+    let plan: serde_json::Value = serde_json::from_slice(&run.stdout).expect("plan json");
+    assert_eq!(plan["model"], "org/name");
+    assert_eq!(plan["parameters"], 20640);
+}
+
+#[test]
+fn an_existing_directory_wins_over_the_cache() {
+    let home = common::TempDir::new("hf-home-dir-wins");
+    cached_snapshot(home.path());
+    let local = home.path().join("org/name");
+    std::fs::create_dir_all(&local).expect("create model dir");
+    common::write_tiny_llama(&local);
+    let run = plan_model_in("org/name", home.path(), home.path());
+    assert_success(&run);
+    assert!(!text(&run.stderr).contains("model: org/name"));
+}
+
+#[test]
+fn an_uncached_model_id_exits_with_2_and_says_how_to_fetch_it() {
+    let home = common::TempDir::new("hf-home-empty");
+    let run = plan_model_in("org/name", home.path(), home.path());
+    let stdout = text(&run.stdout);
+    assert_eq!(run.status.code(), Some(2), "stdout: {stdout}");
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("error json");
+    let error = json["error"].as_str().expect("error string");
+    let cache = home.path().join(".cache/huggingface/hub");
+    assert!(error.contains("hf download org/name"), "{error}");
+    assert!(error.contains(s(&cache)), "{error}");
+}
+
 /// Run `finetune --task pretrain --seq-len 16 --max-steps 2` on `data`,
 /// writing into `out`; `extra` is appended to the arguments.
 fn finetune(model: &Path, data: &Path, out: &Path, extra: &[&str]) -> Output {
