@@ -65,6 +65,20 @@ A full walkthrough with measured numbers is in
 - `ferrotensor-cli demo` (or `--demo`) plays a simulated training UI; it does not
   train anything.
 
+## Scripting: `--json` and exit codes
+
+`plan`, `finetune`, `train`, `eval`, `generate` and `info` take `--json`:
+stdout then carries one JSON object when the command ends, and progress and
+other text go to stderr (`generate` streams its text there too). On an error
+stdout carries `{"error": "<message>"}`. The keys of each object are listed in
+[AGENTS.md](../AGENTS.md#json-output).
+
+Every command exits with 0 on success, 1 on a runtime error (I/O, the GPU, a
+kernel out of tolerance) and 2 when the input is invalid or this machine
+cannot meet the request: a missing model or data file, a flag value out of
+range, no GPU adapter, or no configuration that fits. clap's usage errors
+also exit with 2.
+
 ## Frozen base weights: f16, f32 or 4-bit (experimental)
 
 By default the frozen linear-layer weights (attention, MLP and `lm_head`)
@@ -174,7 +188,8 @@ ferrotensor plan                 # the documented SmolLM2 sizes and which fit
   sequences per step. Seq 128 is used only when nothing fits at 256, and a
   note says so. `--weights f16|f32|q4` (default f16) and `--lora-rank`
   (default 8) are fixed by the flags.
-- Exit code 0 when a configuration fits, 2 when none does, 1 on error.
+- Exit code 0 when a configuration fits, 2 when none does or the input is
+  invalid, 1 on a runtime error.
 - `--json` prints one object with the keys `adapter`, `backend`,
   `device_type`, `budget_mib`, `budget_source`, `model`, `parameters`,
   `chosen` (`batch_size`, `seq_len`, `rank`, `precision`,

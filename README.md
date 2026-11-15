@@ -275,6 +275,10 @@ block checkpointing that fit this machine's GPU memory, prints that plan,
 then trains. `train` sets nothing for you; use it to choose every setting
 by hand.
 
+For scripts and coding agents, `plan`, `finetune`, `train`, `eval`,
+`generate` and `info` take `--json` and print one JSON object, and exit codes
+are the same across commands; [AGENTS.md](AGENTS.md) lists both.
+
 `--help` lists every flag. A step-by-step walkthrough with real output is in
 [docs/examples/lora-sft.md](docs/examples/lora-sft.md).
 This path is experimental.

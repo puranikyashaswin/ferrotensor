@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `--json` on `finetune`, `train`, `eval` and `generate`: stdout carries one JSON object when the command ends (the training summary with the measured GPU peak, and for `finetune` the plan; the loss and perplexity; the generated text and token counts) and every other line goes to stderr. With `--json`, errors print `{"error": "..."}` on stdout. `AGENTS.md` documents each object, the exit codes and the one-command path for coding agents, and `llms.txt` indexes the docs. (#115)
 - `ferrotensor export-adapter --format peft` and `ferrotensor_trainer::peft` (`export_peft_adapter`, `save_peft_adapter`, `load_peft_adapter`) write and read Hugging Face PEFT adapter directories for Llama-style models. `eval --lora`, `generate --lora` and `train --resume` accept a PEFT directory. CI loads the exported adapter in PyTorch + PEFT and checks its logits against Ferrotensor's within 1e-3. (#74)
 - Tests: the loss and per-parameter gradients of LoRA training (one sequence, batched, masked, trainable base) are checked against PyTorch autograd on a tiny model (`ferrotensor-trainer/tests/gradient_parity.rs`). (#86)
 - `train --memory-report[=N]`: a GPU memory breakdown by category (weights, adapters, optimizer state, activations, gradients, loss) after model load and the first N optimizer steps, with JSON output; `WgpuContext::memory()` exposes the counters. (#90)
@@ -22,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI: every example is executed, on CPU or software Vulkan (#82); the flash attention and reference tests run in the GPU job (#77); the CLI runs end to end on a tiny model (#79); the Python GPU parity tests run, and `FERROTENSOR_RUN_GPU_TESTS` is the one switch (#80).
 
 ### Changed
+- `ferrotensor` exit codes are the same for every command: 0 success, 1 runtime error, 2 invalid input or a request this machine cannot meet. Invalid input (a missing model, `config.json` or data file, a flag out of range, a dataset with no usable examples) and a missing GPU adapter (in `info` and in the commands that open the GPU) now exit with 2 instead of 1. `finetune` reports a plan that does not fit as `error: ...` instead of `finetune: ...`; the exit code stays 2. (#115)
 - Backward keeps the first gradient each tensor receives instead of copying it into a new buffer. (#91)
 - Backward releases each intermediate gradient once it has been used; after `backward` only leaves hold gradients, and a repeated `backward` adds exactly one more gradient per leaf. (#92)
 - The buffer pool keeps buffers freed beyond its cap reusable until the GPU has finished the work recorded before them, then drops them and polls so wgpu destroys them at once (`FERROTENSOR_POOL_OVERFLOW=0` restores the old behaviour); the memory report's awaiting-GPU count now drops as submitted work finishes. (#93)

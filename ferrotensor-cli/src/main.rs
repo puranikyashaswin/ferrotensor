@@ -22,7 +22,7 @@ mod profile_report;
 
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use ferrotensor_autograd::{AdamW, OptimizerLoad, WarmupCosineScheduler};
-use ferrotensor_backend::{ComputeEngine, MemoryCategory, WgpuContext};
+use ferrotensor_backend::{ComputeEngine, ContextError, MemoryCategory, WgpuContext};
 use ferrotensor_graph::lfm::{legacy_llama_name, Lfm2Model};
 use ferrotensor_graph::model_builder::{Lfm2ModelBuilder, LoRaConfig};
 use ferrotensor_loader::{Lfm2Config, ModelLoader, Sampler, Tokenizer, WeightsContext};
@@ -43,6 +43,73 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+const MIB: u64 = 1024 * 1024;
+
+/// Process exit codes, the same for every command. clap's usage errors also
+/// exit with 2.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Exit {
+    /// The command did what was asked.
+    Success = 0,
+    /// It failed while running: I/O, the GPU, a kernel out of tolerance.
+    RuntimeError = 1,
+    /// The input is invalid, or this machine cannot meet the request.
+    Unmet = 2,
+}
+
+impl Exit {
+    /// The code for a command that failed with `error`.
+    fn for_error(error: &(dyn std::error::Error + 'static)) -> Self {
+        // No adapter is this machine, as in `info` and `plan`; a device the
+        // adapter refused is a runtime failure.
+        let no_adapter = matches!(
+            error.downcast_ref::<ContextError>(),
+            Some(ContextError::NoAdapter { .. })
+        );
+        if no_adapter || error.is::<Unmet>() {
+            Self::Unmet
+        } else {
+            Self::RuntimeError
+        }
+    }
+}
+
+/// An error the caller fixes by changing the request; exits with
+/// [`Exit::Unmet`].
+#[derive(Debug)]
+struct Unmet(String);
+
+impl std::fmt::Display for Unmet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unmet {}
+
+fn unmet(message: impl Into<String>) -> Box<dyn std::error::Error> {
+    Box::new(Unmet(message.into()))
+}
+
+/// Prints `value` as the one JSON object a `--json` run writes to stdout.
+fn print_json(value: &impl serde::Serialize) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
+}
+
+/// Writes generated text as it arrives: to stdout, or to stderr when stdout
+/// carries `--json` output.
+fn stream_text(text: &str, json: bool) {
+    if json {
+        eprint!("{text}");
+        return;
+    }
+    let mut stdout = std::io::stdout();
+    if let Err(e) = write!(stdout, "{text}").and_then(|()| stdout.flush()) {
+        log::warn!("cannot write generated text: {e}");
+    }
+}
 
 /// Fine-tune, evaluate and sample from small language models on the GPU
 /// (Metal, Vulkan or DX12 through wgpu).
@@ -290,6 +357,10 @@ struct TrainArgs {
     /// with the median wall time and write OUT/profile.json.
     #[arg(long)]
     profile: bool,
+    /// Print one JSON summary to stdout when the run ends; everything else
+    /// goes to stderr.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -303,6 +374,9 @@ struct EvalArgs {
     /// also works; the model then loads in f32.
     #[arg(long, value_name = "FILE")]
     lora: Option<PathBuf>,
+    /// Print the result as one JSON object.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -369,6 +443,9 @@ struct GenerateArgs {
     /// Recompute the whole sequence every token instead of using the KV cache.
     #[arg(long)]
     no_kv_cache: bool,
+    /// Stream the text to stderr and print one JSON object with it to stdout.
+    #[arg(long)]
+    json: bool,
 }
 
 /// Hint printed after a panic that looks like the GPU running out of memory.
@@ -408,45 +485,59 @@ fn main() {
     // command line from defaults.
     let matches = Cli::command().get_matches();
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
-    let result = match cli.command {
+    let json = match &cli.command {
+        Command::Finetune(args) => args.train.json,
+        Command::Train(args) => args.json,
+        Command::Eval(args) => args.json,
+        Command::Generate(args) => args.json,
+        Command::Info(args) => args.json,
+        Command::Plan(args) => args.json,
+        _ => false,
+    };
+    let code = match run(cli.command, &matches, json) {
+        Ok(code) => code,
+        Err(e) => {
+            if json {
+                println!("{:#}", serde_json::json!({ "error": e.to_string() }));
+            } else {
+                eprintln!("error: {e}");
+            }
+            Exit::for_error(e.as_ref())
+        }
+    };
+    std::process::exit(code as i32);
+}
+
+fn run(command: Command, matches: &clap::ArgMatches, json: bool) -> Result<Exit> {
+    match command {
         Command::Finetune(args) => {
             let user_set = matches
                 .subcommand_matches("finetune")
                 .map_or_else(finetune::UserSet::default, finetune::UserSet::from_matches);
-            finetune::run(*args, user_set).map(|outcome| {
-                if outcome == plan::Outcome::DoesNotFit {
-                    std::process::exit(2);
-                }
-            })
+            finetune::run(*args, user_set)?;
         }
-        Command::Train(args) => pollster::block_on(train(*args)).map(|_peak_bytes| ()),
-        Command::Eval(args) => pollster::block_on(eval(args)),
-        Command::Generate(args) => pollster::block_on(generate(args)),
-        Command::ClassifyTrain(args) => pollster::block_on(classify::classify_train(*args)),
-        Command::ClassifyPredict(args) => pollster::block_on(classify::classify_predict(args)),
-        Command::Demo => {
-            ferrotensor_trainer::run_demo(ferrotensor_trainer::DemoConfig::default());
-            Ok(())
-        }
-        Command::Info(args) => info::run(args),
-        Command::Plan(args) => plan::run(args).map(|outcome| {
-            if outcome == plan::Outcome::DoesNotFit {
-                std::process::exit(2);
+        Command::Train(args) => {
+            let summary = pollster::block_on(train(*args))?;
+            if json {
+                print_json(&summary)?;
             }
-        }),
-        Command::ExportAdapter(args) => export_adapter(args),
-        Command::Monitor => ferrotensor_monitor::run().map_err(|e| format!("monitor: {e}").into()),
+        }
+        Command::Eval(args) => pollster::block_on(eval(args))?,
+        Command::Generate(args) => pollster::block_on(generate(args))?,
+        Command::ClassifyTrain(args) => pollster::block_on(classify::classify_train(*args))?,
+        Command::ClassifyPredict(args) => pollster::block_on(classify::classify_predict(args))?,
+        Command::Demo => ferrotensor_trainer::run_demo(ferrotensor_trainer::DemoConfig::default()),
+        Command::Info(args) => return info::run(args),
+        Command::Plan(args) => return plan::run(args),
+        Command::ExportAdapter(args) => export_adapter(args)?,
+        Command::Monitor => ferrotensor_monitor::run().map_err(|e| format!("monitor: {e}"))?,
         Command::Benchmark => {
             println!(
                 "Run the kernel benchmarks with: cargo run -p ferrotensor-benchmarks --release"
             );
-            Ok(())
         }
-    };
-    if let Err(e) = result {
-        eprintln!("error: {e}");
-        std::process::exit(1);
     }
+    Ok(Exit::Success)
 }
 
 // ---------------------------------------------------------------------------
@@ -466,11 +557,14 @@ struct Loaded {
 async fn load_base(args: &ModelArgs) -> Result<Loaded> {
     let dir = &args.model;
     if !dir.is_dir() {
-        return Err(format!("model directory {} does not exist", dir.display()).into());
+        return Err(unmet(format!(
+            "model directory {} does not exist",
+            dir.display()
+        )));
     }
     let config_path = dir.join("config.json");
     let config = ModelLoader::load_config(&config_path)
-        .map_err(|e| format!("cannot read {}: {e}", config_path.display()))?;
+        .map_err(|e| unmet(format!("cannot read {}: {e}", config_path.display())))?;
     let tok_path = dir.join("tokenizer.json");
     let tokenizer = Tokenizer::from_file(&tok_path)
         .map_err(|e| format!("cannot load {}: {e}", tok_path.display()))?;
@@ -686,7 +780,7 @@ fn adapter_metadata(path: &Path) -> Result<LoraMetadata> {
 fn export_adapter(args: ExportAdapterArgs) -> Result<()> {
     let config_path = args.model.join("config.json");
     let config = ModelLoader::load_config(&config_path)
-        .map_err(|e| format!("cannot read {}: {e}", config_path.display()))?;
+        .map_err(|e| unmet(format!("cannot read {}: {e}", config_path.display())))?;
     let ckpt = load_lora_checkpoint(&args.lora)?;
     if let Some(modules) = ckpt
         .metadata
@@ -725,10 +819,13 @@ fn export_adapter(args: ExportAdapterArgs) -> Result<()> {
 fn load_dataset(args: &DataArgs, tokenizer: &Tokenizer) -> Result<TextDataset> {
     let path = &args.data;
     if !path.is_file() {
-        return Err(format!("dataset file {} does not exist", path.display()).into());
+        return Err(unmet(format!(
+            "dataset file {} does not exist",
+            path.display()
+        )));
     }
     if args.seq_len < 2 {
-        return Err("--seq-len must be at least 2".into());
+        return Err(unmet("--seq-len must be at least 2"));
     }
     let ext = path
         .extension()
@@ -740,10 +837,9 @@ fn load_dataset(args: &DataArgs, tokenizer: &Tokenizer) -> Result<TextDataset> {
     let ds = match (args.task, ext.as_str()) {
         (Task::Sft, "json") => load_json_sft(path, tokenizer, chat, seq)?,
         (Task::Sft, "txt" | "bin") => {
-            return Err(
-                "SFT expects .json/.jsonl with {\"prompt\", \"response\"}; use --task pretrain for .txt/.bin"
-                    .into(),
-            )
+            return Err(unmet(
+                "SFT expects .json/.jsonl with {\"prompt\", \"response\"}; use --task pretrain for .txt/.bin",
+            ))
         }
         (Task::Sft, _) => TextDataset::from_jsonl_sft(path, tokenizer, chat, seq)
             .map_err(|e| format!("{}: {e}", path.display()))?,
@@ -760,7 +856,9 @@ fn load_dataset(args: &DataArgs, tokenizer: &Tokenizer) -> Result<TextDataset> {
                     .collect();
                 TextDataset::pack_sequences(seqs, seq)
             } else {
-                return Err("pretrain .json must be [token ids] or [\"text\", ...]".into());
+                return Err(unmet(
+                    "pretrain .json must be [token ids] or [\"text\", ...]",
+                ));
             }
         }
         (Task::Pretrain, _) => {
@@ -778,11 +876,10 @@ fn load_dataset(args: &DataArgs, tokenizer: &Tokenizer) -> Result<TextDataset> {
         None => ds,
     };
     if ds.is_empty() {
-        return Err(format!(
+        return Err(unmet(format!(
             "{} produced no usable examples (empty, or every prompt is longer than --seq-len {seq})",
             path.display()
-        )
-        .into());
+        )));
     }
     Ok(ds)
 }
@@ -881,13 +978,32 @@ async fn eval(args: EvalArgs) -> Result<()> {
     }
     let t = Instant::now();
     let (loss, tokens) = evaluate(&base, &model, &ds, usize::MAX).await;
+    let summary = EvalSummary {
+        examples: ds.len(),
+        tokens,
+        loss,
+        perplexity: loss.exp(),
+        seconds: t.elapsed().as_secs_f32(),
+    };
+    if args.json {
+        return print_json(&summary);
+    }
     println!(
         "eval: {} examples, {tokens} tokens, loss {loss:.4}, perplexity {:.3} ({:.1}s)",
-        ds.len(),
-        loss.exp(),
-        t.elapsed().as_secs_f32()
+        summary.examples, summary.perplexity, summary.seconds
     );
     Ok(())
+}
+
+/// What `eval --json` prints. With no supervised tokens the loss is NaN,
+/// which serializes as null.
+#[derive(serde::Serialize, Debug)]
+struct EvalSummary {
+    examples: usize,
+    tokens: usize,
+    loss: f32,
+    perplexity: f32,
+    seconds: f32,
 }
 
 // ---------------------------------------------------------------------------
@@ -902,7 +1018,7 @@ async fn generate(args: GenerateArgs) -> Result<()> {
         eprintln!("{}", loaded_line(path, n, meta.as_ref()));
     }
     if !(0.0..=1.0).contains(&args.top_p) || args.temperature < 0.0 {
-        return Err("--top-p must be in [0, 1] and --temperature >= 0".into());
+        return Err(unmet("--top-p must be in [0, 1] and --temperature >= 0"));
     }
     let mut sampler = Sampler::new(args.temperature, args.top_k, args.top_p, args.seed);
     let prompt_ids = if args.raw {
@@ -912,28 +1028,49 @@ async fn generate(args: GenerateArgs) -> Result<()> {
             .encode_chat(args.system.as_deref(), &args.prompt)
     };
     let use_cache = !args.no_kv_cache;
-    let stats = generate_tokens(
+    let mut text = String::new();
+    let (new_tokens, decode_time, kv_cache) = generate_tokens(
         &base,
         &model,
         &prompt_ids,
         args.max_new_tokens,
         &mut sampler,
         use_cache,
-        |text| {
-            print!("{text}");
-            let _ = std::io::stdout().flush();
+        |delta| {
+            text.push_str(delta);
+            stream_text(delta, args.json);
         },
     )
     .await;
-    println!();
+    stream_text("\n", args.json);
+    let summary = GenerateSummary {
+        text,
+        prompt_tokens: prompt_ids.len(),
+        new_tokens,
+        tokens_per_second: new_tokens as f32 / decode_time.as_secs_f32().max(1e-6),
+        kv_cache,
+    };
     eprintln!(
         "[{} prompt + {} new tokens, {:.1} tok/s, kv cache {}]",
-        prompt_ids.len(),
-        stats.0,
-        stats.0 as f32 / stats.1.as_secs_f32().max(1e-6),
-        if stats.2 { "on" } else { "off" }
+        summary.prompt_tokens,
+        summary.new_tokens,
+        summary.tokens_per_second,
+        if kv_cache { "on" } else { "off" }
     );
+    if args.json {
+        print_json(&summary)?;
+    }
     Ok(())
+}
+
+/// What `generate --json` prints.
+#[derive(serde::Serialize, Debug)]
+struct GenerateSummary {
+    text: String,
+    prompt_tokens: usize,
+    new_tokens: usize,
+    tokens_per_second: f32,
+    kv_cache: bool,
 }
 
 /// Sample up to `max_new` tokens after `prompt`, streaming decoded text to
@@ -1058,9 +1195,25 @@ fn state_path_for(adapter: &Path) -> PathBuf {
     adapter.with_file_name(format!("{name}.state.json"))
 }
 
-/// Runs `train` and returns the peak bytes of tracked GPU memory during
-/// training.
-async fn train(mut args: TrainArgs) -> Result<u64> {
+/// What `train --json` prints at the end of a run. A loss that was never
+/// measured is NaN, which serializes as null.
+#[derive(serde::Serialize, Debug)]
+struct TrainSummary {
+    steps: usize,
+    first_loss: Option<f32>,
+    final_loss: f32,
+    eval_loss_before: Option<f32>,
+    eval_loss_after: Option<f32>,
+    /// Peak of the GPU buffers Ferrotensor tracks, without the driver context.
+    measured_peak_mib: u64,
+    seconds: f32,
+    out_dir: PathBuf,
+    /// `None` on ranks other than 0, which save nothing.
+    adapter: Option<PathBuf>,
+}
+
+/// Runs `train` and returns its summary.
+async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
     if args.lite {
         // Explicit flags win; only defaults are replaced.
         if args.data.seq_len == 256 {
@@ -1075,18 +1228,19 @@ async fn train(mut args: TrainArgs) -> Result<u64> {
         }
     }
     if args.batch_size == 0 || args.grad_accum == 0 || args.lora_rank == 0 {
-        return Err("--batch-size, --grad-accum and --lora-rank must be positive".into());
+        return Err(unmet(
+            "--batch-size, --grad-accum and --lora-rank must be positive",
+        ));
     }
     if args.world_size == 0 || args.rank >= args.world_size {
-        return Err(format!(
+        return Err(unmet(format!(
             "--rank {} must be below --world-size {}",
             args.rank, args.world_size
-        )
-        .into());
+        )));
     }
     let distributed = args.world_size > 1;
     if distributed && args.resume.is_some() {
-        return Err("--resume is not supported with --world-size > 1 yet".into());
+        return Err(unmet("--resume is not supported with --world-size > 1 yet"));
     }
     let is_root = args.rank == 0;
 
@@ -1267,18 +1421,22 @@ async fn train(mut args: TrainArgs) -> Result<u64> {
         .append(true)
         .open(&metrics_path)?;
 
-    if let Some(ds) = &eval_ds {
-        let (loss, tokens) = evaluate(&base, &trainer.model, ds, args.eval_samples).await;
-        eprintln!(
-            "eval before: loss {loss:.4} ppl {:.3} ({tokens} tokens)",
-            loss.exp()
-        );
-        writeln!(
-            metrics,
-            "{}",
-            serde_json::json!({"step": start_step, "eval_loss": loss})
-        )?;
-    }
+    let eval_loss_before = match &eval_ds {
+        Some(ds) => {
+            let (loss, tokens) = evaluate(&base, &trainer.model, ds, args.eval_samples).await;
+            eprintln!(
+                "eval before: loss {loss:.4} ppl {:.3} ({tokens} tokens)",
+                loss.exp()
+            );
+            writeln!(
+                metrics,
+                "{}",
+                serde_json::json!({"step": start_step, "eval_loss": loss})
+            )?;
+            Some(loss)
+        }
+        None => None,
+    };
 
     let save = |trainer: &Trainer, step: usize, best: Option<f32>| -> Result<()> {
         if !is_root {
@@ -1460,31 +1618,44 @@ async fn train(mut args: TrainArgs) -> Result<u64> {
         eprintln!("metrics: {}", metrics_path.display());
     }
 
-    if let Some(ds) = &eval_ds {
-        let (loss, tokens) = evaluate(&base, &trainer.model, ds, args.eval_samples).await;
-        eprintln!(
-            "eval after: loss {loss:.4} ppl {:.3} ({tokens} tokens)",
-            loss.exp()
-        );
-        writeln!(
-            metrics,
-            "{}",
-            serde_json::json!({"step": step, "eval_loss": loss})
-        )?;
-    }
+    let eval_loss_after = match &eval_ds {
+        Some(ds) => {
+            let (loss, tokens) = evaluate(&base, &trainer.model, ds, args.eval_samples).await;
+            eprintln!(
+                "eval after: loss {loss:.4} ppl {:.3} ({tokens} tokens)",
+                loss.exp()
+            );
+            writeln!(
+                metrics,
+                "{}",
+                serde_json::json!({"step": step, "eval_loss": loss})
+            )?;
+            Some(loss)
+        }
+        None => None,
+    };
 
     if let Some(prompt) = &args.sample_prompt {
         let ids = base.tokenizer.encode_chat(None, prompt);
         let mut sampler = Sampler::new(0.0, 0, 1.0, None);
         eprintln!("sample ({prompt:?}):");
         generate_tokens(&base, &trainer.model, &ids, 96, &mut sampler, true, |t| {
-            print!("{t}");
-            let _ = std::io::stdout().flush();
+            stream_text(t, args.json);
         })
         .await;
-        println!();
+        stream_text("\n", args.json);
     }
-    Ok(peak_bytes)
+    Ok(TrainSummary {
+        steps: step,
+        first_loss,
+        final_loss: last_loss,
+        eval_loss_before,
+        eval_loss_after,
+        measured_peak_mib: peak_bytes.div_ceil(MIB),
+        seconds: elapsed.as_secs_f32(),
+        out_dir: args.out,
+        adapter: is_root.then_some(adapter_path),
+    })
 }
 
 #[cfg(test)]
@@ -1923,5 +2094,103 @@ mod tests {
             loaded_line(p, 8, Some(&lora_meta())),
             "lora:   out/x.safetensors (8 tensors)"
         );
+    }
+
+    #[test]
+    fn exit_codes_are_0_1_2_and_unmet_errors_exit_with_2() {
+        assert_eq!(
+            [
+                Exit::Success as i32,
+                Exit::RuntimeError as i32,
+                Exit::Unmet as i32
+            ],
+            [0, 1, 2]
+        );
+        let invalid = unmet("--seq-len must be at least 2");
+        assert_eq!(Exit::for_error(invalid.as_ref()), Exit::Unmet);
+        assert_eq!(invalid.to_string(), "--seq-len must be at least 2");
+        let runtime: Box<dyn std::error::Error> = "the GPU device was lost".into();
+        assert_eq!(Exit::for_error(runtime.as_ref()), Exit::RuntimeError);
+        let no_adapter: Box<dyn std::error::Error> = Box::new(ContextError::NoAdapter {
+            backends: ferrotensor_backend::wgpu::Backends::VULKAN,
+            force_fallback_adapter: false,
+        });
+        assert_eq!(Exit::for_error(no_adapter.as_ref()), Exit::Unmet);
+    }
+
+    #[test]
+    fn train_summary_json_has_every_field_and_nan_as_null() {
+        let summary = TrainSummary {
+            steps: 2,
+            first_loss: Some(4.5),
+            final_loss: f32::NAN,
+            eval_loss_before: None,
+            eval_loss_after: Some(3.25),
+            measured_peak_mib: 1400,
+            seconds: 1.5,
+            out_dir: PathBuf::from("runs/a"),
+            adapter: Some(PathBuf::from("runs/a/lora_adapters.safetensors")),
+        };
+        assert_eq!(
+            serde_json::to_value(&summary).unwrap(),
+            serde_json::json!({
+                "steps": 2,
+                "first_loss": 4.5,
+                "final_loss": null,
+                "eval_loss_before": null,
+                "eval_loss_after": 3.25,
+                "measured_peak_mib": 1400,
+                "seconds": 1.5,
+                "out_dir": "runs/a",
+                "adapter": "runs/a/lora_adapters.safetensors",
+            })
+        );
+    }
+
+    #[test]
+    fn eval_and_generate_summaries_serialize_their_fields() {
+        let eval = EvalSummary {
+            examples: 3,
+            tokens: 40,
+            loss: 2.0,
+            perplexity: 7.5,
+            seconds: 0.25,
+        };
+        assert_eq!(
+            serde_json::to_value(&eval).unwrap(),
+            serde_json::json!({
+                "examples": 3, "tokens": 40, "loss": 2.0, "perplexity": 7.5, "seconds": 0.25,
+            })
+        );
+        let generate = GenerateSummary {
+            text: "w5 w6".to_string(),
+            prompt_tokens: 3,
+            new_tokens: 2,
+            tokens_per_second: 8.0,
+            kv_cache: true,
+        };
+        assert_eq!(
+            serde_json::to_value(&generate).unwrap(),
+            serde_json::json!({
+                "text": "w5 w6", "prompt_tokens": 3, "new_tokens": 2,
+                "tokens_per_second": 8.0, "kv_cache": true,
+            })
+        );
+    }
+
+    #[test]
+    fn json_flag_parses_on_every_command_that_takes_it() {
+        for command in ["train", "finetune", "eval"] {
+            let cli = parse(&[command, "--model", "m", "--data", "d.jsonl", "--json"]).unwrap();
+            let json = match cli.command {
+                Command::Train(args) => args.json,
+                Command::Finetune(args) => args.train.json,
+                Command::Eval(args) => args.json,
+                _ => false,
+            };
+            assert!(json, "{command}");
+        }
+        let cli = parse(&["generate", "--model", "m", "--json"]).unwrap();
+        assert!(matches!(cli.command, Command::Generate(args) if args.json));
     }
 }

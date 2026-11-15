@@ -1,0 +1,29 @@
+# Ferrotensor
+
+> Ferrotensor is a Rust framework for tensors, autograd and LoRA fine-tuning of small language models on the GPU through wgpu and WGSL kernels (Vulkan, Metal or DX12, no CUDA). The `ferrotensor` command plans, trains, evaluates and samples LoRA adapters for Llama-style models; every command that reports a result takes `--json` and uses the same exit codes.
+
+## Start here
+
+- [README](README.md): what Ferrotensor is, install, quickstart, measured results
+- [AGENTS.md](AGENTS.md): the CLI for coding agents and scripts: JSON output per command, exit codes, picking a model, rules for changing the code
+- [CLI reference](ferrotensor-cli/README.md): every `ferrotensor` command and flag group, with measured memory numbers
+
+## Guides
+
+- [LoRA SFT walkthrough](docs/examples/lora-sft.md): fine-tune, evaluate and sample SmolLM2 end to end, with real output
+- [Adapters in PyTorch](docs/examples/peft-export.md): export a LoRA adapter as a Hugging Face PEFT directory
+- [Text classification](docs/examples/classify.md): LoRA fine-tuning of a decoder as a classifier
+- [Testing on your GPU](docs/testing-on-your-gpu.md): check that the kernels pass on a GPU and report the result
+- [Use cases](docs/use-cases.md): runnable programs with the tensor API
+
+## Internals
+
+- [Architecture](docs/architecture.md): one tensor op from the Rust API to a WGSL kernel, GPU op batching, and how the crates fit together
+- [Writing a kernel](docs/writing-a-kernel.md): adding a GPU op
+- [Contributing](CONTRIBUTING.md): setup, tests and the PR process
+
+## Optional
+
+- [Changelog](CHANGELOG.md)
+- [Kernel benchmarks](benchmarks/RESULTS.md)
+- [Mac benchmark harness](docs/benchmarks-mac.md)

@@ -2,6 +2,7 @@
 //! expected to fit this machine's GPU memory, from a first-principles
 //! estimate calibrated on measured peaks.
 
+use crate::Exit;
 use clap::{Args, ValueEnum};
 use ferrotensor_backend::adapters::{self, AdapterReport};
 use ferrotensor_loader::{Lfm2Config, ModelLoader};
@@ -553,25 +554,29 @@ pub fn train_command(model: &str, config: &TrainConfig) -> String {
     )
 }
 
+/// The `chosen` object of `plan --json`, which `finetune --json` repeats.
+pub fn chosen_json(config: &TrainConfig) -> Value {
+    json!({
+        "batch_size": config.batch_size,
+        "seq_len": config.seq_len,
+        "rank": config.lora_rank,
+        "precision": config.precision.as_str(),
+        "checkpoint_blocks": config.checkpointing == Checkpointing::Blocks,
+    })
+}
+
 fn plan_json(shape: &ModelShape, model_arg: &str, plan: &Plan) -> Map<String, Value> {
-    let c = &plan.config;
     let mut fields = Map::new();
     fields.insert("model".into(), json!(shape.name));
     fields.insert("parameters".into(), json!(shape.parameters()));
-    fields.insert(
-        "chosen".into(),
-        json!({
-            "batch_size": c.batch_size,
-            "seq_len": c.seq_len,
-            "rank": c.lora_rank,
-            "precision": c.precision.as_str(),
-            "checkpoint_blocks": c.checkpointing == Checkpointing::Blocks,
-        }),
-    );
+    fields.insert("chosen".into(), chosen_json(&plan.config));
     fields.insert("estimated_peak_mib".into(), json!(plan.estimate.peak_mib));
     fields.insert("margin".into(), json!(SAFETY_MARGIN));
     fields.insert("fits".into(), json!(plan.fits));
-    fields.insert("train_command".into(), json!(train_command(model_arg, c)));
+    fields.insert(
+        "train_command".into(),
+        json!(train_command(model_arg, &plan.config)),
+    );
     fields
 }
 
@@ -603,18 +608,10 @@ fn millions(parameters: u64) -> String {
     format!("{:.1}M", parameters as f64 / 1e6)
 }
 
-/// Whether `plan` found a configuration that fits.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Outcome {
-    /// A plan fits (exit code 0).
-    Fits,
-    /// Nothing fits (exit code 2).
-    DoesNotFit,
-}
-
 /// What one run of `plan` prints besides the adapter and budget.
 struct Report {
-    outcome: Outcome,
+    /// [`Exit::Success`] when a plan fits, [`Exit::Unmet`] when none does.
+    exit: Exit,
     fields: Map<String, Value>,
     lines: Vec<String>,
     notes: Vec<String>,
@@ -626,7 +623,7 @@ struct Report {
 ///
 /// When no GPU adapter is found and no budget is given, or `--model` has
 /// no readable config.json.
-pub fn run(args: PlanArgs) -> Result<Outcome, Box<dyn std::error::Error>> {
+pub fn run(args: PlanArgs) -> Result<Exit, Box<dyn std::error::Error>> {
     let (adapter, budget) = machine_budget(&args.budget)?;
     let pinned = Pinned {
         seq_len: args.seq_len,
@@ -648,13 +645,13 @@ pub fn run(args: PlanArgs) -> Result<Outcome, Box<dyn std::error::Error>> {
         out.insert("budget_source".into(), json!(budget.source.as_str()));
         out.extend(report.fields);
         out.insert("notes".into(), json!(report.notes));
-        println!("{}", serde_json::to_string_pretty(&Value::Object(out))?);
+        crate::print_json(&out)?;
     } else {
         for line in human_lines(adapter.as_ref(), &budget, &report) {
             println!("{line}");
         }
     }
-    Ok(report.outcome)
+    Ok(report.exit)
 }
 
 /// A plan for training one model, as `ferrotensor finetune` uses it.
@@ -700,7 +697,9 @@ fn machine_budget(
 ) -> Result<(Option<AdapterReport>, Budget), Box<dyn std::error::Error>> {
     let adapter = adapters::list_adapters().into_iter().find(|a| a.selected);
     if adapter.is_none() && flags.memory_mib.is_none() && flags.vram_mib.is_none() {
-        return Err("no GPU adapter found; pass --memory-mib to plan for another machine".into());
+        return Err(crate::unmet(
+            "no GPU adapter found; pass --memory-mib to plan for another machine",
+        ));
     }
     let budget = budget(
         flags,
@@ -756,7 +755,7 @@ fn plan_model(
 ) -> Result<(Plan, Report), Box<dyn std::error::Error>> {
     let config_path = dir.join("config.json");
     let config = ModelLoader::load_config(&config_path)
-        .map_err(|e| format!("cannot read {}: {e}", config_path.display()))?;
+        .map_err(|e| crate::unmet(format!("cannot read {}: {e}", config_path.display())))?;
     let model_arg = dir.display().to_string();
     let shape = ModelShape::from_config(model_arg.clone(), &config);
     let plan = choose(&shape, budget_mib, precision, lora_rank, pinned);
@@ -804,10 +803,10 @@ fn plan_model(
         format!("command   {}", train_command(&model_arg, &plan.config)),
     ];
     let report = Report {
-        outcome: if plan.fits {
-            Outcome::Fits
+        exit: if plan.fits {
+            Exit::Success
         } else {
-            Outcome::DoesNotFit
+            Exit::Unmet
         },
         fields: plan_json(&shape, &model_arg, &plan),
         lines,
@@ -842,11 +841,7 @@ fn plan_documented(args: &PlanArgs, budget_mib: u64, pinned: Pinned) -> Report {
     let mut fields = Map::new();
     fields.insert("models".into(), Value::Array(models));
     Report {
-        outcome: if any_fits {
-            Outcome::Fits
-        } else {
-            Outcome::DoesNotFit
-        },
+        exit: if any_fits { Exit::Success } else { Exit::Unmet },
         fields,
         lines,
         notes,
