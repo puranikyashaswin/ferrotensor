@@ -1,7 +1,8 @@
 # ferrotensor-cli
 
 The `ferrotensor-cli` command line for [Ferrotensor](../README.md): LoRA fine-tuning
-(`finetune`, `train`), evaluation (`eval`) and sampling (`generate`, alias `infer`) for
+(`finetune`, `train`), evaluation (`eval`), sampling (`generate`, alias `infer`) and
+conversation (`chat`) for
 small Llama-style models such as SmolLM2 and TinyLlama, on the GPU through
 wgpu (Vulkan, Metal or DX12). It has been tested on an NVIDIA A10G (24 GB)
 through Vulkan, an Apple M2 (8 GB) through Metal, and software Vulkan (Mesa
@@ -39,6 +40,11 @@ cargo run -p ferrotensor-cli --release -- generate \
   --lora ./data/runs/sft/lora_adapters.safetensors \
   --prompt "Give three tips for staying healthy." --temperature 0.7 --top-p 0.9
 
+# Talk to the fine-tuned model, one message per line (see below)
+cargo run -p ferrotensor-cli --release -- chat \
+  --model ./data/models/SmolLM2-135M \
+  --lora ./data/runs/sft/lora_adapters.safetensors
+
 # Held-out loss and perplexity
 cargo run -p ferrotensor-cli --release -- eval \
   --model ./data/models/SmolLM2-135M --data ./data/alpaca/val.jsonl \
@@ -70,8 +76,9 @@ A full walkthrough with measured numbers is in
 `plan`, `finetune`, `train`, `eval`, `generate` and `info` take `--json`:
 stdout then carries one JSON object when the command ends, and progress and
 other text go to stderr (`generate` streams its text there too). On an error
-stdout carries `{"error": "<message>"}`. The keys of each object are listed in
-[AGENTS.md](../AGENTS.md#json-output).
+stdout carries `{"error": "<message>"}`. `chat --json` is the exception: it
+prints one JSON object per reply, each on its own line. The keys of each
+object are listed in [AGENTS.md](../AGENTS.md#json-output).
 
 Every command exits with 0 on success, 1 on a runtime error (I/O, the GPU, a
 kernel out of tolerance) and 2 when the input is invalid or this machine
@@ -369,3 +376,38 @@ Quantized bases (`quantization` or `quantization_config` in `config.json`,
 or `.scales` tensors), files of trained base weights, and adapter tensors
 whose base weight is missing or has another shape are refused before
 anything is written.
+
+## Talk to a model: `chat`
+
+`chat` holds a multi-turn conversation with a base model or, with `--lora`,
+a fine-tuned one. It reads one user message per line of stdin and streams
+each reply as it is generated:
+
+```bash
+cargo run -p ferrotensor-cli --release -- chat \
+  --model ./data/models/SmolLM2-135M \
+  --lora ./data/runs/sft/lora_adapters.safetensors \
+  --system "Answer in one sentence."
+```
+
+`/reset` clears the conversation, and `/exit`, `/quit` or the end of input
+ends it. After each reply stderr gets the same line `generate` prints (prompt
+tokens, new tokens, tokens per second). `--temperature`, `--top-k`,
+`--top-p`, `--seed` and `--max-new-tokens` work as in `generate`.
+
+Each turn re-encodes and re-runs the whole conversation in ChatML: the
+system message, then the user and assistant turns, then the assistant
+header. When the conversation and `--max-new-tokens` no longer fit the
+model's `max_position_embeddings` (from `config.json`), the oldest
+exchanges are dropped, the system message is kept, and stderr says so
+once. A single message that does not fit alone is an error (exit code 2).
+A model without a `max_position_embeddings` entry is not trimmed.
+
+Only models whose tokenizer has the ChatML tokens `<|im_start|>` and
+`<|im_end|>` are supported for now (SmolLM2 has them); for other models
+`chat` exits with 2, and `generate --raw` takes a prompt verbatim.
+
+Input can be piped, which is how scripts and the tests drive it. With
+`--json` each reply is one JSON object per line on stdout,
+`{"reply", "prompt_tokens", "new_tokens", "tokens_per_second"}`, and the
+streamed text goes to stderr.

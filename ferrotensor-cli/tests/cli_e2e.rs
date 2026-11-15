@@ -5,14 +5,35 @@
 
 mod common;
 
+use std::io::Write as _;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 fn ferrotensor(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_ferrotensor"))
         .args(args)
         .output()
         .expect("run the ferrotensor binary")
+}
+
+/// Run the binary with `input` piped to its stdin.
+fn ferrotensor_with_input(args: &[&str], input: &str) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ferrotensor"))
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run the ferrotensor binary");
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(input.as_bytes())
+        .expect("write stdin");
+    child
+        .wait_with_output()
+        .expect("wait for the ferrotensor binary")
 }
 
 fn text(bytes: &[u8]) -> String {
@@ -695,4 +716,134 @@ fn merge_writes_a_model_directory_and_refuses_a_non_empty_output() {
         report,
         serde_json::json!({ "out_dir": s(&json_out), "merged": 2, "copied": 18 })
     );
+}
+
+#[test]
+fn chat_on_a_missing_model_exits_with_2() {
+    let tmp = common::TempDir::new("chat-missing");
+    let missing = tmp.path().join("does-not-exist");
+    let out = ferrotensor(&["chat", "--model", s(&missing)]);
+    let stderr = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
+    assert!(stderr.contains("does not exist"), "stderr: {stderr}");
+
+    // One compact line, like the reply objects.
+    let out = ferrotensor(&["chat", "--model", s(&missing), "--json"]);
+    assert_eq!(out.status.code(), Some(2));
+    let stdout = text(&out.stdout);
+    assert_eq!(stdout.lines().count(), 1, "stdout: {stdout}");
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("error json");
+    let error = json["error"].as_str().expect("error string");
+    assert!(error.contains(s(&missing)), "{error}");
+}
+
+/// A temp directory holding a tiny model whose tokenizer has the ChatML
+/// tokens.
+fn chatml_model_dir(tag: &str) -> common::TempDir {
+    let dir = common::TempDir::new(tag);
+    common::write_tiny_llama(dir.path());
+    common::write_tiny_chatml_tokenizer(dir.path());
+    dir
+}
+
+/// Run `chat` with up to 4 new tokens per reply on the lines of `input`.
+fn chat(model: &Path, extra: &[&str], input: &str) -> Output {
+    let mut args = vec![
+        "chat",
+        "--model",
+        s(model),
+        "--max-new-tokens",
+        "4",
+        "--seed",
+        "1",
+    ];
+    args.extend_from_slice(extra);
+    ferrotensor_with_input(&args, input)
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn chat_answers_each_line_until_exit() {
+    let model = chatml_model_dir("chat-model");
+    // The line after /exit is never read.
+    let run = chat(model.path(), &[], "w5 w6\nw7\n/exit\nw8\n");
+    assert_success(&run);
+    let stderr = text(&run.stderr);
+    // <|im_start|> user w5 w6 <|im_end|> <|im_start|> assistant, where the
+    // tiny vocabulary reads "user" and "assistant" as <unk>.
+    assert!(stderr.contains("[7 prompt + "), "stderr: {stderr}");
+    assert_eq!(
+        stderr.matches(" new tokens, ").count(),
+        2,
+        "stderr: {stderr}"
+    );
+
+    // After /reset the same line gives the same prompt again.
+    let run = chat(model.path(), &["--json"], "w5 w6\n/reset\nw5 w6\n");
+    assert_success(&run);
+    let stdout = text(&run.stdout);
+    let replies: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("one JSON object per line"))
+        .collect();
+    assert_eq!(replies.len(), 2, "stdout: {stdout}");
+    let stderr = text(&run.stderr);
+    for reply in &replies {
+        let mut keys: Vec<&str> = reply
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["new_tokens", "prompt_tokens", "reply", "tokens_per_second"]
+        );
+        assert_eq!(reply["prompt_tokens"], 7, "{reply}");
+        assert!(
+            reply["new_tokens"].as_u64().is_some_and(|n| n <= 4),
+            "{reply}"
+        );
+        let streamed = reply["reply"].as_str().expect("reply text");
+        assert!(stderr.contains(streamed), "{reply}\nstderr: {stderr}");
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn chat_drops_the_oldest_turns_and_refuses_a_message_that_cannot_fit() {
+    let model = chatml_model_dir("chat-trim");
+    let config_path = model.path().join("config.json");
+    let mut config = read_json(&config_path);
+    config["max_position_embeddings"] = serde_json::json!(18);
+    std::fs::write(&config_path, config.to_string()).expect("write config");
+    // 18 positions less 4 new tokens leave 14 for the prompt. The second
+    // message alone is 8 tokens; the third alone is 20.
+    let long = vec!["w9"; 15].join(" ");
+    let run = chat(model.path(), &[], &format!("w5 w6\nw7 w8 w9\n{long}\n"));
+    let stderr = text(&run.stderr);
+    assert_eq!(run.status.code(), Some(2), "stderr: {stderr}");
+    assert!(stderr.contains("[7 prompt + "), "stderr: {stderr}");
+    assert!(stderr.contains("[8 prompt + "), "stderr: {stderr}");
+    assert_eq!(
+        stderr.matches("dropped the oldest turns").count(),
+        1,
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("does not fit the model's 18 positions"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn chat_refuses_a_tokenizer_without_chatml_tokens() {
+    let model = model_dir("chat-no-chatml");
+    let run = ferrotensor_with_input(&["chat", "--model", s(model.path())], "");
+    let stderr = text(&run.stderr);
+    assert_eq!(run.status.code(), Some(2), "stderr: {stderr}");
+    assert!(stderr.contains("ChatML models only"), "stderr: {stderr}");
+    assert!(stderr.contains("generate --raw"), "stderr: {stderr}");
 }

@@ -23,7 +23,11 @@ A model is a Hugging Face checkpoint directory with `config.json`,
 ferrotensor plan --model DIR --json                       # what fits this GPU
 ferrotensor finetune --model DIR --data train.jsonl --json # train with that plan
 ferrotensor eval --model DIR --data val.jsonl --lora outputs/run/lora_adapters.safetensors --json
+ferrotensor chat --model DIR --lora outputs/run/lora_adapters.safetensors --json < questions.txt
 ```
+
+`chat` needs a ChatML model such as SmolLM2 (TinyLlama's tokenizer lacks the
+tokens); `generate --raw` works with any model.
 
 `finetune` writes into `--out` (default `outputs/run`): `lora_adapters.safetensors`,
 its `.state.json` and `.state.safetensors` for `--resume`, `metrics.jsonl` and
@@ -51,8 +55,14 @@ is `null`. On an error stdout carries `{"error": "<message>"}` instead.
 | `train` | `steps`, `first_loss`, `final_loss`, `eval_loss_before`, `eval_loss_after` (null without `--eval-data`), `measured_peak_mib`, `seconds`, `out_dir`, `adapter` |
 | `eval` | `examples`, `tokens`, `loss`, `perplexity`, `seconds` |
 | `generate` | `text`, `prompt_tokens`, `new_tokens`, `tokens_per_second`, `kv_cache` |
+| `chat` | one object per reply, each on its own line: `reply`, `prompt_tokens`, `new_tokens`, `tokens_per_second` |
 | `merge` | `out_dir`, `merged` (tensors with the adapter added), `copied` (tensors copied byte for byte) |
 | `info` | `ferrotensor`, `os`, `arch`, `adapters` (one object per GPU, `selected` marks the one used), `checks` (null without `--check`), and `error` only on failure |
+
+`chat` is the one command that prints more than one object: it reads one
+user message per line of stdin and writes one JSON line per reply, so read
+stdout line by line. An error ends the session with a one-line
+`{"error": ...}` object.
 
 `measured_peak_mib` counts the GPU buffers Ferrotensor tracks, not the driver
 context, so it is below what `nvidia-smi` shows. `classify-train`,
@@ -70,7 +80,9 @@ no `--json`.
 
 Code 2 covers: a missing model directory, `config.json` or data file; a flag
 value out of range; a dataset with no usable examples; no GPU adapter;
-`plan` or `finetune` finding no configuration that fits; and `merge`
+`plan` or `finetune` finding no configuration that fits; `chat`
+refusing a tokenizer without ChatML tokens or a message longer than the
+model's context; and `merge`
 refusing its input (a non-empty `--out`, a quantized base, an adapter that
 does not match the base). clap's usage errors
 also exit with 2, with the usage text on stderr and nothing on stdout.

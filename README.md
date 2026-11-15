@@ -253,7 +253,7 @@ tensor op reaches a WGSL kernel, are in [docs/architecture.md](docs/architecture
 | [`ferrotensor-graph`](ferrotensor-graph) | Transformer building blocks and the Llama/LFM2-style model builder |
 | [`ferrotensor-loader`](ferrotensor-loader) | Safetensors (single and sharded) and tokenizer loading |
 | [`ferrotensor-trainer`](ferrotensor-trainer) | Training loops, LoRA, checkpoints, an optional `GradScaler` |
-| [`ferrotensor-cli`](ferrotensor-cli) | The `ferrotensor` command: `train`, `eval`, `generate` (alias `infer`), `export-adapter`, `merge`, `info`, `classify-train`, `classify-predict`, `monitor`, `demo` |
+| [`ferrotensor-cli`](ferrotensor-cli) | The `ferrotensor` command: `train`, `eval`, `generate` (alias `infer`), `chat`, `export-adapter`, `merge`, `info`, `classify-train`, `classify-predict`, `monitor`, `demo` |
 | [`ferrotensor-monitor`](ferrotensor-monitor) | Terminal dashboard |
 | [`ferrotensor-hub`](ferrotensor-hub) | Hugging Face Hub download helpers |
 | [`ferrotensor-py`](ferrotensor-py) | Python bindings for the `ferrotensor` crate (not published to crates.io) |
@@ -267,10 +267,18 @@ and a chat template for SFT) and can run short pretraining on `.txt` or packed
 
 ```bash
 cargo run -p ferrotensor-cli --release -- finetune \
-  --model ./models/tinyllama \
+  --model ./models/SmolLM2-135M \
   --data ./data/train.jsonl \
   --out ./outputs/run1
+
+# then talk to the result, one message per line
+cargo run -p ferrotensor-cli --release -- chat \
+  --model ./models/SmolLM2-135M \
+  --lora ./outputs/run1/lora_adapters.safetensors
 ```
+
+`chat` needs a tokenizer with the ChatML tokens for now (SmolLM2 has them,
+TinyLlama does not); `generate --raw` works with any model.
 
 `finetune` picks the batch size, sequence length, gradient accumulation and
 block checkpointing that fit this machine's GPU memory, prints that plan,
@@ -278,8 +286,9 @@ then trains. `train` sets nothing for you; use it to choose every setting
 by hand.
 
 For scripts and coding agents, `plan`, `finetune`, `train`, `eval`,
-`generate` and `info` take `--json` and print one JSON object, and exit codes
-are the same across commands; [AGENTS.md](AGENTS.md) lists both.
+`generate` and `info` take `--json` and print one JSON object (`chat` prints
+one per reply), and exit codes are the same across commands;
+[AGENTS.md](AGENTS.md) lists both.
 
 `--help` lists every flag. A step-by-step walkthrough with real output is in
 [docs/examples/lora-sft.md](docs/examples/lora-sft.md).

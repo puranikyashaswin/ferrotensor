@@ -121,6 +121,9 @@ pub struct Lfm2Config {
     /// Per-head dimension when it is not `hidden_size / num_attention_heads`.
     #[serde(default)]
     pub head_dim: Option<usize>,
+    /// Longest sequence, in tokens, the model was trained on, if set.
+    #[serde(default)]
+    pub max_position_embeddings: Option<usize>,
 }
 
 fn default_norm_eps() -> f32 {
