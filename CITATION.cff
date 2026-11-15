@@ -11,8 +11,8 @@ abstract: >-
   It has been tested on an NVIDIA A10G, an Apple M2 and software Vulkan;
   other GPUs are untested.
 authors:
-  - given-names: Puranik Yashaswin
-    family-names: Sharma
+  - given-names: Yashaswin Sharma
+    family-names: Puranik
     email: puranikyashaswinsharma@gmail.com
 repository-code: "https://github.com/puranikyashaswin/ferrotensor"
 url: "https://github.com/puranikyashaswin/ferrotensor"
