@@ -52,7 +52,7 @@ fn check_json(r: &CheckResult) -> Value {
 pub fn run(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
     let adapters = adapters::list_adapters();
     let checks = if args.check && adapters.iter().any(|a| a.selected) {
-        let ctx = pollster::block_on(WgpuContext::new());
+        let ctx = pollster::block_on(WgpuContext::try_new())?;
         Some(pollster::block_on(adapters::self_check(&ctx)))
     } else {
         None

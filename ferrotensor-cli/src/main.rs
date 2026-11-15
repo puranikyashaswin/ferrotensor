@@ -486,7 +486,7 @@ async fn load_base(args: &ModelArgs) -> Result<Loaded> {
         ),
         Device::Cpu => (ferrotensor_backend::wgpu::PowerPreference::LowPower, true),
     };
-    let ctx = Arc::new(WgpuContext::new_with_options(power, fallback).await);
+    let ctx = Arc::new(WgpuContext::try_new_with_options(power, fallback).await?);
     let engine = Arc::new(ComputeEngine::new(&ctx));
     eprintln!("device: {}", ctx.adapter_info());
     eprintln!(
