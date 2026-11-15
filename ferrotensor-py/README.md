@@ -46,6 +46,7 @@ y.backward()
 print(x.grad)  # tensor([[7.0, 11.0], [9.0, 13.0]])
 
 # A model, a loss and an optimizer: learn XOR
+ft.manual_seed(0)  # fixes the initial weights, so the output below repeats
 model = nn.Sequential(nn.Linear(2, 16), nn.Tanh(), nn.Linear(16, 2))
 opt = optim.AdamW(model.parameters(), lr=0.05, weight_decay=0.0)
 inputs = ft.tensor([[0, 0], [0, 1], [1, 0], [1, 1]])
