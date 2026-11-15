@@ -14,7 +14,9 @@ pub struct Tokenizer {
     pub vocab: HashMap<String, u32>,
     /// Id to token string.
     pub id_to_token: HashMap<u32, String>,
-    /// Beginning-of-sequence token id.
+    /// Beginning-of-sequence token id: the `bos_token` of the
+    /// `tokenizer_config.json` beside `tokenizer.json` when it names one,
+    /// else `<|im_start|>`, else `<s>`, else 1.
     pub bos_token_id: u32,
     /// End-of-sequence token id.
     pub eos_token_id: u32,
@@ -40,14 +42,16 @@ struct TokenizerModel {
 impl Tokenizer {
     /// Load tokenizer from tokenizer.json
     ///
-    /// Fails, with a message naming the file, if it is missing, is not a
-    /// regular file, is too large, is not valid, or has an empty vocabulary.
+    /// Fails, with a message naming the file, if it or the
+    /// `tokenizer_config.json` beside it is not a regular file, is too large
+    /// or is not valid, or if the vocabulary is empty.
     /// In the fallback reader (a plain `model.vocab` map) two tokens sharing
     /// one id are rejected; gaps between ids are fine.
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, String> {
         let path = path.as_ref();
         let file = crate::open_regular_file(path, Some(MAX_TOKENIZER_FILE_BYTES))
             .map_err(|e| format!("Failed to read tokenizer.json: {e}"))?;
+        let declared_bos = declared_bos_token(path)?;
 
         if let Ok(hf_tokenizer) = tokenizers::Tokenizer::from_file(path) {
             drop(file);
@@ -57,8 +61,10 @@ impl Tokenizer {
             }
             let id_to_token: HashMap<u32, String> =
                 vocab.iter().map(|(k, v)| (*v, k.clone())).collect();
-            let bos_token_id = hf_tokenizer
-                .token_to_id("<|im_start|>")
+            let bos_token_id = declared_bos
+                .as_deref()
+                .and_then(|token| hf_tokenizer.token_to_id(token))
+                .or_else(|| hf_tokenizer.token_to_id("<|im_start|>"))
                 .or_else(|| hf_tokenizer.token_to_id("<s>"))
                 .unwrap_or(1);
             let eos_token_id = hf_tokenizer
@@ -98,9 +104,10 @@ impl Tokenizer {
             }
         }
 
-        // Find special tokens
-        let bos_token_id = *vocab
-            .get("<|im_start|>")
+        let bos_token_id = *declared_bos
+            .as_deref()
+            .and_then(|token| vocab.get(token))
+            .or_else(|| vocab.get("<|im_start|>"))
             .or_else(|| vocab.get("<s>"))
             .unwrap_or(&1);
         let eos_token_id = *vocab
@@ -230,6 +237,25 @@ impl Tokenizer {
     pub fn encode_conversation(&self, system: Option<&str>, turns: &[impl AsRef<str>]) -> Vec<u32> {
         self.encode(&Self::conversation_prompt(system, turns))
     }
+}
+
+/// The `bos_token` that the `tokenizer_config.json` beside `tokenizer_path`
+/// declares, as a string or as an added-token object; `None` when the file
+/// is absent or declares none (`null` or no key).
+fn declared_bos_token(tokenizer_path: &Path) -> Result<Option<String>, String> {
+    let config_path = tokenizer_path.with_file_name("tokenizer_config.json");
+    if !config_path.exists() {
+        return Ok(None);
+    }
+    let file = crate::open_regular_file(&config_path, Some(MAX_TOKENIZER_FILE_BYTES))
+        .map_err(|e| format!("Failed to read tokenizer_config.json: {e}"))?;
+    let config: serde_json::Value = serde_json::from_reader(std::io::BufReader::new(file))
+        .map_err(|e| format!("Failed to parse {}: {e}", config_path.display()))?;
+    let bos = &config["bos_token"];
+    Ok(bos
+        .as_str()
+        .or_else(|| bos["content"].as_str())
+        .map(str::to_owned))
 }
 
 /// Next-token sampler: temperature, top-k and nucleus (top-p) filtering.
@@ -429,6 +455,103 @@ mod tests {
             pad_token_id: 0,
             hf_tokenizer: Some(Arc::new(hf)),
         })
+    }
+
+    type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Writes `tokenizer` as `tokenizer.json`, and `config` as
+    /// `tokenizer_config.json` when given, into a fresh temp dir, then loads it.
+    fn load_with_config(
+        tag: &str,
+        tokenizer: &serde_json::Value,
+        config: Option<&str>,
+    ) -> Result<Tokenizer, Box<dyn std::error::Error + Send + Sync>> {
+        let dir = std::env::temp_dir().join(format!(
+            "ferrotensor-tokenizer-{tag}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("tokenizer.json"), tokenizer.to_string())?;
+        if let Some(config) = config {
+            std::fs::write(dir.join("tokenizer_config.json"), config)?;
+        }
+        let loaded = Tokenizer::from_file(dir.join("tokenizer.json"));
+        std::fs::remove_dir_all(&dir)?;
+        loaded.map_err(Into::into)
+    }
+
+    /// A word-level Hugging Face tokenizer: `<|endoftext|>` 0,
+    /// `<|im_start|>` 1, `<|im_end|>` 2, `Hi` 3.
+    fn endoftext_chatml_json() -> serde_json::Value {
+        let vocab =
+            serde_json::json!({"<|endoftext|>": 0, "<|im_start|>": 1, "<|im_end|>": 2, "Hi": 3});
+        serde_json::json!({
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [],
+            "normalizer": null,
+            "pre_tokenizer": { "type": "Whitespace" },
+            "post_processor": null,
+            "decoder": null,
+            "model": { "type": "WordLevel", "vocab": vocab, "unk_token": "<|endoftext|>" }
+        })
+    }
+
+    #[test]
+    fn declared_bos_token_replaces_the_chatml_guess() -> TestResult {
+        let json = endoftext_chatml_json();
+        let guessed = load_with_config("bos-none", &json, None)?;
+        assert!(guessed.hf_tokenizer.is_some());
+        assert_eq!(guessed.bos_token_id, 1, "no config: <|im_start|> as before");
+        for (tag, config, bos) in [
+            ("bos-string", r#"{"bos_token": "<|endoftext|>"}"#, 0),
+            (
+                "bos-object",
+                r#"{"bos_token": {"content": "<|endoftext|>", "special": true}}"#,
+                0,
+            ),
+            ("bos-null", r#"{"bos_token": null}"#, 1),
+            ("bos-unknown", r#"{"bos_token": "<s>"}"#, 1),
+        ] {
+            let tok = load_with_config(tag, &json, Some(config))?;
+            assert_eq!(tok.bos_token_id, bos, "{config}");
+            assert_eq!(tok.eos_token_id, 2, "{config}");
+            assert_eq!(tok.pad_token_id, 0, "{config}");
+            // The Hugging Face encoder never reads bos_token_id.
+            assert_eq!(tok.encode("Hi Hi"), guessed.encode("Hi Hi"), "{config}");
+            assert_eq!(tok.encode("Hi Hi"), [3, 3], "{config}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fallback_reader_uses_the_declared_bos_token() -> TestResult {
+        let json =
+            serde_json::json!({ "model": { "vocab": endoftext_chatml_json()["model"]["vocab"] } });
+        let guessed = load_with_config("fallback-none", &json, None)?;
+        assert!(guessed.hf_tokenizer.is_none());
+        assert_eq!(guessed.encode("Hi"), [1, 3]);
+        let declared = load_with_config(
+            "fallback-declared",
+            &json,
+            Some(r#"{"bos_token": "<|endoftext|>"}"#),
+        )?;
+        assert_eq!(declared.encode("Hi"), [0, 3]);
+        assert_eq!(declared.decode(&[1, 3, 2]), "<|im_start|>Hi");
+        Ok(())
+    }
+
+    #[test]
+    fn broken_tokenizer_config_is_an_error() {
+        let err = load_with_config("config-broken", &endoftext_chatml_json(), Some("{"))
+            .err()
+            .map(|e| e.to_string());
+        assert!(
+            err.as_deref()
+                .is_some_and(|e| e.contains("tokenizer_config.json")),
+            "{err:?}"
+        );
     }
 
     #[test]

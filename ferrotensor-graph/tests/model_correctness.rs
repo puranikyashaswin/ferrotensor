@@ -20,7 +20,7 @@ use common::*;
 use ferrotensor_autograd::Tensor;
 use ferrotensor_backend::{DType, UnifiedTensor};
 use ferrotensor_graph::lfm::{Lfm2LayerOp, Lfm2Model};
-use ferrotensor_graph::Linear;
+use ferrotensor_graph::{Embedding, Linear};
 use std::collections::HashMap;
 
 /// Tokens of the test prompt (every id is in the vocabulary).
@@ -324,16 +324,36 @@ fn kv_cache_decoding_matches_the_full_forward() {
     let mut cache = model.new_kv_cache(IDS.len()).expect("all-attention model");
     // A prompt of 4 tokens, then one token at a time.
     let prompt = 4;
-    let mut decoded = host(
-        &gpu,
-        &model.forward(&gpu.engine, &IDS[..prompt], 0, Some(&mut cache), None),
-    );
+    let prefill = model.forward(&gpu.engine, &IDS[..prompt], 0, Some(&mut cache), None);
+    // The base weights are frozen and the cached path records no attention
+    // op, so nothing in it can receive a gradient, even outside `no_grad`.
+    assert!(!prefill.requires_grad, "cached prefill requires a gradient");
+    let mut decoded = host(&gpu, &prefill);
     for pos in prompt..IDS.len() {
         let step = model.forward(&gpu.engine, &IDS[pos..=pos], pos, Some(&mut cache), None);
+        assert!(!step.requires_grad, "cached step {pos} requires a gradient");
         decoded.extend(host(&gpu, &step));
     }
     // A different attention launch (cache offsets) over the same values.
     assert_close(&decoded, &full, 1e-4, "cached decoding vs full forward");
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn embedding_lookup_copies_rows_as_a_constant() {
+    let gpu = gpu();
+    // A trainable 4 x 3 table whose row r holds 3r, 3r + 1, 3r + 2.
+    let table: Vec<f32> = (0..12u8).map(f32::from).collect();
+    let weight = Tensor::new(
+        gpu.ctx.clone(),
+        UnifiedTensor::new(&gpu.ctx, &table, &[4, 3]),
+    );
+    let out = Embedding::new(weight).forward(&gpu.ctx, &gpu.engine, &[2, 0, 2]);
+    assert_eq!(out.data.shape, vec![1, 3, 3]);
+    let expected = [6.0, 7.0, 8.0, 0.0, 1.0, 2.0, 6.0, 7.0, 8.0];
+    assert_close(&host(&gpu, &out), &expected, 0.0, "embedding rows");
+    // No op is recorded, so a gradient here could never reach the table.
+    assert!(!out.requires_grad, "embedding output requires a gradient");
 }
 
 #[test]
