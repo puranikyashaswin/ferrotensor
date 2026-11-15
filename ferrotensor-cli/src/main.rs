@@ -22,7 +22,7 @@ mod profile_report;
 
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use ferrotensor_autograd::{AdamW, OptimizerLoad, WarmupCosineScheduler};
-use ferrotensor_backend::{ComputeEngine, MemoryCategory, WgpuContext};
+use ferrotensor_backend::{ComputeEngine, ContextError, MemoryCategory, WgpuContext};
 use ferrotensor_graph::lfm::{legacy_llama_name, Lfm2Model};
 use ferrotensor_graph::model_builder::{Lfm2ModelBuilder, LoRaConfig};
 use ferrotensor_loader::{Lfm2Config, ModelLoader, Sampler, Tokenizer, WeightsContext};
@@ -61,7 +61,13 @@ enum Exit {
 impl Exit {
     /// The code for a command that failed with `error`.
     fn for_error(error: &(dyn std::error::Error + 'static)) -> Self {
-        if error.is::<Unmet>() {
+        // No adapter is this machine, as in `info` and `plan`; a device the
+        // adapter refused is a runtime failure.
+        let no_adapter = matches!(
+            error.downcast_ref::<ContextError>(),
+            Some(ContextError::NoAdapter { .. })
+        );
+        if no_adapter || error.is::<Unmet>() {
             Self::Unmet
         } else {
             Self::RuntimeError
@@ -2105,6 +2111,11 @@ mod tests {
         assert_eq!(invalid.to_string(), "--seq-len must be at least 2");
         let runtime: Box<dyn std::error::Error> = "the GPU device was lost".into();
         assert_eq!(Exit::for_error(runtime.as_ref()), Exit::RuntimeError);
+        let no_adapter: Box<dyn std::error::Error> = Box::new(ContextError::NoAdapter {
+            backends: ferrotensor_backend::wgpu::Backends::VULKAN,
+            force_fallback_adapter: false,
+        });
+        assert_eq!(Exit::for_error(no_adapter.as_ref()), Exit::Unmet);
     }
 
     #[test]

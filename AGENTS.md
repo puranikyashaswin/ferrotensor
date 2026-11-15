@@ -108,8 +108,10 @@ The `plan` estimate is calibrated on these A10G peaks; its worst error there is
   need a GPU are `#[ignore]` and run in CI with `--ignored` on software Vulkan.
 - No `unwrap`, `expect` or `panic!` outside tests; propagate errors with `?`.
   No `let _ =`, `.ok()` or `unwrap_or_default()` to silence a `Result`.
-- Lint suppression is `#[expect(lint, reason = "...")]`, never a bare `#[allow]`.
-  `unsafe` is denied.
+- In library code a lint is suppressed with `#[expect(lint, reason = "...")]`.
+  Test and example files carry one `#![allow(...)]` at the top, or one
+  `#[allow(...)]` on `mod tests`.
+- `unsafe` is denied, except the loader's two documented memory-map sites.
 - Comments say why, not what. A doc comment is one summary sentence, plus
   `# Errors`, `# Panics` or `# Safety` when they apply.
 - No new dependency without the maintainer's approval. One concern per PR.
