@@ -461,6 +461,16 @@ and two AdamW moments (16 bytes per parameter) plus activations; `plan` does
 not cover `pretrain`. Not included: a learned tokenizer, tied embeddings,
 mixed precision, and document boundaries (the corpus is one stream).
 
+The CI test trains a tiny model (2 layers, hidden 64, 4 heads, context 64,
+164,544 parameters) on one sentence repeated 100 times, on software Vulkan
+(llvmpipe): with `--lr 3e-3`, `--warmup-steps 20` and 150 steps the logged
+training loss fell from 3.91 at step 25 to 0.0114 at step 150 (uniform
+guessing is ln 259 = 5.56), and greedy `generate --raw` continues "the quick
+brown" with " fox jumps". This shows the path learns; it says nothing about
+quality on real text. The exported directory gives the same eval loss as
+the trained weights it came from, and loads in Transformers with the same
+loss within 1e-3.
+
 ## Sample from a model: `generate`
 
 `generate` stops with exit code 2 when the prompt encodes to no tokens or is

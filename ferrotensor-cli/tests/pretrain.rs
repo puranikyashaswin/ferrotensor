@@ -124,7 +124,7 @@ fn pretrain_learns_a_repeated_sentence_and_the_directory_reloads() {
         &model,
         &[
             "--max-steps",
-            "300",
+            "150",
             "--warmup-steps",
             "20",
             "--lr",
@@ -140,12 +140,16 @@ fn pretrain_learns_a_repeated_sentence_and_the_directory_reloads() {
         2 * 259 * 64 + 2 * (4 * 64 * 64 + 3 * 256 * 64 + 2 * 64) + 64
     );
     assert_eq!(summary["vocab_size"], 259);
-    assert_eq!(summary["steps"], 300);
+    assert_eq!(summary["steps"], 150);
     let first = summary["first_loss"].as_f64().expect("first loss");
     let last = summary["final_loss"].as_f64().expect("final loss");
     eprintln!("pretrain loss: first logged {first:.4}, final {last:.4}");
-    // Uniform guessing over 259 tokens costs ln 259 = 5.56.
-    assert!(last < 0.15 * 259f64.ln(), "final loss {last}");
+    // Uniform guessing over 259 tokens costs ln 259 = 5.56. This test on
+    // software Vulkan logged 3.91 at step 25, 0.041 at step 75 and 0.0114 at
+    // step 150; the bound, 2% of ln 259 (0.111), leaves about a tenfold
+    // margin and still fails a model that has not memorised the sentence.
+    assert!(first > 1.0, "first logged loss {first}");
+    assert!(last < 0.02 * 259f64.ln(), "final loss {last}");
     for file in [
         "config.json",
         "tokenizer.json",
@@ -215,7 +219,7 @@ fn pretrain_learns_a_repeated_sentence_and_the_directory_reloads() {
         (exported - in_training_layout).abs() < 1e-5,
         "exported {exported}, trained {in_training_layout}"
     );
-    assert!(exported < 0.15 * 259f64.ln(), "exported loss {exported}");
+    assert!(exported < 0.02 * 259f64.ln(), "exported loss {exported}");
 }
 
 #[test]
