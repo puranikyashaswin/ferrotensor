@@ -46,7 +46,8 @@ sequences per optimizer step.
   loss mask, trainable base weights) with fixtures from PyTorch autograd
   ([`scripts/gen_gradient_fixtures.py`](scripts/gen_gradient_fixtures.py)).
   Every element must be within 1e-4 + 1e-3 × |expected|; the largest
-  gradient difference on the A10G was 9.5e-7. It runs on every pull request
+  gradient difference is below 1e-6 (9.2e-7 in the confirmation run on the
+  A10G). It runs on every pull request
   on software Vulkan. The model is tiny, so it does not catch effects that
   only appear at scale.
 - **Held-out loss against PyTorch + PEFT on CUDA.** Same GPU, same recipe,
@@ -58,25 +59,27 @@ sequences per optimizer step.
   was measured on a 0.6 development build with f32 base weights, before the
   memory work below
   ([comparison](docs/examples/lora-sft.md#against-pytorch--peft-on-cuda-same-gpu)).
-- **Less GPU memory for LoRA, with the same losses.** Peak GPU memory
-  (`nvidia-smi`, MiB) for 30 optimizer steps with f16 base weights, batch 1
-  × 8-step accumulation unless noted:
+- **Less GPU memory for LoRA.** Peak GPU memory (`nvidia-smi`, MiB) for 30
+  optimizer steps with f16 base weights, batch 1 × 8-step accumulation
+  unless noted, all measured in one session on one A10G: 0.6 is the
+  released v0.6.0, 0.7 is merged `main` (`af41068`):
 
   | Model | 0.6 | 0.7 default | 0.7 `--checkpoint-blocks` | Time per step with `--checkpoint-blocks` |
   |---|---:|---:|---:|---:|
-  | SmolLM2-135M | 3,451 | 2,362 | 1,890 | +26% |
-  | SmolLM2-360M | 5,411 | 3,595 | 2,719 | +31% |
-  | SmolLM2-1.7B | 11,607 | 8,222 | 5,245 | +39% |
-  | SmolLM2-135M, batch 8 | 15,758 | 9,401 | 2,879 | +19% |
+  | SmolLM2-135M | 3,515 | 2,306 | 1,890 | +24% |
+  | SmolLM2-360M | 5,411 | 3,579 | 2,783 | +30% |
+  | SmolLM2-1.7B | 11,671 | 8,142 | 5,313 | +38% |
+  | SmolLM2-135M, batch 8 | 16,270 | 9,441 | 2,767 | +20% |
 
-  <!-- Maintainer: the 0.6 column is the stage-0 baseline measured at 364490b with this setup. The walkthrough's 0.6 table (250 steps at b319ce7) has 12,199 MiB for SmolLM2-1.7B with f16 weights; the 592 MiB difference is not explained yet, so only one baseline is shown here. -->
-
-  Losses are identical at every stage: the training loss and gradient norm
-  as printed at all 30 steps, and the held-out loss after them. The 0.7
-  default releases each intermediate gradient once it is used and reuses
-  freed buffers; `--checkpoint-blocks` recomputes each decoder block's
-  forward pass during backward instead of keeping its activations. The same
-  setting measured in separate sessions differed by up to 192 MiB.
+  Within 0.7, the default and `--checkpoint-blocks` print identical training
+  losses and gradient norms at all 30 steps and the same held-out loss after
+  them. Against 0.6 the losses differ slightly (SmolLM2-1.7B held-out 1.4561
+  in 0.6, 1.4560 in 0.7), because 0.7 gives every LoRA adapter its own
+  initial A matrix. The 0.7 default releases each intermediate gradient once
+  it is used and reuses freed buffers; `--checkpoint-blocks` recomputes each
+  decoder block's forward pass during backward instead of keeping its
+  activations. The same setting measured in separate sessions differed by
+  up to about 70 MiB.
   `train --memory-report` prints where the memory goes
   ([CLI docs](ferrotensor-cli/README.md#where-gpu-memory-goes---memory-report)).
 - **Adapters for PyTorch.** `ferrotensor export-adapter` writes a standard
@@ -307,7 +310,7 @@ against them; kernel-level numbers for Ferrotensor alone are in
 - [x] Tested on NVIDIA GPUs through Vulkan, and the GPU suites run in CI on software Vulkan ([results](benchmarks/RESULTS.md))
 - [x] LoRA measured up to SmolLM2-1.7B, with the backward passes and the loss on the GPU ([walkthrough](docs/examples/lora-sft.md#on-an-nvidia-gpu-three-model-sizes))
 - [ ] Op fusion on by default (needs a measurement on more GPUs)
-- [x] Lower host memory when loading models (SmolLM2-1.7B peaks at 5.3 GB of host memory)
+- [x] Lower host memory when loading models (SmolLM2-1.7B LoRA peak host memory 5,087 MiB before, 1,575 MiB after)
 - [x] Batched LoRA training and f16 base weights ([measured](docs/examples/lora-sft.md#batching-f16-base-weights-and-lower-host-memory-06))
 - [x] Gradient parity with PyTorch autograd in CI, PEFT adapter export
 - [x] Lower GPU memory for LoRA: gradients released early, freed buffers reused, `--checkpoint-blocks`

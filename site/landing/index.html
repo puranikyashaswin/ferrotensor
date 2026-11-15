@@ -219,9 +219,9 @@
       </ul>
       <p class="pb-cap">Held-out loss on 2,744 Alpaca tokens, lower is better. Same GPU, recipe and seed setup. Ferrotensor with f16 base weights ends at 1.0640; with f32 base weights it ends at 1.0657 and runs at 0.37 of PyTorch's speed.</p>
       <dl class="pstats">
-        <div><dt>GPU memory, 0.7</dt><dd>8,222&nbsp;MiB</dd></div>
-        <div><dt>With <code>--checkpoint-blocks</code></dt><dd>5,245&nbsp;MiB</dd></div>
-        <div><dt>Host memory</dt><dd>5.3&nbsp;GB</dd></div>
+        <div><dt>GPU memory, 0.7</dt><dd>8,142&nbsp;MiB</dd></div>
+        <div><dt>With <code>--checkpoint-blocks</code></dt><dd>5,313&nbsp;MiB</dd></div>
+        <div><dt>Host memory, 0.7</dt><dd>1,575&nbsp;MiB</dd></div>
         <div><dt>Speed vs PyTorch</dt><dd>0.37×</dd></div>
       </dl>
       <a class="proof-src" href="docs/examples/lora-sft.html#against-pytorch--peft-on-cuda-same-gpu">Method and every number</a>
@@ -254,18 +254,18 @@
         <p class="figure"><a href="docs/examples/lora-sft.html#batching-f16-base-weights-and-lower-host-memory-06">1.7B</a> <span class="unit">params</span></p>
         <p class="figure-cap">LoRA fine-tuning on one 24&nbsp;GB GPU</p>
         <svg class="bars" viewBox="0 0 260 92" role="img" aria-labelledby="mem-t">
-          <title id="mem-t">Peak GPU memory for LoRA on SmolLM2-1.7B on an NVIDIA A10G: 11,607 MiB in 0.6, 8,222 MiB in 0.7, 5,245 MiB in 0.7 with --checkpoint-blocks. Losses identical in all three.</title>
+          <title id="mem-t">Peak GPU memory for LoRA on SmolLM2-1.7B on an NVIDIA A10G: 11,671 MiB in 0.6, 8,142 MiB in 0.7, 5,313 MiB in 0.7 with --checkpoint-blocks. Within 0.7, losses are identical with and without --checkpoint-blocks.</title>
           <rect class="bar-old" x="0" y="4" width="260" height="20" rx="2"/>
-          <text class="bar-in-old" x="8" y="19">0.6 · 11,607 MiB GPU memory</text>
-          <rect class="bar-old" x="0" y="36" width="184" height="20" rx="2"/>
-          <text class="bar-in-old" x="8" y="51">0.7 · 8,222 MiB</text>
-          <rect class="bar-new" x="0" y="68" width="117" height="20" rx="2"/>
-          <text class="bar-in" x="8" y="83">5,245 MiB</text>
-          <text x="124" y="83">--checkpoint-blocks</text>
+          <text class="bar-in-old" x="8" y="19">0.6 · 11,671 MiB GPU memory</text>
+          <rect class="bar-old" x="0" y="36" width="181" height="20" rx="2"/>
+          <text class="bar-in-old" x="8" y="51">0.7 · 8,142 MiB</text>
+          <rect class="bar-new" x="0" y="68" width="118" height="20" rx="2"/>
+          <text class="bar-in" x="8" y="83">5,313 MiB</text>
+          <text x="125" y="83">--checkpoint-blocks</text>
         </svg>
         <ul class="facts">
           <li>Held-out loss <a href="docs/examples/lora-sft.html#batching-f16-base-weights-and-lower-host-memory-06">2.6474 → 1.0640</a> in 250 steps</li>
-          <li>Losses <a href="docs/examples/lora-sft.html#less-gpu-memory-07">identical at every stage</a>; <code>--checkpoint-blocks</code> costs 19 to 39% more time per step</li>
+          <li>Losses <a href="docs/examples/lora-sft.html#less-gpu-memory-07">identical with and without</a> <code>--checkpoint-blocks</code>, which costs 20 to 38% more time per step</li>
           <li>SmolLM2-135M, 360M and 1.7B <a href="docs/examples/lora-sft.html#on-an-nvidia-gpu-three-model-sizes">measured with one script</a></li>
         </ul>
         <a class="card-src" href="docs/examples/lora-sft.html#less-gpu-memory-07">GPU memory by stage and model</a>
@@ -293,8 +293,8 @@
 
       <article class="card">
         <p class="card-k">Checked correctness</p>
-        <p class="figure"><a href="docs/examples/lora-sft.html#correctness-checks">9.5e-7</a></p>
-        <p class="figure-cap">largest gradient difference from PyTorch autograd, checked in CI</p>
+        <p class="figure"><a href="docs/examples/lora-sft.html#correctness-checks">9.2e-7</a></p>
+        <p class="figure-cap">largest gradient difference from PyTorch autograd in the confirmation run, below 1e-6; checked in CI</p>
         <svg class="checks" viewBox="0 0 260 44" aria-hidden="true">
           <g><rect class="cell" x="0" y="0" width="8" height="8" rx="1"/><rect class="cell" x="10.4" y="0" width="8" height="8" rx="1"/><rect class="cell" x="20.8" y="0" width="8" height="8" rx="1"/><rect class="cell" x="31.2" y="0" width="8" height="8" rx="1"/><rect class="cell" x="41.6" y="0" width="8" height="8" rx="1"/><rect class="cell" x="52" y="0" width="8" height="8" rx="1"/><rect class="cell" x="62.4" y="0" width="8" height="8" rx="1"/><rect class="cell" x="72.8" y="0" width="8" height="8" rx="1"/><rect class="cell" x="83.2" y="0" width="8" height="8" rx="1"/><rect class="cell" x="93.6" y="0" width="8" height="8" rx="1"/><rect class="cell" x="104" y="0" width="8" height="8" rx="1"/><rect class="cell" x="114.4" y="0" width="8" height="8" rx="1"/><rect class="cell" x="124.8" y="0" width="8" height="8" rx="1"/><rect class="cell" x="135.2" y="0" width="8" height="8" rx="1"/><rect class="cell" x="145.6" y="0" width="8" height="8" rx="1"/><rect class="cell" x="156" y="0" width="8" height="8" rx="1"/><rect class="cell" x="166.4" y="0" width="8" height="8" rx="1"/><rect class="cell" x="176.8" y="0" width="8" height="8" rx="1"/><rect class="cell" x="187.2" y="0" width="8" height="8" rx="1"/><rect class="cell" x="197.6" y="0" width="8" height="8" rx="1"/><rect class="cell" x="208" y="0" width="8" height="8" rx="1"/><rect class="cell" x="218.4" y="0" width="8" height="8" rx="1"/><rect class="cell" x="228.8" y="0" width="8" height="8" rx="1"/><rect class="cell" x="239.2" y="0" width="8" height="8" rx="1"/><rect class="cell" x="249.6" y="0" width="8" height="8" rx="1"/><rect class="cell" x="0" y="12" width="8" height="8" rx="1"/><rect class="cell" x="10.4" y="12" width="8" height="8" rx="1"/><rect class="cell" x="20.8" y="12" width="8" height="8" rx="1"/><rect class="cell" x="31.2" y="12" width="8" height="8" rx="1"/><rect class="cell" x="41.6" y="12" width="8" height="8" rx="1"/><rect class="cell" x="52" y="12" width="8" height="8" rx="1"/><rect class="cell" x="62.4" y="12" width="8" height="8" rx="1"/><rect class="cell" x="72.8" y="12" width="8" height="8" rx="1"/><rect class="cell" x="83.2" y="12" width="8" height="8" rx="1"/><rect class="cell" x="93.6" y="12" width="8" height="8" rx="1"/><rect class="cell" x="104" y="12" width="8" height="8" rx="1"/><rect class="cell" x="114.4" y="12" width="8" height="8" rx="1"/><rect class="cell" x="124.8" y="12" width="8" height="8" rx="1"/><rect class="cell" x="135.2" y="12" width="8" height="8" rx="1"/><rect class="cell" x="145.6" y="12" width="8" height="8" rx="1"/><rect class="cell" x="156" y="12" width="8" height="8" rx="1"/><rect class="cell" x="166.4" y="12" width="8" height="8" rx="1"/><rect class="cell" x="176.8" y="12" width="8" height="8" rx="1"/><rect class="cell" x="187.2" y="12" width="8" height="8" rx="1"/><rect class="cell" x="197.6" y="12" width="8" height="8" rx="1"/><rect class="cell" x="208" y="12" width="8" height="8" rx="1"/><rect class="cell" x="218.4" y="12" width="8" height="8" rx="1"/><rect class="cell" x="228.8" y="12" width="8" height="8" rx="1"/><rect class="cell" x="239.2" y="12" width="8" height="8" rx="1"/><rect class="cell" x="249.6" y="12" width="8" height="8" rx="1"/></g>
           <text x="0" y="40">one square per gradient tensor compared</text>
@@ -517,7 +517,7 @@ x = ft.<span class="f">tensor</span>([[<span class="n">0</span>, <span class="n"
     <ol class="road">
       <li class="road-done"><span class="pill">Measured</span><h3>Apple and NVIDIA GPUs</h3><p>The same LoRA recipe gave SmolLM2-135M the same held-out loss on an Apple M2 through Metal (0.4 build) and an NVIDIA A10G through Vulkan.</p></li>
       <li class="road-done"><span class="pill">Measured</span><h3>Parity with PyTorch</h3><p>Same GPU and recipe as PyTorch + PEFT on CUDA: identical loss before training, within 0.005 after, at 0.32 to 0.84 of its speed. LoRA gradients checked against PyTorch autograd in CI.</p></li>
-      <li class="road-done"><span class="pill">Measured</span><h3>Less GPU memory</h3><p>LoRA on SmolLM2-1.7B: 11,607 MiB in 0.6, 8,222 MiB in 0.7 and 5,245 MiB with <code>--checkpoint-blocks</code>, with the same printed losses.</p></li>
+      <li class="road-done"><span class="pill">Measured</span><h3>Less GPU memory</h3><p>LoRA on SmolLM2-1.7B: 11,671 MiB in 0.6, 8,142 MiB in 0.7 and 5,313 MiB with <code>--checkpoint-blocks</code>, which prints the same losses as the 0.7 default.</p></li>
       <li><span class="pill">Next</span><h3>AMD and Intel GPUs</h3><p>The same Vulkan and DX12 path, waiting for its first published results. <a href="docs/testing-on-your-gpu.html">Test it on your GPU</a>.</p></li>
       <li><span class="pill">Next</span><h3>Faster large matmuls</h3><p>Matmul tiles tuned per GPU, to close the gap with cuBLAS on billion-parameter models.</p></li>
       <li><span class="pill">Planned</span><h3>Fine-tuning in a browser tab</h3><p>wgpu also targets WebGPU in the browser: LoRA on the visitor's own GPU, with the training data never uploaded.</p></li>

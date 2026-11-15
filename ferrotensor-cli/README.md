@@ -92,7 +92,12 @@ weights, and peak GPU memory (`nvidia-smi`, with `--checkpoint-blocks`) is lower
 | SmolLM2-360M | 1.3228 | 1.4087 | 2,783 MiB | 1,998 MiB |
 | SmolLM2-1.7B | 1.0640 | 1.1198 | 5,281 MiB | 3,741 MiB |
 
-These are 250-step runs in separate sessions; the 30-step stage table gives 2,719 and 5,245 MiB for the same setting.
+These are 250-step runs in separate sessions. In the 30-step confirmation run of
+merged `main`, SmolLM2-1.7B with `--checkpoint-blocks` peaked at 5,313 MiB with f16 base
+weights and 3,741 MiB with `--q4-weights`, and the held-out loss after 30 steps was
+1.6245 with 4-bit weights against 1.4560 with f16 (2.6474 and 3.7470 before
+training): 4-bit is still worse. Peaks for the same setting vary between sessions by
+up to about 70 MiB.
 
 The format is plain round-to-nearest in groups of 64, not the NF4 format
 of QLoRA.
@@ -117,15 +122,15 @@ of QLoRA.
 block's input during the forward pass and recomputes the block's forward
 during backward, instead of keeping all its activations. It trades time for
 memory. Measured on an NVIDIA A10G (24 GB) with SmolLM2, f16 base weights,
-sequence length 256 and 30 optimizer steps (peak from `nvidia-smi`, median
-seconds per step):
+sequence length 256 and 30 optimizer steps, all in one session on merged
+`main` (peak from `nvidia-smi`, seconds per step as printed at step 30):
 
 | Model | Peak GPU memory, off → on | Seconds per step, off → on |
 |---|---:|---:|
-| SmolLM2-135M, batch 1 × accum 8 | 2,362 → 1,890 MiB | 1.17 → 1.47 (+26%) |
-| SmolLM2-360M, batch 1 × accum 8 | 3,595 → 2,719 MiB | 1.56 → 2.04 (+31%) |
-| SmolLM2-1.7B, batch 1 × accum 8 | 8,222 → 5,245 MiB | 2.275 → 3.16 (+39%) |
-| SmolLM2-135M, batch 8 × accum 8 | 9,401 → 2,879 MiB | 2.63 → 3.13 (+19%) |
+| SmolLM2-135M, batch 1 × accum 8 | 2,306 → 1,890 MiB | 1.19 → 1.48 (+24%) |
+| SmolLM2-360M, batch 1 × accum 8 | 3,579 → 2,783 MiB | 1.59 → 2.06 (+30%) |
+| SmolLM2-1.7B, batch 1 × accum 8 | 8,142 → 5,313 MiB | 2.30 → 3.18 (+38%) |
+| SmolLM2-135M, batch 8 × accum 8 | 9,441 → 2,767 MiB | 2.51 → 3.01 (+20%) |
 
 The training loss and gradient norm, as printed at every step, and the
 held-out loss were identical with the flag on and off. The unit tests in
