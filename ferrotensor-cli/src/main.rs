@@ -6,6 +6,7 @@
 //! ferrotensor-cli train    --model DIR --data train.jsonl --out runs/sft
 //! ferrotensor-cli eval     --model DIR --data val.jsonl --lora runs/sft/lora_adapters.safetensors
 //! ferrotensor-cli generate --model DIR --lora runs/sft/lora_adapters.safetensors --prompt "Hi"
+//! ferrotensor-cli chat     --model DIR --lora runs/sft/lora_adapters.safetensors
 //! ferrotensor-cli classify-train   --model DIR --data train.jsonl --output runs/cls
 //! ferrotensor-cli classify-predict --model DIR --classifier runs/cls --data test.jsonl --output probs.jsonl
 //! ferrotensor-cli info --check
@@ -13,6 +14,7 @@
 //! ferrotensor-cli export-adapter --lora runs/sft/lora_adapters.safetensors --model DIR --output runs/sft/peft
 //! ```
 
+mod chat;
 mod classify;
 mod finetune;
 mod info;
@@ -138,6 +140,9 @@ enum Command {
     /// Generate text from a prompt (top-k / top-p / temperature sampling).
     #[command(visible_alias = "infer")]
     Generate(GenerateArgs),
+    /// A multi-turn conversation with a ChatML model, one user message per
+    /// line of stdin.
+    Chat(chat::ChatArgs),
     /// LoRA fine-tuning of a decoder as a text classifier, from JSONL
     /// {"text", "label"} lines.
     ClassifyTrain(Box<classify::ClassifyTrainArgs>),
@@ -428,6 +433,19 @@ struct GenerateArgs {
     /// Feed the prompt to the model verbatim.
     #[arg(long)]
     raw: bool,
+    #[command(flatten)]
+    sampling: SamplingArgs,
+    /// Recompute the whole sequence every token instead of using the KV cache.
+    #[arg(long)]
+    no_kv_cache: bool,
+    /// Stream the text to stderr and print one JSON object with it to stdout.
+    #[arg(long)]
+    json: bool,
+}
+
+/// Sampling flags shared by `generate` and `chat`.
+#[derive(Args, Debug)]
+struct SamplingArgs {
     /// Maximum tokens to generate.
     #[arg(long, default_value_t = 128)]
     max_new_tokens: usize,
@@ -443,12 +461,20 @@ struct GenerateArgs {
     /// Seed for reproducible sampling.
     #[arg(long)]
     seed: Option<u64>,
-    /// Recompute the whole sequence every token instead of using the KV cache.
-    #[arg(long)]
-    no_kv_cache: bool,
-    /// Stream the text to stderr and print one JSON object with it to stdout.
-    #[arg(long)]
-    json: bool,
+}
+
+impl SamplingArgs {
+    fn sampler(&self) -> Result<Sampler> {
+        if !(0.0..=1.0).contains(&self.top_p) || self.temperature < 0.0 {
+            return Err(unmet("--top-p must be in [0, 1] and --temperature >= 0"));
+        }
+        Ok(Sampler::new(
+            self.temperature,
+            self.top_k,
+            self.top_p,
+            self.seed,
+        ))
+    }
 }
 
 /// Hint printed after a panic that looks like the GPU running out of memory.
@@ -493,6 +519,7 @@ fn main() {
         Command::Train(args) => args.json,
         Command::Eval(args) => args.json,
         Command::Generate(args) => args.json,
+        Command::Chat(args) => args.json,
         Command::Info(args) => args.json,
         Command::Plan(args) => args.json,
         Command::Merge(args) => args.json,
@@ -528,6 +555,7 @@ fn run(command: Command, matches: &clap::ArgMatches, json: bool) -> Result<Exit>
         }
         Command::Eval(args) => pollster::block_on(eval(args))?,
         Command::Generate(args) => pollster::block_on(generate(args))?,
+        Command::Chat(args) => pollster::block_on(chat::run(args))?,
         Command::ClassifyTrain(args) => pollster::block_on(classify::classify_train(*args))?,
         Command::ClassifyPredict(args) => pollster::block_on(classify::classify_predict(args))?,
         Command::Demo => ferrotensor_trainer::run_demo(ferrotensor_trainer::DemoConfig::default()),
@@ -1022,10 +1050,7 @@ async fn generate(args: GenerateArgs) -> Result<()> {
         let n = restore_adapter(&base, &model, path)?;
         eprintln!("{}", loaded_line(path, n, meta.as_ref()));
     }
-    if !(0.0..=1.0).contains(&args.top_p) || args.temperature < 0.0 {
-        return Err(unmet("--top-p must be in [0, 1] and --temperature >= 0"));
-    }
-    let mut sampler = Sampler::new(args.temperature, args.top_k, args.top_p, args.seed);
+    let mut sampler = args.sampling.sampler()?;
     let prompt_ids = if args.raw {
         base.tokenizer.encode(&args.prompt)
     } else {
@@ -1038,7 +1063,7 @@ async fn generate(args: GenerateArgs) -> Result<()> {
         &base,
         &model,
         &prompt_ids,
-        args.max_new_tokens,
+        args.sampling.max_new_tokens,
         &mut sampler,
         use_cache,
         |delta| {
@@ -1048,20 +1073,8 @@ async fn generate(args: GenerateArgs) -> Result<()> {
     )
     .await;
     stream_text("\n", args.json);
-    let summary = GenerateSummary {
-        text,
-        prompt_tokens: prompt_ids.len(),
-        new_tokens,
-        tokens_per_second: new_tokens as f32 / decode_time.as_secs_f32().max(1e-6),
-        kv_cache,
-    };
-    eprintln!(
-        "[{} prompt + {} new tokens, {:.1} tok/s, kv cache {}]",
-        summary.prompt_tokens,
-        summary.new_tokens,
-        summary.tokens_per_second,
-        if kv_cache { "on" } else { "off" }
-    );
+    let summary = GenerateSummary::new(text, prompt_ids.len(), new_tokens, decode_time, kv_cache);
+    eprintln!("{}", summary.stats_line());
     if args.json {
         print_json(&summary)?;
     }
@@ -1076,6 +1089,35 @@ struct GenerateSummary {
     new_tokens: usize,
     tokens_per_second: f32,
     kv_cache: bool,
+}
+
+impl GenerateSummary {
+    fn new(
+        text: String,
+        prompt_tokens: usize,
+        new_tokens: usize,
+        decode_time: Duration,
+        kv_cache: bool,
+    ) -> Self {
+        Self {
+            text,
+            prompt_tokens,
+            new_tokens,
+            tokens_per_second: new_tokens as f32 / decode_time.as_secs_f32().max(1e-6),
+            kv_cache,
+        }
+    }
+
+    /// The line `generate` and `chat` print to stderr after a reply.
+    fn stats_line(&self) -> String {
+        format!(
+            "[{} prompt + {} new tokens, {:.1} tok/s, kv cache {}]",
+            self.prompt_tokens,
+            self.new_tokens,
+            self.tokens_per_second,
+            if self.kv_cache { "on" } else { "off" }
+        )
+    }
 }
 
 /// Sample up to `max_new` tokens after `prompt`, streaming decoded text to
@@ -1767,7 +1809,7 @@ mod tests {
         let Command::Generate(g) = cli.command else {
             panic!("expected generate");
         };
-        assert_eq!(g.top_k, 5);
+        assert_eq!(g.sampling.top_k, 5);
         assert_eq!(g.prompt, "hi");
     }
 

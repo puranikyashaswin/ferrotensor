@@ -204,21 +204,31 @@ impl Tokenizer {
     /// ending with the assistant header so the model continues as the
     /// assistant: `<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n`.
     pub fn chat_prompt(system: Option<&str>, user: &str) -> String {
+        Self::conversation_prompt(system, &[user])
+    }
+
+    /// The ChatML prompt for a conversation: an optional system turn, then
+    /// `turns` alternating user and assistant (user first), then the
+    /// assistant header.
+    pub fn conversation_prompt(system: Option<&str>, turns: &[impl AsRef<str>]) -> String {
+        let roles = ["user", "assistant"].into_iter().cycle();
+        let turns = roles.zip(turns.iter().map(AsRef::<str>::as_ref));
         let mut prompt = String::new();
-        if let Some(sys) = system {
-            prompt.push_str("<|im_start|>system\n");
-            prompt.push_str(sys);
-            prompt.push_str("<|im_end|>\n");
+        for (role, text) in system.map(|sys| ("system", sys)).into_iter().chain(turns) {
+            prompt.push_str(&format!("<|im_start|>{role}\n{text}<|im_end|>\n"));
         }
-        prompt.push_str("<|im_start|>user\n");
-        prompt.push_str(user);
-        prompt.push_str("<|im_end|>\n<|im_start|>assistant\n");
+        prompt.push_str("<|im_start|>assistant\n");
         prompt
     }
 
     /// Encode [`chat_prompt`](Self::chat_prompt).
     pub fn encode_chat(&self, system: Option<&str>, user: &str) -> Vec<u32> {
-        self.encode(&Self::chat_prompt(system, user))
+        self.encode_conversation(system, &[user])
+    }
+
+    /// Encode [`conversation_prompt`](Self::conversation_prompt).
+    pub fn encode_conversation(&self, system: Option<&str>, turns: &[impl AsRef<str>]) -> Vec<u32> {
+        self.encode(&Self::conversation_prompt(system, turns))
     }
 }
 
@@ -371,5 +381,84 @@ mod tests {
             Tokenizer::chat_prompt(Some("Be brief."), "Hi"),
             "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
         );
+    }
+
+    /// A word-level tokenizer with ChatML special tokens: `<|im_start|>` 1,
+    /// `<|im_end|>` 2, `system` 3, `user` 4, `assistant` 5, `Hi` 6,
+    /// `Hello` 7, `Bye` 8, `Be` 9, `brief` 10, `.` 11.
+    fn chatml_tokenizer() -> Result<Tokenizer, Box<dyn std::error::Error>> {
+        let words = [
+            "<unk>",
+            "<|im_start|>",
+            "<|im_end|>",
+            "system",
+            "user",
+            "assistant",
+            "Hi",
+            "Hello",
+            "Bye",
+            "Be",
+            "brief",
+            ".",
+        ];
+        let vocab: HashMap<String, u32> =
+            (0u32..).zip(words).map(|(id, w)| (w.into(), id)).collect();
+        let special = |id: u32| {
+            serde_json::json!({
+                "id": id, "content": words[id as usize], "single_word": false, "lstrip": false,
+                "rstrip": false, "normalized": false, "special": true
+            })
+        };
+        let json = serde_json::json!({
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [special(1), special(2)],
+            "normalizer": null,
+            "pre_tokenizer": { "type": "Whitespace" },
+            "post_processor": null,
+            "decoder": null,
+            "model": { "type": "WordLevel", "vocab": vocab, "unk_token": "<unk>" }
+        });
+        let hf: tokenizers::Tokenizer = json.to_string().parse()?;
+        Ok(Tokenizer {
+            id_to_token: vocab.iter().map(|(w, &id)| (id, w.clone())).collect(),
+            vocab,
+            bos_token_id: 1,
+            eos_token_id: 2,
+            pad_token_id: 0,
+            hf_tokenizer: Some(Arc::new(hf)),
+        })
+    }
+
+    #[test]
+    fn one_turn_conversation_encodes_like_encode_chat() -> Result<(), Box<dyn std::error::Error>> {
+        let tok = chatml_tokenizer()?;
+        for system in [None, Some("Be brief.")] {
+            assert_eq!(
+                tok.encode_conversation(system, &["Hi"]),
+                tok.encode_chat(system, "Hi")
+            );
+        }
+        assert_eq!(tok.encode_chat(None, "Hi"), [1, 4, 6, 2, 1, 5]);
+        Ok(())
+    }
+
+    #[test]
+    fn two_turn_conversation_is_the_turns_in_chatml() -> Result<(), Box<dyn std::error::Error>> {
+        let tok = chatml_tokenizer()?;
+        let turns = ["Hi", "Hello", "Bye"];
+        let user_hi = [1, 4, 6, 2];
+        let assistant_hello = [1, 5, 7, 2];
+        let user_bye = [1, 4, 8, 2];
+        let header = [1, 5];
+        let without_system = [&user_hi[..], &assistant_hello, &user_bye, &header].concat();
+        assert_eq!(tok.encode_conversation(None, &turns), without_system);
+        let system = [1, 3, 9, 10, 11, 2];
+        assert_eq!(
+            tok.encode_conversation(Some("Be brief."), &turns),
+            [&system[..], &without_system].concat()
+        );
+        Ok(())
     }
 }

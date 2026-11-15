@@ -163,6 +163,29 @@ pub fn write_tiny_tokenizer(dir: &Path) {
     std::fs::write(dir.join("tokenizer.json"), tokenizer.to_string()).expect("write tokenizer");
 }
 
+/// Write the tokenizer of [`write_tiny_tokenizer`] with the last two ids
+/// replaced by the ChatML special tokens `<|im_start|>` (62) and
+/// `<|im_end|>` (63).
+pub fn write_tiny_chatml_tokenizer(dir: &Path) {
+    write_tiny_tokenizer(dir);
+    let path = dir.join("tokenizer.json");
+    let mut json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("read tokenizer"))
+            .expect("parse tokenizer");
+    let mut added = Vec::new();
+    for (id, token) in [(62, "<|im_start|>"), (63, "<|im_end|>")] {
+        let vocab = json["model"]["vocab"].as_object_mut().expect("vocab");
+        vocab.remove(&format!("w{id}"));
+        vocab.insert(token.to_string(), serde_json::json!(id));
+        added.push(serde_json::json!({
+            "id": id, "content": token, "single_word": false, "lstrip": false,
+            "rstrip": false, "normalized": false, "special": true
+        }));
+    }
+    json["added_tokens"] = serde_json::Value::Array(added);
+    std::fs::write(path, json.to_string()).expect("write tokenizer");
+}
+
 /// Write `count` token ids (cycling through 4..VOCAB) as little-endian u32
 /// to `path`: a `--task pretrain` dataset.
 pub fn write_token_bin(path: &Path, count: usize) {
