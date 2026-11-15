@@ -62,6 +62,22 @@ def test_mlp_loss_drops_and_fits(tmp_path):
         assert F.accuracy(fresh(x), y) == acc
 
 
+def test_readme_xor_quickstart_learns_xor():
+    # Same model, optimizer and loop as the Quickstart in ferrotensor-py/README.md.
+    ft.manual_seed(0)
+    model = nn.Sequential(nn.Linear(2, 16), nn.Tanh(), nn.Linear(16, 2))
+    opt = optim.AdamW(model.parameters(), lr=0.05, weight_decay=0.0)
+    inputs = ft.tensor([[0, 0], [0, 1], [1, 0], [1, 1]])
+    targets = [0, 1, 1, 0]
+    for _ in range(200):
+        opt.zero_grad()
+        loss = F.cross_entropy(model(inputs), targets)
+        loss.backward()
+        opt.step()
+    assert loss.item() < 0.05, loss.item()
+    assert model(inputs).argmax(dim=1).tolist() == [0.0, 1.0, 1.0, 0.0]
+
+
 def test_regression_with_sgd():
     xs = [[i / 10] for i in range(-10, 11)]
     x = ft.tensor(xs)
