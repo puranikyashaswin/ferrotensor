@@ -267,3 +267,82 @@ fn q4_weights_train_and_generate_without_the_checkpoint() {
     let stderr = text(&run.stderr);
     assert!(stderr.contains("new tokens"), "stderr: {stderr}");
 }
+
+/// Run `plan` and parse its JSON; returns the exit code too.
+fn plan_json(args: &[&str]) -> (Option<i32>, serde_json::Value) {
+    let out = ferrotensor(args);
+    let stdout = text(&out.stdout);
+    let json = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("{e}\nstdout: {stdout}\nstderr: {}", text(&out.stderr)));
+    (out.status.code(), json)
+}
+
+#[test]
+fn plan_picks_the_largest_batch_that_fits_a_given_budget() {
+    let model = model_dir("plan-fits");
+    let (code, plan) = plan_json(&[
+        "plan",
+        "--model",
+        s(model.path()),
+        "--json",
+        "--memory-mib",
+        "100000",
+    ]);
+    assert_eq!(code, Some(0), "{plan}");
+    assert_eq!(plan["budget_mib"], 100000);
+    assert_eq!(plan["budget_source"], "user");
+    // Tiny model: 2 layers, hidden 32, FFN 64, 4 heads (2 KV), vocab 64, tied.
+    assert_eq!(plan["parameters"], 20640);
+    assert_eq!(plan["fits"], true);
+    assert_eq!(plan["margin"], 0.15);
+    assert_eq!(
+        plan["chosen"],
+        serde_json::json!({
+            "batch_size": 8,
+            "seq_len": 256,
+            "rank": 8,
+            "precision": "f16",
+            "checkpoint_blocks": false,
+        })
+    );
+    // weights 1 + adapters 1 + activations 62 + logits 1 + overhead 1350.
+    assert_eq!(plan["estimated_peak_mib"], 1415);
+    let command = plan["train_command"].as_str().expect("train_command");
+    assert!(
+        command.ends_with("--batch-size 8 --grad-accum 1 --seq-len 256 --lora-rank 8"),
+        "{command}"
+    );
+}
+
+#[test]
+fn plan_exits_with_2_when_nothing_fits() {
+    let model = model_dir("plan-too-small");
+    let (code, plan) = plan_json(&[
+        "plan",
+        "--model",
+        s(model.path()),
+        "--json",
+        "--memory-mib",
+        "1000",
+    ]);
+    assert_eq!(code, Some(2), "{plan}");
+    assert_eq!(plan["fits"], false);
+    assert_eq!(plan["chosen"]["checkpoint_blocks"], true);
+    assert_eq!(plan["chosen"]["batch_size"], 1);
+    assert_eq!(plan["chosen"]["seq_len"], 128);
+    // weights 1 + adapters 1 + activations 2 + logits 1 + overhead 1350.
+    assert_eq!(plan["estimated_peak_mib"], 1355);
+}
+
+#[test]
+fn plan_without_a_model_lists_the_documented_sizes() {
+    let (code, plan) = plan_json(&["plan", "--json", "--memory-mib", "8000"]);
+    assert_eq!(code, Some(0), "{plan}");
+    let models = plan["models"].as_array().expect("models array");
+    let names: Vec<&str> = models.iter().filter_map(|m| m["model"].as_str()).collect();
+    assert_eq!(names, ["SmolLM2-135M", "SmolLM2-360M", "SmolLM2-1.7B"]);
+    assert_eq!(models[0]["estimated_peak_mib"], 4679);
+    assert_eq!(models[2]["chosen"]["batch_size"], 1);
+    assert_eq!(models[2]["chosen"]["seq_len"], 128);
+    assert_eq!(models[2]["fits"], true);
+}

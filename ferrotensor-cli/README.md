@@ -116,6 +116,43 @@ of QLoRA.
 - With `--memory-report`, the 4-bit weights appear under base weights as
   "of which 4-bit".
 
+## What fits this machine: `plan`
+
+`plan` estimates the peak GPU memory of LoRA training and prints the
+largest configuration expected to fit, with the `train` line to run it. It
+reads only the model's `config.json` and does not train.
+
+```bash
+ferrotensor plan --model ./data/models/SmolLM2-360M
+ferrotensor plan --model ./data/models/SmolLM2-360M --memory-mib 3000 --json
+ferrotensor plan                 # the documented SmolLM2 sizes and which fit
+```
+
+- Budget: `--memory-mib` wins; else `--vram-mib`; else, on a GPU that
+  shares system RAM (integrated GPUs, Apple silicon), 60% of the system
+  RAM; else an assumed 4,096 MiB, because wgpu does not report the memory
+  of a discrete GPU. The output says which (`measured`, `assumed`, `user`).
+- Choice: no checkpointing before `--checkpoint-blocks`, then the larger
+  batch (8, 4, 2, 1), then the longer sequence (256, 128, or only
+  `--seq-len`), keeping 15% of the budget free. `--weights f16|f32|q4`
+  (default f16) and `--lora-rank` (default 8) are fixed by the flags.
+- Exit code 0 when a configuration fits, 2 when none does, 1 on error.
+- `--json` prints one object with the keys `adapter`, `backend`,
+  `device_type`, `budget_mib`, `budget_source`, `model`, `parameters`,
+  `chosen` (`batch_size`, `seq_len`, `rank`, `precision`,
+  `checkpoint_blocks`), `estimated_peak_mib`, `margin`, `fits`,
+  `train_command` and `notes`. Without `--model` the per-model keys are in
+  a `models` array instead.
+
+The peak is an estimate: base weights at their precision, LoRA adapters
+with gradients and AdamW state, activations kept for backward (only block
+inputs with `--checkpoint-blocks`), the logits and their gradient, and a
+fixed 1,350 MiB for the driver context and buffer pool. Its constants are
+calibrated on the eight A10G peaks in the table below (SmolLM2 135M, 360M
+and 1.7B, f16 weights, sequence length 256); the estimate is within 13.3%
+of each of them. Other GPUs, f32 and 4-bit weights, LFM2 models and other
+sequence lengths are not calibrated.
+
 ## Less GPU memory: `--checkpoint-blocks`
 
 `train --checkpoint-blocks` (off by default) keeps only each decoder
