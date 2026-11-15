@@ -264,12 +264,16 @@ and a chat template for SFT) and can run short pretraining on `.txt` or packed
 `.bin` token files:
 
 ```bash
-cargo run -p ferrotensor-cli --release -- train \
-  --lite --task sft \
+cargo run -p ferrotensor-cli --release -- finetune \
   --model ./models/tinyllama \
   --data ./data/train.jsonl \
   --out ./outputs/run1
 ```
+
+`finetune` picks the batch size, sequence length, gradient accumulation and
+block checkpointing that fit this machine's GPU memory, prints that plan,
+then trains. `train` sets nothing for you; use it to choose every setting
+by hand.
 
 `--help` lists every flag. A step-by-step walkthrough with real output is in
 [docs/examples/lora-sft.md](docs/examples/lora-sft.md).
