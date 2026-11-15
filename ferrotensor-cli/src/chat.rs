@@ -201,7 +201,7 @@ mod tests {
         ];
         let defaults = (128, 0.7, 50, 0.9, None);
         for command in ["generate", "chat"] {
-            for (flags, want) in [(&set[..], (9, 0.5, 7, 0.8, Some(3))), (&[], defaults)] {
+            for (flags, want) in [(&set[..], (9, 0.5, 7, 0.8, Some(3))), (&[][..], defaults)] {
                 let args = ["ferrotensor", command, "--model", "m"].into_iter();
                 let cli = Cli::try_parse_from(args.chain(flags.iter().copied()))?;
                 let s = match cli.command {
