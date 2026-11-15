@@ -17,7 +17,7 @@
 
 use crate::checkpoint::{load_lora_checkpoint, save_lora_checkpoint};
 use crate::{classification_loss, global_grad_norm, TrainError};
-use ferrotensor_autograd::{AdamW, LRScheduler, Tensor};
+use ferrotensor_autograd::{no_grad, AdamW, LRScheduler, Tensor};
 use ferrotensor_backend::{ComputeEngine, UnifiedTensor, WgpuContext};
 use ferrotensor_graph::lfm::Lfm2Model;
 use ferrotensor_graph::ClassifierHead;
@@ -359,7 +359,7 @@ pub fn predict_probs(
     }
     let (padded, lengths) = pad_right(rows, pad_token)?;
     let refs: Vec<&[u32]> = padded.iter().map(Vec::as_slice).collect();
-    let logits = head.forward(engine, model, &refs, &lengths);
+    let logits = no_grad(|| head.forward(engine, model, &refs, &lengths));
     let host = pollster::block_on(logits.data.to_vec(&logits.ctx));
     Ok(softmax_rows(&host, head.classes()))
 }
