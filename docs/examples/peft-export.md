@@ -37,7 +37,27 @@ tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-135M")
 ```
 
 `model.merge_and_unload()` folds the adapter into the base weights if you
-want a plain `transformers` model.
+want a plain `transformers` model. `ferrotensor merge` does the same
+without PyTorch (next section).
+
+## Merge into a standalone model
+
+```bash
+./target/release/ferrotensor merge \
+  --model data/models/SmolLM2-135M \
+  --lora data/runs/sft/lora_adapters.safetensors \
+  --out data/models/SmolLM2-135M-sft
+```
+
+The output directory holds `model.safetensors`, with every adapted weight
+replaced by `W + alpha / rank * (A B)^T` in the base's dtype, and the base's
+`config.json`, generation config and tokenizer files. It loads with
+`AutoModelForCausalLM.from_pretrained` and with `ferrotensor generate` or
+`eval` without `--lora`. `--lora` also takes a PEFT adapter directory. With
+an adapter on `lm_head` and tied embeddings, the output has its own
+`lm_head.weight` and `tie_word_embeddings: false`; merging into the shared
+matrix would change the embeddings too. Details are in the
+[CLI docs](../../ferrotensor-cli/README.md#a-standalone-model-merge).
 
 ## Load a PEFT adapter in Ferrotensor
 
@@ -92,7 +112,9 @@ exports it with `export-adapter`, and runs
 [`scripts/check_peft_export.py`](../../scripts/check_peft_export.py): it
 loads the base model with `transformers`, the adapter with `peft`, checks
 that every adapter tensor loaded, and compares the logits for fixed token
-ids with the ones Ferrotensor computed. Pinned versions: torch 2.14.1 (CPU
+ids with the ones Ferrotensor computed. It then loads the directory
+`ferrotensor merge` wrote from the same adapter as a plain `transformers`
+model and compares its logits the same way. Pinned versions: torch 2.14.1 (CPU
 wheel), transformers 5.20.2, peft 0.21.2, safetensors 0.8.0. To run it
 yourself:
 
@@ -100,10 +122,13 @@ yourself:
 cargo run --release -p ferrotensor-trainer --example peft_fixture -- out
 cargo run --release -p ferrotensor-cli -- export-adapter \
   --lora out/adapter.safetensors --model out/model --output out/peft
+cargo run --release -p ferrotensor-cli -- merge \
+  --lora out/adapter.safetensors --model out/model --out out/merged
 python -m venv .venv && . .venv/bin/activate
 pip install --index-url https://download.pytorch.org/whl/cpu torch==2.14.1
 pip install transformers==5.20.2 peft==0.21.2 safetensors==0.8.0
-python scripts/check_peft_export.py --model out/model --adapter out/peft --logits out/logits.json
+python scripts/check_peft_export.py --model out/model --adapter out/peft \
+  --logits out/logits.json --merged out/merged
 ```
 
 The GPU tests in
@@ -111,3 +136,8 @@ The GPU tests in
 check that export then import gives bit-identical logits, that the exported
 keys and shapes are exactly PEFT's, and that adapters with the old names
 still load.
+[`ferrotensor-trainer/tests/merge_adapter.rs`](../../ferrotensor-trainer/tests/merge_adapter.rs)
+checks that a merge copies untouched tensors byte for byte, changes adapted
+ones by the expected delta, keeps f16 as f16, refuses mismatches, and, on
+the GPU, that the merged model's logits equal those of base plus adapter
+within 1e-4.

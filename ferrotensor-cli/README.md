@@ -338,3 +338,33 @@ The values in angle brackets are placeholders. Step time minus the time
 waiting on the GPU is roughly the time the host spends recording work;
 waiting includes the wait inside each readback, and forced synchronizes
 are the waits that free upload staging memory every 256 MiB of uploads.
+
+## A standalone model: `merge`
+
+`merge` folds a LoRA adapter into the base weights and writes a model
+directory that loads without `--lora`, here and in Hugging Face
+Transformers:
+
+```bash
+cargo run -p ferrotensor-cli --release -- merge \
+  --model ./data/models/SmolLM2-135M \
+  --lora ./data/runs/sft/lora_adapters.safetensors \
+  --out ./data/models/SmolLM2-135M-sft
+```
+
+Every adapted weight becomes `W + alpha / rank * (A B)^T`, computed in f32
+and stored in the base's dtype (F32, F16 or BF16); every other tensor is
+copied byte for byte into one `model.safetensors`, also when the base is
+sharded. `config.json`, `generation_config.json` and the tokenizer files are
+copied unchanged. An adapter on `lm_head` of a model with tied embeddings
+(SmolLM2) writes a separate `lm_head.weight` and sets
+`tie_word_embeddings` to false, since the embeddings stay as they were.
+
+The merge runs on the host without a GPU and streams: one tensor is read,
+changed row by row and written before the next, so host memory stays near
+one row plus the adapter instead of the model. `--lora` takes a Ferrotensor
+adapter file or a PEFT adapter directory. `--out` must be new or empty.
+Quantized bases (`quantization` or `quantization_config` in `config.json`,
+or `.scales` tensors), files of trained base weights, and adapter tensors
+whose base weight is missing or has another shape are refused before
+anything is written.

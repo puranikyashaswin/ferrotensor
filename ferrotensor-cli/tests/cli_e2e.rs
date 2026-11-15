@@ -612,3 +612,67 @@ fn finetune_force_trains_the_smallest_configuration() {
         (&serde_json::json!(2), &serde_json::json!(1))
     );
 }
+
+#[test]
+fn merge_writes_a_model_directory_and_refuses_a_non_empty_output() {
+    let model = model_dir("merge-model");
+    let tmp = common::TempDir::new("merge-out");
+    // A rank-2 adapter on q_proj of both layers, with the metadata `train`
+    // writes.
+    let a = vec![0u8; common::HIDDEN * 2 * 4];
+    let b = vec![0u8; 2 * common::HIDDEN * 4];
+    let mut views = std::collections::HashMap::new();
+    for l in 0..common::LAYERS {
+        let p = format!("model.layers.{l}.self_attn.q_proj");
+        for (suffix, shape, bytes) in [
+            ("lora_A", vec![common::HIDDEN, 2], &a),
+            ("lora_B", vec![2, common::HIDDEN], &b),
+        ] {
+            let view = safetensors::tensor::TensorView::new(safetensors::Dtype::F32, shape, bytes)
+                .expect("tensor view");
+            views.insert(format!("{p}.{suffix}.weight"), view);
+        }
+    }
+    let metadata = std::collections::HashMap::from([
+        ("format".to_string(), "ferrotensor-lora".to_string()),
+        ("rank".to_string(), "2".to_string()),
+        ("alpha".to_string(), "4".to_string()),
+        ("target_modules".to_string(), "q_proj".to_string()),
+    ]);
+    let adapter = tmp.path().join("adapter.safetensors");
+    std::fs::write(
+        &adapter,
+        safetensors::tensor::serialize(views, &Some(metadata)).expect("serialize"),
+    )
+    .expect("write adapter");
+
+    let merged = tmp.path().join("merged");
+    let merge = |out: &Path| {
+        ferrotensor(&[
+            "merge",
+            "--model",
+            s(model.path()),
+            "--lora",
+            s(&adapter),
+            "--out",
+            s(out),
+        ])
+    };
+    let run = merge(&merged);
+    assert_success(&run);
+    assert!(
+        text(&run.stdout).contains("(2 tensors merged, 18 copied)"),
+        "stdout: {}",
+        text(&run.stdout)
+    );
+    for name in ["model.safetensors", "config.json", "tokenizer.json"] {
+        assert!(merged.join(name).is_file(), "{name} is missing");
+    }
+
+    for out in [merged.as_path(), model.path()] {
+        let run = merge(out);
+        assert_eq!(run.status.code(), Some(1));
+        let stderr = text(&run.stderr);
+        assert!(stderr.contains("is not empty"), "stderr: {stderr}");
+    }
+}

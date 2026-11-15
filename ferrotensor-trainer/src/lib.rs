@@ -8,7 +8,7 @@
 //! averaging. [`data`] builds SFT and
 //! pretraining datasets, [`checkpoint`] saves and restores LoRA adapters and
 //! optimizer state, [`peft`] converts adapters to and from the Hugging Face
-//! PEFT format, and [`classify`] fine-tunes a decoder with LoRA as a sequence
+//! PEFT format, [`merge`] folds an adapter into the base weights, and [`classify`] fine-tunes a decoder with LoRA as a sequence
 //! classifier ([`ClassifierTrainer`]).
 
 #![warn(missing_docs)]
@@ -26,6 +26,7 @@ pub mod data;
 pub mod demo;
 pub mod distributed;
 pub mod memory;
+pub mod merge;
 pub mod peft;
 pub mod scaler;
 

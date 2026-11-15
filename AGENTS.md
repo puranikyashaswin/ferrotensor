@@ -51,6 +51,7 @@ is `null`. On an error stdout carries `{"error": "<message>"}` instead.
 | `train` | `steps`, `first_loss`, `final_loss`, `eval_loss_before`, `eval_loss_after` (null without `--eval-data`), `measured_peak_mib`, `seconds`, `out_dir`, `adapter` |
 | `eval` | `examples`, `tokens`, `loss`, `perplexity`, `seconds` |
 | `generate` | `text`, `prompt_tokens`, `new_tokens`, `tokens_per_second`, `kv_cache` |
+| `merge` | `out_dir`, `merged` (tensors with the adapter added), `copied` (tensors copied byte for byte) |
 | `info` | `ferrotensor`, `os`, `arch`, `adapters` (one object per GPU, `selected` marks the one used), `checks` (null without `--check`), and `error` only on failure |
 
 `measured_peak_mib` counts the GPU buffers Ferrotensor tracks, not the driver

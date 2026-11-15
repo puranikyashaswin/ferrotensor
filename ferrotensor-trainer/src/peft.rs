@@ -144,7 +144,7 @@ impl LoraSlot {
 }
 
 /// Row-major `[rows, cols]` to `[cols, rows]`.
-fn transpose(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+pub(crate) fn transpose(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     let mut out = vec![0.0; data.len()];
     for r in 0..rows {
         for c in 0..cols {
