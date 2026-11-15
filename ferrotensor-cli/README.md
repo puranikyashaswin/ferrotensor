@@ -130,12 +130,18 @@ ferrotensor plan                 # the documented SmolLM2 sizes and which fit
 
 - Budget: `--memory-mib` wins; else `--vram-mib`; else, on a GPU that
   shares system RAM (integrated GPUs, Apple silicon), 60% of the system
-  RAM; else an assumed 4,096 MiB, because wgpu does not report the memory
-  of a discrete GPU. The output says which (`measured`, `assumed`, `user`).
-- Choice: no checkpointing before `--checkpoint-blocks`, then the larger
-  batch (8, 4, 2, 1), then the longer sequence (256, 128, or only
-  `--seq-len`), keeping 15% of the budget free. `--weights f16|f32|q4`
-  (default f16) and `--lora-rank` (default 8) are fixed by the flags.
+  RAM; else, on an NVIDIA GPU, the smallest `memory.total` that
+  `nvidia-smi` lists; else an assumed 4,096 MiB, because wgpu does not
+  report the memory of a discrete GPU. The output says which (`measured`,
+  `assumed`, `user`).
+- Choice: the longer sequence first (256, then 128, or only `--seq-len`),
+  then no checkpointing before `--checkpoint-blocks`, then the larger batch
+  (8, 4, 2, 1), keeping 15% of the budget free. Sequence length comes first
+  because a shorter one cuts longer examples, which changes what is
+  trained; batch size only changes speed, and the train line keeps 8
+  sequences per step. Seq 128 is used only when nothing fits at 256, and a
+  note says so. `--weights f16|f32|q4` (default f16) and `--lora-rank`
+  (default 8) are fixed by the flags.
 - Exit code 0 when a configuration fits, 2 when none does, 1 on error.
 - `--json` prints one object with the keys `adapter`, `backend`,
   `device_type`, `budget_mib`, `budget_source`, `model`, `parameters`,

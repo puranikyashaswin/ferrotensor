@@ -307,8 +307,9 @@ pub struct Plan {
 }
 
 /// The first configuration that fits `budget_mib` with the safety margin:
-/// no checkpointing before checkpointing, then larger batch, then longer
-/// sequence. When none fits, the smallest one, with `fits` false.
+/// longer sequence first (cutting examples changes what is trained, batch
+/// size only changes speed), then no checkpointing before checkpointing,
+/// then larger batch. When none fits, the smallest one, with `fits` false.
 pub fn choose(
     shape: &ModelShape,
     budget_mib: u64,
@@ -340,9 +341,9 @@ pub fn choose(
             fits: estimate.peak_mib as f64 <= usable_mib,
         }
     };
-    for checkpointing in [Checkpointing::Off, Checkpointing::Blocks] {
-        for batch_size in BATCH_SIZES {
-            for &seq_len in seq_lens {
+    for &seq_len in seq_lens {
+        for checkpointing in [Checkpointing::Off, Checkpointing::Blocks] {
+            for batch_size in BATCH_SIZES {
                 let plan = plan_for(checkpointing, batch_size, seq_len);
                 if plan.fits {
                     return plan;
@@ -357,7 +358,8 @@ pub fn choose(
 /// Where the memory budget came from.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum BudgetSource {
-    /// Derived from what the machine reports (system RAM of a unified GPU).
+    /// Derived from what the machine reports (system RAM of a unified GPU,
+    /// or nvidia-smi).
     Measured,
     /// A conservative default, not measured.
     Assumed,
@@ -387,11 +389,13 @@ pub struct Budget {
 }
 
 /// The budget from `--memory-mib`, `--vram-mib`, the system RAM of a GPU
-/// that shares it, or else an assumed default, in that order.
+/// that shares it, `nvidia_smi_mib` for an NVIDIA GPU, or else an assumed
+/// default, in that order.
 pub fn budget(
     args: &PlanArgs,
     adapter: Option<&AdapterReport>,
     total_ram_mib: Result<u64, String>,
+    nvidia_smi_mib: impl FnOnce() -> Result<u64, String>,
 ) -> Budget {
     let user = |mib, flag: &str| Budget {
         mib,
@@ -421,9 +425,47 @@ pub fn budget(
             },
             Err(e) => assumed(format!("cannot read system RAM ({e})")),
         },
+        Some(a) if a.vendor == "NVIDIA" => match nvidia_smi_mib() {
+            Ok(mib) => Budget {
+                mib,
+                source: BudgetSource::Measured,
+                reason: "memory.total from nvidia-smi (the smallest GPU listed)".into(),
+            },
+            Err(e) => assumed(format!(
+                "wgpu does not report the memory of a discrete GPU and nvidia-smi failed ({e})"
+            )),
+        },
         Some(_) => assumed("wgpu does not report the memory of a discrete GPU".into()),
         None => assumed("no GPU adapter found".into()),
     }
+}
+
+/// The smallest `memory.total` in the output of `nvidia-smi
+/// --query-gpu=memory.total --format=csv,noheader,nounits`, in MiB.
+///
+/// # Errors
+///
+/// When the output lists no GPU or a line is not a number.
+pub fn parse_nvidia_smi_total_mib(output: &str) -> Result<u64, String> {
+    let mut smallest: Option<u64> = None;
+    for line in output.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let mib: u64 = line
+            .parse()
+            .map_err(|e| format!("nvidia-smi line {line:?}: {e}"))?;
+        smallest = Some(smallest.map_or(mib, |s| s.min(mib)));
+    }
+    smallest.ok_or_else(|| "nvidia-smi listed no GPU".into())
+}
+
+fn nvidia_smi_total_mib() -> Result<u64, String> {
+    let out = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
+        .output()
+        .map_err(|e| format!("cannot run nvidia-smi: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("nvidia-smi exited with {}", out.status));
+    }
+    parse_nvidia_smi_total_mib(&String::from_utf8_lossy(&out.stdout))
 }
 
 /// `MemTotal` from the text of /proc/meminfo, in MiB.
@@ -519,6 +561,16 @@ fn describe(config: &TrainConfig) -> String {
     )
 }
 
+/// The note for a plan below the preferred sequence length, which cuts data.
+fn short_seq_note(model: &str, seq_len: usize) -> Option<String> {
+    (seq_len < SEQ_LENS[0]).then(|| {
+        format!(
+            "{model}: seq {seq_len} cuts every example longer than {seq_len} tokens; \
+             pass --seq-len N to plan and train to keep a length"
+        )
+    })
+}
+
 fn millions(parameters: u64) -> String {
     format!("{:.1}M", parameters as f64 / 1e6)
 }
@@ -552,7 +604,7 @@ pub fn run(args: PlanArgs) -> Result<Outcome, Box<dyn std::error::Error>> {
     if adapter.is_none() && args.memory_mib.is_none() && args.vram_mib.is_none() {
         return Err("no GPU adapter found; pass --memory-mib to plan for another machine".into());
     }
-    let budget = budget(&args, adapter, total_ram_mib());
+    let budget = budget(&args, adapter, total_ram_mib(), nvidia_smi_total_mib);
     let seq_lens = args.seq_len.map_or(SeqLens::Default, SeqLens::Fixed);
     let mut report = match &args.model {
         Some(dir) => plan_model(&args, dir, budget.mib, seq_lens)?,
@@ -615,7 +667,9 @@ fn plan_model(
     let model_arg = dir.display().to_string();
     let shape = ModelShape::from_config(model_arg.clone(), &config);
     let plan = choose(&shape, budget_mib, args.weights, args.lora_rank, seq_lens);
-    let mut notes = Vec::new();
+    let mut notes: Vec<String> = short_seq_note(&shape.name, plan.config.seq_len)
+        .into_iter()
+        .collect();
     if !config.layer_types.is_empty() || config.model_type.as_deref() == Some("lfm2") {
         notes.push("LFM2 blocks are estimated as Llama blocks; not calibrated".into());
     }
@@ -675,9 +729,11 @@ fn plan_documented(args: &PlanArgs, budget_mib: u64, seq_lens: SeqLens) -> Repor
         "model", "parameters", "plan", "estimate"
     )];
     let mut any_fits = false;
+    let mut notes = Vec::new();
     for shape in ModelShape::documented() {
         let plan = choose(&shape, budget_mib, args.weights, args.lora_rank, seq_lens);
         any_fits |= plan.fits;
+        notes.extend(short_seq_note(&shape.name, plan.config.seq_len));
         let model_arg = format!("path/to/{}", shape.name);
         models.push(Value::Object(plan_json(&shape, &model_arg, &plan)));
         lines.push(format!(
@@ -699,7 +755,7 @@ fn plan_documented(args: &PlanArgs, budget_mib: u64, seq_lens: SeqLens) -> Repor
         },
         fields,
         lines,
-        notes: Vec::new(),
+        notes,
     }
 }
 
@@ -788,7 +844,8 @@ mod tests {
     }
 
     #[test]
-    fn chooser_prefers_no_checkpointing_then_batch_then_sequence() {
+    fn chooser_prefers_the_longer_sequence_then_no_checkpointing_then_batch() {
+        // Batch 8 at seq 128 (4,679 MiB) also fits, but seq 256 wins.
         let p = choose(
             &smollm2("SmolLM2-135M"),
             8000,
@@ -804,7 +861,38 @@ mod tests {
                 p.estimate.peak_mib,
                 p.fits
             ),
-            (Checkpointing::Off, 8, 128, 4679, true)
+            (Checkpointing::Off, 4, 256, 5084, true)
+        );
+        assert_eq!(short_seq_note("m", p.config.seq_len), None);
+    }
+
+    #[test]
+    fn chooser_drops_to_seq_128_only_when_256_fails_with_checkpointing() {
+        // Seq 256 needs 5,294 MiB even with checkpointing at batch 1; 6,150
+        // MiB leaves 5,227 usable.
+        let p = choose(
+            &smollm2("SmolLM2-1.7B"),
+            6150,
+            Precision::F16,
+            8,
+            SeqLens::Default,
+        );
+        assert_eq!(
+            (
+                p.config.checkpointing,
+                p.config.batch_size,
+                p.config.seq_len,
+                p.estimate.peak_mib,
+                p.fits
+            ),
+            (Checkpointing::Blocks, 1, 128, 5164, true)
+        );
+        assert_eq!(
+            short_seq_note("SmolLM2-1.7B", p.config.seq_len).as_deref(),
+            Some(
+                "SmolLM2-1.7B: seq 128 cuts every example longer than 128 tokens; \
+                 pass --seq-len N to plan and train to keep a length"
+            )
         );
     }
 
@@ -825,14 +913,14 @@ mod tests {
                 p.estimate.peak_mib,
                 p.fits
             ),
-            (Checkpointing::Blocks, 2, 128, 2407, true)
+            (Checkpointing::Blocks, 1, 256, 2413, true)
         );
     }
 
     #[test]
     fn chooser_keeps_a_fixed_sequence_length() {
-        let seq = SeqLens::Fixed(NonZeroUsize::new(256).expect("non-zero"));
-        let p = choose(&smollm2("SmolLM2-1.7B"), 8000, Precision::F16, 8, seq);
+        let shape = smollm2("SmolLM2-1.7B");
+        let p = choose(&shape, 8000, Precision::F16, 8, SeqLens::Default);
         assert_eq!(
             (
                 p.config.checkpointing,
@@ -841,6 +929,17 @@ mod tests {
                 p.estimate.peak_mib
             ),
             (Checkpointing::Blocks, 4, 256, 6038)
+        );
+        let seq = SeqLens::Fixed(NonZeroUsize::new(128).expect("non-zero"));
+        let p = choose(&shape, 8000, Precision::F16, 8, seq);
+        assert_eq!(
+            (
+                p.config.checkpointing,
+                p.config.batch_size,
+                p.config.seq_len,
+                p.estimate.peak_mib
+            ),
+            (Checkpointing::Off, 1, 128, 6198)
         );
     }
 
@@ -868,8 +967,14 @@ mod tests {
         assert!(!choose(&shape, 6000, Precision::F16, 8, SeqLens::Default).fits);
         let q4 = choose(&shape, 6000, Precision::Q4, 8, SeqLens::Default);
         assert_eq!(
-            (q4.config.batch_size, q4.estimate.peak_mib, q4.fits),
-            (1, 3990, true)
+            (
+                q4.config.checkpointing,
+                q4.config.batch_size,
+                q4.config.seq_len,
+                q4.estimate.peak_mib,
+                q4.fits
+            ),
+            (Checkpointing::Blocks, 8, 256, 4822, true)
         );
     }
 
@@ -901,12 +1006,23 @@ mod tests {
         }
     }
 
+    fn no_nvidia_smi() -> Result<u64, String> {
+        Err("cannot run nvidia-smi: not found".into())
+    }
+
     #[test]
     fn budget_flags_win_over_the_adapter() {
-        let apple = adapter("Apple", "DiscreteGpu");
-        let b = budget(&args(Some(3000), Some(9000)), Some(&apple), Ok(8192));
+        let nvidia = adapter("NVIDIA", "DiscreteGpu");
+        let b = budget(
+            &args(Some(3000), Some(9000)),
+            Some(&nvidia),
+            Ok(8192),
+            || Ok(24000),
+        );
         assert_eq!((b.mib, b.source), (3000, BudgetSource::User));
-        let b = budget(&args(None, Some(9000)), Some(&apple), Ok(8192));
+        let b = budget(&args(None, Some(9000)), Some(&nvidia), Ok(8192), || {
+            Ok(24000)
+        });
         assert_eq!((b.mib, b.source), (9000, BudgetSource::User));
     }
 
@@ -916,34 +1032,75 @@ mod tests {
             &args(None, None),
             Some(&adapter("Apple", "DiscreteGpu")),
             Ok(8192),
+            no_nvidia_smi,
         );
         assert_eq!((b.mib, b.source), (4915, BudgetSource::Measured));
         let b = budget(
             &args(None, None),
             Some(&adapter("Intel", "IntegratedGpu")),
             Ok(16384),
+            no_nvidia_smi,
         );
         assert_eq!((b.mib, b.source), (9830, BudgetSource::Measured));
         let b = budget(
             &args(None, None),
             Some(&adapter("Intel", "IntegratedGpu")),
             Err("no /proc".into()),
+            no_nvidia_smi,
         );
         assert_eq!((b.mib, b.source), (4096, BudgetSource::Assumed));
     }
 
     #[test]
-    fn discrete_gpu_budget_is_assumed() {
+    fn nvidia_budget_comes_from_nvidia_smi() {
         let b = budget(
             &args(None, None),
             Some(&adapter("NVIDIA", "DiscreteGpu")),
             Ok(65536),
+            || Ok(23028),
+        );
+        assert_eq!((b.mib, b.source), (23028, BudgetSource::Measured));
+        assert!(b.reason.contains("nvidia-smi"), "{}", b.reason);
+    }
+
+    #[test]
+    fn discrete_gpu_budget_is_assumed_without_nvidia_smi() {
+        let b = budget(
+            &args(None, None),
+            Some(&adapter("NVIDIA", "DiscreteGpu")),
+            Ok(65536),
+            no_nvidia_smi,
         );
         assert_eq!((b.mib, b.source), (4096, BudgetSource::Assumed));
         assert!(
             b.reason.starts_with("assumed, not measured"),
             "{}",
             b.reason
+        );
+        // nvidia-smi is only asked about NVIDIA adapters.
+        let b = budget(
+            &args(None, None),
+            Some(&adapter("AMD", "DiscreteGpu")),
+            Ok(65536),
+            || Ok(23028),
+        );
+        assert_eq!((b.mib, b.source), (4096, BudgetSource::Assumed));
+    }
+
+    #[test]
+    fn nvidia_smi_output_gives_the_smallest_total() {
+        assert_eq!(parse_nvidia_smi_total_mib("23028\n"), Ok(23028));
+        assert_eq!(parse_nvidia_smi_total_mib("24576\n 8192 \n"), Ok(8192));
+        assert_eq!(
+            parse_nvidia_smi_total_mib(""),
+            Err("nvidia-smi listed no GPU".to_string())
+        );
+        assert_eq!(
+            parse_nvidia_smi_total_mib("NVIDIA-SMI has failed\n"),
+            Err(
+                "nvidia-smi line \"NVIDIA-SMI has failed\": invalid digit found in string"
+                    .to_string()
+            )
         );
     }
 

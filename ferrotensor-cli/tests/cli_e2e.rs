@@ -332,6 +332,15 @@ fn plan_exits_with_2_when_nothing_fits() {
     assert_eq!(plan["chosen"]["seq_len"], 128);
     // weights 1 + adapters 1 + activations 2 + logits 1 + overhead 1350.
     assert_eq!(plan["estimated_peak_mib"], 1355);
+    let notes = plan["notes"].as_array().expect("notes array");
+    assert!(
+        notes
+            .iter()
+            .filter_map(|n| n.as_str())
+            .any(|n| n
+                .contains("seq 128 cuts every example longer than 128 tokens; pass --seq-len N")),
+        "{notes:?}"
+    );
 }
 
 #[test]
@@ -341,8 +350,12 @@ fn plan_without_a_model_lists_the_documented_sizes() {
     let models = plan["models"].as_array().expect("models array");
     let names: Vec<&str> = models.iter().filter_map(|m| m["model"].as_str()).collect();
     assert_eq!(names, ["SmolLM2-135M", "SmolLM2-360M", "SmolLM2-1.7B"]);
-    assert_eq!(models[0]["estimated_peak_mib"], 4679);
-    assert_eq!(models[2]["chosen"]["batch_size"], 1);
-    assert_eq!(models[2]["chosen"]["seq_len"], 128);
+    assert_eq!(models[0]["chosen"]["batch_size"], 4);
+    assert_eq!(models[0]["chosen"]["seq_len"], 256);
+    assert_eq!(models[0]["estimated_peak_mib"], 5084);
+    assert_eq!(models[2]["chosen"]["batch_size"], 4);
+    assert_eq!(models[2]["chosen"]["seq_len"], 256);
+    assert_eq!(models[2]["chosen"]["checkpoint_blocks"], true);
+    assert_eq!(models[2]["estimated_peak_mib"], 6038);
     assert_eq!(models[2]["fits"], true);
 }
