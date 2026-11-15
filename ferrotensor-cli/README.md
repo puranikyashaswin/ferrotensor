@@ -89,6 +89,14 @@ ferrotensor chat --model HuggingFaceTB/SmolLM2-135M
   trained, which `eval --lora`, `generate --lora` and `--resume` load),
   `metrics.jsonl` (one line per logged step / eval) and
   `training_state.json` (read by `ferrotensor-cli monitor`).
+- `--train-modules` picks what trains: `lora` (the default), or base weights
+  by group: `attn`, `mlp`, `norm`, `head`, `all` (every base weight but the
+  token embedding), `embed` (only the token embedding) and `full` (`all`
+  plus the embedding). A trained embedding costs a gradient and two AdamW
+  moments of `vocab x hidden` f32 values each on the GPU, and the table is
+  read back to the host for every forward pass while it trains. With tied
+  embeddings `lm_head` is a separate copy, so training the embedding does
+  not change `lm_head` and training `head` does not change the embedding.
 - `classify-train` fine-tunes the model with LoRA as a text classifier from
   JSONL `{"text", "label"}` lines and `classify-predict` writes per-line
   class probabilities; see

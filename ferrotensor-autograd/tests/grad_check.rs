@@ -113,6 +113,12 @@ fn cases() -> Vec<Case> {
         case("select_token", vec![input(&[3, 5], 13)], |x, _| {
             Tensor::select_token(&x[0], 1)
         }),
+        // Id 2 appears three times (its gradients add up), id 3 never, and
+        // id 9 is outside the 5-row table (a zero row with no gradient).
+        case("embedding", vec![input(&[5, 4], 31)], |x, _| {
+            let table = read(&x[0].ctx, &x[0].data);
+            Tensor::embedding(&x[0], &table, &[&[2, 0, 2], &[1, 9, 2]])
+        }),
         case("reshape", vec![input(&[2, 3], 14)], |x, e| {
             let r = Tensor::reshape(&x[0], &[3, 2]);
             Tensor::mul(&r, &r, e)

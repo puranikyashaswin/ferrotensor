@@ -310,8 +310,11 @@ struct TrainArgs {
     )]
     lora_targets: Vec<String>,
     /// What to train: lora, or base weights by group (all, attn, mlp, norm,
-    /// lm_head). Trained base weights are saved in f32, only the tensors that
-    /// trained, and load with --lora in eval and generate or with --resume.
+    /// lm_head, embed). `all` is every base weight but the token embedding,
+    /// `embed` only the embedding, `full` both. With tied embeddings lm_head
+    /// is a separate copy: training one does not change the other. Trained
+    /// base weights are saved in f32, only the tensors that trained, and load
+    /// with --lora in eval and generate or with --resume.
     #[arg(long, default_value = "lora")]
     train_modules: String,
     /// Log every N optimizer steps.
@@ -715,8 +718,13 @@ fn restore_checkpoint(
 ) -> Result<usize> {
     ensure_not_empty(ckpt, path)?;
     let params = restorable_params(model, ckpt.metadata.as_ref())?;
-    apply_checkpoint(&base.ctx, ckpt, &params)
-        .map_err(|e| format!("{}: {e}", path.display()).into())
+    let restored = apply_checkpoint(&base.ctx, ckpt, &params)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if params.contains_key(EMBED_TOKENS) {
+        // The lookup of a frozen table reads a host copy made at build time.
+        model.clear_host_embeddings();
+    }
+    Ok(restored)
 }
 
 /// Reject a file without tensors. Versions before trained base weights were
@@ -1196,42 +1204,43 @@ async fn generate_tokens(
 // ---------------------------------------------------------------------------
 // train
 
+/// Parameter name of the token embedding table.
+const EMBED_TOKENS: &str = "model.embed_tokens.weight";
+
 fn select_train_params(
     model: &Lfm2Model,
     modules: &str,
 ) -> Result<HashMap<String, ferrotensor_autograd::Tensor>> {
     let mode = modules.to_ascii_lowercase();
-    let params: HashMap<_, _> = match mode.as_str() {
-        "lora" => model.named_lora_params(),
-        "all" => model
+    let params: HashMap<_, _> = if mode == "lora" {
+        model.named_lora_params()
+    } else {
+        model
             .named_params()
             .into_iter()
-            .filter(|(n, _)| !n.contains("embed_tokens"))
-            .collect(),
-        "embed" | "embedding" => {
-            return Err(
-                "training the token embedding is not supported (the lookup runs on the CPU)".into(),
-            )
-        }
-        m => {
-            // Llama blocks name the MLP `mlp`, LFM2 blocks `feed_forward`.
-            let keys = match m {
-                "attn" | "attention" => vec!["self_attn"],
-                "mlp" => vec![".mlp.", ".feed_forward."],
-                "head" => vec!["lm_head"],
-                other => vec![other],
-            };
-            model
-                .named_params()
-                .into_iter()
-                .filter(|(n, _)| keys.iter().any(|k| n.contains(k)))
-                .collect()
-        }
+            .filter(|(n, _)| trains_base_weight(&mode, n))
+            .collect()
     };
     if params.is_empty() {
         return Err(format!("--train-modules {modules} selects no parameters").into());
     }
     Ok(params)
+}
+
+/// Whether `--train-modules` value `mode` (lowercase, not `lora`) trains the
+/// base weight `name`.
+fn trains_base_weight(mode: &str, name: &str) -> bool {
+    // Llama blocks name the MLP `mlp`, LFM2 blocks `feed_forward`.
+    let keys: &[&str] = match mode {
+        "all" => return !name.contains("embed_tokens"),
+        "full" => return true,
+        "embed" | "embedding" => &["embed_tokens"],
+        "attn" | "attention" => &["self_attn"],
+        "mlp" => &[".mlp.", ".feed_forward."],
+        "head" => &["lm_head"],
+        other => return name.contains(other),
+    };
+    keys.iter().any(|k| name.contains(k))
 }
 
 fn param_count(params: &HashMap<String, ferrotensor_autograd::Tensor>) -> usize {
@@ -1326,6 +1335,7 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
         build_model(&base, lora_on.then_some(&meta), !lora_on)?
     };
     let named_params = select_train_params(&model, &args.train_modules)?;
+    let model = model.with_trainable_embedding(named_params.contains_key(EMBED_TOKENS));
     let train_params: Vec<_> = {
         let mut names: Vec<&String> = named_params.keys().collect();
         // Sorted by the names Llama blocks had before they took Hugging Face
@@ -2112,6 +2122,52 @@ mod tests {
             "{err}"
         );
         assert!(ok(None, "all").is_err());
+    }
+
+    #[test]
+    fn train_modules_select_the_embedding_only_when_asked() {
+        let names = [
+            EMBED_TOKENS,
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.mlp.up_proj.weight",
+            "model.layers.0.input_layernorm.weight",
+            "model.norm.weight",
+            "lm_head.weight",
+        ];
+        let selected = |modules: &str| -> Vec<&str> {
+            let cli = parse(&[
+                "train",
+                "--model",
+                "m",
+                "--data",
+                "d",
+                "--train-modules",
+                modules,
+            ])
+            .unwrap();
+            let Command::Train(args) = cli.command else {
+                panic!("not a train command");
+            };
+            let mode = args.train_modules.to_ascii_lowercase();
+            names
+                .into_iter()
+                .filter(|n| trains_base_weight(&mode, n))
+                .collect()
+        };
+        assert_eq!(selected("all"), &names[1..]);
+        assert_eq!(selected("embed"), [EMBED_TOKENS]);
+        assert_eq!(selected("Embedding"), [EMBED_TOKENS]);
+        assert_eq!(selected("full"), names);
+        assert_eq!(selected("FULL"), names);
+        assert_eq!(selected("attn"), [names[1]]);
+        assert_eq!(selected("head"), ["lm_head.weight"]);
+        assert_eq!(
+            saved_metadata(&lora_meta(), "Full"),
+            LoraMetadata::trained_weights("full")
+        );
+        let weights = LoraMetadata::trained_weights("embed");
+        assert!(check_resume_file(Some(&weights), "embed").is_ok());
+        assert!(check_resume_file(Some(&weights), "full").is_err());
     }
 
     #[test]
