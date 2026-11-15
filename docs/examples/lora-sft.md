@@ -201,12 +201,12 @@ size from `/usr/bin/time -v`.
 
 | Model | 0.6 GPU | 0.7 GPU | 0.7 `--checkpoint-blocks` GPU | 0.6 host | 0.7 host | Time per step 0.7 → `--checkpoint-blocks` |
 |---|---:|---:|---:|---:|---:|---:|
-| SmolLM2-135M, batch 1 | 3,515 MiB | 2,306 MiB | 1,890 MiB | 1,265 MiB | 1,138 MiB | 1.19 → 1.48 s (+24%) |
-| SmolLM2-360M, batch 1 | 5,411 MiB | 3,579 MiB | 2,783 MiB | 1,781 MiB | 1,200 MiB | 1.59 → 2.06 s (+30%) |
-| SmolLM2-1.7B, batch 1 | 11,671 MiB | 8,142 MiB | 5,313 MiB | 5,087 MiB | 1,575 MiB | 2.30 → 3.18 s (+38%) |
-| SmolLM2-135M, batch 8 | 16,270 MiB | 9,441 MiB | 2,767 MiB | 1,400 MiB | 1,322 MiB | 2.51 → 3.01 s (+20%) |
+| SmolLM2-135M, batch 1 | 3,515 MiB | 2,306 MiB | 1,890 MiB | 1,265 MiB | 1,138 MiB | 1.17 → 1.47 s (+26%) |
+| SmolLM2-360M, batch 1 | 5,411 MiB | 3,579 MiB | 2,783 MiB | 1,781 MiB | 1,200 MiB | 1.56 → 2.04 s (+31%) |
+| SmolLM2-1.7B, batch 1 | 11,671 MiB | 8,142 MiB | 5,313 MiB | 5,087 MiB | 1,575 MiB | 2.275 → 3.155 s (+39%) |
+| SmolLM2-135M, batch 8 | 16,270 MiB | 9,441 MiB | 2,767 MiB | 1,400 MiB | 1,322 MiB | 2.645 → 3.135 s (+19%) |
 
-Time per step is the value printed at step 30. Held-out loss after the 30
+Time per step is the median over the 30 steps. Held-out loss after the 30
 steps:
 
 | Model | 0.6 | 0.7, default and `--checkpoint-blocks` |
@@ -226,7 +226,7 @@ steps:
   started from the same A. The held-out loss before training and the
   training loss at step 1 are the same in both, since B starts at zero; the
   gradient norms differ from step 1.
-- `--checkpoint-blocks` costs 20% (135M, batch 8) to 38% (1.7B) more time
+- `--checkpoint-blocks` costs 19% (135M, batch 8) to 39% (1.7B) more time
   per step.
 - Most of the host memory saving comes from the host-memory change in
   model loading (#98). Against `main` just before it (`45a7c39`), peak host
@@ -273,13 +273,13 @@ the same batches on the GPU and compares every element within
 | Case | Gradient tensors | Loss difference | Largest logit difference | Largest gradient difference |
 |---|---:|---:|---:|---:|
 | One sequence | 30 | 4.77e-7 | 1.55e-6 | 5.66e-7 |
-| Batch | 30 | 9.54e-7 | 1.31e-6 | 4.92e-7 |
+| Batch | 30 | 9.54e-7 | 1.31e-6 | 9.54e-7 |
 | Loss mask | 30 | 4.77e-7 | 1.31e-6 | 9.24e-7 |
 | Trainable base weights | 50 | 4.77e-7 | 1.31e-6 | 9.24e-7 |
 
 Those differences are from the confirmation run of merged `main` on the
 A10G: all four cases passed, and the largest gradient difference is below
-1e-6 (9.2e-7 in the confirmation run). The test also runs on every pull
+1e-6 (9.5e-7 in the confirmation run). The test also runs on every pull
 request on software Vulkan:
 
 ```bash

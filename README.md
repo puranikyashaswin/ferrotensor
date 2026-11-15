@@ -46,7 +46,7 @@ sequences per optimizer step.
   loss mask, trainable base weights) with fixtures from PyTorch autograd
   ([`scripts/gen_gradient_fixtures.py`](scripts/gen_gradient_fixtures.py)).
   Every element must be within 1e-4 + 1e-3 × |expected|; the largest
-  gradient difference is below 1e-6 (9.2e-7 in the confirmation run on the
+  gradient difference is below 1e-6 (9.5e-7 in the confirmation run on the
   A10G). It runs on every pull request
   on software Vulkan. The model is tiny, so it does not catch effects that
   only appear at scale.
@@ -62,14 +62,15 @@ sequences per optimizer step.
 - **Less GPU memory for LoRA.** Peak GPU memory (`nvidia-smi`, MiB) for 30
   optimizer steps with f16 base weights, batch 1 × 8-step accumulation
   unless noted, all measured in one session on one A10G: 0.6 is the
-  released v0.6.0, 0.7 is merged `main` (`af41068`):
+  released v0.6.0, 0.7 is merged `main` (`af41068`); the time column
+  compares median seconds per step over the 30 steps:
 
   | Model | 0.6 | 0.7 default | 0.7 `--checkpoint-blocks` | Time per step with `--checkpoint-blocks` |
   |---|---:|---:|---:|---:|
-  | SmolLM2-135M | 3,515 | 2,306 | 1,890 | +24% |
-  | SmolLM2-360M | 5,411 | 3,579 | 2,783 | +30% |
-  | SmolLM2-1.7B | 11,671 | 8,142 | 5,313 | +38% |
-  | SmolLM2-135M, batch 8 | 16,270 | 9,441 | 2,767 | +20% |
+  | SmolLM2-135M | 3,515 | 2,306 | 1,890 | +26% |
+  | SmolLM2-360M | 5,411 | 3,579 | 2,783 | +31% |
+  | SmolLM2-1.7B | 11,671 | 8,142 | 5,313 | +39% |
+  | SmolLM2-135M, batch 8 | 16,270 | 9,441 | 2,767 | +19% |
 
   Within 0.7, the default and `--checkpoint-blocks` print identical training
   losses and gradient norms at all 30 steps and the same held-out loss after
