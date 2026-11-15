@@ -85,7 +85,8 @@ Code 2 covers: a missing model directory, `config.json` or data file; a model
 id that is not in the Hugging Face cache or whose snapshot has no `config.json` (`error` names the cache and
 `hf download <id>`); a flag
 value out of range; a dataset with no usable examples; no GPU adapter;
-`plan` or `finetune` finding no configuration that fits; `chat`
+`plan` or `finetune` finding no configuration that fits; `generate` with a
+prompt that encodes to no tokens or is longer than the model's context; `chat`
 refusing a tokenizer without ChatML tokens or a message longer than the
 model's context; and `merge`
 refusing its input (a non-empty `--out`, a quantized base, an adapter that
