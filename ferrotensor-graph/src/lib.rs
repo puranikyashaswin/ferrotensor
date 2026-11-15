@@ -194,7 +194,8 @@ impl Embedding {
     }
 
     /// Looks up `input_ids` and returns `[1, seq, hidden]`. The lookup runs
-    /// on the CPU (the table is read back from the GPU).
+    /// on the CPU (the table is read back from the GPU) and records no op,
+    /// so its output is a constant and `weight` gets no gradient from it.
     pub fn forward(&self, ctx: &WgpuContext, _engine: &ComputeEngine, input_ids: &[u32]) -> Tensor {
         let hidden_dim = self.weight.data.shape[1];
         let seq_len = input_ids.len();
@@ -205,7 +206,7 @@ impl Embedding {
             let end = start + hidden_dim;
             out_data.extend_from_slice(&w_data[start..end]);
         }
-        Tensor::new(
+        Tensor::frozen(
             self.weight.ctx.clone(),
             UnifiedTensor::new(ctx, &out_data, &[1, seq_len, hidden_dim]),
         )
@@ -413,7 +414,7 @@ impl Attention {
         // hides the cache slots that have not been written yet.
         let attn_out_4d = gqa.forward_at(&q_4d, &c_k_4d, &c_v_4d, mask, pos, &x.ctx, engine);
         let attn_out = attn_out_4d.reshaped(&[batch, seq_len, self.n_heads * self.head_dim]);
-        let attn_tensor = Tensor::new(x.ctx.clone(), attn_out);
+        let attn_tensor = Tensor::frozen(x.ctx.clone(), attn_out);
         self.o_proj.forward(engine, &attn_tensor)
     }
 
