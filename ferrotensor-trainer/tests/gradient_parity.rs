@@ -392,9 +392,9 @@ fn check_case(case_name: &str) {
                 diffs.push(diff(&name, &host(&gpu, &grad), expected));
             }
             (Some(_), None) => panic!("{case_name}: no gradient for {name}"),
-            // Frozen base weights, and the embedding (its lookup runs on
-            // the host, so it never gets a gradient; PyTorch keeps it
-            // frozen too).
+            // Frozen base weights, and the embedding (frozen unless
+            // `with_trainable_embedding` is set; PyTorch keeps it frozen
+            // too).
             (None, Some(_)) => panic!("{case_name}: {name} should be frozen but got a gradient"),
             (None, None) => {}
         }

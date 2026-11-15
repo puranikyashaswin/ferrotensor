@@ -622,6 +622,40 @@ impl AutogradNode for SelectTokenNode {
     }
 }
 
+/// Backward node of [`Tensor::embedding`].
+pub struct EmbeddingNode {
+    /// Table `[vocab, hidden]`.
+    pub table: Tensor,
+    /// The looked-up id of each output row, in order.
+    pub ids: Vec<u32>,
+}
+impl AutogradNode for EmbeddingNode {
+    fn inputs(&self) -> Vec<Tensor> {
+        vec![self.table.clone()]
+    }
+    /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
+    fn backward(&self, grad: &UnifiedTensor, _engine: &ComputeEngine) -> Vec<UnifiedTensor> {
+        let hidden = self.table.data.shape[1];
+        let output_grad = pollster::block_on(grad.to_vec(&self.table.ctx));
+        let mut table_grad = vec![0.0f32; self.table.data.shape.iter().product()];
+        // A repeated id sums the gradients of all its positions; an id outside
+        // the table looked up zeros, so it gets nothing.
+        for (&id, row_grad) in self.ids.iter().zip(output_grad.chunks_exact(hidden)) {
+            let start = id as usize * hidden;
+            if let Some(row) = table_grad.get_mut(start..start + hidden) {
+                for (sum, g) in row.iter_mut().zip(row_grad) {
+                    *sum += g;
+                }
+            }
+        }
+        vec![UnifiedTensor::new(
+            &self.table.ctx,
+            &table_grad,
+            &self.table.data.shape,
+        )]
+    }
+}
+
 /// Backward node of [`Tensor::mse_loss`].
 pub struct MSELossNode {
     /// Predictions.
@@ -1114,6 +1148,34 @@ impl Tensor {
             eps,
         });
         Tensor::with_creator(input.ctx.clone(), out_data, node)
+    }
+
+    /// Rows of `table` `[vocab, hidden]` for equally long `rows` of ids, as
+    /// `[rows, seq, hidden]`, gathered on the host from `table_host`, the
+    /// table's values; an id outside the table gives a row of zeros.
+    ///
+    /// The output records an [`EmbeddingNode`] only when `table` requires a
+    /// gradient; otherwise it is a frozen constant.
+    pub fn embedding(table: &Tensor, table_host: &[f32], rows: &[&[u32]]) -> Tensor {
+        let hidden = table.data.shape[1];
+        let seq_len = rows.first().map_or(0, |r| r.len());
+        let mut gathered = Vec::with_capacity(rows.len() * seq_len * hidden);
+        for &id in rows.iter().flat_map(|r| r.iter()) {
+            let start = id as usize * hidden;
+            match table_host.get(start..start + hidden) {
+                Some(row) => gathered.extend_from_slice(row),
+                None => gathered.extend(std::iter::repeat_n(0.0, hidden)),
+            }
+        }
+        let out_data = UnifiedTensor::new(&table.ctx, &gathered, &[rows.len(), seq_len, hidden]);
+        if !table.requires_grad {
+            return Tensor::frozen(table.ctx.clone(), out_data);
+        }
+        let node = Arc::new(EmbeddingNode {
+            table: table.clone(),
+            ids: rows.iter().flat_map(|r| r.iter().copied()).collect(),
+        });
+        Tensor::with_creator(table.ctx.clone(), out_data, node)
     }
 
     /// Row `token_index` of `[seq, vocab]` logits.

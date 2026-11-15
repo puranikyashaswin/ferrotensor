@@ -269,6 +269,73 @@ fn resume_continues_from_a_saved_adapter() {
     assert_eq!(read_json(&state)["step"], serde_json::json!(4));
 }
 
+/// `--train-modules embed` trains the token embedding: `eval --lora` on the
+/// saved weights gives the held-out loss the trained model gave at the end
+/// of `train`, and `--resume` continues from the file.
+#[test]
+#[ignore = "needs a GPU"]
+fn a_trained_embedding_saves_loads_and_resumes() {
+    let model = model_dir("embed-model");
+    let out = common::TempDir::new("embed-out");
+    let data = out.path().join("tokens.bin");
+    common::write_token_bin(&data, 400);
+    let embed = [
+        "--train-modules",
+        "embed",
+        "--lr",
+        "1e-2",
+        "--warmup-steps",
+        "0",
+    ];
+
+    let mut extra = embed.to_vec();
+    extra.extend_from_slice(&["--eval-data", s(&data), "--json"]);
+    let run = train(model.path(), &data, out.path(), 3, &extra);
+    assert_success(&run);
+    let summary: serde_json::Value = serde_json::from_str(&text(&run.stdout)).expect("train json");
+    let before = summary["eval_loss_before"]
+        .as_f64()
+        .expect("eval_loss_before");
+    let after = summary["eval_loss_after"]
+        .as_f64()
+        .expect("eval_loss_after");
+    assert!(
+        (before - after).abs() > 1e-3,
+        "training the embedding did not change the loss: {summary}"
+    );
+
+    let weights = out.path().join("trained_weights.safetensors");
+    let run = ferrotensor(&[
+        "eval",
+        "--model",
+        s(model.path()),
+        "--data",
+        s(&data),
+        "--task",
+        "pretrain",
+        "--seq-len",
+        "16",
+        "--lora",
+        s(&weights),
+        "--json",
+    ]);
+    assert_success(&run);
+    let json: serde_json::Value = serde_json::from_str(&text(&run.stdout)).expect("eval json");
+    let loss = json["loss"].as_f64().expect("loss");
+    // Both runs evaluate the same f32 weights through the same code; a stale
+    // host copy of the table would give `before` instead.
+    assert!(
+        (loss - after).abs() < 1e-4,
+        "eval {loss} vs end of train {after} (before training {before})"
+    );
+
+    let mut extra = embed.to_vec();
+    extra.extend_from_slice(&["--resume", s(&weights)]);
+    assert_success(&train(model.path(), &data, out.path(), 5, &extra));
+    let state = out.path().join("training_state.json");
+    assert_eq!(read_json(&state)["step"], serde_json::json!(5));
+}
+
 #[test]
 #[ignore = "needs a GPU"]
 fn generate_emits_tokens() {

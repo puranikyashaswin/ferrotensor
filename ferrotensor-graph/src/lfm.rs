@@ -1,7 +1,7 @@
 use crate::model_builder::Architecture;
 use crate::{Attention, KVCacheLayer, Linear, RMSNorm, Tensor, MLP};
 use ferrotensor_backend::{ComputeEngine, UnifiedTensor};
-use std::cell::OnceCell;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -271,8 +271,9 @@ pub fn llama_name_from_legacy(name: &str) -> Option<String> {
 /// Llama-style (every block is attention), as built by
 /// [`Lfm2ModelBuilder`](crate::model_builder::Lfm2ModelBuilder).
 pub struct Lfm2Model {
-    /// Embedding table `[vocab, hidden]`.
-    pub embed_tokens: Tensor, // Embedding weight
+    /// Embedding table `[vocab, hidden]`. Frozen unless
+    /// [`with_trainable_embedding`](Self::with_trainable_embedding) is set.
+    pub embed_tokens: Tensor,
     /// Optional norm applied right after the embedding (neither Llama nor
     /// Hugging Face LFM2 use one; LFM2's `embedding_norm` is its final norm).
     pub embedding_norm: Option<RMSNorm>,
@@ -284,8 +285,8 @@ pub struct Lfm2Model {
     pub lm_head: Linear,
     /// Host copy of `embed_tokens` for the embedding lookup, which runs on
     /// the CPU: given by the model builder from the checkpoint, or else read
-    /// back from the GPU once on first use.
-    embed_host: OnceCell<Vec<f32>>,
+    /// back from the GPU once on first use. Unused while the table trains.
+    embed_host: RefCell<Option<Vec<f32>>>,
     /// Naming family of [`named_params`](Self::named_params).
     architecture: Architecture,
     /// Recompute each block in backward instead of keeping its activations
@@ -295,7 +296,9 @@ pub struct Lfm2Model {
 
 impl Lfm2Model {
     /// Assemble a model from its parts. Parameters get LFM2 names until
-    /// [`with_architecture`](Self::with_architecture) says otherwise.
+    /// [`with_architecture`](Self::with_architecture) says otherwise, and
+    /// `embed_tokens` is frozen until
+    /// [`with_trainable_embedding`](Self::with_trainable_embedding).
     pub fn new(
         embed_tokens: Tensor,
         embedding_norm: Option<RMSNorm>,
@@ -304,12 +307,15 @@ impl Lfm2Model {
         lm_head: Linear,
     ) -> Self {
         Self {
-            embed_tokens,
+            embed_tokens: Tensor {
+                requires_grad: false,
+                ..embed_tokens
+            },
             embedding_norm,
             layers,
             norm_f,
             lm_head,
-            embed_host: OnceCell::new(),
+            embed_host: RefCell::new(None),
             architecture: Architecture::Lfm2,
             checkpoint_blocks: false,
         }
@@ -346,6 +352,26 @@ impl Lfm2Model {
     /// Whether [`with_block_checkpointing`](Self::with_block_checkpointing) is on.
     pub fn block_checkpointing(&self) -> bool {
         self.checkpoint_blocks
+    }
+
+    /// Let `embed_tokens` receive a gradient (it is frozen otherwise, even
+    /// when the other base weights train). While it trains, every lookup
+    /// reads the table back from the GPU, so it sees each optimizer step;
+    /// the host copy is dropped. A tied `lm_head` is a separate copy and does
+    /// not follow the table.
+    pub fn with_trainable_embedding(mut self, on: bool) -> Self {
+        self.embed_tokens.requires_grad = on;
+        if on {
+            self.clear_host_embeddings();
+        }
+        self
+    }
+
+    /// Drop the host copy of `embed_tokens`, so the next lookup reads the
+    /// table back from the GPU. Call it after writing new values into
+    /// `embed_tokens`, such as trained weights loaded from a file.
+    pub fn clear_host_embeddings(&self) {
+        *self.embed_host.borrow_mut() = None;
     }
 
     /// Runs `layer` on `x`, checkpointed when enabled and no cache is used.
@@ -577,46 +603,38 @@ impl Lfm2Model {
         ctx: &Arc<ferrotensor_backend::WgpuContext>,
         rows: &[&[u32]],
     ) -> Tensor {
-        let hidden_dim = self.embed_tokens.data.shape[1];
-        let seq_len = rows.first().map_or(0, |r| r.len());
-        let mut data = Vec::with_capacity(rows.len() * seq_len * hidden_dim);
-
-        // Host-side lookup against a cached copy of the table (there is no
-        // GPU gather kernel yet). Out-of-range ids map to zeros.
-        let w = self
-            .embed_host
-            .get_or_init(|| pollster::block_on(self.embed_tokens.data.to_vec(ctx)));
-        for &id in rows.iter().flat_map(|r| r.iter()) {
-            let start = (id as usize) * hidden_dim;
-            match w.get(start..start + hidden_dim) {
-                Some(row) => data.extend_from_slice(row),
-                None => data.extend(std::iter::repeat_n(0.0, hidden_dim)),
-            }
-        }
-        // The lookup is not differentiable, so its output is a constant.
-        Tensor::frozen(
-            ctx.clone(),
-            UnifiedTensor::new(ctx, &data, &[rows.len(), seq_len, hidden_dim]),
-        )
+        // The lookup runs on the host (there is no GPU gather kernel yet).
+        // A frozen table reads a cached copy; a training table changes every
+        // optimizer step, so it is read back each time.
+        let read_back;
+        let mut cached = self.embed_host.borrow_mut();
+        let table: &[f32] = if self.embed_tokens.requires_grad {
+            read_back = pollster::block_on(self.embed_tokens.data.to_vec(ctx));
+            &read_back
+        } else {
+            cached.get_or_insert_with(|| pollster::block_on(self.embed_tokens.data.to_vec(ctx)))
+        };
+        Tensor::embedding(&self.embed_tokens, table, rows)
     }
 
     /// Use `table`, the values uploaded as `embed_tokens`, as the host copy
     /// for the embedding lookup instead of reading it back from the GPU on
     /// first use. Like the copy read on first use, it is a snapshot: later
-    /// writes to `embed_tokens` do not reach it.
+    /// writes to `embed_tokens` reach it only after
+    /// [`clear_host_embeddings`](Self::clear_host_embeddings).
     pub(crate) fn with_host_embeddings(self, table: Vec<f32>) -> Self {
         debug_assert_eq!(
             table.len(),
             self.embed_tokens.data.shape.iter().product::<usize>()
         );
-        let _ = self.embed_host.set(table);
+        *self.embed_host.borrow_mut() = Some(table);
         self
     }
 
     /// The host copy of the embedding table, if it has been filled.
     #[cfg(test)]
-    pub(crate) fn host_embeddings(&self) -> Option<&[f32]> {
-        self.embed_host.get().map(Vec::as_slice)
+    pub(crate) fn host_embeddings(&self) -> Option<Vec<f32>> {
+        self.embed_host.borrow().clone()
     }
 
     /// Only the LoRA adapter tensors (what LoRA fine-tuning updates).
