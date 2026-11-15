@@ -13,6 +13,9 @@ readme = "README.md"
 keywords = ["huggingface", "machine-learning", "models", "download", "safetensors"]
 categories = ["science", "algorithms"]
 
+[lints]
+workspace = true
+
 [dependencies]
 ferrotensor-backend = { path = "../ferrotensor-backend", version = "0.6.0" }
 ferrotensor-graph = { path = "../ferrotensor-graph", version = "0.6.0" }
