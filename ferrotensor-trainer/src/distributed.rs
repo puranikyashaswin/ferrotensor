@@ -227,6 +227,7 @@ pub fn shard_indices(len: usize, rank: usize, world_size: usize) -> Vec<usize> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::time::Duration;

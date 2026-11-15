@@ -8,6 +8,8 @@
 //! cargo test -p ferrotensor-trainer --test qwen3_attention -- --ignored --test-threads=1
 //! ```
 
+#![allow(clippy::expect_used, clippy::panic)]
+
 mod common;
 
 use common::*;

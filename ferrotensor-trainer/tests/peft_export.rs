@@ -10,6 +10,8 @@
 //! `scripts/check_peft_export.py` checks the other half: the same exported
 //! adapter loaded by PyTorch + PEFT gives the same logits.
 
+#![allow(clippy::expect_used)]
+
 mod common;
 
 use common::*;

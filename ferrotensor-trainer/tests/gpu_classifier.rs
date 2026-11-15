@@ -1,6 +1,8 @@
 //! Sequence classification on a tiny Llama-style model: hidden-state taps,
 //! the classifier head, its loss and its gradients.
 
+#![allow(clippy::expect_used)]
+
 mod common;
 
 use common::*;

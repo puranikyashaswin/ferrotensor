@@ -552,6 +552,7 @@ fn pack_windows(sequences: Vec<Vec<u32>>, max_len: usize) -> Vec<Vec<u32>> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

@@ -1,5 +1,7 @@
 //! Adapter and training-state files, without a GPU.
 
+#![allow(clippy::expect_used)]
+
 mod common;
 
 use common::TempDir;

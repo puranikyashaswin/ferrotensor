@@ -3,6 +3,7 @@
 //! few helpers to build, train and score it.
 
 #![allow(dead_code)]
+#![allow(clippy::expect_used)]
 
 use ferrotensor_autograd::{AdamW, Tensor};
 use ferrotensor_backend::{ComputeEngine, WgpuContext};

@@ -2,6 +2,7 @@
 //! written to a temporary directory, and helpers to train it.
 
 #![allow(dead_code)]
+#![allow(clippy::expect_used)]
 
 use ferrotensor_autograd::{AdamW, Tensor};
 use ferrotensor_backend::{ComputeEngine, WgpuContext};

@@ -1,6 +1,8 @@
 //! Training-focused regression tests for masked loss and packing semantics.
 //! These are CPU-only and do not require a GPU.
 
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
 use ferrotensor_trainer::{
     masked_cross_entropy_from_logits, DataLoader, Dataset, TextDataset, TrainingExample,
 };

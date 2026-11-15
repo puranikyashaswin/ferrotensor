@@ -603,6 +603,7 @@ fn read_moments(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{moments_path, LoraMetadata, TrainingCheckpoint, TrainingState};
     use crate::scaler::GradScalerCheckpoint;
