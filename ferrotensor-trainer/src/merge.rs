@@ -439,7 +439,11 @@ pub fn merge_adapter(
         if let Err(remove_err) = std::fs::remove_file(&tmp) {
             log::warn!("cannot remove {}: {remove_err}", tmp.display());
         }
-        return Err(err.into());
+        return Err(std::io::Error::new(
+            err.kind(),
+            format!("cannot write {}: {err}", tmp.display()),
+        )
+        .into());
     }
 
     for name in COPIED_FILES {
