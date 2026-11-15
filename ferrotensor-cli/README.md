@@ -431,8 +431,8 @@ In order, it
    byte `b` as token `b + 3` (259 tokens), a BPE model without merges over
    the `ByteLevel` characters. Any UTF-8 text encodes to its bytes and
    decodes back exactly; `<s>` in the text stays three bytes;
-2. writes `config.json` and `model.safetensors` in the Hugging Face Llama
-   layout from `--layers` (default 4), `--hidden` (128), `--heads` (4),
+2. writes `config.json` and, in `init/`, the initial model in the Hugging
+   Face Llama layout from `--layers` (default 4), `--hidden` (128), `--heads` (4),
    `--mlp-hidden` (4 x hidden) and `--context` (256, written as
    `max_position_embeddings`): norm scales are ones, every other weight is
    drawn from a normal distribution with standard deviation 0.02 by a
@@ -441,18 +441,23 @@ In order, it
    defaults give 1,116,032 parameters;
 3. writes the bytes of `--data` as `tokens.bin` (little-endian u32, newlines
    kept, the file read once);
-4. runs `train --task pretrain --train-modules full` on that directory:
+4. runs `train --task pretrain --train-modules full` from `init/`:
    every weight and the embedding train in f32 on windows of `--seq-len`
    tokens (default `--context`), with `--lr 1e-3`, `--warmup-steps 100`,
    `--max-steps 2000`, `--batch-size 8`, `--grad-accum 1` and
    `--save-every 500` unless given;
-5. writes the trained weights over `model.safetensors`, linears transposed
+5. writes the trained weights as `model.safetensors`, linears transposed
    back to `[out, in]`.
 
 `--resume` continues a run in the same `--out` from its
 `trained_weights.safetensors` and training state; pass the flags of the
 first run, with `--max-steps` counting the steps before the resume. Without
-`--resume`, an `--out` that already holds `model.safetensors` is refused.
+`--resume`, an `--out` that already holds `model.safetensors` or `init/` is
+refused. A run that stops early (Ctrl-C, a crash) leaves no
+`model.safetensors`, so `generate` refuses the directory and names
+`pretrain --resume`; a resume with `--max-steps` at or below the step in
+`training_state.json` trains nothing and exports the weights saved at that
+step.
 `--json` prints every `train` key plus `parameters` and `vocab_size`.
 
 Host memory while training is about 20 bytes per byte of the corpus (the

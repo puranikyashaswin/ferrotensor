@@ -94,7 +94,7 @@ refusing its input (a non-empty `--out`, a quantized base, an adapter that
 does not match the base); and `pretrain` refusing a model size the kernels
 cannot run (`--hidden` not a multiple of `--heads`, an odd head size or one
 above 128), a `--seq-len` above `--context`, an `--out` that already holds
-`model.safetensors` without `--resume`, or `--resume` without
+`model.safetensors` or `init/` without `--resume`, or `--resume` without
 `trained_weights.safetensors`. clap's usage errors
 also exit with 2, with the usage text on stderr and nothing on stdout.
 

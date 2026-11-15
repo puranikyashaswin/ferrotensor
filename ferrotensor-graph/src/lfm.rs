@@ -2,7 +2,7 @@ use crate::model_builder::Architecture;
 use crate::{Attention, KVCacheLayer, Linear, RMSNorm, Tensor, MLP};
 use ferrotensor_backend::{ComputeEngine, UnifiedTensor};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// LFM2 short-convolution operator: projection, depthwise conv, projection.
@@ -365,6 +365,63 @@ impl Lfm2Model {
             self.clear_host_embeddings();
         }
         self
+    }
+
+    /// Let only the base weights whose [`named_params`](Self::named_params)
+    /// name `trains` accepts receive a gradient, and freeze the others; LoRA
+    /// adapters keep their setting. A selected embedding trains as with
+    /// [`with_trainable_embedding`](Self::with_trainable_embedding).
+    pub fn with_trainable_base_weights(mut self, trains: impl Fn(&str) -> bool) -> Self {
+        // Matched by buffer, so the names are those of `named_params` alone.
+        let trainable: HashSet<*const UnifiedTensor> = self
+            .named_params()
+            .iter()
+            .filter(|(name, _)| trains(name))
+            .map(|(_, tensor)| Arc::as_ptr(&tensor.data))
+            .collect();
+        let mut weights = vec![
+            &mut self.embed_tokens,
+            &mut self.norm_f.weight,
+            &mut self.lm_head.weight,
+        ];
+        weights.extend(self.embedding_norm.iter_mut().map(|n| &mut n.weight));
+        for layer in &mut self.layers {
+            let mlp = &mut layer.mlp;
+            weights.extend([
+                &mut layer.operator_norm.weight,
+                &mut layer.ffn_norm.weight,
+                &mut mlp.gate_proj.weight,
+                &mut mlp.up_proj.weight,
+                &mut mlp.down_proj.weight,
+            ]);
+            match &mut layer.op {
+                Lfm2LayerOp::Attention(a) => {
+                    weights.extend([
+                        &mut a.q_proj.weight,
+                        &mut a.k_proj.weight,
+                        &mut a.v_proj.weight,
+                        &mut a.o_proj.weight,
+                    ]);
+                    weights.extend(
+                        [&mut a.q_norm, &mut a.k_norm]
+                            .into_iter()
+                            .flatten()
+                            .map(|n| &mut n.weight),
+                    );
+                }
+                Lfm2LayerOp::Conv(c) => weights.extend([
+                    &mut c.in_proj.weight,
+                    &mut c.conv_weight,
+                    &mut c.conv_bias,
+                    &mut c.out_proj.weight,
+                ]),
+            }
+        }
+        for weight in weights {
+            weight.requires_grad = trainable.contains(&Arc::as_ptr(&weight.data));
+        }
+        let embedding = self.embed_tokens.requires_grad;
+        self.with_trainable_embedding(embedding)
     }
 
     /// Drop the host copy of `embed_tokens`, so the next lookup reads the
