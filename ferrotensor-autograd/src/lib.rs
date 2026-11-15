@@ -298,6 +298,26 @@ impl AutogradNode for MulNode {
     }
 }
 
+/// Backward node of [`Tensor::scale`].
+pub struct ScaleNode {
+    /// Tensor before scaling.
+    pub input: Tensor,
+    /// Constant factor.
+    pub factor: f32,
+}
+impl AutogradNode for ScaleNode {
+    fn inputs(&self) -> Vec<Tensor> {
+        vec![self.input.clone()]
+    }
+    /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
+    fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
+        let grad_in = UnifiedTensor::empty(&self.input.ctx, &self.input.data.shape);
+        engine.copy_tensor(&self.input.ctx, grad, &grad_in, 0);
+        engine.gradient_scale(&self.input.ctx, &grad_in, self.factor);
+        vec![grad_in]
+    }
+}
+
 /// Backward node of [`Tensor::sub`].
 pub struct SubNode {
     /// Left operand.
@@ -900,6 +920,17 @@ impl Tensor {
             b: b.clone(),
         });
         Tensor::with_creator(a.ctx.clone(), out_data, node)
+    }
+    /// Element-wise product with a constant that gets no gradient.
+    pub fn scale(input: &Tensor, factor: f32, engine: &ComputeEngine) -> Tensor {
+        let out_data = UnifiedTensor::empty(&input.ctx, &input.data.shape);
+        engine.copy_tensor(&input.ctx, &input.data, &out_data, 0);
+        engine.gradient_scale(&input.ctx, &out_data, factor);
+        let node = Arc::new(ScaleNode {
+            input: input.clone(),
+            factor,
+        });
+        Tensor::with_creator(input.ctx.clone(), out_data, node)
     }
     /// Element-wise difference of equally shaped tensors.
     pub fn sub(a: &Tensor, b: &Tensor, engine: &ComputeEngine) -> Tensor {
