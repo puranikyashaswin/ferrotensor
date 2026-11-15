@@ -1,6 +1,8 @@
 //! End-to-end tests: run the `ferrotensor` binary on a tiny random model and
 //! check exit codes and the files it writes.
 
+#![allow(clippy::expect_used)]
+
 mod common;
 
 use std::path::Path;

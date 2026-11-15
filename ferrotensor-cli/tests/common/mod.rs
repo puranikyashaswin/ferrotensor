@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+#![allow(clippy::expect_used)]
 //! Shared fixtures: a tiny randomly initialised Llama-style model directory
 //! (config, weights, tokenizer) and a token dataset for the CLI tests.
 

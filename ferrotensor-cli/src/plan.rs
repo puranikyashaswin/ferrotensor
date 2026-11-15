@@ -849,6 +849,7 @@ fn plan_documented(args: &PlanArgs, budget_mib: u64, pinned: Pinned) -> Report {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
