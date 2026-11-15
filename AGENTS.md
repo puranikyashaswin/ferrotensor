@@ -51,6 +51,7 @@ is `null`. On an error stdout carries `{"error": "<message>"}` instead.
 | `train` | `steps`, `first_loss`, `final_loss`, `eval_loss_before`, `eval_loss_after` (null without `--eval-data`), `measured_peak_mib`, `seconds`, `out_dir`, `adapter` |
 | `eval` | `examples`, `tokens`, `loss`, `perplexity`, `seconds` |
 | `generate` | `text`, `prompt_tokens`, `new_tokens`, `tokens_per_second`, `kv_cache` |
+| `merge` | `out_dir`, `merged` (tensors with the adapter added), `copied` (tensors copied byte for byte) |
 | `info` | `ferrotensor`, `os`, `arch`, `adapters` (one object per GPU, `selected` marks the one used), `checks` (null without `--check`), and `error` only on failure |
 
 `measured_peak_mib` counts the GPU buffers Ferrotensor tracks, not the driver
@@ -68,8 +69,10 @@ no `--json`.
 | 101 | A panic, with no JSON on stdout | wgpu panics when the GPU device is lost, most often because it ran out of memory (stderr then ends with a hint). Lower `--batch-size` or `--seq-len`, or use `finetune`. |
 
 Code 2 covers: a missing model directory, `config.json` or data file; a flag
-value out of range; a dataset with no usable examples; no GPU adapter; and
-`plan` or `finetune` finding no configuration that fits. clap's usage errors
+value out of range; a dataset with no usable examples; no GPU adapter;
+`plan` or `finetune` finding no configuration that fits; and `merge`
+refusing its input (a non-empty `--out`, a quantized base, an adapter that
+does not match the base). clap's usage errors
 also exit with 2, with the usage text on stderr and nothing on stdout.
 
 ## Picking a model

@@ -111,8 +111,9 @@ jobs:
       - name: GPU suites (ignored tests)
         run: cargo test --release --workspace -- --ignored --test-threads=1
       # A LoRA adapter trained here, exported with `export-adapter --format
-      # peft`, must give the same logits in PyTorch + PEFT (CPU wheels).
-      - name: PEFT export against PyTorch + PEFT
+      # peft`, must give the same logits in PyTorch + PEFT (CPU wheels), and
+      # the model `merge` writes from it the same logits in transformers.
+      - name: PEFT export and merge against PyTorch + PEFT
         run: |
           out="$RUNNER_TEMP/peft-check"
           venv="$RUNNER_TEMP/peft-venv"
@@ -123,8 +124,11 @@ jobs:
           cargo run --release -p ferrotensor-cli -- export-adapter \
             --lora "$out/adapter.safetensors" --model "$out/model" \
             --output "$out/peft" --format peft
+          cargo run --release -p ferrotensor-cli -- merge \
+            --lora "$out/adapter.safetensors" --model "$out/model" --out "$out/merged"
           "$venv/bin/python" scripts/check_peft_export.py \
-            --model "$out/model" --adapter "$out/peft" --logits "$out/logits.json"
+            --model "$out/model" --adapter "$out/peft" --logits "$out/logits.json" \
+            --merged "$out/merged"
       - name: Autograd finite-difference checks
         run: cargo test --release -p ferrotensor-autograd --test grad_check -- --test-threads=1
       - name: Tensor API GPU parity

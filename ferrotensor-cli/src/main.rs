@@ -17,6 +17,7 @@ mod classify;
 mod finetune;
 mod info;
 mod memory_report;
+mod merge;
 mod plan;
 mod profile_report;
 
@@ -155,6 +156,8 @@ enum Command {
     Plan(plan::PlanArgs),
     /// Convert a LoRA adapter to another format (PEFT, for PyTorch).
     ExportAdapter(ExportAdapterArgs),
+    /// Write a model directory with a LoRA adapter folded into the weights.
+    Merge(merge::MergeArgs),
     /// Print how to run the kernel benchmarks.
     #[command(long_flag = "benchmark")]
     Benchmark,
@@ -492,6 +495,7 @@ fn main() {
         Command::Generate(args) => args.json,
         Command::Info(args) => args.json,
         Command::Plan(args) => args.json,
+        Command::Merge(args) => args.json,
         _ => false,
     };
     let code = match run(cli.command, &matches, json) {
@@ -530,6 +534,7 @@ fn run(command: Command, matches: &clap::ArgMatches, json: bool) -> Result<Exit>
         Command::Info(args) => return info::run(args),
         Command::Plan(args) => return plan::run(args),
         Command::ExportAdapter(args) => export_adapter(args)?,
+        Command::Merge(args) => merge::run(args, json)?,
         Command::Monitor => ferrotensor_monitor::run().map_err(|e| format!("monitor: {e}"))?,
         Command::Benchmark => {
             println!(

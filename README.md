@@ -86,6 +86,8 @@ sequences per optimizer step.
 - **Adapters for PyTorch.** `ferrotensor export-adapter` writes a standard
   PEFT adapter; CI loads it in PyTorch + PEFT and checks that the logits
   match Ferrotensor's within 1e-3 ([how](docs/examples/peft-export.md)).
+  `ferrotensor merge` folds the adapter into the base weights and writes a
+  standalone model directory ([CLI docs](ferrotensor-cli/README.md#a-standalone-model-merge)).
 
 On an Apple M2 (8 GB) through Metal, a 0.4 build fine-tuned SmolLM2-135M with
 the same recipe to the same held-out loss as the A10G with that build (2.4250
@@ -251,7 +253,7 @@ tensor op reaches a WGSL kernel, are in [docs/architecture.md](docs/architecture
 | [`ferrotensor-graph`](ferrotensor-graph) | Transformer building blocks and the Llama/LFM2-style model builder |
 | [`ferrotensor-loader`](ferrotensor-loader) | Safetensors (single and sharded) and tokenizer loading |
 | [`ferrotensor-trainer`](ferrotensor-trainer) | Training loops, LoRA, checkpoints, an optional `GradScaler` |
-| [`ferrotensor-cli`](ferrotensor-cli) | The `ferrotensor` command: `train`, `eval`, `generate` (alias `infer`), `export-adapter`, `info`, `classify-train`, `classify-predict`, `monitor`, `demo` |
+| [`ferrotensor-cli`](ferrotensor-cli) | The `ferrotensor` command: `train`, `eval`, `generate` (alias `infer`), `export-adapter`, `merge`, `info`, `classify-train`, `classify-predict`, `monitor`, `demo` |
 | [`ferrotensor-monitor`](ferrotensor-monitor) | Terminal dashboard |
 | [`ferrotensor-hub`](ferrotensor-hub) | Hugging Face Hub download helpers |
 | [`ferrotensor-py`](ferrotensor-py) | Python bindings for the `ferrotensor` crate (not published to crates.io) |

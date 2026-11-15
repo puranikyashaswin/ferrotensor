@@ -448,6 +448,11 @@ impl WeightsContext {
         )))
     }
 
+    /// Names of every tensor in the loaded files, in no particular order.
+    pub fn tensor_names(&self) -> impl Iterator<Item = &str> {
+        self.weight_map.keys().map(String::as_str)
+    }
+
     /// Returns the shape and dtype name of a tensor, or `None` if it is missing.
     pub fn get_tensor_info(&self, name: &str) -> Option<(Vec<usize>, String)> {
         // Shape, Dtype(str)

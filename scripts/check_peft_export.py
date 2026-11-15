@@ -8,11 +8,17 @@ adapter. Exits non-zero when they differ by more than --tolerance, when the
 adapter does not load completely, or when the adapter barely changes the
 logits (the comparison would then prove nothing).
 
+With --merged, also loads the directory written by `ferrotensor merge` as an
+ordinary transformers checkpoint and compares its logits the same way.
+
     cargo run --release -p ferrotensor-trainer --example peft_fixture -- out
     cargo run --release -p ferrotensor-cli -- export-adapter \\
         --lora out/adapter.safetensors --model out/model --output out/peft
+    cargo run --release -p ferrotensor-cli -- merge \\
+        --lora out/adapter.safetensors --model out/model --out out/merged
     python scripts/check_peft_export.py \\
-        --model out/model --adapter out/peft --logits out/logits.json
+        --model out/model --adapter out/peft --logits out/logits.json \\
+        --merged out/merged
 
 Needs torch, transformers, peft and safetensors (CI pins torch 2.14.1 CPU,
 transformers 5.20.2, peft 0.21.2, safetensors 0.8.0).
@@ -39,6 +45,7 @@ def main() -> None:
     parser.add_argument("--model", required=True, help="base model directory")
     parser.add_argument("--adapter", required=True, help="PEFT adapter directory")
     parser.add_argument("--logits", required=True, help="logits.json written by Ferrotensor")
+    parser.add_argument("--merged", help="model directory written by `ferrotensor merge`")
     parser.add_argument("--tolerance", type=float, default=1e-3)
     args = parser.parse_args()
 
@@ -88,6 +95,21 @@ def main() -> None:
         fail("the adapter changes the logits too little for this comparison to mean anything")
     if diff > args.tolerance:
         fail("PyTorch + PEFT and Ferrotensor disagree")
+
+    if args.merged:
+        merged = AutoModelForCausalLM.from_pretrained(
+            args.merged, dtype=torch.float32, attn_implementation="eager"
+        )
+        merged.eval()
+        with torch.no_grad():
+            merged_logits = merged(input_ids).logits[0]
+        merged_diff = (merged_logits - reference).abs().max().item()
+        print(
+            f"max |logits(merged, PyTorch) - logits(Ferrotensor)| = {merged_diff:.3e} "
+            f"(tolerance {args.tolerance:g})"
+        )
+        if merged_diff > args.tolerance:
+            fail("the merged model and Ferrotensor with the adapter disagree")
     print("OK")
 
 

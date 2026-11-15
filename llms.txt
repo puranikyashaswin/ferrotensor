@@ -11,7 +11,7 @@
 ## Guides
 
 - [LoRA SFT walkthrough](docs/examples/lora-sft.md): fine-tune, evaluate and sample SmolLM2 end to end, with real output
-- [Adapters in PyTorch](docs/examples/peft-export.md): export a LoRA adapter as a Hugging Face PEFT directory
+- [Adapters in PyTorch](docs/examples/peft-export.md): export a LoRA adapter as a Hugging Face PEFT directory, or merge it into a standalone model with `ferrotensor merge`
 - [Text classification](docs/examples/classify.md): LoRA fine-tuning of a decoder as a classifier
 - [Testing on your GPU](docs/testing-on-your-gpu.md): check that the kernels pass on a GPU and report the result
 - [Use cases](docs/use-cases.md): runnable programs with the tensor API
