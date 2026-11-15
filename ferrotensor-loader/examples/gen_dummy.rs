@@ -19,7 +19,7 @@ fn main() {
     let data_a: Vec<u8> = vec![1, 2, 3, 4]; // Int8 data
     let data_b: Vec<u8> = vec![10, 20, 30, 40]; // Int8 data
 
-    let map: HashMap<String, TensorView> = [
+    let map: HashMap<String, TensorView<'_>> = [
         (
             "tensor_a".to_string(),
             TensorView::new(Dtype::U8, vec![4], &data_a).unwrap(),

@@ -604,7 +604,7 @@ pub fn run() -> Result<()> {
 // UI Rendering
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn ui(f: &mut Frame, app: &App) {
+fn ui(f: &mut Frame<'_>, app: &App) {
     // Main layout
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -635,7 +635,7 @@ fn ui(f: &mut Frame, app: &App) {
     }
 }
 
-fn draw_header(f: &mut Frame, area: Rect, app: &App) {
+fn draw_header(f: &mut Frame<'_>, area: Rect, app: &App) {
     let titles = ["[1] Dashboard", "[2] Training", "[3] Chat", "[4] Models"];
     let tabs = Tabs::new(titles.iter().map(|s| Line::from(*s)).collect::<Vec<_>>())
         .block(
@@ -663,7 +663,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(tabs, area);
 }
 
-fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
+fn draw_footer(f: &mut Frame<'_>, area: Rect, app: &App) {
     let status = if app.is_training {
         let eta = format_duration(app.training_stats.eta_seconds);
         format!(
@@ -710,7 +710,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(footer, area);
 }
 
-fn draw_dashboard(f: &mut Frame, area: Rect, app: &App) {
+fn draw_dashboard(f: &mut Frame<'_>, area: Rect, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -803,7 +803,7 @@ fn draw_dashboard(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(ram_spark, bottom_chunks[1]);
 }
 
-fn draw_training(f: &mut Frame, area: Rect, app: &App) {
+fn draw_training(f: &mut Frame<'_>, area: Rect, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(32), Constraint::Min(0)])
@@ -968,14 +968,14 @@ fn draw_training(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(acc_chart, chart_chunks[1]);
 }
 
-fn draw_chat(f: &mut Frame, area: Rect, app: &App) {
+fn draw_chat(f: &mut Frame<'_>, area: Rect, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(3)])
         .split(area);
 
     // Messages
-    let messages: Vec<ListItem> = app
+    let messages: Vec<ListItem<'_>> = app
         .chat_history
         .iter()
         .map(|m| {
@@ -1017,14 +1017,14 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(input, chunks[1]);
 }
 
-fn draw_models(f: &mut Frame, area: Rect, app: &App) {
+fn draw_models(f: &mut Frame<'_>, area: Rect, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
 
     // Model list
-    let items: Vec<ListItem> = app
+    let items: Vec<ListItem<'_>> = app
         .available_models
         .iter()
         .enumerate()
@@ -1099,7 +1099,7 @@ fn draw_models(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(detail_block, chunks[1]);
 }
 
-fn draw_help_overlay(f: &mut Frame) {
+fn draw_help_overlay(f: &mut Frame<'_>) {
     let area = f.area();
     let block = Block::default()
         .title(" Keyboard Shortcuts ")

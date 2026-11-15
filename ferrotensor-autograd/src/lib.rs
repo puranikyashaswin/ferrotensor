@@ -52,7 +52,7 @@ pub struct Tensor {
 }
 
 impl std::fmt::Debug for Tensor {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Tensor")
             .field("shape", &self.data.shape)
             .finish()
