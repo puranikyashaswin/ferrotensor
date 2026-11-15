@@ -2,8 +2,8 @@
 
 The GPU compute layer of the LLM stack in [Ferrotensor](../README.md): a wgpu context
 (`WgpuContext`), `UnifiedTensor` buffers, and the hand-written WGSL kernels in
-`src/*.wgsl` behind `ComputeEngine` (tiled matmul, RoPE, RMSNorm, SiLU,
-softmax, AdamW and SGD updates, losses, int8/affine dequantisation, flash
+`src/shaders/*.wgsl` behind `ComputeEngine` (tiled matmul, RoPE, RMSNorm, SiLU,
+softmax, AdamW and SGD updates, losses, int8/affine dequantisation, 4-bit weight matmul, flash
 attention v2 forward and backward), plus a buffer pool. Runs on Metal and
 Vulkan.
 

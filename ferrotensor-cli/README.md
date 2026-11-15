@@ -1,10 +1,14 @@
 # ferrotensor-cli
 
-The `ferrotensor-cli` command line for [Ferrotensor](../README.md): LoRA fine-tuning
-(`finetune`, `train`), evaluation (`eval`), sampling (`generate`, alias `infer`) and
-conversation (`chat`) for
+The `ferrotensor-cli` command line for [Ferrotensor](../README.md): a GPU
+check (`info`), memory planning (`plan`), LoRA fine-tuning (`finetune`, `train`),
+evaluation (`eval`), sampling (`generate`, alias `infer`), conversation (`chat`),
+adapter export and merging (`export-adapter`, `merge`) and training a byte-level
+model from scratch (`pretrain`), for
 small Llama-style models such as SmolLM2 and TinyLlama, on the GPU through
-wgpu (Vulkan, Metal or DX12). It has been tested on an NVIDIA A10G (24 GB)
+wgpu (Vulkan, Metal or DX12). It also has `classify-train` and
+`classify-predict` (text classification), `monitor`, `demo` and `benchmark`.
+It has been tested on an NVIDIA A10G (24 GB)
 through Vulkan, an Apple M2 (8 GB) through Metal, and software Vulkan (Mesa
 lavapipe) in CI; other GPUs are untested, and
 [reports are welcome](../docs/testing-on-your-gpu.md).
@@ -20,6 +24,12 @@ ferrotensor --help
 ```bash
 cargo run -p ferrotensor-cli --release -- --help            # commands
 cargo run -p ferrotensor-cli --release -- train --help      # every training flag
+
+# Check the GPU and the kernels on it
+cargo run -p ferrotensor-cli --release -- info --check
+
+# What fits this machine, without training
+cargo run -p ferrotensor-cli --release -- plan --model ./data/models/SmolLM2-135M
 
 # The short path: LoRA SFT with batch size, sequence length, gradient
 # accumulation and checkpointing picked to fit this machine (see below)
@@ -49,6 +59,22 @@ cargo run -p ferrotensor-cli --release -- chat \
 cargo run -p ferrotensor-cli --release -- eval \
   --model ./data/models/SmolLM2-135M --data ./data/alpaca/val.jsonl \
   --lora ./data/runs/sft/lora_adapters.safetensors
+
+# A standalone model directory with the adapter folded in (see below)
+cargo run -p ferrotensor-cli --release -- merge \
+  --model ./data/models/SmolLM2-135M \
+  --lora ./data/runs/sft/lora_adapters.safetensors \
+  --out ./data/models/SmolLM2-135M-sft
+
+# Or a PEFT adapter directory for PyTorch
+cargo run -p ferrotensor-cli --release -- export-adapter \
+  --model ./data/models/SmolLM2-135M \
+  --lora ./data/runs/sft/lora_adapters.safetensors \
+  --output ./data/runs/sft/peft
+
+# Train a tiny byte-level model from random weights (see below)
+cargo run -p ferrotensor-cli --release -- pretrain \
+  --data corpus.txt --out ./data/models/tiny
 ```
 
 A full walkthrough with measured numbers is in
@@ -83,12 +109,12 @@ ferrotensor chat --model HuggingFaceTB/SmolLM2-135M
   `{"prompt": ..., "response": ...}` objects, optional `"system"`.
 - Pretraining data (`--task pretrain`): `.txt` lines, a `.json` array of
   strings or token ids, or packed little-endian `u32` tokens in `.bin`.
-- Outputs in `--out`: `lora_adapters.safetensors` (+ `.state.json` for
-  `--resume`; with `--train-modules` other than `lora` the file is
+- Outputs in `--out`: `lora_adapters.safetensors` (+ `.state.json` and
+  `.state.safetensors` for `--resume`; with `--train-modules` other than `lora` the file is
   `trained_weights.safetensors` and holds the f32 base weights that
   trained, which `eval --lora`, `generate --lora` and `--resume` load),
   `metrics.jsonl` (one line per logged step / eval) and
-  `training_state.json` (read by `ferrotensor-cli monitor`).
+  `training_state.json` (read by `ferrotensor monitor`).
 - `--train-modules` picks what trains: `lora` (the default), or base weights
   by group: `attn`, `mlp`, `norm`, `head`, `all` (every base weight but the
   token embedding), `embed` (only the token embedding) and `full` (`all`
@@ -101,17 +127,21 @@ ferrotensor chat --model HuggingFaceTB/SmolLM2-135M
   JSONL `{"text", "label"}` lines and `classify-predict` writes per-line
   class probabilities; see
   [docs/examples/classify.md](../docs/examples/classify.md).
-- `ferrotensor-cli demo` (or `--demo`) plays a simulated training UI; it does not
-  train anything.
+- `ferrotensor demo` (or `--demo`) plays a simulated training UI; it does not
+  train anything. `ferrotensor monitor` (or `--monitor`) is the terminal
+  dashboard, and `ferrotensor benchmark` prints how to run the kernel
+  benchmarks.
 
 ## Scripting: `--json` and exit codes
 
-`plan`, `finetune`, `train`, `eval`, `generate` and `info` take `--json`:
-stdout then carries one JSON object when the command ends, and progress and
-other text go to stderr (`generate` streams its text there too). On an error
-stdout carries `{"error": "<message>"}`. `chat --json` is the exception: it
-prints one JSON object per reply, each on its own line. The keys of each
-object are listed in [AGENTS.md](../AGENTS.md#json-output).
+`plan`, `finetune`, `train`, `eval`, `generate`, `chat`, `merge`, `pretrain`
+and `info` take `--json`: stdout then carries one JSON object when the
+command ends, and progress and other text go to stderr (`generate` and `chat`
+stream their text there too). On an error stdout carries
+`{"error": "<message>"}`. `chat --json` is the exception: it prints one JSON
+object per reply, each on its own line. `classify-train`, `classify-predict`,
+`export-adapter`, `monitor`, `demo` and `benchmark` take no `--json`. The keys
+of each object are listed in [AGENTS.md](../AGENTS.md#json-output).
 
 Every command exits with 0 on success, 1 on a runtime error (I/O, the GPU, a
 kernel out of tolerance) and 2 when the input is invalid or this machine
@@ -126,7 +156,7 @@ are stored as f16 and every product is computed in f32; `--f32-weights`
 keeps them f32. Both compute the same model up to f16 rounding of the
 weights.
 
-`--q4-weights` (on `train`, `eval` and `generate`, off by default) is
+`--q4-weights` (on every command that loads a model, off by default) is
 experimental and changes the model's outputs. It stores
 the frozen weights of every decoder-block projection (`q/k/v/o_proj`,
 `gate/up/down_proj`) at 4 bits: affine codes in groups of 64 along the
@@ -447,7 +477,8 @@ In order, it
    `--max-steps 2000`, `--batch-size 8`, `--grad-accum 1` and
    `--save-every 500` unless given;
 5. writes the trained weights as `model.safetensors`, linears transposed
-   back to `[out, in]`.
+   back to `[out, in]`. `trained_weights.safetensors` and the training state
+   stay in `--out` for `--resume`.
 
 `--resume` continues a run in the same `--out` from its
 `trained_weights.safetensors` and training state; pass the flags of the
@@ -459,6 +490,9 @@ refused. A run that stops early (Ctrl-C, a crash) leaves no
 `training_state.json` trains nothing and exports the weights saved at that
 step.
 `--json` prints every `train` key plus `parameters` and `vocab_size`.
+`--device`, `--checkpoint-blocks`, `--grad-clip`, `--weight-decay` and
+`--log-every` work as in `train`, and `--seed` also seeds the initial weights;
+`pretrain --help` lists every flag and default.
 
 Host memory while training is about 20 bytes per byte of the corpus (the
 token windows, held twice). GPU memory is the f32 weights, their gradients

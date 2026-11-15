@@ -24,8 +24,8 @@ No GPU? `Device::cpu()` runs the same code.
 
 ## Command-line tool
 
-The `ferrotensor` command fine-tunes small Llama-style models with LoRA and
-runs `train`, `eval` and `generate`:
+The `ferrotensor` command plans and runs LoRA fine-tuning of small Llama-style models,
+chats with the result, merges the adapter into the weights and trains a tiny model from scratch (`plan`, `finetune`, `chat`, `merge`, `pretrain`, `train`, `eval`, `generate`):
 
 ```bash
 cargo install ferrotensor-cli

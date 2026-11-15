@@ -5,7 +5,7 @@ the `ferrotensor` crate. Each of those lives
 in [`ferrotensor/examples/`](../ferrotensor/examples), runs with one command, and the
 output below was captured from a real run on an Apple M2 (Metal) with Rust
 1.99.1. Numbers that depend on random initialisation vary from run to
-run; timings are single-machine snapshots, not benchmarks.
+run; timings are single-machine snapshots.
 
 Sections 5 to 7 use the LLM training stack (`ferrotensor-graph` and
 `ferrotensor-trainer`). They live in
@@ -52,11 +52,11 @@ epoch 59  train loss 0.0081  test accuracy 99.5%
 ```
 
 The data are two noisy interleaved half-circles generated in the example, so
-this is a smoke test of the training stack, not a benchmark. The whole run
+this is a smoke test of the training stack. The whole run
 takes about half a second on the CPU.
 
 `FERROTENSOR_DEVICE=gpu` trains the same model on the GPU. It works (final test
-accuracy 99.5% in our run) and takes about 2 s against about 0.2 s on the CPU
+accuracy 99.5% in one run) and takes about 2 s against about 0.2 s on the CPU
 (1.8-2.2 s in the [benchmark runs](../benchmarks/RESULTS.md#ferrotensor-tensor-api-cpu-and-gpu-devices);
 it was 12-17 s before ops were batched): a 1,218-parameter model gives the GPU
 too little work to amortise the cost of each dispatch. Use the CPU device for
@@ -104,8 +104,8 @@ What this does and does not show:
   training windows. With 3.7 KB of text and 110k parameters the model is
   starting to memorise the corpus; there is no held-out set, so this says
   nothing about generalisation.
-- The samples are partly English-shaped, partly garbage. It is a working
-  training loop, not a language model.
+- The samples are partly English-shaped, partly garbage. They show a working
+  training loop.
 - On this machine the GPU path (`FERROTENSOR_DEVICE=gpu`) trains the same 600
   steps in 31.9 s versus 42.5 s on the CPU (it took 105 s before GPU ops were
   [batched](architecture.md#batched-gpu-dispatch); method and numbers in
@@ -139,8 +139,8 @@ causal scaled-dot-product attention, [1, 8 heads, seq, 64]
    512       53.0        7.9      6.7x      5.96e-7
 ```
 
-Read this honestly: the GPU is up to about 5x faster on large matmuls here,
-not orders of magnitude, and no faster at small sizes. The 2048x2048 matmul
+The GPU is up to about 5x faster on large matmuls here,
+and no faster at small sizes. The 2048x2048 matmul
 is about 118 GFLOPS on the GPU (2 n^3 flops / 0.1455 s; the tuned kernels in
 `ferrotensor-backend` reach 611 GFLOPS at 4096). This is one run on a machine
 that may be doing other work, so expect noise. The agreement column
@@ -232,9 +232,9 @@ apply_checkpoint(&ctx, &checkpoint, &fresh.named_lora_params())?;
 
 (Simplified: the example sorts the parameters by name and passes them as a
 list.) The program asserts that the loss at least halves and that the
-reloaded model gives the trained loss within 1e-4. A single fixed pattern is
-memorised, not generalised: this checks that the training stack works, it
-does not measure a model. For a real model and dataset, see the
+reloaded model gives the trained loss within 1e-4. The model memorises one
+fixed pattern, which checks that the training stack works and says nothing
+about model quality. For a real model and dataset, see the
 [LoRA walkthrough](examples/lora-sft.md).
 
 ## 6. Stop and resume a training run
@@ -286,8 +286,8 @@ The resumed run matches the straight run at every step (the program fails if
 any resumed step differs by more than 1e-5, relative). Without the optimizer
 state the run goes on from the same weights but takes different steps. Its
 loss happens to fall faster here (likely because AdamW's first steps after a
-fresh start are large); the point is that it is a different run, not that it
-is worse.
+fresh start are large); the example shows that it is a different run
+from the straight one.
 
 ## 7. Greedy generation with the KV cache
 

@@ -47,7 +47,7 @@ lets two builds be compared bit for bit. Results are in
 Each case first runs 3 warm-up calls. It then dispatches the kernel in batches
 of up to 64 calls (about 20 ms of work per batch) and waits for the GPU once
 per batch, so per-call CPU overhead overlaps with GPU work. The reported time
-is the median per-call time over 5–30 batches. Throughput uses `2*M*N*K` FLOPs
+is the median per-call time over 5 to 30 batches. Throughput uses `2*M*N*K` FLOPs
 for matmul, `2*B*H*S^2*D` for causal attention forward (2.5x that for the
 backward pass), and bytes read plus written for the row and element-wise
 kernels.

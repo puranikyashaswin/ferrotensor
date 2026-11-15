@@ -46,7 +46,7 @@ ferrotensor info --check
 This runs matmul (at sizes that are not multiples of any tile size), softmax
 and RMSNorm on the selected GPU and compares each with a CPU reference. Each
 line says `ok` or `FAIL` with the largest error and the tolerance. The command
-exits with an error if any kernel fails.
+exits with 1 if any kernel fails and with 2 if no GPU adapter is found.
 
 ## 3. Run the tests and benchmarks (optional)
 
@@ -81,6 +81,6 @@ Open an issue with the output of:
 ferrotensor info --check --json
 ```
 
-Whether everything passed or something failed, the report tells us which
+Whether everything passed or something failed, the report records which
 hardware, driver and backend Ferrotensor has now been tried on. If you also ran
 the tests or the benchmark, paste their output too.
