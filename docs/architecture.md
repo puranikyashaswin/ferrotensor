@@ -13,7 +13,7 @@ source level:
 | Stack | Crates | What it is |
 |-------|--------|------------|
 | **Tensor API** | `ferrotensor` (and `ferrotensor-py`, its Python binding) | A PyTorch-style `Tensor` with autograd, `nn`, `optim`, `serialize` and a CPU device. Has its own small set of generic WGSL kernels (`ferrotensor/src/backend/kernels.rs`). |
-| **LLM fine-tuning stack** | `ferrotensor-backend`, `ferrotensor-autograd`, `ferrotensor-graph`, `ferrotensor-loader`, `ferrotensor-trainer`, `ferrotensor-cli`, `ferrotensor-monitor`, `ferrotensor-hub` | Hand-written kernels for Llama/LFM2-style models (RoPE, RMSNorm, flash attention, AdamW, int8 dequantisation), LoRA, safetensors loading, the training CLI. |
+| **LLM fine-tuning stack** | `ferrotensor-backend`, `ferrotensor-autograd`, `ferrotensor-graph`, `ferrotensor-loader`, `ferrotensor-trainer`, `ferrotensor-cli`, `ferrotensor-monitor`, `ferrotensor-hub` | Hand-written kernels for Llama/LFM2-style models (RoPE, RMSNorm, flash attention, AdamW, int8 dequantisation, a 4-bit weight matmul), LoRA, safetensors loading, the training CLI. |
 
 `ferrotensor/Cargo.toml` does not depend on any of the LLM crates, so the two
 stacks share no code. The rest of this page is about the `ferrotensor` tensor API; the LLM stack is described
@@ -23,7 +23,9 @@ in each crate's README.
 flowchart TD
     cli[ferrotensor-cli] --> trainer[ferrotensor-trainer]
     cli --> monitor[ferrotensor-monitor]
-    hub[ferrotensor-hub] --> graphc[ferrotensor-graph]
+    cli --> hub[ferrotensor-hub]
+    monitor --> trainer
+    hub --> graphc[ferrotensor-graph]
     trainer --> graphc
     trainer --> autograd[ferrotensor-autograd]
     trainer --> loader[ferrotensor-loader]
@@ -226,7 +228,7 @@ It depends only on the public API of the `ferrotensor` crate.
   devices and batched GPU dispatch behave exactly as described above: Python
   only issues ops, and the work is recorded and submitted at the next read
   back (`.item()`, `.tolist()`, printing).
-- **Errors, not panics.** Arguments are checked in the bindings and raise
+- **Python exceptions.** Arguments are checked in the bindings and raise
   `ValueError`, `IndexError` or `TypeError`. Every call into the crate also
   runs inside a `catch_unwind` guard (`src/error.rs`), so an assertion the
   checks missed arrives as a `RuntimeError` rather than aborting Python.
@@ -245,7 +247,16 @@ RoPE, flash attention, SwiGLU), with optional LoRA on the projections.
 `ferrotensor-autograd` supplies the gradient tape and `ferrotensor-trainer` the loops
 (SFT with response-only loss, pretraining, an optional loss scaler that the CLI does not use,
 checkpoint save/resume, and for `ferrotensor pretrain` a randomly initialised
-model and the export of trained weights as a Hugging Face checkpoint). Ops inside `ferrotensor_autograd::no_grad(|| ...)` record no
-tape, so `generate`, `chat`, `eval` and classification predictions keep no intermediate
-activations alive. `ferrotensor-cli` is the front end. This stack is
-experimental; see the status table in the [README](../README.md).
+model and the export of trained weights as a Hugging Face checkpoint). Training
+updates LoRA adapters by default; `train --train-modules` trains base weights
+instead, by group (`attn`, `mlp`, `norm`, `head`, `all`, `embed`, `full`). The
+token embedding trains through `Tensor::embedding` in `ferrotensor-autograd`,
+which gathers rows on the host and scatter-adds the gradient into the table on
+backward. Ops inside `ferrotensor_autograd::no_grad(|| ...)` record no
+tape, so `generate`, `chat`, `eval`, the evaluation during `train` and
+classification predictions keep no intermediate activations alive; the
+`ferrotensor` crate has its own `no_grad`, used in the sections above.
+`ferrotensor-cli` is the front end: `info`, `plan`, `finetune`, `train`, `eval`,
+`generate`, `chat`, `export-adapter`, `merge`, `pretrain` and the classifier
+commands. This stack is experimental; see the status table in the
+[README](../README.md).

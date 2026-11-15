@@ -1,10 +1,10 @@
 # Ferrotensor
 
-> Ferrotensor is a Rust framework for tensors, autograd and LoRA fine-tuning of small language models on the GPU through wgpu and WGSL kernels (Vulkan, Metal or DX12, no CUDA). The `ferrotensor` command plans, trains, evaluates and samples LoRA adapters for Llama-style models; every command that reports a result takes `--json` and uses the same exit codes.
+> Ferrotensor is a Rust framework for tensors, autograd and LoRA fine-tuning of small language models on the GPU through wgpu and WGSL kernels (Vulkan, Metal or DX12, no CUDA). The `ferrotensor` command plans, fine-tunes, chats with, merges and evaluates LoRA adapters for Llama-style models and trains a small byte-level model from scratch; `plan`, `finetune`, `train`, `eval`, `generate`, `chat`, `merge`, `pretrain` and `info` take `--json`, and every command uses the same exit codes.
 
 ## Start here
 
-- [README](README.md): what Ferrotensor is, install, quickstart, measured results
+- [README](README.md): what Ferrotensor is, the commands, install, quickstart, measured results
 - [AGENTS.md](AGENTS.md): the CLI for coding agents and scripts: JSON output per command, exit codes, picking a model, rules for changing the code
 - [CLI reference](ferrotensor-cli/README.md): every `ferrotensor` command and flag group, with measured memory numbers
 

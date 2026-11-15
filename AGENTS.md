@@ -3,8 +3,9 @@
 Ferrotensor is a Rust framework for tensors, autograd and LoRA fine-tuning of
 small language models on the GPU, through wgpu and hand-written WGSL kernels
 (Vulkan, Metal or DX12; no CUDA). The `ferrotensor` command (crate
-`ferrotensor-cli`) plans, trains, evaluates and samples LoRA adapters for
-Llama-style models such as SmolLM2 and TinyLlama.
+`ferrotensor-cli`) plans, trains, evaluates, samples and merges LoRA adapters
+for Llama-style models such as SmolLM2 and TinyLlama, and trains a small
+byte-level model from scratch.
 
 ## Install
 
@@ -27,6 +28,8 @@ ferrotensor plan --model DIR --json                       # what fits this GPU
 ferrotensor finetune --model DIR --data train.jsonl --json # train with that plan
 ferrotensor eval --model DIR --data val.jsonl --lora outputs/run/lora_adapters.safetensors --json
 ferrotensor chat --model DIR --lora outputs/run/lora_adapters.safetensors --json < questions.txt
+ferrotensor merge --model DIR --lora outputs/run/lora_adapters.safetensors --out outputs/merged --json
+ferrotensor pretrain --data corpus.txt --out outputs/tiny --json  # from random weights; generate --raw loads it
 ```
 
 `chat` needs a ChatML model such as SmolLM2 (TinyLlama's tokenizer lacks the
@@ -55,7 +58,7 @@ is `null`. On an error stdout carries `{"error": "<message>"}` instead.
 |---|---|
 | `plan` | `adapter`, `backend`, `device_type`, `budget_mib`, `budget_source`, `model`, `parameters`, `chosen`, `estimated_peak_mib`, `margin`, `fits`, `train_command`, `notes`; without `--model` the per-model keys are in a `models` array |
 | `finetune` | `chosen` (`batch_size`, `seq_len`, `rank`, `precision`, `checkpoint_blocks`), `grad_accum`, `budget_mib`, `estimated_peak_mib`, `fits`, then every `train` key |
-| `train` | `steps`, `first_loss`, `final_loss`, `eval_loss_before`, `eval_loss_after` (null without `--eval-data`), `measured_peak_mib`, `seconds`, `out_dir`, `adapter` |
+| `train` | `steps`, `first_loss`, `final_loss`, `eval_loss_before`, `eval_loss_after` (null without `--eval-data`), `measured_peak_mib`, `seconds`, `out_dir`, `adapter` (null on ranks above 0, which save nothing) |
 | `eval` | `examples`, `tokens`, `loss`, `perplexity`, `seconds` |
 | `generate` | `text`, `prompt_tokens`, `new_tokens`, `tokens_per_second`, `kv_cache` |
 | `chat` | one object per reply, each on its own line: `reply`, `prompt_tokens`, `new_tokens`, `tokens_per_second` |
@@ -138,7 +141,7 @@ The `plan` estimate is calibrated on these A10G peaks; its worst error there is
   Test and example files carry one `#![allow(...)]` at the top, or one
   `#[allow(...)]` on `mod tests`.
 - `unsafe` is denied, except the loader's two documented memory-map sites.
-- Comments say why, not what. A doc comment is one summary sentence, plus
+- A comment says why the code does something. A doc comment is one summary sentence, plus
   `# Errors`, `# Panics` or `# Safety` when they apply.
 - No new dependency without the maintainer's approval. One concern per PR.
 - Tests assert concrete values against an independent reference.

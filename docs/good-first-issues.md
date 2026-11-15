@@ -58,8 +58,8 @@ before/after numbers and the machine in the PR.
 the `f32` ids straight from the id tensor's GPU buffer; ids outside
 `[0, vocab)` give zero rows. The tests in `ferrotensor/src/nn/embedding.rs`
 check that `forward` and `forward_ids` agree bit for bit on the CPU and (with
-`FERROTENSOR_RUN_GPU_TESTS=1`) on the GPU. The backward pass still scatters
-the gradient on the host.
+`FERROTENSOR_RUN_GPU_TESTS=1`) on the GPU. The backward pass scatters
+the gradient with the `scatter_rows` kernel (see issue 16).
 
 ## 6. Make loss-function target types consistent
 
@@ -226,7 +226,7 @@ Done when the existing clipping tests pass unchanged and
 
 ## 19. Fuse chains of element-wise ops into one kernel
 
-*Design written: [docs/design/op-fusion.md](design/op-fusion.md). Implementation follows it.*
+*Done, off by default: `FERROTENSOR_FUSION=1` fuses element-wise chains into one dispatch; design in [docs/design/op-fusion.md](design/op-fusion.md).*
 
 *harder · `performance`, `kernels`*
 

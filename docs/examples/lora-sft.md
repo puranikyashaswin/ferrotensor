@@ -176,9 +176,9 @@ memory is the `nvidia-smi` peak for both.
 - Speed: Ferrotensor is slower. It runs at 0.84× of PyTorch's speed for
   SmolLM2-135M at batch 1, 0.32× at batch 8, and 0.37× for SmolLM2-1.7B
   (f32 base weights), so it takes 1.2 to 3.1 times PyTorch's time per step.
-  I think most of the gap is in the large matrix multiplications, where
-  PyTorch uses cuBLAS and Ferrotensor one portable WGSL kernel; I have not
-  profiled it kernel by kernel.
+  The gap is probably mostly in the large matrix multiplications, where
+  PyTorch uses cuBLAS and Ferrotensor one portable WGSL kernel; it has not
+  been profiled kernel by kernel.
 - PyTorch used less GPU memory in every configuration and fit SmolLM2-1.7B
   at batch 8, which this 0.6 build did not on a 24 GB card. There is no
   matched comparison with PyTorch after the memory work in 0.7.

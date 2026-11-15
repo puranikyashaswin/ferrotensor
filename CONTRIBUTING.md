@@ -1,6 +1,6 @@
 # Contributing to Ferrotensor
 
-Thanks for your interest. Ferrotensor is a young, one-maintainer project, so small,
+Ferrotensor is a young, one-maintainer project, so small,
 focused pull requests that come with tests are the easiest to review and merge.
 
 ## Setup
@@ -78,20 +78,21 @@ Run these before pushing; they are what CI runs:
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cargo doc --workspace --no-deps
+RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links" cargo doc --workspace --no-deps --exclude ferrotensor-cli
+RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links" cargo doc -p ferrotensor-cli --no-deps
 ```
 
-> Known issue: on recent stable toolchains `cargo clippy` currently stops at a
-> lint-priority error in the workspace `Cargo.toml`
-> ([issue 1](docs/good-first-issues.md#1-cargo-clippy-fails-on-a-workspace-lint-priority-error)).
-> Fixing it is a good first PR.
+Every crate sets `[lints] workspace = true`, so the workspace lints apply
+everywhere, and CI runs clippy with `-D warnings`:
 
 - Document every public item (`missing_docs` is a warning).
-- No `unsafe` (the workspace forbids it).
-- Avoid `unwrap()`, `expect()` and `panic!` in library code except for
-  documented precondition panics (the lints warn on them).
+- `unsafe` code is denied, except the loader's two memory-map sites, each
+  marked with `#[allow(unsafe_code)]`.
+- No `unwrap()`, `expect()` or `panic!` in library code except for
+  documented precondition panics; `unwrap_used`, `expect_used` and `panic`
+  are warnings, so `-D warnings` fails on them.
 - Match the surrounding code: naming, comment density, error handling.
 - Do not add benchmark or performance claims to docs without a measurement you
   can reproduce, and say which machine produced it.
@@ -130,7 +131,7 @@ If you want to take one, comment on the issue so work is not duplicated.
 
 - **Bugs:** include `rustc --version`, OS, GPU (`Device::best().name()`), and
   the smallest program that reproduces it. Say whether it also fails on
-  `Device::cpu()`, which tells us if the bug is in a kernel or in the op logic.
+  `Device::cpu()`, which shows whether the bug is in a kernel or in the op logic.
 - **Features:** describe the use case first, then the proposed API.
 - **Security issues:** see [SECURITY.md](SECURITY.md); do not open a public issue.
 

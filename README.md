@@ -26,10 +26,30 @@ the shader. It is young: pre-1.0, one maintainer, small-scale by design.
 Arithmetic and trainable parameters are f32; the CLI stores frozen LoRA base
 weights as f16 by default to save memory (`--f32-weights` keeps them f32).
 
-- [Install](#install) · [Quickstart](#quickstart) · [Python](#python) · [Features](#feature-matrix) · [Architecture](#architecture) · [Compared with candle, burn and tch](#compared-with-candle-burn-and-tch) · [Roadmap](#roadmap)
+- [The commands](#the-commands) · [Install](#install) · [Quickstart](#quickstart) · [Python](#python) · [Features](#feature-matrix) · [Architecture](#architecture) · [Compared with candle, burn and tch](#compared-with-candle-burn-and-tch) · [Roadmap](#roadmap)
 <!-- Switch the how-to guide link back to https://ferrotensor.dev/guide/ once the domain's DNS points at GitHub Pages. -->
-- Docs: [how-to guide](https://puranikyashaswin.github.io/ferrotensor/guide/) · [architecture](docs/architecture.md) · [writing a kernel](docs/writing-a-kernel.md) · [use cases](docs/use-cases.md) · [LoRA SFT walkthrough](docs/examples/lora-sft.md) · [adapters in PyTorch (PEFT)](docs/examples/peft-export.md) · [benchmarks](benchmarks/RESULTS.md) · [testing on your GPU](docs/testing-on-your-gpu.md) · [Mac benchmark harness](docs/benchmarks-mac.md) · [API docs](https://docs.rs/ferrotensor)
+- Docs: [how-to guide](https://puranikyashaswin.github.io/ferrotensor/guide/) · [architecture](docs/architecture.md) · [writing a kernel](docs/writing-a-kernel.md) · [use cases](docs/use-cases.md) · [CLI reference](ferrotensor-cli/README.md) · [LoRA SFT walkthrough](docs/examples/lora-sft.md) · [adapters in PyTorch (PEFT)](docs/examples/peft-export.md) · [benchmarks](benchmarks/RESULTS.md) · [testing on your GPU](docs/testing-on-your-gpu.md) · [Mac benchmark harness](docs/benchmarks-mac.md) · [API docs](https://docs.rs/ferrotensor)
 
+
+## The commands
+
+The `ferrotensor` command (crate `ferrotensor-cli`) takes a small
+Llama-style model from a GPU check to a trained, usable model. `DIR` is a
+model directory or a Hugging Face id already in the local cache; every flag
+is in the [CLI README](ferrotensor-cli/README.md).
+
+| Step | Command | What it does |
+|---|---|---|
+| 1 | `ferrotensor info --check` | Lists the GPUs wgpu can use and runs the matmul, softmax and RMSNorm kernels on one against a CPU reference |
+| 2 | `ferrotensor plan --model DIR` | Estimates peak GPU memory and picks the batch size, sequence length and checkpointing that fit this machine |
+| 3 | `ferrotensor finetune --model DIR --data train.jsonl --out outputs/run` | Runs LoRA fine-tuning with the settings `plan` chose and writes `lora_adapters.safetensors` |
+| 4 | `ferrotensor chat --model DIR --lora outputs/run/lora_adapters.safetensors` | Talks to the result, one message per line (ChatML models such as SmolLM2) |
+| 5 | `ferrotensor merge --model DIR --lora outputs/run/lora_adapters.safetensors --out outputs/merged` | Folds the adapter into the base weights and writes a standalone model directory; `export-adapter` writes a PEFT adapter for PyTorch instead |
+| 6 | `ferrotensor pretrain --data corpus.txt --out outputs/tiny` | Trains a small byte-level model from random weights, for learning and experiments; `generate --raw` loads the result |
+
+`eval`, `generate` and `train` (every setting chosen by hand) are in the same
+CLI. For scripts and coding agents, `--json` and shared exit codes are listed
+in [AGENTS.md](AGENTS.md).
 
 ## Highlights
 
@@ -99,7 +119,7 @@ You need Rust 1.88+ (`rustup` is enough). On macOS no other setup is needed.
 
 ```bash
 cargo add ferrotensor           # the tensor API, in your project
-cargo install ferrotensor-cli   # the `ferrotensor` command: LoRA train / eval / generate
+cargo install ferrotensor-cli   # the `ferrotensor` command: plan, fine-tune, chat, merge, pretrain
 pip install ferrotensor         # Python bindings (macOS arm64 and Linux x86_64 wheels)
 ```
 
@@ -208,7 +228,7 @@ tested, incomplete, or only checked on one machine.
 | Checkpoint/resume (`ferrotensor-trainer`) | **Experimental** | |
 | Loss scaler (`GradScaler` in `ferrotensor-trainer`) | **Experimental** | A library type: `Trainer::with_grad_scaler` attaches it, the CLI does not use it, and `ferrotensor demo` only constructs one. Gradients are f32, so there is no f16 underflow for it to guard against |
 | Mixed-precision (f16 activations and gradients) training | Planned | Today only frozen LoRA base weights are stored below f32 (f16 by default; 4-bit with `--q4-weights`, experimental, [changes the results](ferrotensor-cli/README.md#frozen-base-weights-f16-f32-or-4-bit-experimental)); arithmetic, activations, gradients and adapters are f32 |
-| Terminal monitor, Hub download helpers | **Experimental** | `ferrotensor-monitor`, `ferrotensor-hub` |
+| Terminal monitor, Hugging Face cache helpers | **Experimental** | `ferrotensor-monitor`, `ferrotensor-hub` |
 | `f16` / `bf16` tensors in the `ferrotensor` API | Planned | |
 | Convolutions, sort/top-k, cumsum in the `ferrotensor` API | Planned | |
 | Batched GPU dispatch in the `ferrotensor` API | **Stable** | Ops submit together at each read back; `char_transformer` trains faster on the GPU than the CPU, but chains of tiny ops are still faster on the CPU ([numbers](benchmarks/RESULTS.md#ferrotensor-tensor-api-cpu-and-gpu-devices)) |
@@ -224,7 +244,9 @@ tested, incomplete, or only checked on one machine.
 flowchart TD
     cli[ferrotensor-cli] --> trainer[ferrotensor-trainer]
     cli --> monitor[ferrotensor-monitor]
-    hub[ferrotensor-hub] --> graphc[ferrotensor-graph]
+    cli --> hub[ferrotensor-hub]
+    monitor --> trainer
+    hub --> graphc[ferrotensor-graph]
     trainer --> graphc
     trainer --> autograd[ferrotensor-autograd]
     trainer --> loader[ferrotensor-loader]
@@ -252,10 +274,10 @@ tensor op reaches a WGSL kernel, are in [docs/architecture.md](docs/architecture
 | [`ferrotensor-autograd`](ferrotensor-autograd) | Gradient tape for the backend tensors |
 | [`ferrotensor-graph`](ferrotensor-graph) | Transformer building blocks and the Llama/LFM2-style model builder |
 | [`ferrotensor-loader`](ferrotensor-loader) | Safetensors (single and sharded) and tokenizer loading |
-| [`ferrotensor-trainer`](ferrotensor-trainer) | Training loops, LoRA, checkpoints, an optional `GradScaler` |
-| [`ferrotensor-cli`](ferrotensor-cli) | The `ferrotensor` command: `train`, `eval`, `generate` (alias `infer`), `chat`, `export-adapter`, `merge`, `pretrain`, `info`, `classify-train`, `classify-predict`, `monitor`, `demo` |
+| [`ferrotensor-trainer`](ferrotensor-trainer) | Training loops, LoRA, checkpoints, PEFT export, adapter merging, from-scratch initialisation, an optional `GradScaler` |
+| [`ferrotensor-cli`](ferrotensor-cli) | The `ferrotensor` command: `info`, `plan`, `finetune`, `train`, `eval`, `generate` (alias `infer`), `chat`, `export-adapter`, `merge`, `pretrain`, `classify-train`, `classify-predict`, `monitor`, `demo`, `benchmark` |
 | [`ferrotensor-monitor`](ferrotensor-monitor) | Terminal dashboard |
-| [`ferrotensor-hub`](ferrotensor-hub) | Hugging Face Hub download helpers |
+| [`ferrotensor-hub`](ferrotensor-hub) | Finds a model in the local Hugging Face cache and reads its `config.json`; downloads nothing |
 | [`ferrotensor-py`](ferrotensor-py) | Python bindings for the `ferrotensor` crate (not published to crates.io) |
 | [`benchmarks`](benchmarks) | GPU kernel and tensor-API benchmarks |
 
@@ -296,7 +318,7 @@ block checkpointing that fit this machine's GPU memory, prints that plan,
 then trains. `train` sets nothing for you; use it to choose every setting
 by hand.
 
-For scripts and coding agents, `plan`, `finetune`, `train`, `pretrain`,
+For scripts and coding agents, `plan`, `finetune`, `train`, `pretrain`, `merge`,
 `eval`, `generate` and `info` take `--json` and print one JSON object (`chat` prints
 one per reply), and exit codes are the same across commands;
 [AGENTS.md](AGENTS.md) lists both.
@@ -318,8 +340,8 @@ cargo run -p ferrotensor-cli --release -- generate \
 
 ## Compared with candle, burn and tch
 
-These are good projects; Ferrotensor is not trying to replace them. The honest
-picture, as of this writing:
+These are good projects, and Ferrotensor does not aim to replace them. How
+they compare as of this writing:
 
 | | Ferrotensor | [candle](https://github.com/huggingface/candle) | [burn](https://github.com/tracel-ai/burn) | [tch-rs](https://github.com/LaurentMazare/tch-rs) |
 |---|---|---|---|---|
@@ -334,8 +356,8 @@ training framework, tch-rs when you need exact PyTorch semantics and CUDA.
 Choose Ferrotensor to learn how the stack works end to end, when you want a
 dependency-light wgpu-only codebase you can read and modify, or to
 experiment on a consumer GPU without installing CUDA. Ferrotensor does not match
-their op coverage, model support or hardening, and we have not benchmarked it
-against them; kernel-level numbers for Ferrotensor alone are in
+their op coverage, model support or hardening, and it has not been benchmarked
+against them. Kernel-level numbers for Ferrotensor alone are in
 [benchmarks/RESULTS.md](benchmarks/RESULTS.md).
 
 ## Roadmap

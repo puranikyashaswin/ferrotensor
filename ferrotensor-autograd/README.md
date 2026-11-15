@@ -5,7 +5,8 @@ GPU tensors, used by `ferrotensor-graph` and `ferrotensor-trainer`. A `Tensor` w
 `UnifiedTensor` with a gradient slot and the node that produced it; ops such as
 `Tensor::matmul` run a GPU kernel and record a node, and `Tensor::backward`
 walks the graph in reverse. The crate also has `AdamW`, learning-rate
-schedulers and gradient `checkpoint`ing.
+schedulers, gradient `checkpoint`ing, `no_grad` and a token embedding whose
+table can train (`Tensor::embedding`).
 
 ```rust
 use std::sync::Arc;
@@ -24,10 +25,10 @@ pollster::block_on(async {
 });
 ```
 
-> **TODO:** this snippet is written against the current API but could not be
-> run: it depends on `ComputeEngine::new`, which currently fails with a WGSL
-> parse error (see the [`ferrotensor-backend`](../ferrotensor-backend/README.md) note).
-> Re-verify once that is fixed.
+The snippet needs a GPU adapter, so it is not run in CI. Inside
+`ferrotensor_autograd::no_grad(|| ...)` ops record no node and their inputs
+are released as soon as nothing else holds them; `generate`, `chat`, `eval`
+and classification predictions run that way.
 
 For the PyTorch-style tensor API with its own autograd on CPU and GPU, see the
 [`ferrotensor`](../ferrotensor) crate.

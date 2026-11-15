@@ -4,8 +4,10 @@ Training loops for [Ferrotensor](../README.md)'s LLM stack: `Trainer` (response-
 cross-entropy, gradient accumulation averaged over the window, global
 gradient-norm clipping, learning-rate schedules, optional `GradScaler`),
 SFT and pretraining datasets with a seeded `DataLoader`, LoRA adapter
-save/load (safetensors with rank/alpha/targets metadata) and resumable
-training checkpoints, plus a file-based gradient sync prototype for
+save/load (safetensors with rank/alpha/targets metadata), PEFT adapter
+export and import (`peft`), folding an adapter into base weights (`merge`),
+random initialisation and export for `ferrotensor pretrain` (`pretrain`) and
+resumable training checkpoints, plus a file-based gradient sync prototype for
 multi-process runs. **Experimental.**
 
 Most people use it through `ferrotensor-cli`:

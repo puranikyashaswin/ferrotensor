@@ -12,7 +12,7 @@ You normally reach this crate through the CLI, which loads a model directory
 and attaches LoRA adapters:
 
 ```bash
-cargo run -p ferrotensor-cli --release -- infer --model ./models/tinyllama --prompt "Hello"
+cargo run -p ferrotensor-cli --release -- generate --raw --model ./models/tinyllama --prompt "Hello"
 ```
 
 Model loading lives in [`ferrotensor-loader`](../ferrotensor-loader); training in
