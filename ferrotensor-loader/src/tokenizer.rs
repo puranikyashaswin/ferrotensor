@@ -386,7 +386,7 @@ mod tests {
     /// A word-level tokenizer with ChatML special tokens: `<|im_start|>` 1,
     /// `<|im_end|>` 2, `system` 3, `user` 4, `assistant` 5, `Hi` 6,
     /// `Hello` 7, `Bye` 8, `Be` 9, `brief` 10, `.` 11.
-    fn chatml_tokenizer() -> Result<Tokenizer, Box<dyn std::error::Error>> {
+    fn chatml_tokenizer() -> Result<Tokenizer, Box<dyn std::error::Error + Send + Sync>> {
         let words = [
             "<unk>",
             "<|im_start|>",
@@ -432,7 +432,8 @@ mod tests {
     }
 
     #[test]
-    fn one_turn_conversation_encodes_like_encode_chat() -> Result<(), Box<dyn std::error::Error>> {
+    fn one_turn_conversation_encodes_like_encode_chat(
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let tok = chatml_tokenizer()?;
         for system in [None, Some("Be brief.")] {
             assert_eq!(
@@ -445,7 +446,8 @@ mod tests {
     }
 
     #[test]
-    fn two_turn_conversation_is_the_turns_in_chatml() -> Result<(), Box<dyn std::error::Error>> {
+    fn two_turn_conversation_is_the_turns_in_chatml(
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let tok = chatml_tokenizer()?;
         let turns = ["Hi", "Hello", "Bye"];
         let user_hi = [1, 4, 6, 2];
