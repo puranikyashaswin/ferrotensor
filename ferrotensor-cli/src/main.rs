@@ -8,12 +8,14 @@
 //! ferrotensor-cli classify-train   --model DIR --data train.jsonl --output runs/cls
 //! ferrotensor-cli classify-predict --model DIR --classifier runs/cls --data test.jsonl --output probs.jsonl
 //! ferrotensor-cli info --check
+//! ferrotensor-cli plan --model DIR --json
 //! ferrotensor-cli export-adapter --lora runs/sft/lora_adapters.safetensors --model DIR --output runs/sft/peft
 //! ```
 
 mod classify;
 mod info;
 mod memory_report;
+mod plan;
 mod profile_report;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -75,6 +77,9 @@ enum Command {
     Monitor,
     /// Show the GPUs wgpu can use and, with --check, test the kernels on one.
     Info(info::InfoArgs),
+    /// Pick the largest LoRA batch size, sequence length and checkpointing
+    /// setting expected to fit this machine's GPU memory.
+    Plan(plan::PlanArgs),
     /// Convert a LoRA adapter to another format (PEFT, for PyTorch).
     ExportAdapter(ExportAdapterArgs),
     /// Print how to run the kernel benchmarks.
@@ -405,6 +410,11 @@ fn main() {
             Ok(())
         }
         Command::Info(args) => info::run(args),
+        Command::Plan(args) => plan::run(args).map(|outcome| {
+            if outcome == plan::Outcome::DoesNotFit {
+                std::process::exit(2);
+            }
+        }),
         Command::ExportAdapter(args) => export_adapter(args),
         Command::Monitor => ferrotensor_monitor::run().map_err(|e| format!("monitor: {e}").into()),
         Command::Benchmark => {
