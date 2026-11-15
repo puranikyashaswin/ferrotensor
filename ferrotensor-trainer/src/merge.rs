@@ -284,6 +284,59 @@ fn adapters_by_target<'a>(
     Ok(out)
 }
 
+/// The safetensors header of tensors stored back to back in this order,
+/// with `{"format": "pt"}` as metadata, padded with spaces to a multiple of
+/// 8 bytes.
+pub(crate) fn safetensors_header<'a>(
+    tensors: impl IntoIterator<Item = (&'a str, Dtype, &'a [usize])>,
+) -> Result<Vec<u8>> {
+    let mut header = serde_json::Map::new();
+    header.insert(
+        "__metadata__".to_string(),
+        serde_json::json!({ "format": "pt" }),
+    );
+    let mut offset = 0;
+    for (name, dtype, shape) in tensors {
+        let len = shape.iter().product::<usize>() * dtype.size();
+        let info = TensorInfo {
+            dtype,
+            shape: shape.to_vec(),
+            data_offsets: (offset, offset + len),
+        };
+        header.insert(name.to_string(), serde_json::to_value(info)?);
+        offset += len;
+    }
+    let mut header = serde_json::to_vec(&header)?;
+    header.resize(header.len().next_multiple_of(8), b' ');
+    Ok(header)
+}
+
+/// Writes `path` through `<path>.safetensors.tmp`: `write` fills the
+/// temporary file, which is synced and renamed to `path`. On an error the
+/// temporary file is removed, `path` is left as it was, and the error keeps
+/// its kind and names the temporary file.
+pub(crate) fn write_through_temp_file(
+    path: &Path,
+    write: impl FnOnce(&mut BufWriter<File>) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let tmp = path.with_extension("safetensors.tmp");
+    let mut file = BufWriter::new(File::create(&tmp)?);
+    let finished = write(&mut file)
+        .and_then(|()| file.into_inner().map_err(|e| e.into_error()))
+        .and_then(|file| file.sync_all())
+        .and_then(|()| std::fs::rename(&tmp, path));
+    if let Err(err) = finished {
+        if let Err(remove_err) = std::fs::remove_file(&tmp) {
+            log::warn!("cannot remove {}: {remove_err}", tmp.display());
+        }
+        return Err(std::io::Error::new(
+            err.kind(),
+            format!("cannot write {}: {err}", tmp.display()),
+        ));
+    }
+    Ok(())
+}
+
 /// Writes the safetensors file: the header length, the header, then the
 /// bytes of each entry in order.
 fn write_weights(
@@ -399,25 +452,11 @@ pub fn merge_adapter(
     // Widest dtype first, as the safetensors crate orders tensors, so every
     // tensor starts at a multiple of its element size.
     entries.sort_by(|x, y| y.dtype.cmp(&x.dtype).then_with(|| x.name.cmp(&y.name)));
-
-    let mut header = serde_json::Map::new();
-    header.insert(
-        "__metadata__".to_string(),
-        serde_json::json!({ "format": "pt" }),
-    );
-    let mut offset = 0;
-    for e in &entries {
-        let len = e.shape.iter().product::<usize>() * e.dtype.size();
-        let info = TensorInfo {
-            dtype: e.dtype,
-            shape: e.shape.clone(),
-            data_offsets: (offset, offset + len),
-        };
-        header.insert(e.name.clone(), serde_json::to_value(info)?);
-        offset += len;
-    }
-    let mut header = serde_json::to_vec(&header)?;
-    header.resize(header.len().next_multiple_of(8), b' ');
+    let header = safetensors_header(
+        entries
+            .iter()
+            .map(|e| (e.name.as_str(), e.dtype, e.shape.as_slice())),
+    )?;
 
     // I/O errors keep their type, so callers can tell them from bad input.
     std::fs::create_dir_all(out_dir).map_err(|e| {
@@ -427,24 +466,9 @@ pub fn merge_adapter(
         )
     })?;
     let path = out_dir.join(MERGED_WEIGHTS_FILE);
-    let tmp = path.with_extension("safetensors.tmp");
-    let finished = {
-        let mut file = BufWriter::new(File::create(&tmp)?);
-        write_weights(&mut file, &header, &entries, &weights)
-            .and_then(|()| file.into_inner().map_err(|e| e.into_error()))
-            .and_then(|file| file.sync_all())
-            .and_then(|()| std::fs::rename(&tmp, &path))
-    };
-    if let Err(err) = finished {
-        if let Err(remove_err) = std::fs::remove_file(&tmp) {
-            log::warn!("cannot remove {}: {remove_err}", tmp.display());
-        }
-        return Err(std::io::Error::new(
-            err.kind(),
-            format!("cannot write {}: {err}", tmp.display()),
-        )
-        .into());
-    }
+    write_through_temp_file(&path, |file| {
+        write_weights(file, &header, &entries, &weights)
+    })?;
 
     for name in COPIED_FILES {
         let from = model_dir.join(name);

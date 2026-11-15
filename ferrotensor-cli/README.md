@@ -410,6 +410,57 @@ or `.scales` tensors), files of trained base weights, and adapter tensors
 whose base weight is missing or has another shape are refused before
 anything is written.
 
+## Train from scratch: `pretrain`
+
+`pretrain` trains a small byte-level Llama-style model from random weights
+on a text file and leaves a model directory that `generate --raw` loads. It
+is meant for learning and experiments: f32 weights, untied embeddings,
+training defaults that are conservative and not tuned, and no claim about
+speed or about quality beyond the CI test below.
+
+```bash
+cargo run -p ferrotensor-cli --release -- pretrain \
+  --data corpus.txt --out ./data/models/tiny
+cargo run -p ferrotensor-cli --release -- generate \
+  --model ./data/models/tiny --raw --prompt "Once upon a time"
+```
+
+In order, it
+
+1. writes a byte-level `tokenizer.json`: `<pad>` 0, `<s>` 1, `</s>` 2, then
+   byte `b` as token `b + 3` (259 tokens), a BPE model without merges over
+   the `ByteLevel` characters. Any UTF-8 text encodes to its bytes and
+   decodes back exactly; `<s>` in the text stays three bytes;
+2. writes `config.json` and `model.safetensors` in the Hugging Face Llama
+   layout from `--layers` (default 4), `--hidden` (128), `--heads` (4),
+   `--mlp-hidden` (4 x hidden) and `--context` (256, written as
+   `max_position_embeddings`): norm scales are ones, every other weight is
+   drawn from a normal distribution with standard deviation 0.02 by a
+   generator seeded with `--seed`, so a seed always gives the same model.
+   The head size `--hidden / --heads` must be even and at most 128. The
+   defaults give 1,116,032 parameters;
+3. writes the bytes of `--data` as `tokens.bin` (little-endian u32, newlines
+   kept, the file read once);
+4. runs `train --task pretrain --train-modules full` on that directory:
+   every weight and the embedding train in f32 on windows of `--seq-len`
+   tokens (default `--context`), with `--lr 1e-3`, `--warmup-steps 100`,
+   `--max-steps 2000`, `--batch-size 8`, `--grad-accum 1` and
+   `--save-every 500` unless given;
+5. writes the trained weights over `model.safetensors`, linears transposed
+   back to `[out, in]`.
+
+`--resume` continues a run in the same `--out` from its
+`trained_weights.safetensors` and training state; pass the flags of the
+first run, with `--max-steps` counting the steps before the resume. Without
+`--resume`, an `--out` that already holds `model.safetensors` is refused.
+`--json` prints every `train` key plus `parameters` and `vocab_size`.
+
+Host memory while training is about 20 bytes per byte of the corpus (the
+token windows, held twice). GPU memory is the f32 weights, their gradients
+and two AdamW moments (16 bytes per parameter) plus activations; `plan` does
+not cover `pretrain`. Not included: a learned tokenizer, tied embeddings,
+mixed precision, and document boundaries (the corpus is one stream).
+
 ## Sample from a model: `generate`
 
 `generate` stops with exit code 2 when the prompt encodes to no tokens or is

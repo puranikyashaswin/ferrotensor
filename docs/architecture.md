@@ -244,7 +244,8 @@ Usage and API coverage are in
 RoPE, flash attention, SwiGLU), with optional LoRA on the projections.
 `ferrotensor-autograd` supplies the gradient tape and `ferrotensor-trainer` the loops
 (SFT with response-only loss, pretraining, an optional loss scaler that the CLI does not use,
-checkpoint save/resume). Ops inside `ferrotensor_autograd::no_grad(|| ...)` record no
+checkpoint save/resume, and for `ferrotensor pretrain` a randomly initialised
+model and the export of trained weights as a Hugging Face checkpoint). Ops inside `ferrotensor_autograd::no_grad(|| ...)` record no
 tape, so `generate`, `chat`, `eval` and classification predictions keep no intermediate
 activations alive. `ferrotensor-cli` is the front end. This stack is
 experimental; see the status table in the [README](../README.md).

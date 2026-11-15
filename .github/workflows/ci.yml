@@ -112,8 +112,10 @@ jobs:
         run: cargo test --release --workspace -- --ignored --test-threads=1
       # A LoRA adapter trained here, exported with `export-adapter --format
       # peft`, must give the same logits in PyTorch + PEFT (CPU wheels), and
-      # the model `merge` writes from it the same logits in transformers.
-      - name: PEFT export and merge against PyTorch + PEFT
+      # the model `merge` writes from it the same logits in transformers. The
+      # model `pretrain` writes must load in transformers with the loss
+      # `eval` reports.
+      - name: PEFT export, merge and pretrain against PyTorch + PEFT
         run: |
           out="$RUNNER_TEMP/peft-check"
           venv="$RUNNER_TEMP/peft-venv"
@@ -126,9 +128,18 @@ jobs:
             --output "$out/peft" --format peft
           cargo run --release -p ferrotensor-cli -- merge \
             --lora "$out/adapter.safetensors" --model "$out/model" --out "$out/merged"
+          for i in $(seq 50); do echo "the quick brown fox jumps over the lazy dog."; done \
+            > "$out/corpus.txt"
+          cargo run --release -p ferrotensor-cli -- pretrain --data "$out/corpus.txt" \
+            --out "$out/pretrained" --layers 2 --hidden 32 --heads 4 --context 32 \
+            --max-steps 20 --warmup-steps 5
+          cargo run --release -p ferrotensor-cli -- eval --model "$out/pretrained" \
+            --data "$out/pretrained/tokens.bin" --task pretrain --seq-len 32 \
+            --max-samples 1 --f32-weights --json > "$out/pretrained-eval.json"
           "$venv/bin/python" scripts/check_peft_export.py \
             --model "$out/model" --adapter "$out/peft" --logits "$out/logits.json" \
-            --merged "$out/merged"
+            --merged "$out/merged" \
+            --pretrained "$out/pretrained" --pretrained-eval "$out/pretrained-eval.json"
       - name: Autograd finite-difference checks
         run: cargo test --release -p ferrotensor-autograd --test grad_check -- --test-threads=1
       - name: Tensor API GPU parity

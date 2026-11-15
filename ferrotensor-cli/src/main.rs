@@ -11,6 +11,7 @@
 //! ferrotensor-cli classify-predict --model DIR --classifier runs/cls --data test.jsonl --output probs.jsonl
 //! ferrotensor-cli info --check
 //! ferrotensor-cli plan --model DIR --json
+//! ferrotensor-cli pretrain --data corpus.txt --out runs/tiny
 //! ferrotensor-cli export-adapter --lora runs/sft/lora_adapters.safetensors --model DIR --output runs/sft/peft
 //! ```
 
@@ -22,6 +23,7 @@ mod memory_report;
 mod merge;
 mod model_id;
 mod plan;
+mod pretrain;
 mod profile_report;
 
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
@@ -165,6 +167,9 @@ enum Command {
     ExportAdapter(ExportAdapterArgs),
     /// Write a model directory with a LoRA adapter folded into the weights.
     Merge(merge::MergeArgs),
+    /// Train a small byte-level Llama-style model from random weights on a
+    /// text file, into a model directory that generate loads.
+    Pretrain(Box<pretrain::PretrainArgs>),
     /// Print how to run the kernel benchmarks.
     #[command(long_flag = "benchmark")]
     Benchmark,
@@ -530,6 +535,7 @@ fn main() {
         Command::Info(args) => args.json,
         Command::Plan(args) => args.json,
         Command::Merge(args) => args.json,
+        Command::Pretrain(args) => args.json,
         _ => false,
     };
     // `chat --json` writes one object per line, so its error is one line too.
@@ -577,6 +583,7 @@ fn run(command: Command, matches: &clap::ArgMatches, json: bool) -> Result<Exit>
         Command::Plan(args) => return plan::run(args),
         Command::ExportAdapter(args) => export_adapter(args)?,
         Command::Merge(args) => merge::run(args, json)?,
+        Command::Pretrain(args) => pollster::block_on(pretrain::run(*args))?,
         Command::Monitor => ferrotensor_monitor::run().map_err(|e| format!("monitor: {e}"))?,
         Command::Benchmark => {
             println!(

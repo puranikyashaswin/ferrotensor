@@ -60,6 +60,7 @@ is `null`. On an error stdout carries `{"error": "<message>"}` instead.
 | `generate` | `text`, `prompt_tokens`, `new_tokens`, `tokens_per_second`, `kv_cache` |
 | `chat` | one object per reply, each on its own line: `reply`, `prompt_tokens`, `new_tokens`, `tokens_per_second` |
 | `merge` | `out_dir`, `merged` (tensors with the adapter added), `copied` (tensors copied byte for byte) |
+| `pretrain` | every `train` key, then `parameters` and `vocab_size` (259: a byte-level tokenizer) |
 | `info` | `ferrotensor`, `os`, `arch`, `adapters` (one object per GPU, `selected` marks the one used), `checks` (null without `--check`), and `error` only on failure |
 
 `chat` is the one command that prints more than one object: it reads one
@@ -90,7 +91,11 @@ prompt that encodes to no tokens or is longer than the model's context; `chat`
 refusing a tokenizer without ChatML tokens or a message longer than the
 model's context; and `merge`
 refusing its input (a non-empty `--out`, a quantized base, an adapter that
-does not match the base). clap's usage errors
+does not match the base); and `pretrain` refusing a model size the kernels
+cannot run (`--hidden` not a multiple of `--heads`, an odd head size or one
+above 128), a `--seq-len` above `--context`, an `--out` that already holds
+`model.safetensors` without `--resume`, or `--resume` without
+`trained_weights.safetensors`. clap's usage errors
 also exit with 2, with the usage text on stderr and nothing on stdout.
 
 ## Picking a model

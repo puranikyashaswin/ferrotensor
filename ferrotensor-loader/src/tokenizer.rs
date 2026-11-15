@@ -239,6 +239,65 @@ impl Tokenizer {
     }
 }
 
+/// Id of byte 0 in [`byte_level_tokenizer_json`]: byte `b` is id `b + 3`,
+/// after `<pad>` 0, `<s>` 1 and `</s>` 2.
+pub const BYTE_LEVEL_FIRST_BYTE_ID: u32 = 3;
+
+/// Number of tokens in [`byte_level_tokenizer_json`].
+pub const BYTE_LEVEL_VOCAB_SIZE: usize = 259;
+
+/// A Hugging Face `tokenizer.json` that encodes text as its UTF-8 bytes and
+/// decodes them back exactly.
+///
+/// It is a BPE model without merges over `<pad>` 0, `<s>` 1, `</s>` 2 and
+/// the 256 characters the `ByteLevel` pre-tokenizer stands bytes in for,
+/// byte `b` at id `b + 3`; [`Tokenizer::from_file`] finds the three special
+/// tokens at those ids. They are plain vocabulary entries, not added tokens,
+/// so text that contains `<s>` still encodes as its bytes.
+pub fn byte_level_tokenizer_json() -> serde_json::Value {
+    let vocab: serde_json::Map<String, serde_json::Value> = ["<pad>", "<s>", "</s>"]
+        .into_iter()
+        .map(str::to_owned)
+        .chain(byte_level_chars().iter().map(char::to_string))
+        .zip(0u32..)
+        .map(|(token, id)| (token, id.into()))
+        .collect();
+    let byte_level = serde_json::json!({
+        "type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": true
+    });
+    serde_json::json!({
+        "version": "1.0",
+        "truncation": null,
+        "padding": null,
+        "added_tokens": [],
+        "normalizer": null,
+        "pre_tokenizer": byte_level,
+        "post_processor": null,
+        "decoder": byte_level,
+        "model": {
+            "type": "BPE", "dropout": null, "unk_token": null,
+            "continuing_subword_prefix": null, "end_of_word_suffix": null,
+            "fuse_unk": false, "byte_fallback": false, "ignore_merges": false,
+            "vocab": vocab, "merges": []
+        }
+    })
+}
+
+/// The character GPT-2's byte-level BPE, and the `tokenizers` `ByteLevel`
+/// pre-tokenizer, uses for each byte: printable Latin-1 bytes stand for
+/// themselves, the other 68 take U+0100 onward in byte order.
+fn byte_level_chars() -> [char; 256] {
+    let printable = |b: u8| matches!(b, b'!'..=b'~' | 0xA1..=0xAC | 0xAE..=0xFF);
+    let mut chars = ['\0'; 256];
+    for b in (0..=255u8).filter(|&b| printable(b)) {
+        chars[usize::from(b)] = char::from(b);
+    }
+    for (b, c) in (0..=255u8).filter(|&b| !printable(b)).zip('\u{100}'..) {
+        chars[usize::from(b)] = c;
+    }
+    chars
+}
+
 /// The `bos_token` that the `tokenizer_config.json` beside `tokenizer_path`
 /// declares, as a string or as an added-token object; `None` when the file
 /// is absent or declares none (`null` or no key).
@@ -539,6 +598,53 @@ mod tests {
         )?;
         assert_eq!(declared.encode("Hi"), [0, 3]);
         assert_eq!(declared.decode(&[1, 3, 2]), "<|im_start|>Hi");
+        Ok(())
+    }
+
+    #[test]
+    fn byte_level_tokenizer_loads_with_the_special_ids_the_loader_expects() -> TestResult {
+        let tok = load_with_config("byte-level", &byte_level_tokenizer_json(), None)?;
+        assert!(
+            tok.hf_tokenizer.is_some(),
+            "parsed by the Hugging Face reader"
+        );
+        assert_eq!(tok.vocab.len(), BYTE_LEVEL_VOCAB_SIZE);
+        assert_eq!(
+            (tok.pad_token_id, tok.bos_token_id, tok.eos_token_id),
+            (0, 1, 2)
+        );
+        // By hand: 'H' 72, 'i' 105, ' ' 32, '\n' 10, 'é' is C3 A9; each plus 3.
+        assert_eq!(tok.encode("Hi \n"), [75, 108, 35, 13]);
+        assert_eq!(tok.encode("é"), [0xC3 + 3, 0xA9 + 3]);
+        assert_eq!(tok.vocab["Ġ"], 35, "GPT-2's character for the space byte");
+        assert_eq!(
+            tok.encode("<s></s>").len(),
+            7,
+            "specials in text stay bytes"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn byte_level_tokenizer_maps_every_byte_and_round_trips() -> TestResult {
+        let tok = load_with_config("byte-round-trip", &byte_level_tokenizer_json(), None)?;
+        // U+0000..=U+007F are the single bytes 0..=127; U+0080..=U+00FF are
+        // two bytes, C2 or C3 then 80..=BF, so together every byte occurs.
+        for scalar in 0u32..=0xFF {
+            let text = char::from_u32(scalar).ok_or("scalar")?.to_string();
+            let expected: Vec<u32> = text.bytes().map(|b| u32::from(b) + 3).collect();
+            assert_eq!(tok.encode(&text), expected, "U+{scalar:04X}");
+            assert_eq!(tok.decode(&expected), text, "U+{scalar:04X}");
+        }
+        for text in [
+            "plain ASCII.",
+            "héllo → 世界\n\ttab",
+            "  two spaces\r\n",
+            "🦀<pad>",
+        ] {
+            assert_eq!(tok.decode(&tok.encode(text)), text);
+            assert_eq!(tok.encode(text).len(), text.len());
+        }
         Ok(())
     }
 
