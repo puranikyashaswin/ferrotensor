@@ -6,6 +6,8 @@
 //! cargo test --release -p ferrotensor-graph --test lfm_conv -- --ignored
 //! ```
 
+#![allow(clippy::panic)]
+
 mod common;
 
 use common::{gpu, pseudo_random};

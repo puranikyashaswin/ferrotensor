@@ -26,3 +26,6 @@ bytemuck = "1.14"
 rand = "0.8"
 half = "2"
 tokenizers = "0.19"
+
+[lints]
+workspace = true

@@ -7,6 +7,8 @@
 //! writes (`tensor_a` holds the bytes 1, 2, 3, 4). The example exits with an
 //! error unless the result is [6.0, 8.0, 10.0, 12.0].
 
+#![allow(clippy::unwrap_used)]
+
 use ferrotensor_backend::{ComputeEngine, UnifiedTensor, WgpuContext};
 use ferrotensor_loader::WeightsContext;
 use std::sync::Arc;

@@ -5,6 +5,8 @@
 //! blocks, so every read releases pages; reading them again, in any order,
 //! must fault the same bytes back in from the file.
 
+#![allow(clippy::expect_used)]
+
 use ferrotensor_loader::WeightsContext;
 use safetensors::Dtype;
 use std::collections::HashMap;

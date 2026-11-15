@@ -300,6 +300,10 @@ impl ModelLoader {
     pub fn load_safetensors<P: AsRef<Path>>(path: P) -> Result<memmap2::Mmap, LoaderError> {
         let path = path.as_ref();
         let file = open_regular_file(path, None)?;
+        // SAFETY: the file is opened read-only and the mapping is only read.
+        // The one hazard is another process truncating the file while it is
+        // mapped; `open_regular_file` has already ruled out directories and pipes.
+        #[allow(unsafe_code)]
         let mmap = unsafe { MmapOptions::new().map(&file) }.map_err(|e| {
             LoaderError::Io(std::io::Error::new(
                 e.kind(),
@@ -654,6 +658,7 @@ impl WeightsContext {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

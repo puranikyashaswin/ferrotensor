@@ -6,6 +6,8 @@
 //! writes. The example exits with an error when the tensors are not the ones
 //! `gen_dummy` wrote.
 
+#![allow(clippy::unwrap_used, clippy::panic)]
+
 use ferrotensor_loader::WeightsContext;
 
 fn main() {

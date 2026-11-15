@@ -24,7 +24,7 @@ rust-version = "1.88"
 homepage = "https://github.com/puranikyashaswin/ferrotensor"
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 missing_docs = "warn"
 rust_2018_idioms = { level = "warn", priority = -1 }
 

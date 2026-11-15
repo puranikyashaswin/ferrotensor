@@ -6,6 +6,8 @@
 //! cargo test -p ferrotensor-autograd --test checkpoint_params -- --ignored --test-threads=1
 //! ```
 
+#![allow(clippy::expect_used)]
+
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{Arc, Weak};

@@ -357,6 +357,10 @@ impl Lfm2Model {
     /// replay closure, so the replay draws exactly the first pass's masks and
     /// recomputes exactly what the first pass computed.
     #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::expect_used,
+        reason = "the closure passed to checkpoint_with_params returns exactly one tensor"
+    )]
     fn run_block(
         &self,
         layer: &Lfm2Block,

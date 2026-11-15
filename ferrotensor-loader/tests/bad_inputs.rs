@@ -6,6 +6,8 @@
 //! the shape of a tensor against the config in the model builder) are not
 //! reachable from here.
 
+#![allow(clippy::expect_used, clippy::panic)]
+
 use ferrotensor_loader::{Lfm2Config, LoaderError, ModelLoader, Tokenizer, WeightsContext};
 use safetensors::Dtype;
 use serde_json::{json, Value};

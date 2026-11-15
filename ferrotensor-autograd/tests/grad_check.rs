@@ -3,6 +3,8 @@
 //! Needs a GPU: runs only with `FERROTENSOR_RUN_GPU_TESTS=1` (use
 //! `--test-threads=1`; creating several wgpu devices at once can fail).
 
+#![allow(clippy::expect_used)]
+
 use std::sync::Arc;
 
 use ferrotensor_autograd::{checkpoint_single, Tensor};

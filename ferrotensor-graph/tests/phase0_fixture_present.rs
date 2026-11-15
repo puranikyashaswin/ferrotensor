@@ -1,6 +1,8 @@
 //! Ensures the Phase 0 reference fixture is available for parity tests.
 //! Generates it via the pure-Python helper when missing.
 
+#![allow(clippy::expect_used)]
+
 use std::path::PathBuf;
 
 fn fixture_path() -> PathBuf {

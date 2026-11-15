@@ -1,6 +1,8 @@
 //! Loading safetensors checkpoints from fixtures generated in the test
 //! (no GPU, no downloads).
 
+#![allow(clippy::expect_used)]
+
 use ferrotensor_loader::{LoaderError, ModelLoader, WeightsContext};
 use safetensors::Dtype;
 use std::collections::HashMap;
