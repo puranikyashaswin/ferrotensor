@@ -253,7 +253,7 @@ tensor op reaches a WGSL kernel, are in [docs/architecture.md](docs/architecture
 | [`ferrotensor-graph`](ferrotensor-graph) | Transformer building blocks and the Llama/LFM2-style model builder |
 | [`ferrotensor-loader`](ferrotensor-loader) | Safetensors (single and sharded) and tokenizer loading |
 | [`ferrotensor-trainer`](ferrotensor-trainer) | Training loops, LoRA, checkpoints, an optional `GradScaler` |
-| [`ferrotensor-cli`](ferrotensor-cli) | The `ferrotensor` command: `train`, `eval`, `generate` (alias `infer`), `chat`, `export-adapter`, `merge`, `info`, `classify-train`, `classify-predict`, `monitor`, `demo` |
+| [`ferrotensor-cli`](ferrotensor-cli) | The `ferrotensor` command: `train`, `eval`, `generate` (alias `infer`), `chat`, `export-adapter`, `merge`, `pretrain`, `info`, `classify-train`, `classify-predict`, `monitor`, `demo` |
 | [`ferrotensor-monitor`](ferrotensor-monitor) | Terminal dashboard |
 | [`ferrotensor-hub`](ferrotensor-hub) | Hugging Face Hub download helpers |
 | [`ferrotensor-py`](ferrotensor-py) | Python bindings for the `ferrotensor` crate (not published to crates.io) |
@@ -296,14 +296,25 @@ block checkpointing that fit this machine's GPU memory, prints that plan,
 then trains. `train` sets nothing for you; use it to choose every setting
 by hand.
 
-For scripts and coding agents, `plan`, `finetune`, `train`, `eval`,
-`generate` and `info` take `--json` and print one JSON object (`chat` prints
+For scripts and coding agents, `plan`, `finetune`, `train`, `pretrain`,
+`eval`, `generate` and `info` take `--json` and print one JSON object (`chat` prints
 one per reply), and exit codes are the same across commands;
 [AGENTS.md](AGENTS.md) lists both.
 
 `--help` lists every flag. A step-by-step walkthrough with real output is in
 [docs/examples/lora-sft.md](docs/examples/lora-sft.md).
 This path is experimental.
+
+`pretrain` trains a small byte-level model from random weights on a text
+file, for learning and experiments (f32, untied embeddings, defaults not
+tuned), and leaves a model directory that `generate` loads
+([CLI docs](ferrotensor-cli/README.md#train-from-scratch-pretrain)):
+
+```bash
+cargo run -p ferrotensor-cli --release -- pretrain --data corpus.txt --out ./outputs/tiny
+cargo run -p ferrotensor-cli --release -- generate \
+  --model ./outputs/tiny --raw --prompt "Once upon a time"
+```
 
 ## Compared with candle, burn and tch
 

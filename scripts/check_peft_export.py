@@ -11,6 +11,11 @@ logits (the comparison would then prove nothing).
 With --merged, also loads the directory written by `ferrotensor merge` as an
 ordinary transformers checkpoint and compares its logits the same way.
 
+With --pretrained and --pretrained-eval, also loads the directory written by
+`ferrotensor pretrain`, requires every weight to load with none left over,
+and compares its loss on the first window of the directory's tokens.bin with
+the loss `ferrotensor eval --json --max-samples 1` reported for that window.
+
     cargo run --release -p ferrotensor-trainer --example peft_fixture -- out
     cargo run --release -p ferrotensor-cli -- export-adapter \\
         --lora out/adapter.safetensors --model out/model --output out/peft
@@ -26,6 +31,7 @@ transformers 5.20.2, peft 0.21.2, safetensors 0.8.0).
 
 import argparse
 import json
+import struct
 import sys
 from pathlib import Path
 
@@ -40,12 +46,38 @@ def fail(message: str) -> None:
     sys.exit(1)
 
 
+def check_pretrained(model_dir: Path, eval_path: Path, tolerance: float) -> None:
+    """Compare the loss of a `pretrain` directory in transformers with `eval`'s."""
+    reported = json.loads(eval_path.read_text())
+    # A window of n tokens gives n - 1 predicted tokens.
+    window = reported["tokens"] + 1
+    ids = list(struct.unpack(f"<{window}I", (model_dir / "tokens.bin").read_bytes()[: 4 * window]))
+    model, info = AutoModelForCausalLM.from_pretrained(
+        model_dir, dtype=torch.float32, attn_implementation="eager", output_loading_info=True
+    )
+    if info["missing_keys"] or info["unexpected_keys"]:
+        fail(f"pretrained weights do not match the model: {info}")
+    model.eval()
+    input_ids = torch.tensor([ids])
+    with torch.no_grad():
+        loss = model(input_ids, labels=input_ids).loss.item()
+    diff = abs(loss - reported["loss"])
+    print(
+        f"pretrained loss on {window} tokens: transformers {loss:.6f}, "
+        f"Ferrotensor {reported['loss']:.6f}, difference {diff:.3e} (tolerance {tolerance:g})"
+    )
+    if diff > tolerance:
+        fail("the pretrained model gives a different loss in transformers")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--model", required=True, help="base model directory")
     parser.add_argument("--adapter", required=True, help="PEFT adapter directory")
     parser.add_argument("--logits", required=True, help="logits.json written by Ferrotensor")
     parser.add_argument("--merged", help="model directory written by `ferrotensor merge`")
+    parser.add_argument("--pretrained", help="model directory written by `ferrotensor pretrain`")
+    parser.add_argument("--pretrained-eval", help="`ferrotensor eval --json` output for it")
     parser.add_argument("--tolerance", type=float, default=1e-3)
     args = parser.parse_args()
 
@@ -110,6 +142,8 @@ def main() -> None:
         )
         if merged_diff > args.tolerance:
             fail("the merged model and Ferrotensor with the adapter disagree")
+    if args.pretrained:
+        check_pretrained(Path(args.pretrained), Path(args.pretrained_eval), args.tolerance)
     print("OK")
 
 

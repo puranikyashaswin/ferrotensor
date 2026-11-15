@@ -8,7 +8,9 @@
 //! averaging. [`data`] builds SFT and
 //! pretraining datasets, [`checkpoint`] saves and restores LoRA adapters and
 //! optimizer state, [`peft`] converts adapters to and from the Hugging Face
-//! PEFT format, [`merge`] folds an adapter into the base weights, and [`classify`] fine-tunes a decoder with LoRA as a sequence
+//! PEFT format, [`merge`] folds an adapter into the base weights,
+//! [`pretrain`] writes a randomly initialised model and exports trained
+//! weights as a Hugging Face checkpoint, and [`classify`] fine-tunes a decoder with LoRA as a sequence
 //! classifier ([`ClassifierTrainer`]).
 
 use ferrotensor_autograd::{AutogradNode, LRScheduler, Optimizer, Tensor};
@@ -26,6 +28,7 @@ pub mod distributed;
 pub mod memory;
 pub mod merge;
 pub mod peft;
+pub mod pretrain;
 pub mod scaler;
 
 pub use classify::{ClassifierStepStats, ClassifierTrainer};
