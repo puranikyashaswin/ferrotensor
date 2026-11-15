@@ -18,6 +18,8 @@
 //! cargo test --release -p ferrotensor-trainer --test gradient_parity -- --ignored --test-threads=1
 //! ```
 
+#![allow(clippy::expect_used, clippy::panic)]
+
 use ferrotensor_autograd::Tensor;
 use ferrotensor_backend::{ComputeEngine, UnifiedTensor, WgpuContext};
 use ferrotensor_graph::lfm::{Lfm2LayerOp, Lfm2Model};

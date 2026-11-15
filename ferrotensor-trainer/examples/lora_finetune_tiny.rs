@@ -28,6 +28,8 @@
 //! |reloaded - trained| = 0.00e0
 //! ```
 
+#![allow(clippy::expect_used)]
+
 #[path = "common/mod.rs"]
 mod common;
 

@@ -2,6 +2,8 @@
 //! gradient accumulation, the two learning rates, skipped steps, saving and
 //! loading, and the first-token-skipping pooling.
 
+#![allow(clippy::expect_used)]
+
 mod common;
 
 use common::*;

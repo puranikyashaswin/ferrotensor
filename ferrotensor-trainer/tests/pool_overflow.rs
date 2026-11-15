@@ -11,6 +11,8 @@
 //! cargo test -p ferrotensor-trainer --test pool_overflow -- --ignored --test-threads=1
 //! ```
 
+#![allow(clippy::expect_used)]
+
 mod common;
 
 use common::*;

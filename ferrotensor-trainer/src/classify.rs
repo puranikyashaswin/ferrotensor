@@ -789,6 +789,7 @@ pub fn score(probs: &[Vec<f32>], labels: &[u32], classes: usize) -> ClassifyScor
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

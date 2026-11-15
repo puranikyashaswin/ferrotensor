@@ -26,6 +26,8 @@
 //! final loss without the optimizer state differs by 0.3602
 //! ```
 
+#![allow(clippy::expect_used)]
+
 #[path = "common/mod.rs"]
 mod common;
 

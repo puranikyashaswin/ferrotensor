@@ -7,6 +7,8 @@
 //! cargo test -p ferrotensor-trainer --test block_checkpointing -- --ignored --test-threads=1
 //! ```
 
+#![allow(clippy::expect_used, clippy::panic)]
+
 mod common;
 
 use common::*;

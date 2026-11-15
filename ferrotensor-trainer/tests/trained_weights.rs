@@ -8,6 +8,8 @@
 //! cargo test -p ferrotensor-trainer --test trained_weights -- --ignored --test-threads=1
 //! ```
 
+#![allow(clippy::expect_used)]
+
 mod common;
 
 use common::*;

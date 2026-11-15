@@ -26,6 +26,8 @@
 //! tokens that continue the pattern: 12 of 12
 //! ```
 
+#![allow(clippy::expect_used)]
+
 #[path = "common/mod.rs"]
 mod common;
 

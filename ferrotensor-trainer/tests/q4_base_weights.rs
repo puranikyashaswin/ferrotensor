@@ -14,6 +14,8 @@
 //! cargo test -p ferrotensor-trainer --test q4_base_weights -- --ignored --test-threads=1
 //! ```
 
+#![allow(clippy::expect_used, clippy::panic)]
+
 mod common;
 
 use common::*;

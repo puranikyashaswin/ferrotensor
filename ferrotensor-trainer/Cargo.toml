@@ -25,3 +25,6 @@ log = "0.4"
 bytemuck = { version = "1.14", features = ["derive"] }
 pollster = "0.3"
 half = "2"
+
+[lints]
+workspace = true

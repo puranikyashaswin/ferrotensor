@@ -121,6 +121,10 @@ impl MemoryRecorder {
     }
 
     /// End the current phase, record it as `label` and start the next.
+    #[expect(
+        clippy::expect_used,
+        reason = "the report was pushed to `reports` on the line before"
+    )]
     pub fn record(&mut self, label: impl Into<String>) -> &MemoryReport {
         self.ctx.synchronize();
         let tracker = self.ctx.memory();

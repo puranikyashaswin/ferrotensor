@@ -789,6 +789,7 @@ pub fn masked_cross_entropy_from_logits(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::masked_cross_entropy_from_logits;
     use crate::data::TrainingExample;
