@@ -26,6 +26,9 @@ ferrotensor eval --model DIR --data val.jsonl --lora outputs/run/lora_adapters.s
 ferrotensor chat --model DIR --lora outputs/run/lora_adapters.safetensors --json < questions.txt
 ```
 
+`chat` needs a ChatML model such as SmolLM2 (TinyLlama's tokenizer lacks the
+tokens); `generate --raw` works with any model.
+
 `finetune` writes into `--out` (default `outputs/run`): `lora_adapters.safetensors`,
 its `.state.json` and `.state.safetensors` for `--resume`, `metrics.jsonl` and
 `training_state.json`.
@@ -58,8 +61,8 @@ is `null`. On an error stdout carries `{"error": "<message>"}` instead.
 
 `chat` is the one command that prints more than one object: it reads one
 user message per line of stdin and writes one JSON line per reply, so read
-stdout line by line. An error ends the session; the `{"error": ...}` object
-then comes last, printed over several lines as for every other command.
+stdout line by line. An error ends the session with a one-line
+`{"error": ...}` object.
 
 `measured_peak_mib` counts the GPU buffers Ferrotensor tracks, not the driver
 context, so it is below what `nvidia-smi` shows. `classify-train`,

@@ -727,9 +727,12 @@ fn chat_on_a_missing_model_exits_with_2() {
     assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
     assert!(stderr.contains("does not exist"), "stderr: {stderr}");
 
+    // One compact line, like the reply objects.
     let out = ferrotensor(&["chat", "--model", s(&missing), "--json"]);
     assert_eq!(out.status.code(), Some(2));
-    let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("error json");
+    let stdout = text(&out.stdout);
+    assert_eq!(stdout.lines().count(), 1, "stdout: {stdout}");
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("error json");
     let error = json["error"].as_str().expect("error string");
     assert!(error.contains(s(&missing)), "{error}");
 }

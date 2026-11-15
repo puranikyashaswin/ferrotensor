@@ -525,11 +525,18 @@ fn main() {
         Command::Merge(args) => args.json,
         _ => false,
     };
+    // `chat --json` writes one object per line, so its error is one line too.
+    let one_line = matches!(cli.command, Command::Chat(_));
     let code = match run(cli.command, &matches, json) {
         Ok(code) => code,
         Err(e) => {
             if json {
-                println!("{:#}", serde_json::json!({ "error": e.to_string() }));
+                let error = serde_json::json!({ "error": e.to_string() });
+                if one_line {
+                    println!("{error}");
+                } else {
+                    println!("{error:#}");
+                }
             } else {
                 eprintln!("error: {e}");
             }

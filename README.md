@@ -267,16 +267,18 @@ and a chat template for SFT) and can run short pretraining on `.txt` or packed
 
 ```bash
 cargo run -p ferrotensor-cli --release -- finetune \
-  --model ./models/tinyllama \
+  --model ./models/SmolLM2-135M \
   --data ./data/train.jsonl \
   --out ./outputs/run1
 
-# then talk to the result, one message per line (for now only models whose
-# tokenizer has the ChatML tokens, such as SmolLM2; TinyLlama's does not)
+# then talk to the result, one message per line
 cargo run -p ferrotensor-cli --release -- chat \
-  --model ./models/tinyllama \
+  --model ./models/SmolLM2-135M \
   --lora ./outputs/run1/lora_adapters.safetensors
 ```
+
+`chat` needs a tokenizer with the ChatML tokens for now (SmolLM2 has them,
+TinyLlama does not); `generate --raw` works with any model.
 
 `finetune` picks the batch size, sequence length, gradient accumulation and
 block checkpointing that fit this machine's GPU memory, prints that plan,
