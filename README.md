@@ -277,6 +277,17 @@ cargo run -p ferrotensor-cli --release -- chat \
   --lora ./outputs/run1/lora_adapters.safetensors
 ```
 
+`--model` also takes a Hugging Face model id that is already in the local
+cache (`HF_HUB_CACHE`, `HF_HOME`, `XDG_CACHE_HOME` or `~/.cache/huggingface/hub`,
+as `hf` uses). Ferrotensor does not download anything:
+
+```bash
+hf download HuggingFaceTB/SmolLM2-135M
+cargo run -p ferrotensor-cli --release -- finetune \
+  --model HuggingFaceTB/SmolLM2-135M \
+  --data ./data/train.jsonl
+```
+
 `chat` needs a tokenizer with the ChatML tokens for now (SmolLM2 has them,
 TinyLlama does not); `generate --raw` works with any model.
 

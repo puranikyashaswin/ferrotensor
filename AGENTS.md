@@ -15,7 +15,10 @@ ferrotensor info --check --json # the GPU wgpu uses, and a kernel self-check
 
 From a checkout, replace `ferrotensor` with `cargo run -p ferrotensor-cli --release --`.
 A model is a Hugging Face checkpoint directory with `config.json`,
-`tokenizer.json` and `*.safetensors`.
+`tokenizer.json` and `*.safetensors`. `--model` also takes a Hugging Face model
+id that is already in the cache (`hf download HuggingFaceTB/SmolLM2-135M`, then
+`--model HuggingFaceTB/SmolLM2-135M`); an existing directory of that name wins,
+and nothing is downloaded.
 
 ## The one-command path
 
@@ -78,7 +81,9 @@ no `--json`.
 | 2 | The request cannot be met on this machine, or the input is invalid | Change the request: fix the path or flag named in `error`; when nothing fits, use a smaller model, `--q4-weights`, or `--force` to try the smallest configuration. |
 | 101 | A panic, with no JSON on stdout | wgpu panics when the GPU device is lost, most often because it ran out of memory (stderr then ends with a hint). Lower `--batch-size` or `--seq-len`, or use `finetune`. |
 
-Code 2 covers: a missing model directory, `config.json` or data file; a flag
+Code 2 covers: a missing model directory, `config.json` or data file; a model
+id that is not in the Hugging Face cache or whose snapshot has no `config.json` (`error` names the cache and
+`hf download <id>`); a flag
 value out of range; a dataset with no usable examples; no GPU adapter;
 `plan` or `finetune` finding no configuration that fits; `chat`
 refusing a tokenizer without ChatML tokens or a message longer than the

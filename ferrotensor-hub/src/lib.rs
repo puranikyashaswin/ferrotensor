@@ -17,7 +17,7 @@
 //! ```
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub mod config;
 pub mod models;
@@ -69,7 +69,7 @@ pub type HubResult<T> = Result<T, HubError>;
 /// Main entry point for loading models from HuggingFace Hub.
 ///
 /// Currently supports loading from local directories.
-/// Download models using `huggingface-cli download` or the Python `huggingface_hub` library.
+/// Download models with `hf download` or the Python `huggingface_hub` library.
 ///
 /// # Example
 /// ```no_run
@@ -86,13 +86,14 @@ pub struct FerrotensorHub {
 }
 
 impl FerrotensorHub {
-    /// Create a new FerrotensorHub instance with default cache directory.
-    ///
-    /// Default cache: `~/.cache/huggingface/hub/models--{org}--{model}`
+    /// Create a FerrotensorHub on the Hugging Face cache directory: `HF_HUB_CACHE`,
+    /// else `$HF_HOME/hub`, else `$XDG_CACHE_HOME/huggingface/hub`, else
+    /// `~/.cache/huggingface/hub` (`~` is `HOME`, or `USERPROFILE`). Empty
+    /// variables count as unset.
     pub fn new() -> Self {
-        let cache_dir = dirs_cache_dir().join("huggingface").join("hub");
-
-        Self { cache_dir }
+        Self {
+            cache_dir: cache_dir_from(|name| std::env::var(name).ok()),
+        }
     }
 
     /// Create a FerrotensorHub with a custom cache directory.
@@ -100,39 +101,62 @@ impl FerrotensorHub {
         Self { cache_dir }
     }
 
+    /// The directory that holds the `models--{org}--{model}` folders.
+    pub fn cache_dir(&self) -> &Path {
+        &self.cache_dir
+    }
+
     /// Get the path to a cached model.
     ///
     /// Compatible with HuggingFace cache format.
     pub fn get_model_path(&self, model_id: &str) -> PathBuf {
-        // HuggingFace cache format: models--{org}--{model}
-        let cache_name = format!("models--{}", model_id.replace("/", "--"));
-        self.cache_dir.join(cache_name).join("snapshots")
+        self.model_folder(model_id).join("snapshots")
     }
 
-    /// Find the latest snapshot of a model.
+    /// `models--{org}--{model}` in the cache.
+    fn model_folder(&self, model_id: &str) -> PathBuf {
+        self.cache_dir
+            .join(format!("models--{}", model_id.replace('/', "--")))
+    }
+
+    /// Find the snapshot of a model that Hugging Face's `main` branch points
+    /// to: `snapshots/<hash>` for the hash in `refs/main`, when that directory
+    /// exists. Otherwise the snapshot directory with the smallest name, so
+    /// the result does not depend on directory order (a snapshot's age cannot
+    /// be read from its name).
     pub fn find_latest_snapshot(&self, model_id: &str) -> HubResult<PathBuf> {
         let snapshots_dir = self.get_model_path(model_id);
+        let not_found = || {
+            HubError::ModelNotFound(format!(
+                "Model {model_id} not found. Download with: hf download {model_id} \
+                 (older installs: huggingface-cli download {model_id})"
+            ))
+        };
 
         if !snapshots_dir.exists() {
-            return Err(HubError::ModelNotFound(format!(
-                "Model {} not found. Download with: huggingface-cli download {}",
-                model_id, model_id
-            )));
+            return Err(not_found());
         }
 
-        // Find first snapshot directory
-        let entries = fs::read_dir(&snapshots_dir)?;
-        for entry in entries {
+        let refs_main = self.model_folder(model_id).join("refs").join("main");
+        match fs::read_to_string(&refs_main) {
+            Ok(hash) => {
+                let hash = hash.trim();
+                if !hash.is_empty() && snapshots_dir.join(hash).is_dir() {
+                    return Ok(snapshots_dir.join(hash));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+
+        let mut snapshots = Vec::new();
+        for entry in fs::read_dir(&snapshots_dir)? {
             let entry = entry?;
             if entry.file_type()?.is_dir() {
-                return Ok(entry.path());
+                snapshots.push(entry.path());
             }
         }
-
-        Err(HubError::ModelNotFound(format!(
-            "No snapshots found for {}",
-            model_id
-        )))
+        snapshots.into_iter().min().ok_or_else(not_found)
     }
 
     /// Load model configuration.
@@ -189,29 +213,189 @@ impl Default for FerrotensorHub {
     }
 }
 
-/// Get cache directory (fallback if dirs crate not available)
-fn dirs_cache_dir() -> PathBuf {
-    std::env::var("HOME")
-        .map(|h| PathBuf::from(h).join(".cache"))
-        .unwrap_or_else(|_| PathBuf::from(".cache"))
+/// The Hugging Face hub cache directory, in the order Hugging Face documents;
+/// `var` looks up an environment variable.
+fn cache_dir_from(var: impl Fn(&str) -> Option<String>) -> PathBuf {
+    let var = |name: &str| var(name).filter(|value| !value.is_empty());
+    if let Some(hub) = var("HF_HUB_CACHE") {
+        return PathBuf::from(hub);
+    }
+    if let Some(home) = var("HF_HOME") {
+        return PathBuf::from(home).join("hub");
+    }
+    let cache = match var("XDG_CACHE_HOME") {
+        Some(xdg) => PathBuf::from(xdg),
+        None => var("HOME")
+            .or_else(|| var("USERPROFILE"))
+            .map_or_else(PathBuf::new, PathBuf::from)
+            .join(".cache"),
+    };
+    cache.join("huggingface").join("hub")
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_hub_creation() {
-        let hub = FerrotensorHub::new();
-        assert!(hub.cache_dir.to_string_lossy().contains("huggingface"));
+    /// The cache directory for the variables in `vars`.
+    fn cache_for(vars: &[(&str, &str)]) -> PathBuf {
+        cache_dir_from(|name| {
+            vars.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.to_string())
+        })
     }
 
     #[test]
-    fn test_model_path() {
-        let hub = FerrotensorHub::new();
-        let path = hub.get_model_path("meta-llama/Llama-3.2-1B");
-        assert!(path
-            .to_string_lossy()
-            .contains("models--meta-llama--Llama-3.2-1B"));
+    fn model_path_follows_the_cache_layout() {
+        let hub = FerrotensorHub::with_cache_dir(PathBuf::from("/cache"));
+        assert_eq!(
+            hub.get_model_path("meta-llama/Llama-3.2-1B"),
+            PathBuf::from("/cache/models--meta-llama--Llama-3.2-1B/snapshots")
+        );
+    }
+
+    #[test]
+    fn hf_hub_cache_is_the_hub_directory_itself() {
+        let all = [
+            ("HF_HUB_CACHE", "/hub"),
+            ("HF_HOME", "/hf"),
+            ("XDG_CACHE_HOME", "/xdg"),
+            ("HOME", "/home/u"),
+        ];
+        assert_eq!(cache_for(&all), PathBuf::from("/hub"));
+    }
+
+    #[test]
+    fn hf_home_comes_before_xdg_and_home() {
+        let vars = [
+            ("HF_HOME", "/hf"),
+            ("XDG_CACHE_HOME", "/xdg"),
+            ("HOME", "/home/u"),
+        ];
+        assert_eq!(cache_for(&vars), PathBuf::from("/hf/hub"));
+    }
+
+    #[test]
+    fn xdg_cache_home_comes_before_home() {
+        let vars = [("XDG_CACHE_HOME", "/xdg"), ("HOME", "/home/u")];
+        assert_eq!(cache_for(&vars), PathBuf::from("/xdg/huggingface/hub"));
+    }
+
+    #[test]
+    fn home_and_userprofile_are_the_last_resort() {
+        let home = [("HOME", "/home/u"), ("USERPROFILE", "/users/u")];
+        assert_eq!(
+            cache_for(&home),
+            PathBuf::from("/home/u/.cache/huggingface/hub")
+        );
+        assert_eq!(
+            cache_for(&[("USERPROFILE", "/users/u")]),
+            PathBuf::from("/users/u/.cache/huggingface/hub")
+        );
+        assert_eq!(cache_for(&[]), PathBuf::from(".cache/huggingface/hub"));
+    }
+
+    #[test]
+    fn empty_variables_count_as_unset() {
+        let vars = [
+            ("HF_HUB_CACHE", ""),
+            ("HF_HOME", ""),
+            ("XDG_CACHE_HOME", ""),
+            ("HOME", "/home/u"),
+        ];
+        assert_eq!(
+            cache_for(&vars),
+            PathBuf::from("/home/u/.cache/huggingface/hub")
+        );
+    }
+
+    /// A cache directory under the system temp dir, removed on drop.
+    struct TempCache(PathBuf);
+
+    impl TempCache {
+        fn new(tag: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("ferrotensor-hub-{tag}-{}", std::process::id()));
+            fs::create_dir_all(&dir).expect("create temp cache");
+            Self(dir)
+        }
+
+        /// Adds `snapshots/<hash>` for `org/name`.
+        fn snapshot(&self, hash: &str) {
+            fs::create_dir_all(self.snapshot_path(hash)).expect("create snapshot");
+        }
+
+        fn snapshot_path(&self, hash: &str) -> PathBuf {
+            self.0.join("models--org--name/snapshots").join(hash)
+        }
+
+        fn refs_main(&self, contents: &str) {
+            let refs = self.0.join("models--org--name/refs");
+            fs::create_dir_all(&refs).expect("create refs");
+            fs::write(refs.join("main"), contents).expect("write refs/main");
+        }
+
+        fn latest(&self) -> Option<PathBuf> {
+            FerrotensorHub::with_cache_dir(self.0.clone())
+                .find_latest_snapshot("org/name")
+                .ok()
+        }
+    }
+
+    impl Drop for TempCache {
+        fn drop(&mut self) {
+            if let Err(e) = fs::remove_dir_all(&self.0) {
+                log::warn!("cannot remove {}: {e}", self.0.display());
+            }
+        }
+    }
+
+    #[test]
+    fn refs_main_picks_the_snapshot() {
+        let cache = TempCache::new("refs-main");
+        cache.snapshot("aaa");
+        cache.snapshot("bbb");
+        cache.refs_main("bbb\n");
+        assert_eq!(cache.latest(), Some(cache.snapshot_path("bbb")));
+    }
+
+    #[test]
+    fn without_refs_main_the_smallest_snapshot_name_wins() {
+        let cache = TempCache::new("no-refs");
+        for hash in ["ccc", "aaa", "bbb"] {
+            cache.snapshot(hash);
+        }
+        assert_eq!(cache.latest(), Some(cache.snapshot_path("aaa")));
+    }
+
+    #[test]
+    fn a_refs_main_without_a_snapshot_falls_back() {
+        let cache = TempCache::new("stale-refs");
+        cache.snapshot("bbb");
+        cache.snapshot("ccc");
+        cache.refs_main("zzz");
+        assert_eq!(cache.latest(), Some(cache.snapshot_path("bbb")));
+        cache.refs_main("");
+        assert_eq!(cache.latest(), Some(cache.snapshot_path("bbb")));
+    }
+
+    #[test]
+    fn a_model_without_snapshots_is_not_found() {
+        let cache = TempCache::new("empty");
+        fs::create_dir_all(cache.0.join("models--org--name/snapshots")).expect("create dir");
+        let hub = FerrotensorHub::with_cache_dir(cache.0.clone());
+        let err = hub
+            .find_latest_snapshot("org/name")
+            .err()
+            .map(|e| e.to_string());
+        assert_eq!(
+            err.as_deref(),
+            Some(
+                "Model not found: Model org/name not found. Download with: hf download org/name \
+                 (older installs: huggingface-cli download org/name)"
+            )
+        );
     }
 }

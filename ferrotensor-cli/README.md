@@ -54,6 +54,31 @@ cargo run -p ferrotensor-cli --release -- eval \
 A full walkthrough with measured numbers is in
 [docs/examples/lora-sft.md](../docs/examples/lora-sft.md).
 
+## Model directory or Hugging Face id
+
+Every command's `--model` takes a model directory or a Hugging Face model id
+such as `HuggingFaceTB/SmolLM2-135M` that is already in the local cache:
+
+```bash
+hf download HuggingFaceTB/SmolLM2-135M
+ferrotensor chat --model HuggingFaceTB/SmolLM2-135M
+```
+
+- An existing directory always wins, so `--model org/name` uses `./org/name`
+  when it exists.
+- Otherwise an id (`org/name`, letters, digits, `-`, `_` and `.`) is looked up
+  in the Hugging Face cache, and stderr shows the snapshot it chose once:
+  `model: org/name (<snapshot path>)`. The cache is `HF_HUB_CACHE`, else
+  `$HF_HOME/hub`, else `$XDG_CACHE_HOME/huggingface/hub`, else
+  `~/.cache/huggingface/hub`. The snapshot is the one `refs/main` points to,
+  or the smallest snapshot name when there is no `refs/main`. A snapshot
+  without `config.json` exits with 2 and says the download looks incomplete.
+- An id that is not cached exits with 2 and names the cache directory and the
+  fetch command, `hf download org/name` (`huggingface-cli download org/name`
+  on older installs). Ferrotensor never runs it and never downloads.
+- After a LoRA `train` or `finetune`, stderr ends with a `next:` block: the
+  `chat` and `merge` commands for this run, with `--model` as given.
+
 - SFT data: `.jsonl` (one object per line) or a `.json` array of
   `{"prompt": ..., "response": ...}` objects, optional `"system"`.
 - Pretraining data (`--task pretrain`): `.txt` lines, a `.json` array of

@@ -659,6 +659,7 @@ dependencies = [
  "ferrotensor-autograd",
  "ferrotensor-backend",
  "ferrotensor-graph",
+ "ferrotensor-hub",
  "ferrotensor-loader",
  "ferrotensor-monitor",
  "ferrotensor-trainer",

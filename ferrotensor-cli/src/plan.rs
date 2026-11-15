@@ -40,9 +40,9 @@ const CHECKPOINTINGS: [Checkpointing; 2] = [Checkpointing::Off, Checkpointing::B
 /// Options for `ferrotensor plan`.
 #[derive(Args, Debug)]
 pub struct PlanArgs {
-    /// Model directory (only config.json is read). Without it, the
-    /// documented SmolLM2 sizes are listed.
-    #[arg(long, value_name = "DIR")]
+    /// Model directory or cached Hugging Face model id (only config.json is
+    /// read). Without it, the documented SmolLM2 sizes are listed.
+    #[arg(long, value_name = "DIR_OR_ID")]
     pub model: Option<PathBuf>,
     #[command(flatten)]
     pub budget: BudgetArgs,
@@ -753,7 +753,7 @@ fn plan_model(
     lora_rank: usize,
     pinned: Pinned,
 ) -> Result<(Plan, Report), Box<dyn std::error::Error>> {
-    let config_path = dir.join("config.json");
+    let config_path = crate::resolve_model(dir)?.join("config.json");
     let config = ModelLoader::load_config(&config_path)
         .map_err(|e| crate::unmet(format!("cannot read {}: {e}", config_path.display())))?;
     let model_arg = dir.display().to_string();
