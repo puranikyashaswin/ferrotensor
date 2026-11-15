@@ -82,6 +82,10 @@ impl WgpuContext {
     ///
     /// # Panics
     /// Panics if no adapter or device is available.
+    #[expect(
+        clippy::expect_used,
+        reason = "no adapter or device is a documented panic; no fallible constructor exists yet"
+    )]
     pub async fn new_with_options(
         power_preference: wgpu::PowerPreference,
         force_fallback_adapter: bool,
@@ -137,6 +141,10 @@ impl WgpuContext {
 
     /// Records GPU work into the pending command encoder; it runs after
     /// everything recorded before it. Submits once enough ops are pending.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "lock poisoning means another thread panicked while holding the lock"
+    )]
     pub(crate) fn record(&self, f: impl FnOnce(&mut CommandEncoder)) {
         let mut pending = self.pending.lock().unwrap();
         let encoder = pending.encoder.get_or_insert_with(|| {
@@ -152,6 +160,10 @@ impl WgpuContext {
 
     /// Submits all recorded work to the queue. Reads and writes through
     /// [`UnifiedTensor`](crate::UnifiedTensor) do this themselves.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "lock poisoning means another thread panicked while holding the lock"
+    )]
     pub fn flush(&self) {
         let mut pending = self.pending.lock().unwrap();
         self.submit(&mut pending);

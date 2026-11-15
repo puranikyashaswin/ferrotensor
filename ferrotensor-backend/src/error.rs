@@ -277,6 +277,7 @@ pub fn calculate_size(shape: &[usize]) -> usize {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

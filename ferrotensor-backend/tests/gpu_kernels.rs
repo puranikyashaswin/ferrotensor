@@ -9,6 +9,8 @@
 //! All tests share one device (creating several wgpu devices concurrently is
 //! unreliable on some drivers).
 
+#![allow(clippy::unwrap_used)]
+
 use ferrotensor_backend::{
     q4, AdamParams, AttentionOptions, ComputeEngine, DType, MemoryCategory, UnifiedTensor,
     WgpuContext, MASKED_CE_SKIP, SUM_SQUARES_CHUNK,
@@ -1811,4 +1813,12 @@ fn long_op_chains_keep_their_order() {
         x = y;
     }
     assert_eq!(read(&x), vec![1000.0; 64]);
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn q4_upload_rejects_non_matrix_shapes() {
+    let g = gpu();
+    let err = UnifiedTensor::from_f32_as_q4(&g.ctx, &[0.0; 8], &[2, 2, 2]).unwrap_err();
+    assert_eq!(err, q4::Q4Error::NotMatrix { rank: 3 });
 }

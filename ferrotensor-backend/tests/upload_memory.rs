@@ -13,6 +13,7 @@
 //! test binary so no other test shares the process's peak.
 
 #![cfg(target_os = "linux")]
+#![allow(clippy::expect_used)]
 
 use ferrotensor_backend::{UnifiedTensor, WgpuContext};
 
