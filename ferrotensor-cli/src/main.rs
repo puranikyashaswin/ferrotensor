@@ -24,7 +24,7 @@ mod plan;
 mod profile_report;
 
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
-use ferrotensor_autograd::{AdamW, OptimizerLoad, WarmupCosineScheduler};
+use ferrotensor_autograd::{no_grad, AdamW, OptimizerLoad, WarmupCosineScheduler};
 use ferrotensor_backend::{ComputeEngine, ContextError, MemoryCategory, WgpuContext};
 use ferrotensor_graph::lfm::{legacy_llama_name, Lfm2Model};
 use ferrotensor_graph::model_builder::{Lfm2ModelBuilder, LoRaConfig};
@@ -988,7 +988,7 @@ async fn evaluate(
     let mut loss_sum = 0.0f64;
     let mut tokens = 0usize;
     for ex in ds.examples().iter().take(limit) {
-        let logits = model.forward(&base.engine, &ex.input_ids, 0, None, None);
+        let logits = no_grad(|| model.forward(&base.engine, &ex.input_ids, 0, None, None));
         let host = logits.data.to_vec(&base.ctx).await;
         if let Some((loss, n)) = masked_cross_entropy_from_logits(
             &host,
@@ -1162,7 +1162,7 @@ async fn generate_tokens(
     let mut generated: Vec<u32> = Vec::new();
     let mut printed = String::new();
     let start = Instant::now();
-    let mut logits = model.forward(&base.engine, &tokens, 0, cache.as_mut(), None);
+    let mut logits = no_grad(|| model.forward(&base.engine, &tokens, 0, cache.as_mut(), None));
     for _ in 0..max_new {
         let host = logits.data.to_vec(&base.ctx).await;
         let rows = host.len() / vocab;
@@ -1178,17 +1178,19 @@ async fn generate_tokens(
             emit(delta);
             printed = text;
         }
-        logits = if cached {
-            model.forward(
-                &base.engine,
-                &[next],
-                tokens.len() - 1,
-                cache.as_mut(),
-                None,
-            )
-        } else {
-            model.forward(&base.engine, &tokens, 0, None, None)
-        };
+        logits = no_grad(|| {
+            if cached {
+                model.forward(
+                    &base.engine,
+                    &[next],
+                    tokens.len() - 1,
+                    cache.as_mut(),
+                    None,
+                )
+            } else {
+                model.forward(&base.engine, &tokens, 0, None, None)
+            }
+        });
     }
     (generated.len(), start.elapsed(), cached)
 }

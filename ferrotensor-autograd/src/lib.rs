@@ -16,9 +16,44 @@
 use ferrotensor_backend::{
     AdamParams, AttentionOptions, ComputeEngine, DType, UnifiedTensor, WgpuContext,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::Arc;
+
+thread_local! {
+    static GRAD_ENABLED: Cell<bool> = const { Cell::new(true) };
+}
+
+/// Run `f` without recording ops on this thread: every tensor an op returns
+/// inside `f` has no creator and requires no gradient, so the op's inputs are
+/// released as soon as nothing else holds them (inference and evaluation).
+///
+/// Calls nest, and the previous state is restored when `f` returns or
+/// panics. Do not call [`Tensor::backward`] inside `f`: a [`checkpoint`]ed
+/// block replays its forward during backward and would record nothing.
+///
+/// # Example
+/// ```no_run
+/// use ferrotensor_autograd::{no_grad, Tensor};
+/// use ferrotensor_backend::{ComputeEngine, UnifiedTensor, WgpuContext};
+/// use std::sync::Arc;
+///
+/// let ctx = Arc::new(pollster::block_on(WgpuContext::new()));
+/// let engine = ComputeEngine::new(&ctx);
+/// let w = Tensor::new(ctx.clone(), UnifiedTensor::new(&ctx, &[1.0, 2.0], &[1, 2]));
+/// let y = no_grad(|| Tensor::scale(&w, 3.0, &engine));
+/// assert!(y.creator.is_none() && !y.requires_grad);
+/// ```
+pub fn no_grad<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            GRAD_ENABLED.with(|enabled| enabled.set(self.0));
+        }
+    }
+    let _restore = Restore(GRAD_ENABLED.with(|enabled| enabled.replace(false)));
+    f()
+}
 
 /// A recorded op: maps the output gradient to one gradient per input.
 pub trait AutogradNode {
@@ -79,12 +114,16 @@ impl Tensor {
         }
     }
 
-    /// A tensor produced by the op `creator`.
+    /// A tensor produced by the op `creator`; inside [`no_grad`] the node is
+    /// dropped and the tensor is a leaf that requires no gradient.
     pub fn with_creator(
         ctx: Arc<WgpuContext>,
         data: UnifiedTensor,
         creator: Arc<dyn AutogradNode>,
     ) -> Tensor {
+        if !GRAD_ENABLED.with(Cell::get) {
+            return Self::frozen(ctx, data);
+        }
         let requires_grad = creator.inputs().iter().any(|t| t.requires_grad);
         Tensor {
             data: Arc::new(data),
