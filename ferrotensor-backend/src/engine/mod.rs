@@ -2,6 +2,7 @@
 
 use crate::{UnifiedTensor, WgpuContext};
 use std::borrow::Cow;
+use std::sync::atomic::Ordering::Relaxed;
 use wgpu::{util::DeviceExt, Buffer, Device};
 
 mod attention;
@@ -117,6 +118,10 @@ fn groups64(n: usize) -> (u32, u32, u32) {
 /// dispatch is recorded, so it is counted as awaiting GPU from the start.
 fn uniform(ctx: &WgpuContext, bytes: &[u8]) -> Buffer {
     ctx.memory().count_dispatch_buffer(bytes.len() as u64);
+    ctx.counters.uniform_buffers.fetch_add(1, Relaxed);
+    ctx.counters
+        .uniform_bytes
+        .fetch_add(bytes.len() as u64, Relaxed);
     ctx.device
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Uniform"),
@@ -256,6 +261,8 @@ impl ComputeEngine {
             layout: &kernel.layout,
             entries: &entries,
         });
+        ctx.counters.bind_groups.fetch_add(1, Relaxed);
+        ctx.counters.dispatches.fetch_add(1, Relaxed);
         ctx.record(|encoder| {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
             pass.set_pipeline(&kernel.pipeline);

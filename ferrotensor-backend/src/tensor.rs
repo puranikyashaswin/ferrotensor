@@ -2,9 +2,11 @@
 
 use crate::memory::{Allocation, MemoryCategory};
 use crate::pool::BufferPool;
+use crate::profile::GpuCounters;
 use crate::WgpuContext;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use wgpu::{util::DeviceExt, Buffer};
 
 /// Element type of a tensor buffer.
@@ -311,7 +313,13 @@ impl UnifiedTensor {
 
     /// Copies the tensor back to the CPU, waiting for queued GPU work.
     pub async fn to_vec(&self, context: &WgpuContext) -> Vec<f32> {
+        let start = Instant::now();
         let size = self.size_in_bytes();
+        context.counters.readbacks.fetch_add(1, Ordering::Relaxed);
+        context
+            .counters
+            .readback_bytes
+            .fetch_add(size, Ordering::Relaxed);
         let staging = context.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Staging"),
             size,
@@ -338,6 +346,7 @@ impl UnifiedTensor {
         let res = bytemuck::cast_slice(&data).to_vec();
         drop(data);
         staging.unmap();
+        GpuCounters::add_elapsed(&context.counters.readback_nanos, start);
         res
     }
 }

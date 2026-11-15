@@ -97,8 +97,15 @@ fn train_writes_adapter_state_and_metrics() {
     let data = out.path().join("tokens.bin");
     common::write_token_bin(&data, 400);
 
-    let run = train(model.path(), &data, out.path(), 4, &[]);
+    let run = train(model.path(), &data, out.path(), 4, &["--profile"]);
     assert_success(&run);
+
+    let profile = read_json(&out.path().join("profile.json"));
+    assert_eq!(profile["steps_profiled"], 4);
+    let dispatches = profile["dispatches_per_step"]
+        .as_u64()
+        .expect("dispatches_per_step is a count");
+    assert!(dispatches > 0, "profile: {profile}");
 
     for name in [
         "lora_adapters.safetensors",
