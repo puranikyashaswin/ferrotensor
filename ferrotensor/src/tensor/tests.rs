@@ -4,6 +4,8 @@
 //! differences. With `FERROTENSOR_RUN_GPU_TESTS=1` the same cases also run on the
 //! GPU and must match the CPU forward values and gradients.
 
+#![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 

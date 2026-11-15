@@ -127,7 +127,7 @@ fn to_f32(name: &str, dtype: Dtype, bytes: &[u8]) -> Result<Vec<f32>, SerializeE
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect(),
         Dtype::F64 => words(8)
-            .map(|b| f64::from_le_bytes(b.try_into().expect("8-byte chunk")) as f32)
+            .map(|b| f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f32)
             .collect(),
         Dtype::BF16 => words(2)
             .map(|b| f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16))
@@ -267,6 +267,7 @@ pub fn load_model<P: AsRef<Path>>(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::nn;

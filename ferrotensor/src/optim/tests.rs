@@ -1,5 +1,7 @@
 //! Optimizer behaviour and end-to-end training on the CPU device.
 
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
 use crate::prelude::*;
 
 fn leaf(data: &[f32]) -> Tensor {

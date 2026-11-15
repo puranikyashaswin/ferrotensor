@@ -15,6 +15,8 @@
 //! The example exits with an error unless the loss fell during training and
 //! the cached forward pass matches the full one.
 
+#![allow(clippy::expect_used)]
+
 use std::collections::BTreeMap;
 
 use ferrotensor::optim::{LrScheduler, WarmupCosineLr};

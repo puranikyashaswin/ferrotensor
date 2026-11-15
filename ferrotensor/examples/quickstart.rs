@@ -2,6 +2,8 @@
 //!
 //! Run with: cargo run --release -p ferrotensor --example quickstart
 
+#![allow(clippy::expect_used)]
+
 use ferrotensor::prelude::*;
 
 /// Panics unless `got` matches `want` element by element.

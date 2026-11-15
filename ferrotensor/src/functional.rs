@@ -121,6 +121,10 @@ pub fn dropout(x: &Tensor, p: f32, training: bool) -> Tensor {
 /// equal leading dims. With `causal`, query `i` attends only to keys
 /// `j <= i + (Lk - Lq)` (so a query block at the end of a longer key
 /// sequence still sees its own past).
+#[expect(
+    clippy::expect_used,
+    reason = "shape precondition of an op that returns no Result"
+)]
 pub fn scaled_dot_product_attention(q: &Tensor, k: &Tensor, v: &Tensor, causal: bool) -> Tensor {
     let d = *q.shape.last().expect("attention inputs need a feature dim");
     let lq = q.shape[q.ndim() - 2];
@@ -451,6 +455,7 @@ pub fn accuracy<'a>(logits: &Tensor, targets: impl Into<Targets<'a>>) -> f32 {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::tensor::tests::{check_gpu_parity, check_gradients, Case, Init};

@@ -218,6 +218,7 @@ impl std::fmt::Debug for MultiHeadAttention {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::no_grad;

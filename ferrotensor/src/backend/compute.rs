@@ -139,6 +139,10 @@ impl ComputeEngine {
         }
     }
 
+    #[expect(
+        clippy::panic,
+        reason = "kernel names are compiled in by new, so a missing one is a bug in this crate"
+    )]
     fn kernel(&self, name: &str) -> &(ComputePipeline, BindGroupLayout) {
         self.pipelines
             .get(name)
@@ -156,6 +160,10 @@ impl ComputeEngine {
     /// Grid of at least `groups` workgroups (at least one), spilling into the
     /// y dimension past 65535; the kernels rebuild the workgroup index as
     /// `x + y * nx`.
+    #[expect(
+        clippy::expect_used,
+        reason = "a grid of more than u32::MAX workgroups cannot be dispatched"
+    )]
     pub fn workgroup_grid(groups: usize) -> (u32, u32, u32) {
         let groups = u32::try_from(groups.max(1)).expect("too many workgroups");
         if groups <= MAX_GROUPS_PER_DIM {
@@ -185,6 +193,7 @@ impl std::fmt::Debug for ComputeEngine {
 }
 
 #[cfg(test)]
+#[allow(clippy::panic)]
 mod tests {
     use super::*;
 

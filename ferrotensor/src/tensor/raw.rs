@@ -27,6 +27,10 @@ fn u32_buffer(ctx: &GpuContext, data: &[u32]) -> Buffer {
         })
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "wgpu buffer sizes are limited to u32 dimensions"
+)]
 fn as_u32(values: &[usize]) -> Vec<u32> {
     values
         .iter()
@@ -243,6 +247,10 @@ impl Tensor {
     ///
     /// # Panics
     /// Panics when the shapes cannot be broadcast together.
+    #[expect(
+        clippy::panic,
+        reason = "shape precondition of an op that returns no Result"
+    )]
     pub(crate) fn binary_raw(&self, other: &Tensor, op: u32) -> Tensor {
         self.assert_same_device(other);
         let out_shape = broadcast_shapes(&self.shape, &other.shape).unwrap_or_else(|| {
@@ -383,6 +391,10 @@ impl Tensor {
 
     /// Matrix product over the last two dims, with leading batch dims that
     /// are either equal or present on one side only.
+    #[expect(
+        clippy::panic,
+        reason = "shape precondition of an op that returns no Result"
+    )]
     pub(crate) fn matmul_raw(&self, other: &Tensor) -> Tensor {
         self.assert_same_device(other);
         assert!(
