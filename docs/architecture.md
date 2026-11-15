@@ -15,9 +15,8 @@ source level:
 | **Tensor API** | `ferrotensor` (and `ferrotensor-py`, its Python binding) | A PyTorch-style `Tensor` with autograd, `nn`, `optim`, `serialize` and a CPU device. Has its own small set of generic WGSL kernels (`ferrotensor/src/backend/kernels.rs`). |
 | **LLM fine-tuning stack** | `ferrotensor-backend`, `ferrotensor-autograd`, `ferrotensor-graph`, `ferrotensor-loader`, `ferrotensor-trainer`, `ferrotensor-cli`, `ferrotensor-monitor`, `ferrotensor-hub` | Hand-written kernels for Llama/LFM2-style models (RoPE, RMSNorm, flash attention, AdamW, int8 dequantisation), LoRA, safetensors loading, the training CLI. |
 
-`ferrotensor/Cargo.toml` lists the LLM crates as dependencies, but `ferrotensor/src` does
-not call into them today (see [good-first-issues](good-first-issues.md)). The
-rest of this page is about the `ferrotensor` tensor API; the LLM stack is described
+`ferrotensor/Cargo.toml` does not depend on any of the LLM crates, so the two
+stacks share no code. The rest of this page is about the `ferrotensor` tensor API; the LLM stack is described
 in each crate's README.
 
 ```mermaid
