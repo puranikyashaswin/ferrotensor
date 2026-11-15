@@ -60,6 +60,7 @@ pub(crate) fn release(mmap: &memmap2::Mmap, data: &[u8]) {
         // call (the caller's borrow of `data` has ended). MADV_DONTNEED
         // only drops the process's page-table entries for it; the next
         // access faults the pages in again from the file, unchanged.
+        #[allow(unsafe_code)]
         let _ = unsafe {
             mmap.unchecked_advise_range(
                 memmap2::UncheckedAdvice::DontNeed,

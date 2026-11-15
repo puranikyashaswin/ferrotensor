@@ -209,6 +209,11 @@ impl ClassifierHead {
     /// # Panics
     /// If `hidden_states` does not hold one tensor per tap, or
     /// `lengths` does not match the batch.
+    #[expect(
+        clippy::panic,
+        clippy::expect_used,
+        reason = "shape preconditions, listed under Panics above"
+    )]
     pub fn logits(
         &self,
         engine: &ComputeEngine,

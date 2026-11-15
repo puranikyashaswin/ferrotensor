@@ -3,6 +3,7 @@
 //! directory, plus helpers to load it on the GPU.
 
 #![allow(dead_code)]
+#![allow(clippy::expect_used)]
 
 use ferrotensor_backend::{ComputeEngine, WgpuContext};
 use ferrotensor_graph::lfm::Lfm2Model;

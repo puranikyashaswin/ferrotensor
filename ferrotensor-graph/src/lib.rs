@@ -135,6 +135,10 @@ impl Linear {
 
     /// Projects `[tokens, in]` or `[batch, seq, in]` to the same leading
     /// shape with `out` features.
+    #[expect(
+        clippy::panic,
+        reason = "shape precondition of an op that returns Tensor"
+    )]
     pub fn forward(&self, engine: &ComputeEngine, x: &Tensor) -> Tensor {
         match x.data.shape.as_slice() {
             [_, _] => self.project_2d(engine, x),

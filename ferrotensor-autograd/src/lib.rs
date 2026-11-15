@@ -423,6 +423,10 @@ pub fn apply_rope_in_place(
 }
 
 /// [`apply_rope_in_place`] with base frequency `theta`.
+#[expect(
+    clippy::panic,
+    reason = "shape precondition of an op that returns no Result"
+)]
 pub fn apply_rope_theta_in_place(
     data: &mut [f32],
     shape: &[usize],
@@ -813,6 +817,10 @@ where
 /// [`checkpoint`] for a single-input, single-output function.
 ///
 /// For a computation that captures weights, use [`checkpoint_with_params`].
+#[expect(
+    clippy::expect_used,
+    reason = "the wrapper closure always returns exactly one tensor"
+)]
 pub fn checkpoint_single<F>(input: Tensor, forward_fn: F, engine: &ComputeEngine) -> Tensor
 where
     F: Fn(&Tensor, &ComputeEngine) -> Tensor + 'static,
@@ -878,6 +886,10 @@ impl Tensor {
     }
 
     /// Flatten `[batch, seq, hidden]` to `[batch * seq, hidden]` (2-D inputs pass through).
+    #[expect(
+        clippy::panic,
+        reason = "shape precondition of an op that returns Tensor"
+    )]
     pub fn reshape_2d(input: &Tensor) -> Tensor {
         match input.data.shape.as_slice() {
             [_, _] => input.clone(),
@@ -887,6 +899,10 @@ impl Tensor {
     }
 
     /// Reshape `[batch * seq, hidden]` back to `[batch, seq, hidden]`.
+    #[expect(
+        clippy::expect_used,
+        reason = "shape precondition: input has at least one dimension"
+    )]
     pub fn unflatten_last(input: &Tensor, batch: usize, seq: usize) -> Tensor {
         let hidden = *input
             .data
@@ -1063,6 +1079,10 @@ impl Tensor {
     }
 
     /// Row `token_index` of `[seq, vocab]` logits.
+    #[expect(
+        clippy::expect_used,
+        reason = "shape precondition: input has at least one dimension"
+    )]
     pub fn select_token(input: &Tensor, token_index: usize) -> Tensor {
         let vocab_size = *input
             .data
@@ -1669,6 +1689,7 @@ impl LRScheduler for WarmupCosineScheduler {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
 

@@ -10,6 +10,8 @@
 //! is compared with the table read back from the GPU.
 //! These tests need a GPU adapter, so they are `#[ignore]`d.
 
+#![allow(clippy::expect_used, clippy::panic)]
+
 use crate::lfm::{Lfm2LayerOp, Lfm2Model};
 use crate::model_builder::Lfm2ModelBuilder;
 use ferrotensor_backend::{ComputeEngine, DType, UnifiedTensor, WgpuContext};

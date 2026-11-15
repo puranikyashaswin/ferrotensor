@@ -5,6 +5,8 @@
 //!
 //! The path defaults to `dummy.safetensors` in the current directory.
 
+#![allow(clippy::unwrap_used)]
+
 use safetensors::serialize_to_file;
 use safetensors::tensor::{Dtype, TensorView};
 use std::collections::HashMap;

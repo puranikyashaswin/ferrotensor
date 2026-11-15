@@ -12,6 +12,8 @@
 //! cargo test --release -p ferrotensor-graph --test model_correctness -- --ignored --test-threads=1
 //! ```
 
+#![allow(clippy::expect_used, clippy::panic)]
+
 mod common;
 
 use common::*;

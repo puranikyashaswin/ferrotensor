@@ -71,6 +71,10 @@ impl FlashAttention {
 
     /// `[seq, dim]`, `[batch, seq, dim]` or `[batch, seq, heads, head_dim]`
     /// viewed as `[batch, seq, num_heads, head_dim]`.
+    #[expect(
+        clippy::panic,
+        reason = "shape precondition of an op that returns no Result"
+    )]
     fn heads_view(&self, t: &UnifiedTensor) -> UnifiedTensor {
         let (batch, seq) = match t.shape.len() {
             2 => (1, t.shape[0]),
@@ -378,6 +382,10 @@ impl GroupedQueryAttention {
     /// position `pos`: query `i` attends to keys `0..=pos + i` when causal.
     /// Used to decode against a KV cache, where `k`/`v` hold the cache.
     #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::panic,
+        reason = "shape precondition of an op that returns no Result"
+    )]
     pub fn forward_at(
         &self,
         q: &UnifiedTensor,
