@@ -372,7 +372,7 @@ fn generate_clips_new_tokens_to_the_context_and_refuses_a_longer_prompt() {
         "{json}"
     );
 
-    let long = vec!["w9"; 11].join(" ");
+    let long = ["w9"; 11].join(" ");
     let run = ferrotensor(&[
         "generate",
         "--model",
