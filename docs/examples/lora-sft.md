@@ -452,4 +452,4 @@ training normally (losses 1.4960 and 1.6540).
   forward pass; real Qwen3 checkpoints are not measured yet. Released LFM2
   checkpoints are rejected because their per-head q/k layernorm
   (`q_layernorm`) is not wired up, and LFM2 conv blocks also lack the B/C
-  gating and a backward pass.
+  gating.

@@ -22,17 +22,7 @@ impl Lfm2Conv {
     /// Applies the operator to `x`.
     pub fn forward(&self, engine: &ComputeEngine, x: &Tensor) -> Tensor {
         let projected = self.in_proj.forward(engine, x);
-
-        let out_data = UnifiedTensor::empty(&x.ctx, &projected.data.shape);
-        engine.conv1d(
-            &x.ctx,
-            &projected.data,
-            &self.conv_weight.data,
-            &self.conv_bias.data,
-            &out_data,
-        );
-
-        let conv_out = Tensor::new(x.ctx.clone(), out_data);
+        let conv_out = Tensor::conv1d(&projected, &self.conv_weight, &self.conv_bias, engine);
         self.out_proj.forward(engine, &conv_out)
     }
 

@@ -100,6 +100,11 @@ fn cases() -> Vec<Case> {
             vec![input(&[6], 11), input(&[6], 12)],
             |x, e| Tensor::silu_gate_fused(&x[0], &x[1], e),
         ),
+        case(
+            "conv1d",
+            vec![input(&[3, 5], 28), input(&[3, 3], 29), input(&[3], 30)],
+            |x, e| Tensor::conv1d(&x[0], &x[1], &x[2], e),
+        ),
         case("select_token", vec![input(&[3, 5], 13)], |x, _| {
             Tensor::select_token(&x[0], 1)
         }),
