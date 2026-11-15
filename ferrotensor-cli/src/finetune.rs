@@ -1,19 +1,19 @@
 //! `ferrotensor finetune`: `train` with the memory settings `plan` picks for
 //! this machine, for each setting not given on the command line.
 
-use crate::plan::{self, BudgetArgs, Checkpointing, Outcome, Pinned, Precision, TrainConfig};
-use crate::{Result, TrainArgs};
+use crate::plan::{self, BudgetArgs, Checkpointing, Pinned, Precision, TrainConfig};
+use crate::{unmet, Result, TrainArgs, TrainSummary};
 use clap::parser::ValueSource;
 use clap::{ArgMatches, Args};
+use serde::Serialize;
+use serde_json::Value;
 use std::num::NonZeroUsize;
-
-const MIB: u64 = 1024 * 1024;
 
 /// Options for `ferrotensor finetune`: those of `train` plus the budget.
 #[derive(Args, Debug)]
 pub struct FinetuneArgs {
     #[command(flatten)]
-    train: TrainArgs,
+    pub(crate) train: TrainArgs,
     #[command(flatten)]
     budget: BudgetArgs,
     /// Train even when no configuration is expected to fit, with the
@@ -46,7 +46,7 @@ impl UserSet {
 /// The values the chooser must keep: the planner-owned flags the user set.
 fn pinned(args: &TrainArgs, user_set: UserSet) -> Result<Pinned> {
     let positive = |value: usize, flag: &str| {
-        NonZeroUsize::new(value).ok_or_else(|| format!("{flag} must be positive"))
+        NonZeroUsize::new(value).ok_or_else(|| unmet(format!("{flag} must be positive")))
     };
     Ok(Pinned {
         seq_len: user_set
@@ -102,24 +102,35 @@ fn apply_plan(args: &mut TrainArgs, user_set: UserSet, config: &TrainConfig) -> 
     ]
 }
 
+/// What `finetune --json` prints: the plan, then the `train` summary.
+#[derive(Serialize, Debug)]
+struct FinetuneSummary {
+    chosen: Value,
+    grad_accum: usize,
+    budget_mib: u64,
+    estimated_peak_mib: u64,
+    /// False only when `--force` trained a configuration that does not fit.
+    fits: bool,
+    #[serde(flatten)]
+    train: TrainSummary,
+}
+
 /// Runs `ferrotensor finetune`: prints the plan to stderr, then trains.
-/// Returns [`Outcome::DoesNotFit`] when nothing fits and training did not
-/// start because `--force` was not given.
 ///
 /// # Errors
 ///
-/// When `--lite` is given, a pinned value is zero, planning fails or
-/// training fails.
-pub fn run(args: FinetuneArgs, user_set: UserSet) -> Result<Outcome> {
+/// When `--lite` is given, a pinned value is zero, planning fails, nothing
+/// fits and `--force` was not given, or training fails.
+pub fn run(args: FinetuneArgs, user_set: UserSet) -> Result<()> {
     let FinetuneArgs {
         train: mut train_args,
         budget,
         force,
     } = args;
     if train_args.lite {
-        return Err("finetune picks the memory settings itself; drop --lite \
-                    or use train --lite"
-            .into());
+        return Err(unmet(
+            "finetune picks the memory settings itself; drop --lite or use train --lite",
+        ));
     }
     let (precision, precision_source) =
         match (train_args.model.q4_weights, train_args.model.f32_weights) {
@@ -152,19 +163,31 @@ pub fn run(args: FinetuneArgs, user_set: UserSet) -> Result<Outcome> {
             planned.budget_mib, planned.needed_budget_mib
         );
         if !force {
-            eprintln!("finetune: {shortfall}; pass --force to train anyway");
-            return Ok(Outcome::DoesNotFit);
+            return Err(unmet(format!("{shortfall}; pass --force to train anyway")));
         }
         eprintln!("finetune: {shortfall}; training anyway (--force)");
     }
 
-    let measured_mib = pollster::block_on(crate::train(train_args))?.div_ceil(MIB);
+    let json = train_args.json;
+    let grad_accum = train_args.grad_accum;
+    let train = pollster::block_on(crate::train(train_args))?;
+    let measured_mib = train.measured_peak_mib;
     eprintln!(
         "memory: estimated peak {estimated_mib} MiB, measured {measured_mib} MiB ({:+.1}%); \
          measured counts the GPU buffers Ferrotensor tracks, not the driver context",
         (measured_mib as f64 - estimated_mib as f64) / estimated_mib as f64 * 100.0
     );
-    Ok(Outcome::Fits)
+    if json {
+        crate::print_json(&FinetuneSummary {
+            chosen: plan::chosen_json(&planned.plan.config),
+            grad_accum,
+            budget_mib: planned.budget_mib,
+            estimated_peak_mib: estimated_mib,
+            fits: planned.plan.fits,
+            train,
+        })?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -313,6 +336,53 @@ mod tests {
         assert_eq!(
             pinned(&args, user_set).map_err(|e| e.to_string()),
             Err("--seq-len must be positive".to_string())
+        );
+    }
+
+    #[test]
+    fn finetune_summary_puts_the_plan_next_to_the_train_fields() {
+        let summary = FinetuneSummary {
+            chosen: plan::chosen_json(&config(2, 128, Checkpointing::Blocks)),
+            grad_accum: 4,
+            budget_mib: 4096,
+            estimated_peak_mib: 3000,
+            fits: true,
+            train: TrainSummary {
+                steps: 2,
+                first_loss: Some(4.5),
+                final_loss: 4.25,
+                eval_loss_before: None,
+                eval_loss_after: None,
+                measured_peak_mib: 2900,
+                seconds: 1.5,
+                out_dir: "runs/a".into(),
+                adapter: Some("runs/a/lora_adapters.safetensors".into()),
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(&summary).expect("serialize"),
+            serde_json::json!({
+                "chosen": {
+                    "batch_size": 2,
+                    "seq_len": 128,
+                    "rank": 8,
+                    "precision": "f16",
+                    "checkpoint_blocks": true,
+                },
+                "grad_accum": 4,
+                "budget_mib": 4096,
+                "estimated_peak_mib": 3000,
+                "fits": true,
+                "steps": 2,
+                "first_loss": 4.5,
+                "final_loss": 4.25,
+                "eval_loss_before": null,
+                "eval_loss_after": null,
+                "measured_peak_mib": 2900,
+                "seconds": 1.5,
+                "out_dir": "runs/a",
+                "adapter": "runs/a/lora_adapters.safetensors",
+            })
         );
     }
 }

@@ -1,6 +1,7 @@
 //! `ferrotensor info`: the GPUs wgpu sees, which one Ferrotensor uses, and
 //! (with `--check`) whether its kernels give correct results on it.
 
+use crate::Exit;
 use clap::Args;
 use ferrotensor_backend::adapters::{self, AdapterReport, CheckResult};
 use ferrotensor_backend::WgpuContext;
@@ -47,9 +48,11 @@ fn check_json(r: &CheckResult) -> Value {
     })
 }
 
-/// Runs `ferrotensor info`. Fails (exit code 1) if no adapter is found or a
-/// `--check` kernel is out of tolerance.
-pub fn run(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
+/// Runs `ferrotensor info` and prints the report, with the error when there
+/// is one: [`Exit::Unmet`] if no adapter is found, [`Exit::RuntimeError`]
+/// if a `--check` kernel is out of tolerance. The report goes out even then,
+/// because a bug report needs it.
+pub fn run(args: InfoArgs) -> Result<Exit, Box<dyn std::error::Error>> {
     let adapters = adapters::list_adapters();
     let checks = if args.check && adapters.iter().any(|a| a.selected) {
         let ctx = pollster::block_on(WgpuContext::try_new())?;
@@ -57,16 +60,32 @@ pub fn run(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    let failure = if adapters.is_empty() {
+        Some((Exit::Unmet, "no GPU adapter found".to_string()))
+    } else {
+        checks.iter().flatten().find(|r| !r.passed()).map(|failed| {
+            (
+                Exit::RuntimeError,
+                format!(
+                    "{} is out of tolerance on this GPU; please open an issue with `ferrotensor info --check --json`",
+                    failed.name
+                ),
+            )
+        })
+    };
 
     if args.json {
-        let out = json!({
+        let mut out = json!({
             "ferrotensor": env!("CARGO_PKG_VERSION"),
             "os": std::env::consts::OS,
             "arch": std::env::consts::ARCH,
             "adapters": adapters.iter().map(adapter_json).collect::<Vec<_>>(),
             "checks": checks.as_ref().map(|c| c.iter().map(check_json).collect::<Vec<_>>()),
         });
-        println!("{}", serde_json::to_string_pretty(&out)?);
+        if let Some((_, message)) = &failure {
+            out["error"] = json!(message);
+        }
+        crate::print_json(&out)?;
     } else {
         println!(
             "ferrotensor {} on {} {}",
@@ -118,17 +137,9 @@ pub fn run(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
         } else if args.check {
             println!("\nNo GPU to check.");
         }
+        if let Some((_, message)) = &failure {
+            eprintln!("error: {message}");
+        }
     }
-
-    if adapters.is_empty() {
-        return Err("no GPU adapter found".into());
-    }
-    if let Some(failed) = checks.iter().flatten().find(|r| !r.passed()) {
-        return Err(format!(
-            "{} is out of tolerance on this GPU; please open an issue with `ferrotensor info --check --json`",
-            failed.name
-        )
-        .into());
-    }
-    Ok(())
+    Ok(failure.map_or(Exit::Success, |(exit, _)| exit))
 }

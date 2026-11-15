@@ -86,15 +86,40 @@ fn missing_model_directory_is_an_error_not_a_panic() {
     let missing = tmp.path().join("does-not-exist");
     let out = ferrotensor(&["train", "--model", s(&missing), "--data", s(&missing)]);
     let stderr = text(&out.stderr);
+    // 2: invalid input, which the caller fixes by changing the request.
     assert_eq!(
         out.status.code(),
-        Some(1),
+        Some(2),
         "stdout: {}\nstderr: {stderr}",
         text(&out.stdout)
     );
     assert!(stderr.contains("error:"), "stderr: {stderr}");
     assert!(stderr.contains("does not exist"), "stderr: {stderr}");
     assert!(!stderr.contains("panicked"), "stderr: {stderr}");
+}
+
+#[test]
+fn json_errors_are_one_object_on_stdout() {
+    let tmp = common::TempDir::new("missing-json");
+    let missing = tmp.path().join("does-not-exist");
+    let missing = s(&missing);
+    let model_and_data = ["--model", missing, "--data", missing, "--json"];
+    for (command, extra) in [
+        ("train", &[][..]),
+        ("eval", &[][..]),
+        ("finetune", &["--memory-mib", "4096"][..]),
+    ] {
+        let mut args = vec![command];
+        args.extend_from_slice(&model_and_data);
+        args.extend_from_slice(extra);
+        let out = ferrotensor(&args);
+        let stdout = text(&out.stdout);
+        let json: serde_json::Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("{command}: {e}\nstdout: {stdout}"));
+        assert_eq!(out.status.code(), Some(2), "{command}: {json}");
+        let error = json["error"].as_str().expect("error string");
+        assert!(error.contains(missing), "{command}: {error}");
+    }
 }
 
 #[test]
@@ -172,6 +197,30 @@ fn eval_reports_a_finite_loss_with_the_adapter() {
         loss.is_finite() && loss > 0.0,
         "loss {loss} in line: {line}"
     );
+
+    let run = ferrotensor(&[
+        "eval",
+        "--model",
+        s(model.path()),
+        "--data",
+        s(&data),
+        "--task",
+        "pretrain",
+        "--seq-len",
+        "16",
+        "--lora",
+        s(&adapter),
+        "--json",
+    ]);
+    assert_success(&run);
+    let json: serde_json::Value = serde_json::from_str(&text(&run.stdout)).expect("eval json");
+    let json_loss = json["loss"].as_f64().expect("loss");
+    assert!(
+        (json_loss - f64::from(loss)).abs() < 1e-4,
+        "{json} vs {line}"
+    );
+    let perplexity = json["perplexity"].as_f64().expect("perplexity");
+    assert!((perplexity - json_loss.exp()).abs() < 1e-3, "{json}");
 }
 
 #[test]
@@ -217,6 +266,32 @@ fn generate_emits_tokens() {
     let stderr = text(&run.stderr);
     assert!(stderr.contains("[3 prompt + "), "stderr: {stderr}");
     assert!(stderr.contains("new tokens"), "stderr: {stderr}");
+
+    // With --json the text streams to stderr and stdout holds only the object.
+    let run = ferrotensor(&[
+        "generate",
+        "--model",
+        s(model.path()),
+        "--prompt",
+        "w5 w6 w7",
+        "--raw",
+        "--max-new-tokens",
+        "4",
+        "--seed",
+        "1",
+        "--json",
+    ]);
+    assert_success(&run);
+    let json: serde_json::Value = serde_json::from_str(&text(&run.stdout)).expect("generate json");
+    assert_eq!(json["prompt_tokens"], 3, "{json}");
+    assert_eq!(json["kv_cache"], true, "{json}");
+    assert!(
+        json["new_tokens"].as_u64().is_some_and(|n| n <= 4),
+        "{json}"
+    );
+    let generated = json["text"].as_str().expect("text");
+    let stderr = text(&run.stderr);
+    assert!(stderr.contains(generated), "{json}\nstderr: {stderr}");
 }
 
 /// With 4-bit base weights the checkpoint is unmapped once the model is
@@ -397,8 +472,31 @@ fn finetune_trains_with_the_plan_and_writes_the_train_files() {
     let data = out.path().join("tokens.bin");
     common::write_token_bin(&data, 400);
 
-    let run = finetune(model.path(), &data, out.path(), &["--memory-mib", "100000"]);
+    let run = finetune(
+        model.path(),
+        &data,
+        out.path(),
+        &["--memory-mib", "100000", "--json"],
+    );
     assert_success(&run);
+    let json: serde_json::Value = serde_json::from_str(&text(&run.stdout)).expect("finetune json");
+    assert_eq!(json["steps"], 2, "{json}");
+    assert_eq!(json["fits"], true, "{json}");
+    assert_eq!(json["budget_mib"], 100000, "{json}");
+    assert_eq!(json["grad_accum"], 1, "{json}");
+    assert_eq!(json["chosen"]["batch_size"], 8, "{json}");
+    assert_eq!(json["chosen"]["seq_len"], 16, "{json}");
+    assert_eq!(json["out_dir"], s(out.path()), "{json}");
+    assert!(
+        json["final_loss"].as_f64().is_some_and(f64::is_finite),
+        "{json}"
+    );
+    assert!(
+        json["measured_peak_mib"]
+            .as_u64()
+            .is_some_and(|mib| mib > 0),
+        "{json}"
+    );
     let stderr = text(&run.stderr);
     assert!(
         stderr.contains(
@@ -448,7 +546,7 @@ fn finetune_exits_with_2_and_does_not_train_when_nothing_fits() {
     // 1354 / 0.85 rounds up to 1593.
     assert!(
         stderr.contains(
-            "finetune: no configuration fits the 1 MiB budget; the smallest needs 1354 MiB, \
+            "error: no configuration fits the 1 MiB budget; the smallest needs 1354 MiB, \
              which fits a budget of 1593 MiB or more; pass --force to train anyway"
         ),
         "stderr: {stderr}"
@@ -460,6 +558,23 @@ fn finetune_exits_with_2_and_does_not_train_when_nothing_fits() {
     assert!(
         !out.path().join("lora_adapters.safetensors").exists(),
         "an adapter was written"
+    );
+
+    let run = finetune(
+        model.path(),
+        &data,
+        out.path(),
+        &["--memory-mib", "1", "--json"],
+    );
+    let stdout = text(&run.stdout);
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}\nstdout: {stdout}"));
+    assert_eq!(run.status.code(), Some(2), "{json}");
+    assert!(
+        json["error"]
+            .as_str()
+            .is_some_and(|e| e.starts_with("no configuration fits the 1 MiB budget")),
+        "{json}"
     );
 }
 
