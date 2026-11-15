@@ -50,6 +50,7 @@ def test_device_mismatch_raises(gpu):
 
 
 def test_train_on_gpu(gpu):
+    ft.manual_seed(0)
     x = ft.randn(64, 4, device=gpu)
     y = (x.sum(1) > 0).tolist()
     model = nn.Sequential(nn.Linear(4, 16, device=gpu), nn.ReLU(), nn.Linear(16, 2, device=gpu))
@@ -384,6 +385,7 @@ def test_creation_on_gpu(gpu):
 
 
 def test_random_on_gpu(gpu):
+    ft.manual_seed(7)
     u = ft.rand(500, device=gpu)
     n = ft.randn(2000, device=gpu)
     assert u.device == gpu and n.device == gpu
@@ -460,6 +462,7 @@ def test_layers_match_cpu(gpu):
 
 
 def test_dropout_on_gpu(gpu):
+    ft.manual_seed(0)
     x = ft.ones(1000, device=gpu)
     drop = nn.Dropout(0.5)
     y = drop(x)
