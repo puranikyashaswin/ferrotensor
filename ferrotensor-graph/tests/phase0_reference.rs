@@ -1,3 +1,5 @@
+//! `Linear` and `RMSNorm` outputs compared with the Phase 0 reference fixture.
+
 #![allow(clippy::expect_used, clippy::panic)]
 
 use ferrotensor_autograd::Tensor;

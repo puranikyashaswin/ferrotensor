@@ -1,3 +1,5 @@
+//! Runs the terminal monitor dashboard.
+
 use anyhow::Result;
 
 fn main() -> Result<()> {
