@@ -672,6 +672,39 @@ impl AutogradNode for SiLUGateNode {
     }
 }
 
+/// Backward node of [`Tensor::conv1d`].
+pub struct Conv1dNode {
+    /// Input `[dim, seq_len]`.
+    pub input: Tensor,
+    /// Depthwise kernel `[dim, 3]`.
+    pub weight: Tensor,
+    /// Bias `[dim]`.
+    pub bias: Tensor,
+}
+impl AutogradNode for Conv1dNode {
+    fn inputs(&self) -> Vec<Tensor> {
+        vec![self.input.clone(), self.weight.clone(), self.bias.clone()]
+    }
+    /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
+    fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
+        let ctx = &self.input.ctx;
+        // Zeroed: the kernel leaves input elements past `dim * seq_len` alone.
+        let grad_input = UnifiedTensor::zeros(ctx, &self.input.data.shape);
+        let grad_weight = UnifiedTensor::empty(ctx, &self.weight.data.shape);
+        let grad_bias = UnifiedTensor::empty(ctx, &self.bias.data.shape);
+        engine.conv1d_backward(
+            ctx,
+            &self.input.data,
+            &self.weight.data,
+            grad,
+            &grad_input,
+            &grad_weight,
+            &grad_bias,
+        );
+        vec![grad_input, grad_weight, grad_bias]
+    }
+}
+
 // --- Gradient Checkpointing ---
 // Saves memory by recomputing activations during backward pass instead of storing them.
 // Key for training large models on limited memory devices.
@@ -1070,6 +1103,25 @@ impl Tensor {
             gate: gate.clone(),
         });
         Tensor::with_creator(up.ctx.clone(), out_data, node)
+    }
+
+    /// Depthwise 1-D convolution with kernel size 3 and padding 1 (see
+    /// [`ComputeEngine::conv1d`]): `input` `[dim, seq_len]`, `weight`
+    /// `[dim, 3]`, `bias` `[dim]`.
+    pub fn conv1d(
+        input: &Tensor,
+        weight: &Tensor,
+        bias: &Tensor,
+        engine: &ComputeEngine,
+    ) -> Tensor {
+        let out_data = UnifiedTensor::empty(&input.ctx, &input.data.shape);
+        engine.conv1d(&input.ctx, &input.data, &weight.data, &bias.data, &out_data);
+        let node = Arc::new(Conv1dNode {
+            input: input.clone(),
+            weight: weight.clone(),
+            bias: bias.clone(),
+        });
+        Tensor::with_creator(input.ctx.clone(), out_data, node)
     }
 
     /// Flash Attention V2 (fused) over `[batch, seq, heads, head_dim]`.

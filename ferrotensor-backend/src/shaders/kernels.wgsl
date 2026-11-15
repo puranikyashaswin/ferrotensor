@@ -477,6 +477,48 @@ fn conv1d(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups
     conv_out[idx] = res;
 }
 
+// Conv1D backward, one thread per channel (not tuned). With
+// out[d, s] = b[d] + sum_k w[d, k] * x[d, s + k - 1]:
+// gx[d, s] = sum_k g[d, s + 1 - k] * w[d, k],
+// gw[d, k] = sum_s g[d, s] * x[d, s + k - 1], gb[d] = sum_s g[d, s].
+@group(0) @binding(0) var<storage, read> convb_x: array<f32>;
+@group(0) @binding(1) var<storage, read> convb_w: array<f32>;
+@group(0) @binding(2) var<storage, read> convb_g: array<f32>;
+@group(0) @binding(3) var<storage, read_write> convb_gx: array<f32>;
+@group(0) @binding(4) var<storage, read_write> convb_gw: array<f32>;
+@group(0) @binding(5) var<storage, read_write> convb_gb: array<f32>;
+@group(0) @binding(6) var<uniform> convb_p: ConvParams;
+
+@compute @workgroup_size(64)
+fn conv1d_backward(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let d = gid.x + gid.y * nwg.x * 64u;
+    if (d >= convb_p.dim) { return; }
+    let len = convb_p.seq_len;
+    let off = d * len;
+    var gw = array<f32, 3>(0.0, 0.0, 0.0);
+    var gb = 0.0;
+    for (var s = 0u; s < len; s = s + 1u) {
+        let g = convb_g[off + s];
+        gb = gb + g;
+        var gx = 0.0;
+        for (var k = 0u; k < 3u; k = k + 1u) {
+            let i = s + k;
+            if (i >= 1u && i - 1u < len) {
+                gw[k] = gw[k] + g * convb_x[off + i - 1u];
+            }
+            let j = s + 1u;
+            if (j >= k && j - k < len) {
+                gx = gx + convb_g[off + j - k] * convb_w[d * 3u + k];
+            }
+        }
+        convb_gx[off + s] = gx;
+    }
+    for (var k = 0u; k < 3u; k = k + 1u) {
+        convb_gw[d * 3u + k] = gw[k];
+    }
+    convb_gb[d] = gb;
+}
+
 // --- 15. Cross-Entropy Loss (for LLM Training) ---
 // Forward: CE(logits, target) = -log(softmax(logits)[target])
 // Inputs: logits[vocab_size], target (single u32 index)

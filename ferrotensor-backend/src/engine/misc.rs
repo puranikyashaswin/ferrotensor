@@ -44,4 +44,38 @@ impl ComputeEngine {
             groups64(dim * seq_len),
         );
     }
+
+    /// Gradients of [`conv1d`](Self::conv1d) with respect to `input`,
+    /// `weight` and `bias`, given the output gradient `grad_out`. Each
+    /// gradient has the shape of the tensor it belongs to. Writes only the
+    /// first `dim * seq_len` elements of `grad_input`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv1d_backward(
+        &self,
+        ctx: &WgpuContext,
+        input: &UnifiedTensor,
+        weight: &UnifiedTensor,
+        grad_out: &UnifiedTensor,
+        grad_input: &UnifiedTensor,
+        grad_weight: &UnifiedTensor,
+        grad_bias: &UnifiedTensor,
+    ) {
+        let dim = weight.shape[0];
+        let seq_len = input.shape[input.shape.len() - 1];
+        let params = uniform(ctx, bytemuck::cast_slice(&[dim as u32, seq_len as u32]));
+        self.run(
+            ctx,
+            &self.conv1d_bw,
+            &[
+                (0, input.buffer()),
+                (1, weight.buffer()),
+                (2, grad_out.buffer()),
+                (3, grad_input.buffer()),
+                (4, grad_weight.buffer()),
+                (5, grad_bias.buffer()),
+                (6, &params),
+            ],
+            groups64(dim),
+        );
+    }
 }
