@@ -617,9 +617,14 @@ async fn load_base(args: &ModelArgs) -> Result<Loaded> {
     let tokenizer = Tokenizer::from_file(&tok_path)
         .map_err(|e| format!("cannot load {}: {e}", tok_path.display()))?;
     let mut weights = WeightsContext::new();
-    weights
-        .load_model_dir(dir)
-        .map_err(|e| format!("cannot load weights from {}: {e}", dir.display()))?;
+    weights.load_model_dir(dir).map_err(|e| {
+        let unfinished = if dir.join(pretrain::INIT_DIR).is_dir() {
+            "; it is an unfinished `pretrain` run: `pretrain --resume` with the run's flags continues it and writes model.safetensors, and with --max-steps at or below the step it saved (training_state.json) it writes the saved weights without training further"
+        } else {
+            ""
+        };
+        format!("cannot load weights from {}: {e}{unfinished}", dir.display())
+    })?;
 
     let (power, fallback) = match args.device {
         Device::Auto | Device::Gpu => (
@@ -1370,7 +1375,13 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
         build_model(&base, lora_on.then_some(&meta), !lora_on)?
     };
     let named_params = select_train_params(&model, &args.train_modules)?;
-    let model = model.with_trainable_embedding(named_params.contains_key(EMBED_TOKENS));
+    // Base weights outside the selection are frozen, so backward neither
+    // computes nor keeps a gradient the optimizer would never use.
+    let model = if lora_on {
+        model
+    } else {
+        model.with_trainable_base_weights(|name| named_params.contains_key(name))
+    };
     let train_params: Vec<_> = {
         let mut names: Vec<&String> = named_params.keys().collect();
         // Sorted by the names Llama blocks had before they took Hugging Face
@@ -1607,6 +1618,10 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
         .then(|| profile_report::ProfileRun::start(&base.ctx));
 
     'outer: for epoch in 0.. {
+        // A resume at or past --max-steps trains nothing and only saves.
+        if step >= total_steps {
+            break;
+        }
         loader.set_epoch(epoch as u64);
         loader.reset();
         let mut any = false;
@@ -2363,5 +2378,156 @@ mod tests {
     fn a_prompt_longer_than_the_context_has_no_room() {
         assert_eq!(new_tokens_within(10, 11, 20), None);
         assert_eq!(new_tokens_within(0, 1, 0), None);
+    }
+
+    const INPUT: [u32; 7] = [5, 9, 5, 12, 9, 5, 20];
+    const TARGET: [u32; 7] = [9, 5, 12, 9, 5, 20, 3];
+
+    /// A random one-block byte-level model in `dir`, loaded as `train` loads
+    /// a base whose weights train.
+    fn tiny_base(dir: &Path) -> Loaded {
+        let size = ferrotensor_trainer::pretrain::LlamaSize {
+            layers: 1,
+            hidden: 16,
+            heads: 2,
+            mlp_hidden: 32,
+            // Room for the trainer's padding to 32 tokens.
+            context: 64,
+            vocab: ferrotensor_loader::tokenizer::BYTE_LEVEL_VOCAB_SIZE,
+        };
+        fs::create_dir_all(dir).unwrap();
+        ferrotensor_trainer::pretrain::write_random_llama(dir, &size, 0).unwrap();
+        let tokenizer = ferrotensor_loader::tokenizer::byte_level_tokenizer_json();
+        fs::write(dir.join("tokenizer.json"), tokenizer.to_string()).unwrap();
+        pollster::block_on(load_base(&ModelArgs {
+            model: dir.to_path_buf(),
+            device: Device::Auto,
+            f32_weights: true,
+            f16_weights: false,
+            q4_weights: false,
+        }))
+        .unwrap()
+    }
+
+    /// The model `train --train-modules mode` builds, and the parameters it
+    /// hands the optimizer.
+    fn partial_model(
+        base: &Loaded,
+        dir: &Path,
+        mode: &str,
+    ) -> (Lfm2Model, HashMap<String, ferrotensor_autograd::Tensor>) {
+        let mut weights = WeightsContext::new();
+        weights.load_model_dir(dir).unwrap();
+        base.weights.set(Some(weights));
+        let model = build_model(base, None, true).unwrap();
+        let selected = select_train_params(&model, mode).unwrap();
+        let model = model.with_trainable_base_weights(|name| selected.contains_key(name));
+        (model, selected)
+    }
+
+    fn backward(base: &Loaded, model: &Lfm2Model) {
+        let logits = model.forward(&base.engine, &INPUT, 0, None, None);
+        ferrotensor_trainer::masked_cross_entropy(&logits, &TARGET, &[1; 7], &base.engine)
+            .unwrap()
+            .tensor
+            .backward(&base.engine);
+    }
+
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn only_the_selected_base_weights_get_a_gradient() {
+        let dir = std::env::temp_dir().join(format!("ferrotensor-frozen-{}", std::process::id()));
+        let base = tiny_base(&dir);
+        let names = [
+            EMBED_TOKENS,
+            "model.layers.0.input_layernorm.weight",
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.k_proj.weight",
+            "model.layers.0.self_attn.v_proj.weight",
+            "model.layers.0.self_attn.o_proj.weight",
+            "model.layers.0.post_attention_layernorm.weight",
+            "model.layers.0.mlp.gate_proj.weight",
+            "model.layers.0.mlp.up_proj.weight",
+            "model.layers.0.mlp.down_proj.weight",
+            "model.norm.weight",
+            "lm_head.weight",
+        ];
+        for (mode, expected) in [
+            ("attn", &names[2..6]),
+            ("mlp", &names[7..10]),
+            ("head", &names[11..]),
+            ("embed", &names[..1]),
+            ("all", &names[1..]),
+            ("full", &names[..]),
+        ] {
+            let (model, selected) = partial_model(&base, &dir, mode);
+            backward(&base, &model);
+            let mut with_grad: Vec<String> = model
+                .named_params()
+                .into_iter()
+                .filter(|(_, tensor)| tensor.grad.borrow().is_some())
+                .map(|(name, _)| name)
+                .collect();
+            with_grad.sort();
+            let mut expected = expected.to_vec();
+            expected.sort_unstable();
+            assert_eq!(with_grad, expected, "--train-modules {mode}");
+            let mut optimized: Vec<String> = selected.into_keys().collect();
+            optimized.sort();
+            assert_eq!(optimized, expected, "--train-modules {mode}");
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// One step with `--train-modules attn`: the attention weights move,
+    /// every other weight keeps its bits, and the clipped norm is the norm of
+    /// the attention gradients alone, summed by hand.
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn a_partial_step_moves_and_measures_only_the_selected_weights() {
+        let dir = std::env::temp_dir().join(format!("ferrotensor-step-{}", std::process::id()));
+        let base = tiny_base(&dir);
+        let host =
+            |data: &ferrotensor_backend::UnifiedTensor| pollster::block_on(data.to_vec(&base.ctx));
+        let (model, selected) = partial_model(&base, &dir, "attn");
+        let params: Vec<_> = selected.values().cloned().collect();
+        backward(&base, &model);
+        let by_hand = params
+            .iter()
+            .flat_map(|p| host(p.grad.borrow().as_ref().unwrap()))
+            .map(|g| f64::from(g).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let before: HashMap<String, Vec<f32>> = model
+            .named_params()
+            .into_iter()
+            .map(|(name, tensor)| {
+                tensor.zero_grad();
+                (name, host(tensor.data.as_ref()))
+            })
+            .collect();
+
+        let mut trainer = Trainer::new(
+            model,
+            Box::new(AdamW::new(base.engine.clone(), 1e-2)),
+            base.ctx.clone(),
+            base.engine.clone(),
+        )
+        .with_clip_grad_norm(1.0);
+        let stats = trainer.train_step(&INPUT, &TARGET, &params).unwrap();
+        let norm = f64::from(stats.grad_norm.unwrap());
+        assert!(
+            (norm - by_hand).abs() <= 1e-4 * by_hand,
+            "step norm {norm}, by hand {by_hand}"
+        );
+        for (name, tensor) in trainer.model.named_params() {
+            let after = host(tensor.data.as_ref());
+            if selected.contains_key(&name) {
+                assert_ne!(after, before[&name], "{name} did not move");
+            } else {
+                assert_eq!(after, before[&name], "{name} moved");
+            }
+        }
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

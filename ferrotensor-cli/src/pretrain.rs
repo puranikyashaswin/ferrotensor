@@ -16,6 +16,11 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Write as _};
 use std::path::PathBuf;
 
+/// Subdirectory of `--out` that holds the random initial model training
+/// starts from, so `--out` holds `model.safetensors` only once trained
+/// weights are exported into it.
+pub(crate) const INIT_DIR: &str = "init";
+
 /// Options for `ferrotensor pretrain`. The training defaults are
 /// conservative and not tuned.
 #[derive(Args, Debug)]
@@ -24,13 +29,15 @@ pub struct PretrainArgs {
     /// Training holds about 20 bytes of host memory per byte of the file.
     #[arg(long, value_name = "FILE")]
     data: PathBuf,
-    /// Model directory to write: config.json, tokenizer.json,
-    /// model.safetensors, tokens.bin and the training state.
+    /// Model directory to write: config.json, tokenizer.json, tokens.bin,
+    /// the initial model in init/ and the training state, and
+    /// model.safetensors when training ends.
     #[arg(long, value_name = "DIR")]
     out: PathBuf,
     /// Continue the run in --out from its trained_weights.safetensors and
     /// training state. Pass the flags of the first run; --max-steps counts
-    /// the steps before the resume too.
+    /// the steps before the resume too, and at or below the saved step
+    /// exports the saved weights without training.
     #[arg(long)]
     resume: bool,
     /// Decoder blocks.
@@ -144,13 +151,13 @@ fn model_size(args: &PretrainArgs) -> Result<LlamaSize> {
     })
 }
 
-/// The `train` run on `--out`: every base weight and the embedding train in
-/// f32 on the packed tokens. Every field is named, so a new `train` flag
-/// must be decided here.
+/// The `train` run on `--out` from the model in [`INIT_DIR`]: every base
+/// weight and the embedding train in f32 on the packed tokens. Every field
+/// is named, so a new `train` flag must be decided here.
 fn train_args(args: &PretrainArgs, seq_len: usize) -> TrainArgs {
     TrainArgs {
         model: ModelArgs {
-            model: args.out.clone(),
+            model: args.out.join(INIT_DIR),
             device: args.device,
             f32_weights: true,
             f16_weights: false,
@@ -198,9 +205,9 @@ fn train_args(args: &PretrainArgs, seq_len: usize) -> TrainArgs {
     }
 }
 
-/// Runs `ferrotensor pretrain`: writes the tokenizer and a random model
-/// (unless resuming), encodes the corpus, trains, and writes the trained
-/// weights over `model.safetensors`.
+/// Runs `ferrotensor pretrain`: writes the tokenizer, `config.json` and a
+/// random model in [`INIT_DIR`] (unless resuming), encodes the corpus,
+/// trains, and exports the trained weights as `model.safetensors`.
 pub async fn run(args: PretrainArgs) -> Result<()> {
     let size = model_size(&args)?;
     let seq_len = args.seq_len.unwrap_or(args.context);
@@ -218,6 +225,7 @@ pub async fn run(args: PretrainArgs) -> Result<()> {
     }
     let weights_path = args.out.join(MERGED_WEIGHTS_FILE);
     let trained_path = args.out.join("trained_weights.safetensors");
+    let init_dir = args.out.join(INIT_DIR);
     if args.resume {
         if !trained_path.is_file() {
             return Err(unmet(format!(
@@ -226,19 +234,20 @@ pub async fn run(args: PretrainArgs) -> Result<()> {
             )));
         }
     } else {
-        if weights_path.exists() {
+        if weights_path.exists() || init_dir.exists() {
             return Err(unmet(format!(
                 "{} already holds a model; pass --resume to continue it, or choose a new --out",
                 args.out.display()
             )));
         }
-        fs::create_dir_all(&args.out)
-            .map_err(|e| format!("cannot create {}: {e}", args.out.display()))?;
-        fs::write(
-            args.out.join("tokenizer.json"),
-            byte_level_tokenizer_json().to_string(),
-        )?;
-        write_random_llama(&args.out, &size, args.seed)?;
+        fs::create_dir_all(&init_dir)
+            .map_err(|e| format!("cannot create {}: {e}", init_dir.display()))?;
+        let tokenizer = byte_level_tokenizer_json().to_string();
+        for dir in [&args.out, &init_dir] {
+            fs::write(dir.join("tokenizer.json"), &tokenizer)?;
+        }
+        write_random_llama(&init_dir, &size, args.seed)?;
+        fs::copy(init_dir.join("config.json"), args.out.join("config.json"))?;
         eprintln!(
             "init:   {} parameters ({} layers, hidden {}, {} heads, mlp {}, context {}, vocab {}), seed {}",
             size.parameters(),

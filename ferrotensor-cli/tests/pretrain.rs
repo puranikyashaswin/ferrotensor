@@ -105,6 +105,38 @@ fn invalid_sizes_and_a_missing_corpus_exit_with_2() {
     assert!(json_error(&no_state).contains("trained_weights.safetensors does not exist"));
 }
 
+/// A model directory without `model.safetensors` names `pretrain --resume`
+/// when it holds the `init` directory of an unfinished run, and only then.
+#[test]
+fn an_unfinished_run_points_to_resume() {
+    let dir = common::TempDir::new("pretrain-unfinished");
+    common::write_tiny_llama(dir.path());
+    common::write_tiny_tokenizer(dir.path());
+    std::fs::remove_file(dir.path().join("model.safetensors")).expect("remove weights");
+    let generate = || {
+        let run = ferrotensor(&[
+            "generate",
+            "--model",
+            s(dir.path()),
+            "--raw",
+            "--prompt",
+            "the",
+            "--json",
+        ]);
+        assert_eq!(run.status.code(), Some(1), "{}", text(&run.stderr));
+        json_error(&run)
+    };
+    let plain = generate();
+    assert!(plain.contains("no model.safetensors"), "{plain}");
+    assert!(!plain.contains("--resume"), "{plain}");
+    std::fs::create_dir(dir.path().join("init")).expect("create init");
+    let unfinished = generate();
+    assert!(
+        unfinished.contains("unfinished `pretrain` run: `pretrain --resume`"),
+        "{unfinished}"
+    );
+}
+
 /// The `error` of the JSON object a failed `--json` run prints.
 fn json_error(out: &Output) -> String {
     let value: Value = serde_json::from_slice(&out.stdout)
@@ -238,5 +270,79 @@ fn resume_continues_the_run_in_the_same_directory() {
     assert!(
         !stderr.contains("init:"),
         "a resume keeps the model: {stderr}"
+    );
+}
+
+/// A run stopped after its last checkpoint and before the export, as an
+/// interrupt leaves it: `generate` refuses the directory instead of loading
+/// random weights, and a resume at the saved step trains nothing and
+/// exports the saved weights.
+#[test]
+#[ignore = "needs a GPU"]
+fn resume_at_the_saved_step_exports_an_interrupted_run() {
+    let dir = common::TempDir::new("pretrain-interrupted");
+    let corpus = dir.path().join("corpus.txt");
+    std::fs::write(&corpus, SENTENCE.repeat(20)).expect("write corpus");
+    let model = dir.path().join("model");
+    assert_eq!(
+        json_of(&pretrain(&corpus, &model, &["--max-steps", "2"]))["steps"],
+        2
+    );
+    let weights = model.join("model.safetensors");
+    std::fs::remove_file(&weights).expect("remove the export");
+    let metrics = std::fs::read(model.join("metrics.jsonl")).expect("metrics");
+
+    let refused = ferrotensor(&[
+        "generate",
+        "--model",
+        s(&model),
+        "--raw",
+        "--prompt",
+        "the",
+        "--json",
+    ]);
+    assert!(json_error(&refused).contains("pretrain --resume"));
+
+    let recovered = pretrain(&corpus, &model, &["--max-steps", "2", "--resume"]);
+    let stderr = text(&recovered.stderr);
+    // Before the fix the loop took one more step (3) after skipping the
+    // batches it had already seen.
+    assert_eq!(json_of(&recovered)["steps"], 2, "{stderr}");
+    assert!(stderr.contains("continuing at step 2"), "{stderr}");
+    assert!(weights.is_file(), "{stderr}");
+    assert_eq!(
+        std::fs::read(model.join("metrics.jsonl")).expect("metrics"),
+        metrics,
+        "a resume at the saved step logs no step"
+    );
+
+    let eval = |extra: &[&str]| {
+        let tokens = model.join("tokens.bin");
+        let mut args = vec![
+            "eval",
+            "--model",
+            s(&model),
+            "--data",
+            s(&tokens),
+            "--task",
+            "pretrain",
+            "--seq-len",
+            "64",
+            "--max-samples",
+            "4",
+            "--f32-weights",
+            "--json",
+        ];
+        args.extend_from_slice(extra);
+        json_of(&ferrotensor(&args))["loss"]
+            .as_f64()
+            .expect("eval loss")
+    };
+    let exported = eval(&[]);
+    let trained = model.join("trained_weights.safetensors");
+    let in_training_layout = eval(&["--lora", s(&trained)]);
+    assert!(
+        (exported - in_training_layout).abs() < 1e-5,
+        "exported {exported}, trained {in_training_layout}"
     );
 }
