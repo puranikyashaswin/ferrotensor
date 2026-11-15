@@ -1,7 +1,7 @@
 # ferrotensor-cli
 
 The `ferrotensor-cli` command line for [Ferrotensor](../README.md): LoRA fine-tuning
-(`train`), evaluation (`eval`) and sampling (`generate`, alias `infer`) for
+(`finetune`, `train`), evaluation (`eval`) and sampling (`generate`, alias `infer`) for
 small Llama-style models such as SmolLM2 and TinyLlama, on the GPU through
 wgpu (Vulkan, Metal or DX12). It has been tested on an NVIDIA A10G (24 GB)
 through Vulkan, an Apple M2 (8 GB) through Metal, and software Vulkan (Mesa
@@ -20,7 +20,14 @@ ferrotensor --help
 cargo run -p ferrotensor-cli --release -- --help            # commands
 cargo run -p ferrotensor-cli --release -- train --help      # every training flag
 
-# LoRA SFT with response-only loss and the ChatML template
+# The short path: LoRA SFT with batch size, sequence length, gradient
+# accumulation and checkpointing picked to fit this machine (see below)
+cargo run -p ferrotensor-cli --release -- finetune \
+  --model ./data/models/SmolLM2-135M \
+  --data ./data/alpaca/train.jsonl --out ./data/runs/sft
+
+# The explicit path: LoRA SFT (response-only loss, ChatML template) with
+# every setting chosen by hand
 cargo run -p ferrotensor-cli --release -- train \
   --model ./data/models/SmolLM2-135M \
   --data ./data/alpaca/train.jsonl --eval-data ./data/alpaca/val.jsonl \
@@ -115,6 +122,31 @@ of QLoRA.
   pass `--q4-weights` instead.
 - With `--memory-report`, the 4-bit weights appear under base weights as
   "of which 4-bit".
+
+## Fine-tune in one command: `finetune`
+
+`finetune` takes every `train` flag plus `--memory-mib`, `--vram-mib` and
+`--force`. It runs the `plan` below for the model, prints the plan to
+stderr, then trains in the same process.
+
+```bash
+ferrotensor finetune --model ./data/models/SmolLM2-360M --data train.jsonl
+ferrotensor finetune --model ./data/models/SmolLM2-360M --data train.jsonl --seq-len 512
+```
+
+- The plan sets `--batch-size`, `--seq-len`, `--checkpoint-blocks` and
+  `--grad-accum` (8 sequences per step), each only when it is not given.
+  A given `--batch-size`, `--seq-len` or `--checkpoint-blocks` is kept and
+  the plan is chosen around it. `--f32-weights`, `--q4-weights` and
+  `--lora-rank` are passed to the plan as they are. A stderr line says
+  which values came from the plan and which from the command line.
+- When no configuration fits, it prints the estimate and the budget that
+  would fit, exits with code 2 and does not train. `--force` trains anyway
+  with the smallest configuration.
+- After training it prints the estimated peak, the measured peak of the
+  GPU buffers Ferrotensor tracks (without the driver context), and the
+  difference in percent.
+- `--lite` is refused; it sets memory flags itself.
 
 ## What fits this machine: `plan`
 

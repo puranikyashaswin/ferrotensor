@@ -37,6 +37,14 @@ impl MemoryReportRun {
         Ok(())
     }
 
+    /// Highest live, pooled and awaiting-GPU bytes over the recorded phases.
+    pub fn overall_peak_total_bytes(&self) -> u64 {
+        self.recorder
+            .reports
+            .last()
+            .map_or(0, |report| report.overall_peak_total_bytes)
+    }
+
     /// Record the model load.
     pub fn after_load(&mut self) -> std::io::Result<()> {
         self.record("after model load")?;

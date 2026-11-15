@@ -67,6 +67,14 @@ fn train(model: &Path, data: &Path, out: &Path, steps: usize, extra: &[&str]) ->
     ferrotensor(&args)
 }
 
+/// Files a LoRA training run writes into its output directory.
+const RUN_FILES: [&str; 4] = [
+    "lora_adapters.safetensors",
+    "lora_adapters.safetensors.state.json",
+    "training_state.json",
+    "metrics.jsonl",
+];
+
 fn read_json(path: &Path) -> serde_json::Value {
     let content = std::fs::read_to_string(path).expect("read json file");
     serde_json::from_str(&content).expect("parse json file")
@@ -107,12 +115,7 @@ fn train_writes_adapter_state_and_metrics() {
         .expect("dispatches_per_step is a count");
     assert!(dispatches > 0, "profile: {profile}");
 
-    for name in [
-        "lora_adapters.safetensors",
-        "lora_adapters.safetensors.state.json",
-        "training_state.json",
-        "metrics.jsonl",
-    ] {
+    for name in RUN_FILES {
         let path = out.path().join(name);
         let meta = std::fs::metadata(&path)
             .unwrap_or_else(|e| panic!("{} is missing: {e}", path.display()));
@@ -358,4 +361,139 @@ fn plan_without_a_model_lists_the_documented_sizes() {
     assert_eq!(models[2]["chosen"]["checkpoint_blocks"], true);
     assert_eq!(models[2]["estimated_peak_mib"], 6038);
     assert_eq!(models[2]["fits"], true);
+}
+
+/// Run `finetune --task pretrain --seq-len 16 --max-steps 2` on `data`,
+/// writing into `out`; `extra` is appended to the arguments.
+fn finetune(model: &Path, data: &Path, out: &Path, extra: &[&str]) -> Output {
+    let mut args = vec![
+        "finetune",
+        "--model",
+        s(model),
+        "--data",
+        s(data),
+        "--task",
+        "pretrain",
+        "--seq-len",
+        "16",
+        "--out",
+        s(out),
+        "--max-steps",
+        "2",
+        "--log-every",
+        "1",
+        "--lora-rank",
+        "4",
+    ];
+    args.extend_from_slice(extra);
+    ferrotensor(&args)
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn finetune_trains_with_the_plan_and_writes_the_train_files() {
+    let model = model_dir("finetune-model");
+    let out = common::TempDir::new("finetune-out");
+    let data = out.path().join("tokens.bin");
+    common::write_token_bin(&data, 400);
+
+    let run = finetune(model.path(), &data, out.path(), &["--memory-mib", "100000"]);
+    assert_success(&run);
+    let stderr = text(&run.stderr);
+    assert!(
+        stderr.contains(
+            "finetune: --batch-size 8 (plan), --grad-accum 1 (plan), --seq-len 16 (user), \
+             --checkpoint-blocks off (plan), f16 weights (default)"
+        ),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("memory: estimated peak "),
+        "stderr: {stderr}"
+    );
+    for name in RUN_FILES {
+        let path = out.path().join(name);
+        let meta = std::fs::metadata(&path)
+            .unwrap_or_else(|e| panic!("{} is missing: {e}", path.display()));
+        assert!(meta.len() > 0, "{} is empty", path.display());
+    }
+    let state = read_json(&out.path().join("training_state.json"));
+    assert_eq!(
+        (
+            &state["step"],
+            &state["batch_size"],
+            &state["grad_accum_steps"],
+            &state["sequence_length"]
+        ),
+        (
+            &serde_json::json!(2),
+            &serde_json::json!(8),
+            &serde_json::json!(1),
+            &serde_json::json!(16)
+        )
+    );
+}
+
+#[test]
+fn finetune_exits_with_2_and_does_not_train_when_nothing_fits() {
+    let model = model_dir("finetune-too-small");
+    let out = common::TempDir::new("finetune-too-small-out");
+    let data = out.path().join("tokens.bin");
+    common::write_token_bin(&data, 400);
+
+    let run = finetune(model.path(), &data, out.path(), &["--memory-mib", "1"]);
+    let stderr = text(&run.stderr);
+    assert_eq!(run.status.code(), Some(2), "stderr: {stderr}");
+    // weights 1 + adapters 1 + activations 1 + logits 1 + overhead 1350;
+    // 1354 / 0.85 rounds up to 1593.
+    assert!(
+        stderr.contains(
+            "finetune: no configuration fits the 1 MiB budget; the smallest needs 1354 MiB, \
+             which fits a budget of 1593 MiB or more; pass --force to train anyway"
+        ),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("plan      batch 1, seq 16"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !out.path().join("lora_adapters.safetensors").exists(),
+        "an adapter was written"
+    );
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn finetune_force_trains_the_smallest_configuration() {
+    let model = model_dir("finetune-force");
+    let out = common::TempDir::new("finetune-force-out");
+    let data = out.path().join("tokens.bin");
+    common::write_token_bin(&data, 400);
+
+    let run = finetune(
+        model.path(),
+        &data,
+        out.path(),
+        &["--memory-mib", "1", "--force"],
+    );
+    assert_success(&run);
+    let stderr = text(&run.stderr);
+    assert!(
+        stderr.contains("training anyway (--force)"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("--batch-size 1 (plan), --grad-accum 8 (plan)"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("block checkpointing: on"),
+        "stderr: {stderr}"
+    );
+    let state = read_json(&out.path().join("training_state.json"));
+    assert_eq!(
+        (&state["step"], &state["batch_size"]),
+        (&serde_json::json!(2), &serde_json::json!(1))
+    );
 }

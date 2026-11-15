@@ -34,6 +34,7 @@ const ASSUMED_BUDGET_MIB: u64 = 4096;
 const SEQUENCES_PER_STEP: usize = 8;
 const BATCH_SIZES: [usize; 4] = [8, 4, 2, 1];
 const SEQ_LENS: [usize; 2] = [256, 128];
+const CHECKPOINTINGS: [Checkpointing; 2] = [Checkpointing::Off, Checkpointing::Blocks];
 
 /// Options for `ferrotensor plan`.
 #[derive(Args, Debug)]
@@ -42,12 +43,8 @@ pub struct PlanArgs {
     /// documented SmolLM2 sizes are listed.
     #[arg(long, value_name = "DIR")]
     pub model: Option<PathBuf>,
-    /// GPU memory budget in MiB; overrides everything else.
-    #[arg(long, value_name = "MIB")]
-    pub memory_mib: Option<u64>,
-    /// Memory of a discrete GPU in MiB (wgpu cannot read it).
-    #[arg(long, value_name = "MIB")]
-    pub vram_mib: Option<u64>,
+    #[command(flatten)]
+    pub budget: BudgetArgs,
     /// Frozen base weight precision to plan for.
     #[arg(long, value_enum, default_value_t = Precision::F16)]
     pub weights: Precision,
@@ -62,6 +59,17 @@ pub struct PlanArgs {
     pub json: bool,
 }
 
+/// Flags that set the GPU memory budget.
+#[derive(Args, Debug)]
+pub struct BudgetArgs {
+    /// GPU memory budget in MiB; overrides everything else.
+    #[arg(long, value_name = "MIB")]
+    pub memory_mib: Option<u64>,
+    /// Memory of a discrete GPU in MiB (wgpu cannot read it).
+    #[arg(long, value_name = "MIB")]
+    pub vram_mib: Option<u64>,
+}
+
 /// Storage of the frozen base weights.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Precision {
@@ -74,7 +82,8 @@ pub enum Precision {
 }
 
 impl Precision {
-    fn as_str(self) -> &'static str {
+    /// The name `plan` prints.
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::F16 => "f16",
             Self::F32 => "f32",
@@ -286,13 +295,15 @@ pub fn estimate_peak_mib(shape: &ModelShape, config: &TrainConfig) -> Estimate {
     }
 }
 
-/// Sequence lengths the chooser tries.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum SeqLens {
-    /// 256, then 128.
-    Default,
-    /// Only this one.
-    Fixed(NonZeroUsize),
+/// Values the chooser keeps instead of trying its own; `None` tries them.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Pinned {
+    /// Tokens per sequence [tried: 256, then 128].
+    pub seq_len: Option<NonZeroUsize>,
+    /// Sequences per forward pass [tried: 8, 4, 2, 1].
+    pub batch_size: Option<NonZeroUsize>,
+    /// Block checkpointing [tried: off, then on].
+    pub checkpointing: Option<Checkpointing>,
 }
 
 /// A chosen configuration and whether it fits the budget.
@@ -309,21 +320,28 @@ pub struct Plan {
 /// The first configuration that fits `budget_mib` with the safety margin:
 /// longer sequence first (cutting examples changes what is trained, batch
 /// size only changes speed), then no checkpointing before checkpointing,
-/// then larger batch. When none fits, the smallest one, with `fits` false.
+/// then larger batch, trying only the `pinned` value where there is one.
+/// When none fits, the smallest one, with `fits` false.
 pub fn choose(
     shape: &ModelShape,
     budget_mib: u64,
     precision: Precision,
     lora_rank: usize,
-    seq_lens: SeqLens,
+    pinned: Pinned,
 ) -> Plan {
-    let fixed;
-    let seq_lens: &[usize] = match seq_lens {
-        SeqLens::Default => &SEQ_LENS,
-        SeqLens::Fixed(n) => {
-            fixed = [n.get()];
-            &fixed
-        }
+    let seq_pin = pinned.seq_len.map(NonZeroUsize::get);
+    let seq_lens: &[usize] = match &seq_pin {
+        Some(n) => std::slice::from_ref(n),
+        None => &SEQ_LENS,
+    };
+    let batch_pin = pinned.batch_size.map(NonZeroUsize::get);
+    let batch_sizes: &[usize] = match &batch_pin {
+        Some(n) => std::slice::from_ref(n),
+        None => &BATCH_SIZES,
+    };
+    let checkpointings: &[Checkpointing] = match &pinned.checkpointing {
+        Some(c) => std::slice::from_ref(c),
+        None => &CHECKPOINTINGS,
     };
     let usable_mib = budget_mib as f64 * (1.0 - SAFETY_MARGIN);
     let plan_for = |checkpointing, batch_size, seq_len| {
@@ -342,8 +360,8 @@ pub fn choose(
         }
     };
     for &seq_len in seq_lens {
-        for checkpointing in [Checkpointing::Off, Checkpointing::Blocks] {
-            for batch_size in BATCH_SIZES {
+        for &checkpointing in checkpointings {
+            for &batch_size in batch_sizes {
                 let plan = plan_for(checkpointing, batch_size, seq_len);
                 if plan.fits {
                     return plan;
@@ -352,7 +370,12 @@ pub fn choose(
         }
     }
     let shortest = seq_lens.iter().copied().fold(usize::MAX, usize::min);
-    plan_for(Checkpointing::Blocks, 1, shortest)
+    let smallest_batch = batch_sizes.iter().copied().fold(usize::MAX, usize::min);
+    plan_for(
+        pinned.checkpointing.unwrap_or(Checkpointing::Blocks),
+        smallest_batch,
+        shortest,
+    )
 }
 
 /// Where the memory budget came from.
@@ -392,7 +415,7 @@ pub struct Budget {
 /// that shares it, `nvidia_smi_mib` for an NVIDIA GPU, or else an assumed
 /// default, in that order.
 pub fn budget(
-    args: &PlanArgs,
+    args: &BudgetArgs,
     adapter: Option<&AdapterReport>,
     total_ram_mib: Result<u64, String>,
     nvidia_smi_mib: impl FnOnce() -> Result<u64, String>,
@@ -508,9 +531,14 @@ fn total_ram_mib() -> Result<u64, String> {
     }
 }
 
+/// Batches per optimizer step that keep 8 sequences per step.
+pub fn grad_accum_for(batch_size: usize) -> usize {
+    (SEQUENCES_PER_STEP / batch_size).max(1)
+}
+
 /// The `ferrotensor train` line for a plan, keeping 8 sequences per step.
 pub fn train_command(model: &str, config: &TrainConfig) -> String {
-    let grad_accum = (SEQUENCES_PER_STEP / config.batch_size).max(1);
+    let grad_accum = grad_accum_for(config.batch_size);
     let checkpoint = match config.checkpointing {
         Checkpointing::Off => "",
         Checkpointing::Blocks => " --checkpoint-blocks",
@@ -599,35 +627,19 @@ struct Report {
 /// When no GPU adapter is found and no budget is given, or `--model` has
 /// no readable config.json.
 pub fn run(args: PlanArgs) -> Result<Outcome, Box<dyn std::error::Error>> {
-    let adapters = adapters::list_adapters();
-    let adapter = adapters.iter().find(|a| a.selected);
-    if adapter.is_none() && args.memory_mib.is_none() && args.vram_mib.is_none() {
-        return Err("no GPU adapter found; pass --memory-mib to plan for another machine".into());
-    }
-    let budget = budget(&args, adapter, total_ram_mib(), nvidia_smi_total_mib);
-    let seq_lens = args.seq_len.map_or(SeqLens::Default, SeqLens::Fixed);
-    let mut report = match &args.model {
-        Some(dir) => plan_model(&args, dir, budget.mib, seq_lens)?,
-        None => plan_documented(&args, budget.mib, seq_lens),
+    let (adapter, budget) = machine_budget(&args.budget)?;
+    let pinned = Pinned {
+        seq_len: args.seq_len,
+        ..Pinned::default()
     };
-    report.notes.push(
-        "the estimate is calibrated on 8 measured peaks (SmolLM2 135M, 360M and 1.7B, \
-         f16 weights, seq 256, one A10G); its worst error there is 13.3%"
-            .into(),
-    );
-    report
-        .notes
-        .push("replace train.jsonl in the train command with your dataset".into());
-    if budget.source == BudgetSource::Assumed {
-        report
-            .notes
-            .push(format!("budget {} MiB is {}", budget.mib, budget.reason));
-    }
-    let (adapter_name, backend, device_type) = adapter.map_or(("none", "none", "none"), |a| {
-        (a.name.as_str(), a.backend.as_str(), a.device_type.as_str())
-    });
+    let mut report = match &args.model {
+        Some(dir) => plan_model(dir, budget.mib, args.weights, args.lora_rank, pinned)?.1,
+        None => plan_documented(&args, budget.mib, pinned),
+    };
+    push_common_notes(&mut report.notes, &budget);
 
     if args.json {
+        let (adapter_name, backend, device_type) = adapter_fields(adapter.as_ref());
         let mut out = Map::new();
         out.insert("adapter".into(), json!(adapter_name));
         out.insert("backend".into(), json!(backend));
@@ -638,35 +650,116 @@ pub fn run(args: PlanArgs) -> Result<Outcome, Box<dyn std::error::Error>> {
         out.insert("notes".into(), json!(report.notes));
         println!("{}", serde_json::to_string_pretty(&Value::Object(out))?);
     } else {
-        println!("adapter   {adapter_name} ({device_type}, {backend})");
-        println!(
-            "budget    {} MiB ({}: {})",
-            budget.mib,
-            budget.source.as_str(),
-            budget.reason
-        );
-        for line in &report.lines {
+        for line in human_lines(adapter.as_ref(), &budget, &report) {
             println!("{line}");
-        }
-        for note in &report.notes {
-            println!("note: {note}");
         }
     }
     Ok(report.outcome)
 }
 
+/// A plan for training one model, as `ferrotensor finetune` uses it.
+pub struct TrainingPlan {
+    /// The chosen configuration.
+    pub plan: Plan,
+    /// The budget it was chosen for, in MiB.
+    pub budget_mib: u64,
+    /// The smallest budget the configuration fits with the safety margin.
+    pub needed_budget_mib: u64,
+    /// What `plan --model` prints for it, line by line.
+    pub lines: Vec<String>,
+}
+
+/// Plans training the model in `dir` at `precision` and `lora_rank`,
+/// keeping the `pinned` values.
+///
+/// # Errors
+///
+/// When no GPU adapter is found and no budget is given, or `dir` has no
+/// readable config.json.
+pub fn plan_training(
+    flags: &BudgetArgs,
+    dir: &Path,
+    precision: Precision,
+    lora_rank: usize,
+    pinned: Pinned,
+) -> Result<TrainingPlan, Box<dyn std::error::Error>> {
+    let (adapter, budget) = machine_budget(flags)?;
+    let (plan, mut report) = plan_model(dir, budget.mib, precision, lora_rank, pinned)?;
+    push_common_notes(&mut report.notes, &budget);
+    Ok(TrainingPlan {
+        plan,
+        budget_mib: budget.mib,
+        needed_budget_mib: (plan.estimate.peak_mib as f64 / (1.0 - SAFETY_MARGIN)).ceil() as u64,
+        lines: human_lines(adapter.as_ref(), &budget, &report),
+    })
+}
+
+/// The selected GPU adapter and the memory budget for it.
+fn machine_budget(
+    flags: &BudgetArgs,
+) -> Result<(Option<AdapterReport>, Budget), Box<dyn std::error::Error>> {
+    let adapter = adapters::list_adapters().into_iter().find(|a| a.selected);
+    if adapter.is_none() && flags.memory_mib.is_none() && flags.vram_mib.is_none() {
+        return Err("no GPU adapter found; pass --memory-mib to plan for another machine".into());
+    }
+    let budget = budget(
+        flags,
+        adapter.as_ref(),
+        total_ram_mib(),
+        nvidia_smi_total_mib,
+    );
+    Ok((adapter, budget))
+}
+
+fn push_common_notes(notes: &mut Vec<String>, budget: &Budget) {
+    notes.push(
+        "the estimate is calibrated on 8 measured peaks (SmolLM2 135M, 360M and 1.7B, \
+         f16 weights, seq 256, one A10G); its worst error there is 13.3%"
+            .into(),
+    );
+    notes.push("replace train.jsonl in the train command with your dataset".into());
+    if budget.source == BudgetSource::Assumed {
+        notes.push(format!("budget {} MiB is {}", budget.mib, budget.reason));
+    }
+}
+
+/// Name, backend and device type of the adapter, or "none".
+fn adapter_fields(adapter: Option<&AdapterReport>) -> (&str, &str, &str) {
+    adapter.map_or(("none", "none", "none"), |a| {
+        (a.name.as_str(), a.backend.as_str(), a.device_type.as_str())
+    })
+}
+
+/// The lines `plan` prints without `--json`.
+fn human_lines(adapter: Option<&AdapterReport>, budget: &Budget, report: &Report) -> Vec<String> {
+    let (adapter_name, backend, device_type) = adapter_fields(adapter);
+    let mut lines = vec![
+        format!("adapter   {adapter_name} ({device_type}, {backend})"),
+        format!(
+            "budget    {} MiB ({}: {})",
+            budget.mib,
+            budget.source.as_str(),
+            budget.reason
+        ),
+    ];
+    lines.extend(report.lines.iter().cloned());
+    lines.extend(report.notes.iter().map(|note| format!("note: {note}")));
+    lines
+}
+
 fn plan_model(
-    args: &PlanArgs,
     dir: &Path,
     budget_mib: u64,
-    seq_lens: SeqLens,
-) -> Result<Report, Box<dyn std::error::Error>> {
+    precision: Precision,
+    lora_rank: usize,
+    pinned: Pinned,
+) -> Result<(Plan, Report), Box<dyn std::error::Error>> {
     let config_path = dir.join("config.json");
     let config = ModelLoader::load_config(&config_path)
         .map_err(|e| format!("cannot read {}: {e}", config_path.display()))?;
     let model_arg = dir.display().to_string();
     let shape = ModelShape::from_config(model_arg.clone(), &config);
-    let plan = choose(&shape, budget_mib, args.weights, args.lora_rank, seq_lens);
+    let plan = choose(&shape, budget_mib, precision, lora_rank, pinned);
     let mut notes: Vec<String> = short_seq_note(&shape.name, plan.config.seq_len)
         .into_iter()
         .collect();
@@ -678,8 +771,8 @@ fn plan_model(
             "--checkpoint-blocks took 19% to 39% more time per step in the measured runs".into(),
         );
     }
-    if !plan.fits && args.weights == Precision::F16 {
-        let q4 = choose(&shape, budget_mib, Precision::Q4, args.lora_rank, seq_lens);
+    if !plan.fits && precision == Precision::F16 {
+        let q4 = choose(&shape, budget_mib, Precision::Q4, lora_rank, pinned);
         if q4.fits {
             notes.push(format!(
                 "with --weights q4 (experimental, worse held-out loss) this fits: {}, {} MiB",
@@ -710,7 +803,7 @@ fn plan_model(
         ),
         format!("command   {}", train_command(&model_arg, &plan.config)),
     ];
-    Ok(Report {
+    let report = Report {
         outcome: if plan.fits {
             Outcome::Fits
         } else {
@@ -719,10 +812,11 @@ fn plan_model(
         fields: plan_json(&shape, &model_arg, &plan),
         lines,
         notes,
-    })
+    };
+    Ok((plan, report))
 }
 
-fn plan_documented(args: &PlanArgs, budget_mib: u64, seq_lens: SeqLens) -> Report {
+fn plan_documented(args: &PlanArgs, budget_mib: u64, pinned: Pinned) -> Report {
     let mut models = Vec::new();
     let mut lines = vec![format!(
         "\n{:<14} {:>10}  {:<58} {:>10}  fits",
@@ -731,7 +825,7 @@ fn plan_documented(args: &PlanArgs, budget_mib: u64, seq_lens: SeqLens) -> Repor
     let mut any_fits = false;
     let mut notes = Vec::new();
     for shape in ModelShape::documented() {
-        let plan = choose(&shape, budget_mib, args.weights, args.lora_rank, seq_lens);
+        let plan = choose(&shape, budget_mib, args.weights, args.lora_rank, pinned);
         any_fits |= plan.fits;
         notes.extend(short_seq_note(&shape.name, plan.config.seq_len));
         let model_arg = format!("path/to/{}", shape.name);
@@ -851,7 +945,7 @@ mod tests {
             8000,
             Precision::F16,
             8,
-            SeqLens::Default,
+            Pinned::default(),
         );
         assert_eq!(
             (
@@ -875,7 +969,7 @@ mod tests {
             6150,
             Precision::F16,
             8,
-            SeqLens::Default,
+            Pinned::default(),
         );
         assert_eq!(
             (
@@ -903,7 +997,7 @@ mod tests {
             3000,
             Precision::F16,
             8,
-            SeqLens::Default,
+            Pinned::default(),
         );
         assert_eq!(
             (
@@ -920,7 +1014,7 @@ mod tests {
     #[test]
     fn chooser_keeps_a_fixed_sequence_length() {
         let shape = smollm2("SmolLM2-1.7B");
-        let p = choose(&shape, 8000, Precision::F16, 8, SeqLens::Default);
+        let p = choose(&shape, 8000, Precision::F16, 8, Pinned::default());
         assert_eq!(
             (
                 p.config.checkpointing,
@@ -930,7 +1024,10 @@ mod tests {
             ),
             (Checkpointing::Blocks, 4, 256, 6038)
         );
-        let seq = SeqLens::Fixed(NonZeroUsize::new(128).expect("non-zero"));
+        let seq = Pinned {
+            seq_len: NonZeroUsize::new(128),
+            ..Pinned::default()
+        };
         let p = choose(&shape, 8000, Precision::F16, 8, seq);
         assert_eq!(
             (
@@ -944,13 +1041,55 @@ mod tests {
     }
 
     #[test]
+    fn chooser_keeps_a_pinned_batch_size_and_checkpointing() {
+        let shape = smollm2("SmolLM2-135M");
+        let summary = |p: Plan| {
+            (
+                p.config.checkpointing,
+                p.config.batch_size,
+                p.config.seq_len,
+                p.estimate.peak_mib,
+                p.fits,
+            )
+        };
+        // Unpinned this is batch 4 at 5,084 MiB. Batch 2 by hand: weights
+        // 365 + adapters 15 + activations 1,485 + logits 192 + overhead 1,350.
+        let batch_2 = Pinned {
+            batch_size: NonZeroUsize::new(2),
+            ..Pinned::default()
+        };
+        assert_eq!(
+            summary(choose(&shape, 8000, Precision::F16, 8, batch_2)),
+            (Checkpointing::Off, 2, 256, 3407, true)
+        );
+        let blocks = Pinned {
+            checkpointing: Some(Checkpointing::Blocks),
+            ..Pinned::default()
+        };
+        assert_eq!(
+            summary(choose(&shape, 8000, Precision::F16, 8, blocks)),
+            (Checkpointing::Blocks, 8, 256, 2831, true)
+        );
+        // Nothing fits 500 MiB: the smallest plan keeps the pinned batch.
+        // Activations 77 and logits 192 at 512 tokens of seq 128.
+        let batch_4 = Pinned {
+            batch_size: NonZeroUsize::new(4),
+            ..Pinned::default()
+        };
+        assert_eq!(
+            summary(choose(&shape, 500, Precision::F16, 8, batch_4)),
+            (Checkpointing::Blocks, 4, 128, 1999, false)
+        );
+    }
+
+    #[test]
     fn chooser_reports_the_smallest_plan_when_nothing_fits() {
         let p = choose(
             &smollm2("SmolLM2-135M"),
             500,
             Precision::F16,
             8,
-            SeqLens::Default,
+            Pinned::default(),
         );
         assert_eq!(
             (
@@ -964,8 +1103,8 @@ mod tests {
         );
         // 1.7B on 6,000 MiB: f16 needs 5,164 MiB plus the margin; 4-bit fits.
         let shape = smollm2("SmolLM2-1.7B");
-        assert!(!choose(&shape, 6000, Precision::F16, 8, SeqLens::Default).fits);
-        let q4 = choose(&shape, 6000, Precision::Q4, 8, SeqLens::Default);
+        assert!(!choose(&shape, 6000, Precision::F16, 8, Pinned::default()).fits);
+        let q4 = choose(&shape, 6000, Precision::Q4, 8, Pinned::default());
         assert_eq!(
             (
                 q4.config.checkpointing,
@@ -978,15 +1117,10 @@ mod tests {
         );
     }
 
-    fn args(memory_mib: Option<u64>, vram_mib: Option<u64>) -> PlanArgs {
-        PlanArgs {
-            model: None,
+    fn args(memory_mib: Option<u64>, vram_mib: Option<u64>) -> BudgetArgs {
+        BudgetArgs {
             memory_mib,
             vram_mib,
-            weights: Precision::F16,
-            lora_rank: 8,
-            seq_len: None,
-            json: false,
         }
     }
 

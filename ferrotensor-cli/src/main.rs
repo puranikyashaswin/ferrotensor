@@ -2,6 +2,7 @@
 //! Llama-style (and LFM2) models on consumer GPUs.
 //!
 //! ```text
+//! ferrotensor-cli finetune --model DIR --data train.jsonl --out runs/sft
 //! ferrotensor-cli train    --model DIR --data train.jsonl --out runs/sft
 //! ferrotensor-cli eval     --model DIR --data val.jsonl --lora runs/sft/lora_adapters.safetensors
 //! ferrotensor-cli generate --model DIR --lora runs/sft/lora_adapters.safetensors --prompt "Hi"
@@ -13,12 +14,13 @@
 //! ```
 
 mod classify;
+mod finetune;
 mod info;
 mod memory_report;
 mod plan;
 mod profile_report;
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use ferrotensor_autograd::{AdamW, OptimizerLoad, WarmupCosineScheduler};
 use ferrotensor_backend::{ComputeEngine, MemoryCategory, WgpuContext};
 use ferrotensor_graph::lfm::{legacy_llama_name, Lfm2Model};
@@ -57,6 +59,10 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// `train` with the batch size, sequence length, gradient accumulation
+    /// and block checkpointing that `plan` picks for this machine, except
+    /// those given on the command line.
+    Finetune(Box<finetune::FinetuneArgs>),
     /// LoRA fine-tuning (SFT with response-only loss) or LM pretraining.
     Train(Box<TrainArgs>),
     /// Mean loss and perplexity of a model (plus optional adapter) on a dataset.
@@ -398,9 +404,22 @@ fn install_gpu_memory_hint() {
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     install_gpu_memory_hint();
-    let cli = Cli::parse();
+    // Parsed through ArgMatches so `finetune` can tell flags given on the
+    // command line from defaults.
+    let matches = Cli::command().get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     let result = match cli.command {
-        Command::Train(args) => pollster::block_on(train(*args)),
+        Command::Finetune(args) => {
+            let user_set = matches
+                .subcommand_matches("finetune")
+                .map_or_else(finetune::UserSet::default, finetune::UserSet::from_matches);
+            finetune::run(*args, user_set).map(|outcome| {
+                if outcome == plan::Outcome::DoesNotFit {
+                    std::process::exit(2);
+                }
+            })
+        }
+        Command::Train(args) => pollster::block_on(train(*args)).map(|_peak_bytes| ()),
         Command::Eval(args) => pollster::block_on(eval(args)),
         Command::Generate(args) => pollster::block_on(generate(args)),
         Command::ClassifyTrain(args) => pollster::block_on(classify::classify_train(*args)),
@@ -1039,7 +1058,9 @@ fn state_path_for(adapter: &Path) -> PathBuf {
     adapter.with_file_name(format!("{name}.state.json"))
 }
 
-async fn train(mut args: TrainArgs) -> Result<()> {
+/// Runs `train` and returns the peak bytes of tracked GPU memory during
+/// training.
+async fn train(mut args: TrainArgs) -> Result<u64> {
     if args.lite {
         // Explicit flags win; only defaults are replaced.
         if args.data.seq_len == 256 {
@@ -1413,6 +1434,13 @@ async fn train(mut args: TrainArgs) -> Result<()> {
     }
 
     let elapsed = run_start.elapsed();
+    // The tracker's counters are always on; --memory-report resets its peak
+    // at every phase it records, so take the larger of the two.
+    let peak_bytes = base.ctx.memory().peak_total_bytes().max(
+        memory
+            .as_ref()
+            .map_or(0, memory_report::MemoryReportRun::overall_peak_total_bytes),
+    );
     if let Some(p) = profile {
         let json = is_root.then(|| args.out.join(profile_report::FILE_NAME));
         p.finish(json.as_deref())?;
@@ -1456,7 +1484,7 @@ async fn train(mut args: TrainArgs) -> Result<()> {
         .await;
         println!();
     }
-    Ok(())
+    Ok(peak_bytes)
 }
 
 #[cfg(test)]
