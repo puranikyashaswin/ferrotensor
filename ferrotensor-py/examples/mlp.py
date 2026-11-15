@@ -4,7 +4,9 @@ python examples/mlp.py            # CPU
 python examples/mlp.py --device gpu
 
 The script exits with an error if the loss does not fall, if the model does not
-learn the spirals, or if the reloaded model gives a different accuracy.
+learn the spirals, or if the reloaded model gives a different accuracy. It seeds
+the weight initialisation with ``ft.manual_seed(0)``: some unseeded initialisations
+stall near 75% accuracy within the default 300 steps.
 """
 
 from __future__ import annotations
@@ -54,6 +56,7 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=300)
     args = parser.parse_args()
 
+    ft.manual_seed(0)
     device = ft.Device(args.device)
     points, labels = spirals(100)
     x = ft.tensor(points, device=device)
