@@ -402,6 +402,14 @@ or `.scales` tensors), files of trained base weights, and adapter tensors
 whose base weight is missing or has another shape are refused before
 anything is written.
 
+## Sample from a model: `generate`
+
+`generate` stops with exit code 2 when the prompt encodes to no tokens or is
+longer than the model's `max_position_embeddings`. When the prompt fits but
+the prompt plus `--max-new-tokens` does not, it lowers the number of new
+tokens to what fits and says so on stderr. A model without a
+`max_position_embeddings` entry is not checked.
+
 ## Talk to a model: `chat`
 
 `chat` holds a multi-turn conversation with a base model or, with `--lora`,

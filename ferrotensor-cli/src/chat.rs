@@ -103,7 +103,7 @@ pub async fn run(args: ChatArgs) -> Result<()> {
                 stream_text(delta, args.json);
             },
         )
-        .await;
+        .await?;
         stream_text("\n", args.json);
         let summary =
             GenerateSummary::new(reply, prompt_ids.len(), new_tokens, decode_time, kv_cache);

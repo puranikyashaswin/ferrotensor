@@ -317,6 +317,78 @@ fn generate_emits_tokens() {
     assert!(stderr.contains(generated), "{json}\nstderr: {stderr}");
 }
 
+#[test]
+#[ignore = "needs a GPU"]
+fn generate_refuses_a_prompt_that_encodes_to_no_tokens() {
+    let model = model_dir("generate-empty-prompt");
+    let run = ferrotensor(&[
+        "generate",
+        "--model",
+        s(model.path()),
+        "--prompt",
+        "",
+        "--raw",
+    ]);
+    let stderr = text(&run.stderr);
+    assert_eq!(run.status.code(), Some(2), "stderr: {stderr}");
+    assert!(
+        stderr.contains("the prompt encodes to no tokens"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn generate_clips_new_tokens_to_the_context_and_refuses_a_longer_prompt() {
+    let model = model_dir("generate-context");
+    let config_path = model.path().join("config.json");
+    let mut config = read_json(&config_path);
+    config["max_position_embeddings"] = serde_json::json!(10);
+    std::fs::write(&config_path, config.to_string()).expect("write config");
+
+    // 3 prompt tokens leave room for 7 of the 20 requested.
+    let run = ferrotensor(&[
+        "generate",
+        "--model",
+        s(model.path()),
+        "--prompt",
+        "w5 w6 w7",
+        "--raw",
+        "--max-new-tokens",
+        "20",
+        "--seed",
+        "1",
+        "--json",
+    ]);
+    assert_success(&run);
+    let stderr = text(&run.stderr);
+    assert!(
+        stderr.contains("lowered --max-new-tokens from 20 to 7 to fit the model's 10 positions"),
+        "stderr: {stderr}"
+    );
+    let json: serde_json::Value = serde_json::from_str(&text(&run.stdout)).expect("generate json");
+    assert!(
+        json["new_tokens"].as_u64().is_some_and(|n| n <= 7),
+        "{json}"
+    );
+
+    let long = vec!["w9"; 11].join(" ");
+    let run = ferrotensor(&[
+        "generate",
+        "--model",
+        s(model.path()),
+        "--prompt",
+        &long,
+        "--raw",
+    ]);
+    let stderr = text(&run.stderr);
+    assert_eq!(run.status.code(), Some(2), "stderr: {stderr}");
+    assert!(
+        stderr.contains("the prompt is 11 tokens, longer than the model's 10 positions"),
+        "stderr: {stderr}"
+    );
+}
+
 /// With 4-bit base weights the checkpoint is unmapped once the model is
 /// built; training (with block recomputation) and generation run on what
 /// the model holds.

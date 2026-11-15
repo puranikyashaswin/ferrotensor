@@ -1062,13 +1062,28 @@ async fn generate(args: GenerateArgs) -> Result<()> {
         base.tokenizer
             .encode_chat(args.system.as_deref(), &args.prompt)
     };
+    let mut max_new = args.sampling.max_new_tokens;
+    if let Some(limit) = base.config.max_position_embeddings {
+        let fits = new_tokens_within(limit, prompt_ids.len(), max_new).ok_or_else(|| {
+            unmet(format!(
+                "the prompt is {} tokens, longer than the model's {limit} positions",
+                prompt_ids.len()
+            ))
+        })?;
+        if fits < max_new {
+            eprintln!(
+                "lowered --max-new-tokens from {max_new} to {fits} to fit the model's {limit} positions"
+            );
+            max_new = fits;
+        }
+    }
     let use_cache = !args.no_kv_cache;
     let mut text = String::new();
     let (new_tokens, decode_time, kv_cache) = generate_tokens(
         &base,
         &model,
         &prompt_ids,
-        args.sampling.max_new_tokens,
+        max_new,
         &mut sampler,
         use_cache,
         |delta| {
@@ -1076,7 +1091,7 @@ async fn generate(args: GenerateArgs) -> Result<()> {
             stream_text(delta, args.json);
         },
     )
-    .await;
+    .await?;
     stream_text("\n", args.json);
     let summary = GenerateSummary::new(text, prompt_ids.len(), new_tokens, decode_time, kv_cache);
     eprintln!("{}", summary.stats_line());
@@ -1125,9 +1140,19 @@ impl GenerateSummary {
     }
 }
 
+/// How many of `max_new` tokens fit after a prompt of `prompt_len` tokens in
+/// a context of `limit` positions; `None` when the prompt alone is longer
+/// than `limit`.
+fn new_tokens_within(limit: usize, prompt_len: usize, max_new: usize) -> Option<usize> {
+    limit.checked_sub(prompt_len).map(|room| room.min(max_new))
+}
+
 /// Sample up to `max_new` tokens after `prompt`, streaming decoded text to
 /// `emit`. Returns (tokens generated, decode time, whether the KV cache was
 /// used).
+///
+/// # Errors
+/// [`Unmet`] when `prompt` is empty.
 async fn generate_tokens(
     base: &Loaded,
     model: &Lfm2Model,
@@ -1136,7 +1161,10 @@ async fn generate_tokens(
     sampler: &mut Sampler,
     use_cache: bool,
     mut emit: impl FnMut(&str),
-) -> (usize, Duration, bool) {
+) -> Result<(usize, Duration, bool)> {
+    if prompt.is_empty() {
+        return Err(unmet("the prompt encodes to no tokens"));
+    }
     let vocab = base.config.vocab_size;
     let stop: Vec<u32> = [
         Some(base.tokenizer.eos_token_id),
@@ -1190,7 +1218,7 @@ async fn generate_tokens(
             }
         });
     }
-    (generated.len(), start.elapsed(), cached)
+    Ok((generated.len(), start.elapsed(), cached))
 }
 
 // ---------------------------------------------------------------------------
@@ -1696,7 +1724,7 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
         generate_tokens(&base, &trainer.model, &ids, 96, &mut sampler, true, |t| {
             stream_text(t, args.json);
         })
-        .await;
+        .await?;
         stream_text("\n", args.json);
     }
     if is_root && lora_on && !args.json {
@@ -2257,5 +2285,20 @@ mod tests {
         }
         let cli = parse(&["generate", "--model", "m", "--json"]).unwrap();
         assert!(matches!(cli.command, Command::Generate(args) if args.json));
+    }
+
+    #[test]
+    fn new_tokens_are_clipped_to_the_context() {
+        assert_eq!(new_tokens_within(2048, 100, 128), Some(128));
+        assert_eq!(new_tokens_within(2048, 1920, 128), Some(128));
+        assert_eq!(new_tokens_within(2048, 1921, 128), Some(127));
+        assert_eq!(new_tokens_within(10, 3, 20), Some(7));
+        assert_eq!(new_tokens_within(10, 10, 20), Some(0));
+    }
+
+    #[test]
+    fn a_prompt_longer_than_the_context_has_no_room() {
+        assert_eq!(new_tokens_within(10, 11, 20), None);
+        assert_eq!(new_tokens_within(0, 1, 0), None);
     }
 }
