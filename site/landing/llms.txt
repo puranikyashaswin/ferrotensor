@@ -8,7 +8,7 @@ Install:
 - Rust 1.88+ library: `cargo add ferrotensor`
 - LoRA command-line tool (`train`, `eval`, `generate`): `cargo install ferrotensor-cli`
 
-Tested on an NVIDIA A10G (24 GB) through Vulkan, an Apple M2 (8 GB) through Metal, and software Vulkan (Mesa lavapipe) in CI; other GPUs are untested. On the A10G, LoRA on SmolLM2-1.7B took held-out loss from 2.65 to 1.06 in 250 steps; against PyTorch + PEFT on CUDA with the same recipe on the same GPU, the held-out loss is identical before training and within 0.005 after, and Ferrotensor runs at 0.32 to 0.84 of PyTorch's speed. LoRA loss and gradients are checked against PyTorch autograd in CI. Peak GPU memory for LoRA on SmolLM2-1.7B is 8,222 MiB in 0.7 (11,607 MiB in 0.6) and 5,245 MiB with --checkpoint-blocks, with the same printed losses.
+Tested on an NVIDIA A10G (24 GB) through Vulkan, an Apple M2 (8 GB) through Metal, and software Vulkan (Mesa lavapipe) in CI; other GPUs are untested. On the A10G, LoRA on SmolLM2-1.7B took held-out loss from 2.65 to 1.06 in 250 steps; against PyTorch + PEFT on CUDA with the same recipe on the same GPU, the held-out loss is identical before training and within 0.005 after, and Ferrotensor runs at 0.32 to 0.84 of PyTorch's speed. LoRA loss and gradients are checked against PyTorch autograd in CI; the largest gradient difference is below 1e-6 (9.2e-7 in the confirmation run). Peak GPU memory for LoRA on SmolLM2-1.7B is 8,142 MiB in 0.7 (11,671 MiB in 0.6) and 5,313 MiB with --checkpoint-blocks, which prints the same losses as the 0.7 default; peak host memory is 1,575 MiB in 0.7, down from 5,087 MiB.
 
 ## Docs
 

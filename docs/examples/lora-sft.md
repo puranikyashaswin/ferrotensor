@@ -136,7 +136,8 @@ weights stored as f16 (`--f16-weights`, the default since 0.6):
   faster per optimizer step with the identical held-out loss.
 - f16 base weights cut SmolLM2-1.7B's GPU memory by 2.8 GiB and run slightly
   faster; the held-out loss moves by 0.0017.
-- Peak host memory for SmolLM2-1.7B dropped from 20.01 GB to 5.33 GB.
+- In 0.6, peak host memory for SmolLM2-1.7B dropped from 20.01 GB to 5.33 GB;
+  0.7 lowers it to 1,575 MiB ([below](#less-gpu-memory-07)).
 - GPU memory is the peak reported by `nvidia-smi` during training
   (3,861, 16,708, 15,028 and 12,199 MiB).
 - On this 0.6 build, SmolLM2-1.7B with `--batch-size 8` did not fit on the
@@ -189,10 +190,53 @@ each intermediate gradient back to the buffer pool once it is used (on by
 default), freed buffers above the pool's cap stay reusable until the GPU has
 finished the work that freed them (on by default), and `--checkpoint-blocks`
 recomputes each decoder block's forward pass during backward instead of
-keeping its activations (opt-in). Peak GPU memory (`nvidia-smi`, sampled
-every 200 ms, driver context included) on the same A10G with f16 base
-weights, sequence length 256, 8-step gradient accumulation and 30 optimizer
-steps; each column includes the ones before it:
+keeping its activations (opt-in). All numbers below are on the same A10G
+with f16 base weights, sequence length 256, 8-step gradient accumulation and
+30 optimizer steps. GPU memory is the `nvidia-smi` peak (sampled every
+200 ms, driver context included); host memory is the maximum resident set
+size from `/usr/bin/time -v`.
+
+**Confirmation run of merged `main`.** One session, the released v0.6.0
+(`fb6fc49`) against merged `main` (`af41068`):
+
+| Model | 0.6 GPU | 0.7 GPU | 0.7 `--checkpoint-blocks` GPU | 0.6 host | 0.7 host | Time per step 0.7 → `--checkpoint-blocks` |
+|---|---:|---:|---:|---:|---:|---:|
+| SmolLM2-135M, batch 1 | 3,515 MiB | 2,306 MiB | 1,890 MiB | 1,265 MiB | 1,138 MiB | 1.19 → 1.48 s (+24%) |
+| SmolLM2-360M, batch 1 | 5,411 MiB | 3,579 MiB | 2,783 MiB | 1,781 MiB | 1,200 MiB | 1.59 → 2.06 s (+30%) |
+| SmolLM2-1.7B, batch 1 | 11,671 MiB | 8,142 MiB | 5,313 MiB | 5,087 MiB | 1,575 MiB | 2.30 → 3.18 s (+38%) |
+| SmolLM2-135M, batch 8 | 16,270 MiB | 9,441 MiB | 2,767 MiB | 1,400 MiB | 1,322 MiB | 2.51 → 3.01 s (+20%) |
+
+Time per step is the value printed at step 30. Held-out loss after the 30
+steps:
+
+| Model | 0.6 | 0.7, default and `--checkpoint-blocks` |
+|---|---:|---:|
+| SmolLM2-135M, batch 1 | 1.9882 | 1.9907 |
+| SmolLM2-360M, batch 1 | 1.6168 | 1.6152 |
+| SmolLM2-1.7B, batch 1 | 1.4561 | 1.4560 |
+| SmolLM2-135M, batch 8 | 1.9030 | 1.9095 |
+
+- Within 0.7, the default and `--checkpoint-blocks` print identical training
+  losses and gradient norms at all 30 steps, and the same held-out loss.
+  `main` before and after the host-memory change (below) also prints
+  identical losses.
+- Against 0.6 the losses are close but not identical, because 0.7 gives
+  every LoRA adapter its own initial A matrix (commit `e89e80e`). In 0.6,
+  adapters of the same shape in one layer, such as `q_proj` and `o_proj`,
+  started from the same A. The held-out loss before training and the
+  training loss at step 1 are the same in both, since B starts at zero; the
+  gradient norms differ from step 1.
+- `--checkpoint-blocks` costs 20% (135M, batch 8) to 38% (1.7B) more time
+  per step.
+- Most of the host memory saving comes from the host-memory change in
+  model loading (#98). Against `main` just before it (`45a7c39`), peak host
+  memory fell from 5,087 MiB (5.33 GB) to 1,575 MiB (1.65 GB) for
+  SmolLM2-1.7B, from 1,762 to 1,200 MiB for 360M and from 1,253 to
+  1,138 MiB for 135M at batch 1.
+
+**Measured change by change in earlier sessions.** Each column includes the
+ones before it; the 0.6 column here is a development build (`364490b`), not
+the release:
 
 | Model | 0.6 | + release gradients | + reuse freed buffers (0.7 default) | + `--checkpoint-blocks` |
 |---|---:|---:|---:|---:|
@@ -203,14 +247,12 @@ steps; each column includes the ones before it:
 
 <!-- Maintainer: this 0.6 column was measured at 364490b with 30 steps; the 0.6 table above (b319ce7, 250 steps) has 12,199 MiB for SmolLM2-1.7B with f16 weights. The difference is not explained yet. -->
 
-- Losses are identical at every stage: the training loss and gradient norm
-  as printed at all 30 steps, and the held-out loss after them (1.9882,
-  1.6168, 1.4561 and 1.9030 for the four rows).
-- `--checkpoint-blocks` costs time: 19% (135M, batch 8) to 39% (1.7B) more
-  per step ([per model](../../ferrotensor-cli/README.md#less-gpu-memory---checkpoint-blocks)).
-  Releasing gradients and reusing buffers did not slow the 1.7B run (2.375,
-  2.31 and 2.275 s per step).
-- The same setting measured in separate sessions differed by up to 192 MiB.
+- In those sessions, releasing gradients and reusing buffers did not slow
+  the 1.7B run (2.375, 2.31 and 2.275 s per step).
+- Peaks for the same setting vary between sessions by up to about 70 MiB:
+  SmolLM2-1.7B with `--checkpoint-blocks` gave 5,245 MiB in the earlier
+  session, and 5,313 MiB and 5,281 MiB (with `--memory-report`) in the
+  confirmation run.
 - `train --memory-report` shows where the memory goes. For SmolLM2-1.7B,
   the frozen base weights hold 3,648 MiB throughout; the adapters,
   their gradients and the AdamW state together stay under 50 MiB.
@@ -231,12 +273,14 @@ the same batches on the GPU and compares every element within
 | Case | Gradient tensors | Loss difference | Largest logit difference | Largest gradient difference |
 |---|---:|---:|---:|---:|
 | One sequence | 30 | 4.77e-7 | 1.55e-6 | 5.66e-7 |
-| Batch | 30 | 9.54e-7 | 1.31e-6 | 9.54e-7 |
+| Batch | 30 | 9.54e-7 | 1.31e-6 | 4.92e-7 |
 | Loss mask | 30 | 4.77e-7 | 1.31e-6 | 9.24e-7 |
 | Trainable base weights | 50 | 4.77e-7 | 1.31e-6 | 9.24e-7 |
 
-Those differences were measured on the A10G. The test also runs on every
-pull request on software Vulkan:
+Those differences are from the confirmation run of merged `main` on the
+A10G: all four cases passed, and the largest gradient difference is below
+1e-6 (9.2e-7 in the confirmation run). The test also runs on every pull
+request on software Vulkan:
 
 ```bash
 python3 scripts/gen_gradient_fixtures.py   # optional: the fixtures are committed
@@ -387,9 +431,11 @@ training normally (losses 1.4960 and 1.6540).
 - The M2 run above predates moving the RMSNorm and RoPE backward passes and
   the loss to the GPU and batching kernel submissions; its speed and memory
   are not current.
-- Peak host memory for SmolLM2-1.7B is 5.33 GB with every option measured
-  (f16 or 4-bit base weights, with or without `--checkpoint-blocks`): the
-  GPU memory work does not change it. Models above 1.7B are untested.
+- Peak host memory for SmolLM2-1.7B LoRA is 1,575 MiB (1.65 GB) in 0.7,
+  down from 5,087 MiB (5.33 GB) before the host-memory change; 1,565 MiB
+  with `--checkpoint-blocks` and 1,511 MiB with `--q4-weights` as well.
+  Training 1.7B on an 8 GB Mac has not been measured. Models above 1.7B are
+  untested.
 - The logits and their gradient are still materialised: 1,008 MiB at the
   peak for SmolLM2-135M at batch 8 with `--checkpoint-blocks`.
 - 4-bit base weights (`--q4-weights`) are experimental and give a worse

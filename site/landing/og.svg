@@ -32,13 +32,13 @@
   <g transform="translate(435 400)">
     <rect width="330" height="150" rx="12" fill="#1f1b18" stroke="#544a40"/>
     <text class="mono" x="24" y="40" font-size="16" font-weight="600" letter-spacing="1.5" fill="#a39889">GPU MEMORY, 1.7B LORA</text>
-    <text class="mono" x="24" y="92" font-size="40" font-weight="700" letter-spacing="-1" fill="#efe9e1">11.3 → 5.1 <tspan font-size="22" fill="#c3b9ad">GiB</tspan></text>
+    <text class="mono" x="24" y="92" font-size="40" font-weight="700" letter-spacing="-1" fill="#efe9e1">11.4 → 5.2 <tspan font-size="22" fill="#c3b9ad">GiB</tspan></text>
     <text class="sans" x="24" y="127" font-size="18" fill="#c3b9ad">0.6 → 0.7, checkpointed blocks</text>
   </g>
   <g transform="translate(790 400)">
     <rect width="330" height="150" rx="12" fill="#1f1b18" stroke="#f37b45" stroke-width="1.5"/>
     <text class="mono" x="24" y="40" font-size="16" font-weight="600" letter-spacing="1.5" fill="#f37b45">CHECKED</text>
-    <text class="mono" x="24" y="92" font-size="40" font-weight="700" letter-spacing="-1" fill="#efe9e1">9.5e-7</text>
+    <text class="mono" x="24" y="92" font-size="40" font-weight="700" letter-spacing="-1" fill="#efe9e1">9.2e-7</text>
     <text class="sans" x="24" y="127" font-size="18" fill="#c3b9ad">max gradient gap vs PyTorch</text>
   </g>
 </svg>
