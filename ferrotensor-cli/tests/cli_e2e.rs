@@ -671,8 +671,26 @@ fn merge_writes_a_model_directory_and_refuses_a_non_empty_output() {
 
     for out in [merged.as_path(), model.path()] {
         let run = merge(out);
-        assert_eq!(run.status.code(), Some(1));
+        assert_eq!(run.status.code(), Some(2), "invalid input exits with 2");
         let stderr = text(&run.stderr);
         assert!(stderr.contains("is not empty"), "stderr: {stderr}");
     }
+
+    let json_out = tmp.path().join("merged-json");
+    let run = ferrotensor(&[
+        "merge",
+        "--model",
+        s(model.path()),
+        "--lora",
+        s(&adapter),
+        "--out",
+        s(&json_out),
+        "--json",
+    ]);
+    assert_success(&run);
+    let report: serde_json::Value = serde_json::from_slice(&run.stdout).expect("one JSON object");
+    assert_eq!(
+        report,
+        serde_json::json!({ "out_dir": s(&json_out), "merged": 2, "copied": 18 })
+    );
 }

@@ -364,6 +364,7 @@ The merge runs on the host without a GPU and streams: one tensor is read,
 changed row by row and written before the next, so host memory stays near
 one row plus the adapter instead of the model. `--lora` takes a Ferrotensor
 adapter file or a PEFT adapter directory. `--out` must be new or empty.
+`--json` prints `{"out_dir", "merged", "copied"}` (tensor counts).
 Quantized bases (`quantization` or `quantization_config` in `config.json`,
 or `.scales` tensors), files of trained base weights, and adapter tensors
 whose base weight is missing or has another shape are refused before

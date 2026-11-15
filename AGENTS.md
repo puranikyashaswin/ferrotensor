@@ -69,8 +69,10 @@ no `--json`.
 | 101 | A panic, with no JSON on stdout | wgpu panics when the GPU device is lost, most often because it ran out of memory (stderr then ends with a hint). Lower `--batch-size` or `--seq-len`, or use `finetune`. |
 
 Code 2 covers: a missing model directory, `config.json` or data file; a flag
-value out of range; a dataset with no usable examples; no GPU adapter; and
-`plan` or `finetune` finding no configuration that fits. clap's usage errors
+value out of range; a dataset with no usable examples; no GPU adapter;
+`plan` or `finetune` finding no configuration that fits; and `merge`
+refusing its input (a non-empty `--out`, a quantized base, an adapter that
+does not match the base). clap's usage errors
 also exit with 2, with the usage text on stderr and nothing on stdout.
 
 ## Picking a model
