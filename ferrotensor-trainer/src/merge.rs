@@ -284,6 +284,31 @@ fn adapters_by_target<'a>(
     Ok(out)
 }
 
+/// Writes the safetensors file: the header length, the header, then the
+/// bytes of each entry in order.
+fn write_weights(
+    out: &mut impl Write,
+    header: &[u8],
+    entries: &[Entry<'_>],
+    weights: &WeightsContext,
+) -> std::io::Result<()> {
+    out.write_all(&(header.len() as u64).to_le_bytes())?;
+    out.write_all(header)?;
+    for e in entries {
+        let mut written = Ok(());
+        weights
+            .read_bytes(&e.source, |bytes, _| {
+                written = match &e.low_rank {
+                    Some(low_rank) => low_rank.write_merged(bytes, &mut *out),
+                    None => out.write_all(bytes),
+                };
+            })
+            .map_err(std::io::Error::other)?;
+        written?;
+    }
+    Ok(())
+}
+
 /// Write the base model in `model_dir` with `adapter` added to its weights
 /// into `out_dir`, as `model.safetensors` (one file, also for a sharded
 /// base) plus the base's `config.json`, generation config and tokenizer
@@ -403,23 +428,19 @@ pub fn merge_adapter(
     })?;
     let path = out_dir.join(MERGED_WEIGHTS_FILE);
     let tmp = path.with_extension("safetensors.tmp");
-    let mut file = BufWriter::new(File::create(&tmp)?);
-    file.write_all(&(header.len() as u64).to_le_bytes())?;
-    file.write_all(&header)?;
-    for e in &entries {
-        let mut written = Ok(());
-        weights.read_bytes(&e.source, |bytes, _| {
-            written = match &e.low_rank {
-                Some(low_rank) => low_rank.write_merged(bytes, &mut file),
-                None => file.write_all(bytes),
-            };
-        })?;
-        written.map_err(|err| {
-            std::io::Error::new(err.kind(), format!("cannot write {}: {err}", tmp.display()))
-        })?;
+    let finished = {
+        let mut file = BufWriter::new(File::create(&tmp)?);
+        write_weights(&mut file, &header, &entries, &weights)
+            .and_then(|()| file.into_inner().map_err(|e| e.into_error()))
+            .and_then(|file| file.sync_all())
+            .and_then(|()| std::fs::rename(&tmp, &path))
+    };
+    if let Err(err) = finished {
+        if let Err(remove_err) = std::fs::remove_file(&tmp) {
+            log::warn!("cannot remove {}: {remove_err}", tmp.display());
+        }
+        return Err(err.into());
     }
-    file.into_inner().map_err(|e| e.into_error())?.sync_all()?;
-    std::fs::rename(&tmp, &path)?;
 
     for name in COPIED_FILES {
         let from = model_dir.join(name);
@@ -443,6 +464,77 @@ pub fn merge_adapter(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// A context holding the U8 tensor `a` (`[4]`, bytes 1 to 4), the file it
+    /// maps, and the entry that writes it; the caller drops the context, then
+    /// removes the file.
+    fn weights_with_tensor_a(file_name: &str) -> (WeightsContext, PathBuf, Vec<Entry<'static>>) {
+        let path = std::env::temp_dir().join(format!("{}-{file_name}", std::process::id()));
+        let mut header = br#"{"a":{"dtype":"U8","shape":[4],"data_offsets":[0,4]}}"#.to_vec();
+        header.resize(header.len().next_multiple_of(8), b' ');
+        let mut file = (header.len() as u64).to_le_bytes().to_vec();
+        file.extend_from_slice(&header);
+        file.extend_from_slice(&[1, 2, 3, 4]);
+        std::fs::write(&path, file).unwrap();
+        let mut weights = WeightsContext::new();
+        weights.load_file(&path).unwrap();
+        let entries = vec![Entry {
+            name: "a".to_string(),
+            source: "a".to_string(),
+            dtype: Dtype::U8,
+            shape: vec![4],
+            low_rank: None,
+        }];
+        (weights, path, entries)
+    }
+
+    /// Accepts `room` bytes, then fails like a full disk.
+    struct FullAfter {
+        room: usize,
+    }
+
+    impl Write for FullAfter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.room == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    "disk full",
+                ));
+            }
+            let n = buf.len().min(self.room);
+            self.room -= n;
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn write_weights_writes_the_length_the_header_and_the_tensor_bytes() {
+        let (weights, path, entries) = weights_with_tensor_a("write-ok.safetensors");
+        let mut out = Vec::new();
+        write_weights(&mut out, b"12345678", &entries, &weights).unwrap();
+        let mut expected = 8u64.to_le_bytes().to_vec();
+        expected.extend_from_slice(b"12345678");
+        expected.extend_from_slice(&[1, 2, 3, 4]);
+        assert_eq!(out, expected);
+        drop(weights);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn write_weights_returns_the_writers_error_in_the_middle_of_a_tensor() {
+        let (weights, path, entries) = weights_with_tensor_a("write-full.safetensors");
+        // 8 bytes of length and 8 of header leave room for 2 of the 4 tensor bytes.
+        let mut out = FullAfter { room: 18 };
+        let err = write_weights(&mut out, b"12345678", &entries, &weights).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::StorageFull);
+        assert_eq!(err.to_string(), "disk full");
+        drop(weights);
+        std::fs::remove_file(path).unwrap();
+    }
 
     /// `W` is `[2, 3]`, `A` `[3, 2]`, `B` `[2, 2]`, scale 0.5. By hand,
     /// `A B` is `[[1, 2], [3, 4], [4, 6]]`, so

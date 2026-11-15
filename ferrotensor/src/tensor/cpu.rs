@@ -228,7 +228,10 @@ pub(crate) fn softmax(x: &[f32], outer: usize, dim: usize, inner: usize, log: bo
 }
 
 /// The batched `matmul` kernel: `batch` products of `[m, k] @ [k, n]`.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the kernel takes the three sizes, the batch and two batching flags"
+)]
 pub(crate) fn matmul(
     a: &[f32],
     b: &[f32],

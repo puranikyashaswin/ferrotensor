@@ -6,7 +6,6 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
-homepage.workspace = true
 description = "Python bindings for ferrotensor"
 publish = false
 

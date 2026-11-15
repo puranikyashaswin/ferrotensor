@@ -11,8 +11,6 @@
 //! PEFT format, [`merge`] folds an adapter into the base weights, and [`classify`] fine-tunes a decoder with LoRA as a sequence
 //! classifier ([`ClassifierTrainer`]).
 
-#![warn(missing_docs)]
-
 use ferrotensor_autograd::{AutogradNode, LRScheduler, Optimizer, Tensor};
 use ferrotensor_backend::{
     ComputeEngine, MemoryCategory, UnifiedTensor, WgpuContext, MASKED_CE_SKIP, SUM_SQUARES_CHUNK,

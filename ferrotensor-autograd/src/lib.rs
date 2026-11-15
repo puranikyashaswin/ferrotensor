@@ -8,7 +8,6 @@
 //! gradient [`checkpoint`]ing. This is the engine behind `ferrotensor-graph` and
 //! `ferrotensor-trainer`.
 
-#![warn(missing_docs)]
 // `Tensor` shares `Arc<RefCell<..>>` gradient slots across clones; the graph
 // is single-threaded, and the field types are public API used by
 // ferrotensor-graph and ferrotensor-trainer.

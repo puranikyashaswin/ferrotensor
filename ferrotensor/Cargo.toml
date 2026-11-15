@@ -8,7 +8,6 @@ repository.workspace = true
 rust-version.workspace = true
 description = "GPU-accelerated machine learning library for training and inference in Rust"
 documentation = "https://docs.rs/ferrotensor"
-homepage = "https://github.com/puranikyashaswin/ferrotensor"
 readme = "README.md"
 keywords = ["machine-learning", "deep-learning", "gpu", "neural-networks", "transformer"]
 categories = ["science", "algorithms"]

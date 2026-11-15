@@ -391,6 +391,9 @@ impl Tensor {
 
     /// Matrix product over the last two dims, with leading batch dims that
     /// are either equal or present on one side only.
+    ///
+    /// # Panics
+    /// Panics when an operand has fewer than 2 dims, or the inner or batch dims do not match.
     #[expect(
         clippy::panic,
         reason = "shape precondition of an op that returns no Result"

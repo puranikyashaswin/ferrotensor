@@ -44,8 +44,6 @@
 //! The LLM fine-tuning stack (LoRA, LFM2/Llama blocks, the CLI) is built on
 //! `ferrotensor-backend`, `ferrotensor-autograd` and `ferrotensor-graph`.
 
-#![warn(missing_docs)]
-
 pub mod backend;
 pub mod data;
 pub mod functional;
