@@ -280,7 +280,7 @@ fn lora_gradients_match_transformers_with_frozen_biases() {
         let out_dim = adapter.b.data.shape[1];
         let a = host(&gpu, &adapter.a);
         let (shape, weight_grad) = fixture.expected(&format!("grad.{name}"));
-        assert_eq!(shape, &vec![out_dim, in_dim], "{name}: gradient shape");
+        assert_eq!(shape, &[out_dim, in_dim], "{name}: gradient shape");
         let expected: Vec<f32> = (0..rank)
             .flat_map(|r| {
                 let a = &a;
