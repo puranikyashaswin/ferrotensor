@@ -30,15 +30,20 @@ pub struct TempDir(PathBuf);
 
 impl TempDir {
     pub fn new(tag: &str) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // The clock can repeat within one process (microsecond ticks on macOS),
+        // so a counter keeps parallel callers out of each other's directory.
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let dir = std::env::temp_dir().join(format!(
-            "ferrotensor-example-{tag}-{}-{nanos}",
-            std::process::id()
+            "ferrotensor-example-{tag}-{}-{nanos}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
+        std::fs::create_dir(&dir).expect("create temp dir");
         Self(dir)
     }
 
