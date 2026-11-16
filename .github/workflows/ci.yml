@@ -238,7 +238,7 @@ jobs:
           cargo test --release --workspace "${exclude[@]}" --no-fail-fast -- --ignored --test-threads=1
       # Pull requests on DX12: every backend kernel against its CPU reference
       # (9 min on WARP); with the two Tensor API steps below, which check
-      # forward values and gradients against the CPU, the job takes about 16
+      # forward values and gradients against the CPU, the job took 14
       # minutes. The PyTorch gradient parity binary alone took 7 more.
       - name: GPU kernels (DX12 pull-request subset)
         if: ${{ !cancelled() && env.FULL_SUITE != 'true' }}
