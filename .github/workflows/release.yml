@@ -54,3 +54,100 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
+
+  # Publishes the nine library and CLI crates. It runs next to the jobs above and
+  # neither needs them nor is needed by them. Authentication is crates.io trusted
+  # publishing: GitHub signs a token for this job, the action trades it for a
+  # short-lived crates.io token, and the action's post step revokes that token.
+  # No crates.io secret is stored. The trusted-publisher rule of each crate on
+  # crates.io names this workflow file and the crates-io environment.
+  publish-crates:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/ferrotensor
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      # Dependency order: a crate comes after every crate it depends on. It comes
+      # from `cargo metadata --no-deps`; the dependencies inside the workspace are
+      #   ferrotensor, ferrotensor-backend    none
+      #   ferrotensor-autograd                backend
+      #   ferrotensor-loader                  backend
+      #   ferrotensor-graph                   autograd, backend, loader
+      #   ferrotensor-trainer                 autograd, backend, graph, loader
+      #   ferrotensor-hub                     autograd, backend, graph, loader
+      #   ferrotensor-monitor                 trainer
+      #   ferrotensor-cli                     all of the above except ferrotensor
+      CRATES: >-
+        ferrotensor
+        ferrotensor-backend
+        ferrotensor-autograd
+        ferrotensor-loader
+        ferrotensor-graph
+        ferrotensor-trainer
+        ferrotensor-hub
+        ferrotensor-monitor
+        ferrotensor-cli
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check that every crate version matches the tag
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          metadata="$(cargo metadata --no-deps --format-version 1)"
+          for crate in $CRATES; do
+            found="$(jq -r --arg crate "$crate" '.packages[] | select(.name == $crate) | .version' <<<"$metadata")"
+            echo "$crate $found"
+            test "$found" = "$version"
+          done
+      - name: Get a crates.io token
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1.0.6
+      # Safe to run again after a partial failure: a crate whose version is already
+      # on crates.io is skipped. Since cargo 1.66 `cargo publish` returns only when
+      # the crate is in the index, so the next crate finds its dependency; the retry
+      # covers a transient registry error. cargo 1.90 added publishing several
+      # crates in one call, but one call per crate lets this loop skip what exists.
+      - name: Publish the crates in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          agent="ferrotensor-release (https://github.com/${GITHUB_REPOSITORY})"
+          cargo --version
+          on_registry() {
+            code="$(curl -s -o /dev/null -w '%{http_code}' -A "$agent" "https://crates.io/api/v1/crates/$1/$version")"
+            case "$code" in
+              200) return 0 ;;
+              404) return 1 ;;
+              *) echo "crates.io API answered $code for $1 $version" >&2; return 2 ;;
+            esac
+          }
+          for crate in $CRATES; do
+            status=0
+            on_registry "$crate" || status=$?
+            if [ "$status" -eq 0 ]; then
+              echo "$crate $version is already on crates.io; skipping"
+              continue
+            fi
+            for attempt in 1 2 3; do
+              if cargo publish -p "$crate" --locked; then
+                break
+              fi
+              if [ "$attempt" -eq 3 ]; then
+                echo "$crate $version failed after $attempt attempts" >&2
+                exit 1
+              fi
+              sleep 30
+              # The failed call may have published the crate before it gave up waiting.
+              status=0
+              on_registry "$crate" || status=$?
+              if [ "$status" -eq 0 ]; then
+                echo "$crate $version reached crates.io; moving on"
+                break
+              fi
+            done
+          done
