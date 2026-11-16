@@ -46,7 +46,7 @@ is in the [CLI README](ferrotensor-cli/README.md).
 | 4 | `ferrotensor chat --model DIR --lora outputs/run/lora_adapters.safetensors` | Talks to the result, one message per line (ChatML models such as SmolLM2) |
 | 5 | `ferrotensor merge --model DIR --lora outputs/run/lora_adapters.safetensors --out outputs/merged` | Folds the adapter into the base weights and writes a standalone model directory; `export-adapter` writes a PEFT adapter for PyTorch instead |
 | 6 | `ferrotensor export-gguf --model outputs/merged --out model.gguf` | Writes the model as one GGUF v3 file (f16, or `--f32`) for llama.cpp and Ollama; `--lora` adds an adapter while writing. Written to the GGUF v3 specification; loading in llama.cpp is checked on the next hardware run |
-| 7 | `ferrotensor pretrain --data corpus.txt --out outputs/tiny` | Trains a small byte-level model from random weights, for learning and experiments; `generate --raw` loads the result |
+| 7 | `ferrotensor pretrain --data corpus.txt --out outputs/tiny` | Trains a small model from random weights with a byte-level tokenizer, or with `--tokenizer bpe` a BPE one learned from the corpus, for learning and experiments; `generate --raw` loads the result |
 
 `eval`, `generate` and `train` (every setting chosen by hand) are in the same
 CLI. For scripts and coding agents, `--json` and shared exit codes are listed
@@ -328,9 +328,11 @@ one per reply), and exit codes are the same across commands;
 [docs/examples/lora-sft.md](docs/examples/lora-sft.md).
 This path is experimental.
 
-`pretrain` trains a small byte-level model from random weights on a text
-file, for learning and experiments (f32, untied embeddings, defaults not
-tuned), and leaves a model directory that `generate` loads
+`pretrain` trains a small model from random weights on a text file, with a
+byte-level tokenizer or (`--tokenizer bpe --vocab-size N`) a BPE tokenizer
+learned from the same file, for learning and experiments (f32, untied
+embeddings, defaults not tuned), and leaves a model directory that
+`generate` loads
 ([CLI docs](ferrotensor-cli/README.md#train-from-scratch-pretrain)):
 
 ```bash

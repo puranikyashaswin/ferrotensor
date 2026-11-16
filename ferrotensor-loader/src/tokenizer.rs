@@ -3,9 +3,12 @@
 //! Loads and uses the tokenizer.json from the model directory.
 
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
+use tokenizers::pre_tokenizers::byte_level::ByteLevel;
+use tokenizers::{OffsetReferential, OffsetType, PreTokenizedString, PreTokenizer as _};
 
 /// Wraps a Hugging Face `tokenizer.json` with special-token ids.
 #[derive(Debug, Clone)]
@@ -255,10 +258,151 @@ pub const BYTE_LEVEL_VOCAB_SIZE: usize = 259;
 /// tokens at those ids. They are plain vocabulary entries, not added tokens,
 /// so text that contains `<s>` still encodes as its bytes.
 pub fn byte_level_tokenizer_json() -> serde_json::Value {
-    let vocab: serde_json::Map<String, serde_json::Value> = ["<pad>", "<s>", "</s>"]
+    byte_level_bpe_json(byte_level_tokens(), Vec::new())
+}
+
+/// A byte-level BPE `tokenizer.json` of `vocab_size` tokens learned from
+/// `corpus`; the same corpus and size always give the same file.
+///
+/// It extends [`byte_level_tokenizer_json`] with the same ids for the three
+/// special tokens and the 256 bytes, then one token per merge of the most
+/// frequent adjacent pair, a tie going to the pair of lowest ids. The words
+/// are the pieces the `ByteLevel` pre-tokenizer cuts each line into, as at
+/// encoding, so any text encodes and decodes back exactly.
+///
+/// # Errors
+///
+/// If the corpus runs out of pairs to merge before `vocab_size` tokens.
+pub fn train_byte_level_bpe(corpus: &str, vocab_size: usize) -> Result<serde_json::Value, String> {
+    let (mut words, counts) = byte_level_words(corpus)?;
+    let mut pair_counts: HashMap<(u32, u32), u64> = HashMap::new();
+    let mut pair_words: HashMap<(u32, u32), BTreeSet<usize>> = HashMap::new();
+    for (index, (word, &count)) in words.iter().zip(&counts).enumerate() {
+        for pair in word.windows(2).map(|w| (w[0], w[1])) {
+            *pair_counts.entry(pair).or_default() += count;
+            pair_words.entry(pair).or_default().insert(index);
+        }
+    }
+    // Entries go stale as counts change; a popped entry whose count is not
+    // the pair's current one is pushed back with the current count.
+    let mut queue: BinaryHeap<(u64, Reverse<(u32, u32)>)> = pair_counts
+        .iter()
+        .map(|(&pair, &count)| (count, Reverse(pair)))
+        .collect();
+    let mut tokens = byte_level_tokens();
+    let mut ids: HashMap<String, u32> = tokens.iter().cloned().zip(0..).collect();
+    let mut merges = Vec::new();
+    while tokens.len() < vocab_size {
+        let Some((count, Reverse(pair))) = queue.pop() else {
+            return Err(format!(
+                "the corpus yields {} tokens, fewer than {vocab_size}",
+                tokens.len()
+            ));
+        };
+        let current = pair_counts.get(&pair).copied().unwrap_or(0);
+        if current == 0 {
+            continue;
+        }
+        if count != current {
+            queue.push((current, Reverse(pair)));
+            continue;
+        }
+        let (left, right) = (&tokens[pair.0 as usize], &tokens[pair.1 as usize]);
+        merges.push(format!("{left} {right}"));
+        let merged_token = format!("{left}{right}");
+        let merged = match ids.get(&merged_token) {
+            Some(&id) => id,
+            None => {
+                let id = tokens.len() as u32;
+                ids.insert(merged_token.clone(), id);
+                tokens.push(merged_token);
+                id
+            }
+        };
+        let mut grown = HashSet::new();
+        for index in pair_words.remove(&pair).into_iter().flatten() {
+            let word = &mut words[index];
+            if !word.windows(2).any(|w| (w[0], w[1]) == pair) {
+                continue;
+            }
+            for old in word.windows(2) {
+                if let Some(old_count) = pair_counts.get_mut(&(old[0], old[1])) {
+                    *old_count -= counts[index];
+                }
+            }
+            *word = merge_pair(word, pair, merged);
+            for new in word.windows(2).map(|w| (w[0], w[1])) {
+                *pair_counts.entry(new).or_default() += counts[index];
+                pair_words.entry(new).or_default().insert(index);
+                grown.insert(new);
+            }
+        }
+        queue.extend(
+            grown
+                .into_iter()
+                .map(|new| (pair_counts[&new], Reverse(new)))
+                .filter(|&(count, _)| count > 0),
+        );
+    }
+    Ok(byte_level_bpe_json(tokens, merges))
+}
+
+/// The distinct words of `corpus` as byte token ids, in byte order, and how
+/// often each occurs.
+fn byte_level_words(corpus: &str) -> Result<(Vec<Vec<u32>>, Vec<u64>), String> {
+    let pre_tokenizer = ByteLevel::new(false, true, true);
+    let mut word_counts: BTreeMap<&[u8], u64> = BTreeMap::new();
+    for line in corpus.split_inclusive('\n') {
+        let mut pieces = PreTokenizedString::from(line);
+        pre_tokenizer
+            .pre_tokenize(&mut pieces)
+            .map_err(|e| format!("cannot pre-tokenize the corpus: {e}"))?;
+        for (_, (start, end), _) in pieces.get_splits(OffsetReferential::Original, OffsetType::Byte)
+        {
+            *word_counts.entry(&line.as_bytes()[start..end]).or_default() += 1;
+        }
+    }
+    Ok(word_counts
+        .into_iter()
+        .map(|(word, count)| {
+            let ids = word
+                .iter()
+                .map(|&b| u32::from(b) + BYTE_LEVEL_FIRST_BYTE_ID);
+            (ids.collect(), count)
+        })
+        .unzip())
+}
+
+/// `word` with each occurrence of `pair`, from the left, replaced by `merged`.
+fn merge_pair(word: &[u32], pair: (u32, u32), merged: u32) -> Vec<u32> {
+    let mut out = Vec::with_capacity(word.len());
+    let mut i = 0;
+    while i < word.len() {
+        if word.get(i + 1).is_some_and(|&next| (word[i], next) == pair) {
+            out.push(merged);
+            i += 2;
+        } else {
+            out.push(word[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// `<pad>`, `<s>`, `</s>`, then the character standing for each byte.
+fn byte_level_tokens() -> Vec<String> {
+    ["<pad>", "<s>", "</s>"]
         .into_iter()
         .map(str::to_owned)
         .chain(byte_level_chars().iter().map(char::to_string))
+        .collect()
+}
+
+/// A byte-level BPE `tokenizer.json` whose token `i` is `tokens[i]`, with
+/// `merges` ("left right") in rank order.
+fn byte_level_bpe_json(tokens: Vec<String>, merges: Vec<String>) -> serde_json::Value {
+    let vocab: serde_json::Map<String, serde_json::Value> = tokens
+        .into_iter()
         .zip(0u32..)
         .map(|(token, id)| (token, id.into()))
         .collect();
@@ -278,7 +422,7 @@ pub fn byte_level_tokenizer_json() -> serde_json::Value {
             "type": "BPE", "dropout": null, "unk_token": null,
             "continuing_subword_prefix": null, "end_of_word_suffix": null,
             "fuse_unk": false, "byte_fallback": false, "ignore_merges": false,
-            "vocab": vocab, "merges": []
+            "vocab": vocab, "merges": merges
         }
     })
 }
@@ -644,6 +788,86 @@ mod tests {
         ] {
             assert_eq!(tok.decode(&tok.encode(text)), text);
             assert_eq!(tok.encode(text).len(), text.len());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bpe_skips_pairs_a_merge_used_up_and_counts_what_the_corpus_yields() -> TestResult {
+        // Words "aaaa" and " aab". Merging "a a" (4 times) turns "aaaa" into
+        // "aa aa" and " aab" into " aa b", so (' ', a) and (a, b) drop to 0
+        // with their queue entries left behind. The three count-1 pairs then
+        // merge in id order (' ' 35, "aa" 259, 'b' 101), and " aa b" uses up
+        // (aa, b) on the way. That is four merges, 263 tokens in all.
+        let json = train_byte_level_bpe("aaaa aab", 263)?;
+        assert_eq!(
+            json["model"]["merges"],
+            serde_json::json!(["a a", "Ġ aa", "aa aa", "Ġaa b"])
+        );
+        assert_eq!(
+            train_byte_level_bpe("aaaa aab", 264).err().as_deref(),
+            Some("the corpus yields 263 tokens, fewer than 264")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bpe_learns_the_most_frequent_pairs_first() -> TestResult {
+        // The words are "ab" once and " ab" twice: (a, b) occurs 3 times and
+        // (' ', a) twice, so "a b" merges first, then " " with "ab".
+        let json = train_byte_level_bpe("ab ab ab", 261)?;
+        assert_eq!(json["model"]["merges"], serde_json::json!(["a b", "Ġ ab"]));
+        assert_eq!(json["model"]["vocab"]["ab"], 259);
+        assert_eq!(json["model"]["vocab"]["Ġab"], 260);
+        let tok = load_with_config("bpe-merges", &json, None)?;
+        assert_eq!(tok.encode("ab ab"), [259, 260]);
+        assert_eq!(
+            train_byte_level_bpe("ab ab ab", 262).err().as_deref(),
+            Some("the corpus yields 261 tokens, fewer than 262")
+        );
+        Ok(())
+    }
+
+    /// Three lines with a tab, a blank line, leading spaces and non-ASCII
+    /// UTF-8. Repeated three times, every pair inside "the", " the", " sat"
+    /// and " on" occurs 6 or 12 times, so these words become single tokens
+    /// within the first 9 merges; most other pairs occur 3 times.
+    const BPE_LINES: &str =
+        "the cat sat on the mat.\n\tthe dog sat on the log.\n\n  naïve café, 世界\n";
+
+    #[test]
+    fn bpe_extends_the_byte_ids_and_round_trips_any_text() -> TestResult {
+        let corpus = BPE_LINES.repeat(3);
+        let json = train_byte_level_bpe(&corpus, 280)?;
+        let tok = load_with_config("bpe-round-trip", &json, None)?;
+        assert_eq!(tok.vocab.len(), 280);
+        assert_eq!(
+            (tok.pad_token_id, tok.bos_token_id, tok.eos_token_id),
+            (0, 1, 2)
+        );
+        for (token, id) in byte_level_tokens().iter().zip(0u32..) {
+            assert_eq!(tok.vocab[token], id, "{token:?}");
+        }
+        let words = ["the", "Ġsat", "Ġon", "Ġthe"].map(|word| tok.vocab[word]);
+        assert_eq!(tok.encode("the sat on the"), words);
+        for text in [
+            corpus.as_str(),
+            "\n",
+            "\t\t tabs and  spaces \r\n\n",
+            "unseen: 🦀 Ωμέγα <s></s><pad>",
+            "\u{0}\u{7f}\u{80}\u{ff}",
+        ] {
+            assert_eq!(tok.decode(&tok.encode(text)), text, "{text:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bpe_training_is_deterministic() -> TestResult {
+        let corpus = BPE_LINES.repeat(3);
+        let first = train_byte_level_bpe(&corpus, 280)?.to_string();
+        for _ in 0..3 {
+            assert_eq!(train_byte_level_bpe(&corpus, 280)?.to_string(), first);
         }
         Ok(())
     }
