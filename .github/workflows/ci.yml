@@ -176,7 +176,7 @@ jobs:
     # is real hardware and neither says anything about speed. The Qwen2
     # fixture is not generated here, so those four tests skip.
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 150
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
