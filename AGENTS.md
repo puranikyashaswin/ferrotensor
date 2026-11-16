@@ -62,7 +62,7 @@ is `null`. On an error stdout carries `{"error": "<message>"}` instead.
 |---|---|
 | `plan` | `adapter`, `backend`, `device_type`, `budget_mib`, `budget_source`, `model`, `parameters`, `chosen`, `estimated_peak_mib`, `margin`, `fits`, `train_command`, `notes`; without `--model` the per-model keys are in a `models` array |
 | `finetune` | `chosen` (`batch_size`, `seq_len`, `rank`, `precision`, `checkpoint_blocks`), `grad_accum`, `budget_mib`, `estimated_peak_mib`, `fits`, then every `train` key |
-| `train` | `steps`, `first_loss`, `final_loss`, `eval_loss_before`, `eval_loss_after` (null without `--eval-data`), `measured_peak_mib`, `seconds`, `out_dir`, `adapter` (null on ranks above 0, which save nothing) |
+| `train` | `steps`, `first_loss`, `final_loss`, `eval_loss_before`, `eval_loss_after` (null without `--eval-data`), `measured_peak_mib`, `seconds`, `out_dir`, `adapter` (null on ranks above 0, which save nothing), and with `--q4-weights` only, `q4_weights` (`modules`, `skip`, `group`, `tensors`: the 4-bit selection and how many tensors it stored at 4 bits) |
 | `eval` | `examples`, `tokens`, `loss`, `perplexity`, `seconds` |
 | `generate` | `text`, `prompt_tokens`, `new_tokens`, `tokens_per_second` (decode speed: one-token forward passes after the prompt per second, prompt time left out; null when none ran), `prefill_seconds` (time to run the prompt), `kv_cache` |
 | `chat` | one object per reply, each on its own line: `reply`, `prompt_tokens` (the whole conversation), `cached_tokens` (prompt tokens taken from the KV cache of earlier turns, not run again), `new_tokens`, `tokens_per_second` and `prefill_seconds` (as for `generate`; with the kept cache the prefill runs only the uncached tokens) |
@@ -70,6 +70,7 @@ is `null`. On an error stdout carries `{"error": "<message>"}` instead.
 | `export-gguf` | `out_file`, `tensors` (tensors in the GGUF file), `merged` (tensors with the `--lora` adapter added; 0 without it) |
 | `pretrain` | every `train` key, then `parameters`, `vocab_size` (259 for the byte-level tokenizer, `--vocab-size` for BPE) and `tokenizer` (`"byte"` or `"bpe"`) |
 | `info` | `ferrotensor`, `os`, `arch`, `adapters` (one object per GPU, `selected` marks the one used), `checks` (null without `--check`), and `error` only on failure |
+| `q4-report` | `model`, `group`, `tensors` (one object per 2-D weight, by name: `name`, `shape` as stored, `relative_error`, `max_abs_error`, `groups`, `outlier_groups`, `outlier_fraction`) |
 
 `chat` is the one command that prints more than one object: it reads one
 user message per line of stdin and writes one JSON line per reply, so read
@@ -96,7 +97,8 @@ checkpoint the model builder cannot load (a missing or misshapen weight, or a
 `rope_scaling`, `use_sliding_window: true`, a head size above 128); a model
 id that is not in the Hugging Face cache or whose snapshot has no `config.json` (`error` names the cache and
 `hf download <id>`); a flag
-value out of range; a dataset with no usable examples; no GPU adapter;
+value out of range; a `--q4-modules` / `--q4-skip` selection that matches no
+weight; a dataset with no usable examples; no GPU adapter;
 `plan` or `finetune` finding no configuration that fits; `generate` with a
 prompt that encodes to no tokens or is longer than the model's context; `chat`
 refusing a tokenizer without ChatML tokens or a message longer than the
@@ -148,6 +150,18 @@ The `plan` estimate is fitted to 15 A10G peaks with 8 sequences per step: these,
 and batch 4 and 8 runs of SmolLM2 and Qwen2.5-0.5B. It is at most 8.7% below and
 17% above them. Other GPUs, f32 and 4-bit weights and LFM2 models are not
 calibrated.
+
+## 4-bit weights (experimental)
+
+`--q4-weights` still fails its quality gate: the untouched base model has a
+higher held-out loss with it than with f16
+([A10G run](benchmarks/RESULTS.md#4-bit-weights-the-gap-is-there-before-training)).
+Use it only when nothing else fits. `--q4-modules KEYS`, `--q4-skip KEYS`
+(keys as `--train-modules`, plus `layers.N` and `layers.A-B`) and
+`--q4-group 16|32|64|128` exist to study where that loss comes from, and
+`ferrotensor q4-report --model DIR --json` measures the 4-bit error of every
+weight matrix on the host, without a GPU. See
+[ferrotensor-cli/README.md](ferrotensor-cli/README.md#finding-where-the-4-bit-loss-comes-from).
 
 ## Working on the code
 

@@ -161,7 +161,7 @@ keeps them f32. Both compute the same model up to f16 rounding of the
 weights.
 
 `--q4-weights` (on every command that loads a model, off by default) is
-experimental and changes the model's outputs. It stores
+experimental and changes the model's outputs. By default it stores
 the frozen weights of every decoder-block projection (`q/k/v/o_proj`,
 `gate/up/down_proj`) at 4 bits: affine codes in groups of 64 along the
 input dimension, one f16 scale and one f16 minimum per group, about 4.5
@@ -210,6 +210,52 @@ of QLoRA.
   pass `--q4-weights` instead.
 - With `--memory-report`, the 4-bit weights appear under base weights as
   "of which 4-bit".
+
+### Finding where the 4-bit loss comes from
+
+4-bit weights still fail their quality gate: the untouched base model already
+has a higher held-out loss with `--q4-weights` than with f16, most of all
+SmolLM2-1.7B ([A10G run, 16 November 2026](../benchmarks/RESULTS.md#4-bit-weights-the-gap-is-there-before-training)).
+These flags exist to find out which weights carry that damage and whether
+smaller groups help. They change nothing without `--q4-weights`, and need it.
+
+- `--q4-modules KEYS` picks the linear weights stored at 4 bits, as
+  comma-separated keys matched like `--train-modules`: `attn`, `mlp`, `head`
+  (`lm_head`, also when tied to the embedding), `all`, `layers.N`,
+  `layers.A-B`, or a name part such as `q_proj` or `down_proj`. The default
+  `layers` is every decoder-block projection, what `--q4-weights` stored
+  before. The other linear weights stay f16. The token embedding is a host
+  lookup table and is never 4-bit. A selection that matches no weight exits
+  with 2.
+- `--q4-skip KEYS` keeps the weights it matches out, even when
+  `--q4-modules` selects them.
+- `--q4-group N` sets how many weights share one scale and minimum: 16, 32,
+  64 (the default) or 128, so 6, 5, 4.5 or 4.25 bits per weight.
+- `train` writes the choice and the number of 4-bit tensors into
+  `training_state.json` and the adapter's `.state.json`, and `train --json`
+  adds it as `q4_weights` (`modules`, `skip`, `group`, `tensors`). Without
+  `--q4-weights` the key is absent. `plan` and `finetune` still estimate
+  memory for the default selection and groups of 64.
+
+```bash
+ferrotensor eval --model DIR --data val.jsonl --q4-weights --q4-modules mlp --json
+ferrotensor eval --model DIR --data val.jsonl --q4-weights --q4-skip layers.0-1,head --json
+ferrotensor eval --model DIR --data val.jsonl --q4-weights --q4-group 32 --json
+```
+
+`ferrotensor q4-report --model DIR [--q4-group N] [--json]` needs no GPU. It
+reads the checkpoint one tensor at a time, applies the 4-bit round trip to
+every 2-D weight on the host, and prints per tensor its name, its shape as
+stored (`[out, in]`), the relative error `‖W − Ŵ‖ / ‖W‖` (Frobenius norms),
+the largest `|W − Ŵ|`, and the share of groups whose range at least halves
+when their one value farthest from the group mean is left out (one outlier
+sets most of the step). This outlier test works for every group size; a
+6-standard-deviation test could not, since in a group of `n` values no value
+lies more than `√(n − 1)` standard deviations from the mean (3.9 for 16). With
+`--json` it prints one object: `model`, `group` and a `tensors` list with
+`name`, `shape`, `relative_error`, `max_abs_error`, `groups`,
+`outlier_groups` and `outlier_fraction`. The embedding is reported too: with
+tied embeddings it is also `lm_head`.
 
 ## Fine-tune in one command: `finetune`
 
@@ -333,7 +379,7 @@ sequences) and at the highest point seen so far in the run. The rows:
 
 | Row | What it holds |
 |---|---|
-| base weights (frozen) | Model weights uploaded when the model is built, split into f16 (linear layers with the default f16 weights), 4-bit (decoder-block projections with `--q4-weights`) and f32 (embedding, norms, or every weight with `--f32-weights`) |
+| base weights (frozen) | Model weights uploaded when the model is built, split into f16 (linear layers with the default f16 weights), 4-bit (the weights `--q4-weights` selects, by default the decoder-block projections) and f32 (embedding, norms, or every weight with `--f32-weights`) |
 | trainable parameters | The LoRA adapters, or the base weights `--train-modules` selects |
 | optimizer state | The AdamW moments, two f32 tensors per trainable tensor |
 | activations | Forward outputs and intermediates, kept by the autograd graph until the step's backward is done |

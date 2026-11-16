@@ -355,10 +355,12 @@ mod tests {
     /// Deterministic standard normal values (Box-Muller on [`rand_vec`]).
     fn gaussian_vec(n: usize, seed: u64) -> Vec<f32> {
         let u = rand_vec(2 * n, seed);
-        u.chunks_exact(2)
-            .map(|p| {
-                let r = (-2.0 * (1.0 - (p[0] + 1.0) / 2.0).ln()).sqrt();
-                r * (std::f32::consts::PI * p[1]).cos()
+        u.as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&[a, b]| {
+                let r = (-2.0 * (1.0 - (a + 1.0) / 2.0).ln()).sqrt();
+                r * (std::f32::consts::PI * b).cos()
             })
             .collect()
     }
