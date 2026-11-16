@@ -105,6 +105,52 @@ fn invalid_sizes_and_a_missing_corpus_exit_with_2() {
     assert!(json_error(&no_state).contains("trained_weights.safetensors does not exist"));
 }
 
+/// The BPE flags and a corpus the BPE tokenizer cannot use exit with 2
+/// before anything is written.
+#[test]
+fn bpe_flags_and_unusable_corpora_exit_with_2() {
+    let dir = common::TempDir::new("pretrain-bpe-flags");
+    let corpus = dir.path().join("corpus.txt");
+    std::fs::write(&corpus, SENTENCE.repeat(4)).expect("write corpus");
+    let binary = dir.path().join("binary.txt");
+    std::fs::write(&binary, b"caf\xe9\n").expect("write latin-1 corpus");
+    let out = dir.path().join("model");
+    for (data, extra, message) in [
+        (
+            &corpus,
+            &["--vocab-size", "512"][..],
+            "--vocab-size needs --tokenizer bpe",
+        ),
+        (
+            &corpus,
+            &["--tokenizer", "bpe", "--vocab-size", "259"][..],
+            "--vocab-size 259 leaves no token to learn",
+        ),
+        // The sentence's nine words hold well under 4096 - 259 merges.
+        (
+            &corpus,
+            &["--tokenizer", "bpe"][..],
+            "--vocab-size 4096: the corpus yields",
+        ),
+        (
+            &binary,
+            &["--tokenizer", "bpe"][..],
+            "binary.txt is not UTF-8 text (byte 3)",
+        ),
+    ] {
+        let run = pretrain(data, &out, extra);
+        assert_eq!(
+            run.status.code(),
+            Some(2),
+            "{extra:?}: {}",
+            text(&run.stderr)
+        );
+        let error = json_error(&run);
+        assert!(error.contains(message), "{extra:?}: {error}");
+    }
+    assert!(!out.exists(), "nothing is written for invalid input");
+}
+
 /// A model directory without `model.safetensors` names `pretrain --resume`
 /// when it holds the `init` directory of an unfinished run, and only then.
 #[test]
@@ -172,6 +218,7 @@ fn pretrain_learns_a_repeated_sentence_and_the_directory_reloads() {
         2 * 259 * 64 + 2 * (4 * 64 * 64 + 3 * 256 * 64 + 2 * 64) + 64
     );
     assert_eq!(summary["vocab_size"], 259);
+    assert_eq!(summary["tokenizer"], "byte");
     assert_eq!(summary["steps"], 150);
     let first = summary["first_loss"].as_f64().expect("first loss");
     let last = summary["final_loss"].as_f64().expect("final loss");
@@ -252,6 +299,93 @@ fn pretrain_learns_a_repeated_sentence_and_the_directory_reloads() {
         "exported {exported}, trained {in_training_layout}"
     );
     assert!(exported < 0.02 * 259f64.ln(), "exported loss {exported}");
+}
+
+/// With a learned BPE tokenizer the model memorises the sentence, `generate`
+/// decodes its continuation, and a resume reuses the saved tokenizer.
+#[test]
+#[ignore = "needs a GPU"]
+fn pretrain_with_bpe_learns_a_repeated_sentence_and_resume_keeps_the_tokenizer() {
+    let dir = common::TempDir::new("pretrain-bpe");
+    let corpus = dir.path().join("corpus.txt");
+    std::fs::write(&corpus, SENTENCE.repeat(100)).expect("write corpus");
+    let model = dir.path().join("model");
+    let bpe = [
+        "--tokenizer",
+        "bpe",
+        "--vocab-size",
+        "288",
+        "--max-steps",
+        "150",
+        "--warmup-steps",
+        "20",
+        "--lr",
+        "3e-3",
+        "--log-every",
+        "1",
+    ];
+    let run = pretrain(&corpus, &model, &bpe);
+    assert!(text(&run.stderr).contains("bpe:    288 tokens learned"));
+    let summary = json_of(&run);
+    assert_eq!(summary["vocab_size"], 288);
+    assert_eq!(summary["tokenizer"], "bpe");
+    assert_eq!(summary["steps"], 150);
+    let first = summary["first_loss"].as_f64().expect("first loss");
+    let last = summary["final_loss"].as_f64().expect("final loss");
+    eprintln!("bpe pretrain loss: first {first:.4}, final {last:.4}");
+    // Random weights guess near uniformly, ln 288 = 5.66; every token of the
+    // sentence follows from the one before it, so the model can drive the
+    // loss to near zero.
+    assert!(first > 0.5 * 288f64.ln(), "first loss {first}");
+    assert!(last < 0.02 * 288f64.ln(), "final loss {last}");
+    let config: Value =
+        serde_json::from_slice(&std::fs::read(model.join("config.json")).expect("config.json"))
+            .expect("config JSON");
+    assert_eq!(config["vocab_size"], 288);
+
+    // Ten tokens cover at least ten bytes, so at least " fox jum".
+    let generated = json_of(&ferrotensor(&[
+        "generate",
+        "--model",
+        s(&model),
+        "--raw",
+        "--prompt",
+        "the quick brown",
+        "--temperature",
+        "0",
+        "--max-new-tokens",
+        "10",
+        "--f32-weights",
+        "--json",
+    ]));
+    let continuation = generated["text"].as_str().expect("text");
+    eprintln!("bpe greedy continuation: {continuation:?}");
+    assert!(
+        continuation.starts_with(" fox jum"),
+        "continuation {continuation:?}"
+    );
+
+    let tokenizer = std::fs::read(model.join("tokenizer.json")).expect("tokenizer.json");
+    let byte_flags = pretrain(&corpus, &model, &["--resume"]);
+    assert_eq!(byte_flags.status.code(), Some(2));
+    assert!(
+        json_error(&byte_flags).contains("has 288 tokens and the flags ask for 259"),
+        "{}",
+        text(&byte_flags.stdout)
+    );
+    let mut resume = bpe.to_vec();
+    resume.push("--resume");
+    let resumed = pretrain(&corpus, &model, &resume);
+    let stderr = text(&resumed.stderr);
+    assert_eq!(json_of(&resumed)["steps"], 150, "{stderr}");
+    assert!(
+        !stderr.contains("bpe:"),
+        "a resume learns nothing: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(model.join("tokenizer.json")).expect("tokenizer.json"),
+        tokenizer
+    );
 }
 
 #[test]

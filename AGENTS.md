@@ -6,7 +6,7 @@ small language models on the GPU, through wgpu and hand-written WGSL kernels
 `ferrotensor-cli`) plans, trains, evaluates, samples and merges LoRA adapters
 for Llama-style models such as SmolLM2, TinyLlama and Qwen2 (Qwen2.5 checkpoints
 are not measured yet), and trains a small
-byte-level model from scratch.
+model from scratch with a byte-level or a learned BPE tokenizer.
 
 ## Install
 
@@ -31,6 +31,7 @@ ferrotensor eval --model DIR --data val.jsonl --lora outputs/run/lora_adapters.s
 ferrotensor chat --model DIR --lora outputs/run/lora_adapters.safetensors --json < questions.txt
 ferrotensor merge --model DIR --lora outputs/run/lora_adapters.safetensors --out outputs/merged --json
 ferrotensor pretrain --data corpus.txt --out outputs/tiny --json  # from random weights; generate --raw loads it
+ferrotensor pretrain --data corpus.txt --out outputs/tiny-bpe --tokenizer bpe --vocab-size 4096 --json  # BPE learned from the corpus
 ```
 
 `chat` needs a ChatML model such as SmolLM2 (TinyLlama's tokenizer lacks the
@@ -64,7 +65,7 @@ is `null`. On an error stdout carries `{"error": "<message>"}` instead.
 | `generate` | `text`, `prompt_tokens`, `new_tokens`, `tokens_per_second`, `kv_cache` |
 | `chat` | one object per reply, each on its own line: `reply`, `prompt_tokens`, `new_tokens`, `tokens_per_second` |
 | `merge` | `out_dir`, `merged` (tensors with the adapter added), `copied` (tensors copied byte for byte) |
-| `pretrain` | every `train` key, then `parameters` and `vocab_size` (259: a byte-level tokenizer) |
+| `pretrain` | every `train` key, then `parameters`, `vocab_size` (259 for the byte-level tokenizer, `--vocab-size` for BPE) and `tokenizer` (`"byte"` or `"bpe"`) |
 | `info` | `ferrotensor`, `os`, `arch`, `adapters` (one object per GPU, `selected` marks the one used), `checks` (null without `--check`), and `error` only on failure |
 
 `chat` is the one command that prints more than one object: it reads one
@@ -101,8 +102,11 @@ refusing its input (a non-empty `--out`, a quantized base, an adapter that
 does not match the base); and `pretrain` refusing a model size the kernels
 cannot run (`--hidden` not a multiple of `--heads`, an odd head size or one
 above 128), a `--seq-len` above `--context`, an `--out` that already holds
-`model.safetensors` or `init/` without `--resume`, or `--resume` without
-`trained_weights.safetensors`. clap's usage errors
+`model.safetensors` or `init/` without `--resume`, `--resume` without
+`trained_weights.safetensors` or with a saved tokenizer of another size than
+the flags ask for, `--vocab-size` without `--tokenizer bpe`, and for `bpe` a
+`--vocab-size` of 259 or less, one the corpus has too few pairs for, or a
+corpus that is not UTF-8. clap's usage errors
 also exit with 2, with the usage text on stderr and nothing on stdout.
 
 ## Picking a model

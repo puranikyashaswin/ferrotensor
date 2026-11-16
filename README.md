@@ -45,7 +45,7 @@ is in the [CLI README](ferrotensor-cli/README.md).
 | 3 | `ferrotensor finetune --model DIR --data train.jsonl --out outputs/run` | Runs LoRA fine-tuning with the settings `plan` chose and writes `lora_adapters.safetensors` |
 | 4 | `ferrotensor chat --model DIR --lora outputs/run/lora_adapters.safetensors` | Talks to the result, one message per line (ChatML models such as SmolLM2) |
 | 5 | `ferrotensor merge --model DIR --lora outputs/run/lora_adapters.safetensors --out outputs/merged` | Folds the adapter into the base weights and writes a standalone model directory; `export-adapter` writes a PEFT adapter for PyTorch instead |
-| 6 | `ferrotensor pretrain --data corpus.txt --out outputs/tiny` | Trains a small byte-level model from random weights, for learning and experiments; `generate --raw` loads the result |
+| 6 | `ferrotensor pretrain --data corpus.txt --out outputs/tiny` | Trains a small model from random weights with a byte-level tokenizer, or with `--tokenizer bpe` a BPE one learned from the corpus, for learning and experiments; `generate --raw` loads the result |
 
 `eval`, `generate` and `train` (every setting chosen by hand) are in the same
 CLI. For scripts and coding agents, `--json` and shared exit codes are listed
@@ -327,9 +327,11 @@ one per reply), and exit codes are the same across commands;
 [docs/examples/lora-sft.md](docs/examples/lora-sft.md).
 This path is experimental.
 
-`pretrain` trains a small byte-level model from random weights on a text
-file, for learning and experiments (f32, untied embeddings, defaults not
-tuned), and leaves a model directory that `generate` loads
+`pretrain` trains a small model from random weights on a text file, with a
+byte-level tokenizer or (`--tokenizer bpe --vocab-size N`) a BPE tokenizer
+learned from the same file, for learning and experiments (f32, untied
+embeddings, defaults not tuned), and leaves a model directory that
+`generate` loads
 ([CLI docs](ferrotensor-cli/README.md#train-from-scratch-pretrain)):
 
 ```bash

@@ -3,7 +3,7 @@
 The `ferrotensor-cli` command line for [Ferrotensor](../README.md): a GPU
 check (`info`), memory planning (`plan`), LoRA fine-tuning (`finetune`, `train`),
 evaluation (`eval`), sampling (`generate`, alias `infer`), conversation (`chat`),
-adapter export and merging (`export-adapter`, `merge`) and training a byte-level
+adapter export and merging (`export-adapter`, `merge`) and training a small
 model from scratch (`pretrain`), for
 small Llama-style models such as SmolLM2 and TinyLlama, on the GPU through
 wgpu (Vulkan, Metal or DX12). It also has `classify-train` and
@@ -442,8 +442,9 @@ anything is written.
 
 ## Train from scratch: `pretrain`
 
-`pretrain` trains a small byte-level Llama-style model from random weights
-on a text file and leaves a model directory that `generate --raw` loads. It
+`pretrain` trains a small Llama-style model from random weights on a text
+file, with a byte-level tokenizer or a BPE tokenizer learned from the same
+file, and leaves a model directory that `generate --raw` loads. It
 is meant for learning and experiments: f32 weights, untied embeddings,
 training defaults that are conservative and not tuned, and no claim about
 speed or about quality beyond the CI test below.
@@ -453,14 +454,25 @@ cargo run -p ferrotensor-cli --release -- pretrain \
   --data corpus.txt --out ./data/models/tiny
 cargo run -p ferrotensor-cli --release -- generate \
   --model ./data/models/tiny --raw --prompt "Once upon a time"
+# The same with a 4096-token BPE tokenizer learned from corpus.txt
+cargo run -p ferrotensor-cli --release -- pretrain \
+  --data corpus.txt --out ./data/models/tiny-bpe --tokenizer bpe --vocab-size 4096
 ```
 
 In order, it
 
-1. writes a byte-level `tokenizer.json`: `<pad>` 0, `<s>` 1, `</s>` 2, then
-   byte `b` as token `b + 3` (259 tokens), a BPE model without merges over
-   the `ByteLevel` characters. Any UTF-8 text encodes to its bytes and
-   decodes back exactly; `<s>` in the text stays three bytes;
+1. writes `tokenizer.json`. With `--tokenizer byte` (the default) it is
+   byte-level: `<pad>` 0, `<s>` 1, `</s>` 2, then byte `b` as token `b + 3`
+   (259 tokens), a BPE model without merges over the `ByteLevel`
+   characters. Any UTF-8 text encodes to its bytes and decodes back
+   exactly; `<s>` in the text stays three bytes. With `--tokenizer bpe` it
+   learns a byte-level BPE of `--vocab-size` tokens (default 4096) from
+   `--data`, which must be UTF-8: the same 259 tokens at the same ids, then
+   one token per merge of the most frequent adjacent pair within the words
+   the `ByteLevel` pre-tokenizer cuts each line into, a tie going to the
+   pair of lowest ids. The same corpus and size give the same file, every
+   text still decodes back exactly, and a `--vocab-size` of 259 or less, or
+   more than the corpus has pairs for, exits with 2;
 2. writes `config.json` and, in `init/`, the initial model in the Hugging
    Face Llama layout from `--layers` (default 4), `--hidden` (128), `--heads` (4),
    `--mlp-hidden` (4 x hidden) and `--context` (256, written as
@@ -469,8 +481,9 @@ In order, it
    generator seeded with `--seed`, so a seed always gives the same model.
    The head size `--hidden / --heads` must be even and at most 128. The
    defaults give 1,116,032 parameters;
-3. writes the bytes of `--data` as `tokens.bin` (little-endian u32, newlines
-   kept, the file read once);
+3. writes `--data` as token ids in `tokens.bin` (little-endian u32,
+   newlines kept, the file read once; the BPE tokenizer encodes it line by
+   line, as it learned);
 4. runs `train --task pretrain --train-modules full` from `init/`:
    every weight and the embedding train in f32 on windows of `--seq-len`
    tokens (default `--context`), with `--lr 1e-3`, `--warmup-steps 100`,
@@ -482,23 +495,27 @@ In order, it
 
 `--resume` continues a run in the same `--out` from its
 `trained_weights.safetensors` and training state; pass the flags of the
-first run, with `--max-steps` counting the steps before the resume. Without
+first run, with `--max-steps` counting the steps before the resume. A resume
+reuses the saved `tokenizer.json` and never learns it again; when its size
+differs from what `--tokenizer` and `--vocab-size` ask for, it exits with 2.
+Without
 `--resume`, an `--out` that already holds `model.safetensors` or `init/` is
 refused. A run that stops early (Ctrl-C, a crash) leaves no
 `model.safetensors`, so `generate` refuses the directory and names
 `pretrain --resume`; a resume with `--max-steps` at or below the step in
 `training_state.json` trains nothing and exports the weights saved at that
 step.
-`--json` prints every `train` key plus `parameters` and `vocab_size`.
+`--json` prints every `train` key plus `parameters`, `vocab_size` and
+`tokenizer` (`"byte"` or `"bpe"`).
 `--device`, `--checkpoint-blocks`, `--grad-clip`, `--weight-decay` and
 `--log-every` work as in `train`, and `--seed` also seeds the initial weights;
 `pretrain --help` lists every flag and default.
 
-Host memory while training is about 20 bytes per byte of the corpus (the
+Host memory while training is about 20 bytes per token of the corpus (the
 token windows, held twice). GPU memory is the f32 weights, their gradients
 and two AdamW moments (16 bytes per parameter) plus activations; `plan` does
-not cover `pretrain`. Not included: a learned tokenizer, tied embeddings,
-mixed precision, and document boundaries (the corpus is one stream).
+not cover `pretrain`. Not included: tied embeddings, mixed precision, and
+document boundaries (the corpus is one stream).
 
 The CI test trains a tiny model (2 layers, hidden 64, 4 heads, context 64,
 164,544 parameters) on one sentence repeated 100 times, on software Vulkan
