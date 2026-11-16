@@ -12,8 +12,8 @@
 //! it only once the work that uses it has finished and the device is
 //! maintained, which wgpu does on every queue submission and device poll.
 //! Recorded work is submitted in numbered batches; dropped buffers (tensors
-//! the pool does not keep, and the uniform and scratch buffers each kernel
-//! dispatch creates) are counted as *awaiting GPU* from the drop until the
+//! the pool does not keep, and each new kernel uniform buffer, which the
+//! context then keeps for reuse) are counted as *awaiting GPU* from the drop until the
 //! batch being recorded at the drop is known to have finished. That is
 //! learned at a later submission or poll, and at the latest when the context
 //! waits for the GPU ([`WgpuContext::synchronize`](crate::WgpuContext::synchronize)
@@ -30,8 +30,8 @@
 //! Sizes are what Ferrotensor asked wgpu for, after wgpu rounds every buffer
 //! up to a multiple of 4 bytes (see [`memory::wgpu_buffer_size`](crate::memory::wgpu_buffer_size)).
 //! The driver and its allocator add their own alignment and block overhead,
-//! and pipelines, bind groups and wgpu's own upload staging copies are not
-//! counted, so the totals are lower than what `nvidia-smi` or Activity
+//! and pipelines, bind groups, uniform buffers kept for reuse and wgpu's own
+//! upload staging copies are not counted, so the totals are lower than what `nvidia-smi` or Activity
 //! Monitor show.
 
 use crate::DType;

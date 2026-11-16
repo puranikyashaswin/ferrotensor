@@ -1,6 +1,6 @@
 //! Matrix multiplication kernels.
 
-use super::{uniform, ComputeEngine, Kernel};
+use super::{ComputeEngine, Kernel};
 use crate::{DType, UnifiedTensor, WgpuContext};
 
 /// Operand layout understood by the `matmul_blocked` kernel.
@@ -135,15 +135,15 @@ impl ComputeEngine {
         b: &UnifiedTensor,
         out: &UnifiedTensor,
     ) {
-        let params = uniform(ctx, bytemuck::cast_slice(&[m, k, n, layout as u32]));
+        let params = ctx.uniform_buffer(bytemuck::cast_slice(&[m, k, n, layout as u32]));
         // One 16x16 workgroup per 64x64 output tile.
         self.run(
             ctx,
             kernel,
             &[
-                (0, a.buffer()),
-                (1, b.buffer()),
-                (2, out.buffer()),
+                (0, a.shared_buffer()),
+                (1, b.shared_buffer()),
+                (2, out.shared_buffer()),
                 (3, &params),
             ],
             (n.div_ceil(64), m.div_ceil(64), 1),

@@ -27,6 +27,7 @@ pub use wgpu; // Re-export wgpu for downstream crates
 
 pub mod adapters;
 mod context;
+mod dispatch_cache;
 mod engine;
 pub mod memory;
 /// Size-keyed reuse of GPU buffers.

@@ -1,6 +1,6 @@
 //! Normalisation and softmax kernels.
 
-use super::{grid, groups64, uniform, ComputeEngine};
+use super::{grid, groups64, ComputeEngine};
 use crate::{UnifiedTensor, WgpuContext};
 
 impl ComputeEngine {
@@ -27,17 +27,19 @@ impl ComputeEngine {
     ) {
         let size = *input.shape.last().unwrap_or(&1);
         let rows = input.shape.iter().product::<usize>() / size;
-        let params = uniform(
-            ctx,
-            bytemuck::cast_slice(&[size as u32, rows as u32, eps.to_bits(), 0]),
-        );
+        let params = ctx.uniform_buffer(bytemuck::cast_slice(&[
+            size as u32,
+            rows as u32,
+            eps.to_bits(),
+            0,
+        ]));
         self.run(
             ctx,
             &self.rms_norm,
             &[
-                (0, input.buffer()),
-                (1, weight.buffer()),
-                (2, out.buffer()),
+                (0, input.shared_buffer()),
+                (1, weight.shared_buffer()),
+                (2, out.shared_buffer()),
                 (3, &params),
             ],
             grid(rows as u32),
@@ -66,32 +68,34 @@ impl ComputeEngine {
             return;
         }
         let inv_rms = UnifiedTensor::empty(ctx, &[rows]);
-        let params = uniform(
-            ctx,
-            bytemuck::cast_slice(&[size as u32, rows as u32, eps.to_bits(), 0]),
-        );
+        let params = ctx.uniform_buffer(bytemuck::cast_slice(&[
+            size as u32,
+            rows as u32,
+            eps.to_bits(),
+            0,
+        ]));
         self.run(
             ctx,
             &self.rms_norm_bw,
             &[
-                (0, input.buffer()),
-                (1, grad_out.buffer()),
-                (2, weight.buffer()),
-                (3, grad_input.buffer()),
-                (4, inv_rms.buffer()),
+                (0, input.shared_buffer()),
+                (1, grad_out.shared_buffer()),
+                (2, weight.shared_buffer()),
+                (3, grad_input.shared_buffer()),
+                (4, inv_rms.shared_buffer()),
                 (5, &params),
             ],
             grid(rows as u32),
         );
-        let params = uniform(ctx, bytemuck::cast_slice(&[size as u32, rows as u32, 0, 0]));
+        let params = ctx.uniform_buffer(bytemuck::cast_slice(&[size as u32, rows as u32, 0, 0]));
         self.run(
             ctx,
             &self.rms_norm_bw_weight,
             &[
-                (0, input.buffer()),
-                (1, grad_out.buffer()),
-                (2, inv_rms.buffer()),
-                (3, grad_weight.buffer()),
+                (0, input.shared_buffer()),
+                (1, grad_out.shared_buffer()),
+                (2, inv_rms.shared_buffer()),
+                (3, grad_weight.shared_buffer()),
                 (4, &params),
             ],
             groups64(size),
@@ -108,15 +112,15 @@ impl ComputeEngine {
         out: &UnifiedTensor,
     ) {
         let size = x.shape.iter().product::<usize>() as u32;
-        let params = uniform(ctx, bytemuck::cast_slice(&[size]));
+        let params = ctx.uniform_buffer(bytemuck::cast_slice(&[size]));
         self.run(
             ctx,
             &self.rms_residual,
             &[
-                (0, x.buffer()),
-                (1, residual.buffer()),
-                (2, weight.buffer()),
-                (3, out.buffer()),
+                (0, x.shared_buffer()),
+                (1, residual.shared_buffer()),
+                (2, weight.shared_buffer()),
+                (3, out.shared_buffer()),
                 (4, &params),
             ],
             (1, 1, 1),
@@ -127,11 +131,15 @@ impl ComputeEngine {
     pub fn softmax(&self, ctx: &WgpuContext, input: &UnifiedTensor, out: &UnifiedTensor) {
         let size = *input.shape.last().unwrap_or(&1);
         let rows = input.shape.iter().product::<usize>() / size;
-        let params = uniform(ctx, bytemuck::cast_slice(&[size as u32, rows as u32]));
+        let params = ctx.uniform_buffer(bytemuck::cast_slice(&[size as u32, rows as u32]));
         self.run(
             ctx,
             &self.softmax,
-            &[(0, input.buffer()), (1, out.buffer()), (2, &params)],
+            &[
+                (0, input.shared_buffer()),
+                (1, out.shared_buffer()),
+                (2, &params),
+            ],
             grid(rows as u32),
         );
     }
@@ -147,15 +155,15 @@ impl ComputeEngine {
     ) {
         let size = *grad_out.shape.last().unwrap_or(&1);
         let rows = grad_out.shape.iter().product::<usize>() / size;
-        let params = uniform(ctx, bytemuck::cast_slice(&[size as u32, rows as u32]));
+        let params = ctx.uniform_buffer(bytemuck::cast_slice(&[size as u32, rows as u32]));
         self.run(
             ctx,
             &self.softmax_bw,
             &[
                 (2, &params),
-                (3, grad_out.buffer()),
-                (4, final_out.buffer()),
-                (5, grad_in.buffer()),
+                (3, grad_out.shared_buffer()),
+                (4, final_out.shared_buffer()),
+                (5, grad_in.shared_buffer()),
             ],
             grid(rows as u32),
         );

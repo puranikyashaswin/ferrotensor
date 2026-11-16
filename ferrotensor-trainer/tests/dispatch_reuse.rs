@@ -39,27 +39,30 @@ fn steps_after_the_first_reuse_bind_groups_and_uniforms() {
     for (i, s) in steps.iter().enumerate() {
         writeln!(
             log,
-            "tiny model step {}: {} dispatches, {} bind groups created, \
-             {} uniform buffers created",
+            "tiny model step {}: {} dispatches, bind groups {} created {} reused, \
+             uniform buffers {} created {} reused",
             i + 1,
             s.dispatches,
             s.bind_groups,
+            s.bind_groups_reused,
             s.uniform_buffers,
+            s.uniform_buffers_reused,
         )
         .expect("write to stderr");
     }
 
-    let first = &steps[0];
     for s in &steps[1..] {
-        // What a later step still creates is tied to data new in that step:
-        // the uploaded token embeddings and loss weights, and the AdamW step
-        // number.
+        assert_eq!(s.bind_groups + s.bind_groups_reused, s.dispatches);
+        // On main every dispatch created a bind group and every dispatch with
+        // parameters a uniform buffer (190 and 148 per step). What a later
+        // step still creates is tied to data new in that step: the uploaded
+        // token embeddings and loss weights, and the AdamW step number.
         assert!(
             s.bind_groups * 4 < s.dispatches,
             "bind groups created in a later step: {s:?}"
         );
         assert!(
-            s.uniform_buffers * 4 < first.uniform_buffers,
+            s.uniform_buffers * 4 < s.uniform_buffers + s.uniform_buffers_reused,
             "uniform buffers created in a later step: {s:?}"
         );
     }

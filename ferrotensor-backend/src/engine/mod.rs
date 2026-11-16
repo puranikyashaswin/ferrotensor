@@ -3,6 +3,7 @@
 use crate::{UnifiedTensor, WgpuContext};
 use std::borrow::Cow;
 use std::sync::atomic::Ordering::Relaxed;
+use std::sync::Arc;
 use wgpu::{util::DeviceExt, Buffer, Device};
 
 mod attention;
@@ -109,25 +110,25 @@ fn grid(groups: u32) -> (u32, u32, u32) {
     }
 }
 
+/// Records a dispatch of `kernel` with `bind_group` into `ctx`'s pending work.
+fn record_dispatch(
+    ctx: &WgpuContext,
+    kernel: &Kernel,
+    bind_group: &wgpu::BindGroup,
+    groups: (u32, u32, u32),
+) {
+    ctx.counters.dispatches.fetch_add(1, Relaxed);
+    ctx.record(|encoder| {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+        pass.set_pipeline(&kernel.pipeline);
+        pass.set_bind_group(0, bind_group, &[]);
+        pass.dispatch_workgroups(groups.0, groups.1, groups.2);
+    });
+}
+
 /// Grid of 64-wide workgroups covering `n` elements.
 fn groups64(n: usize) -> (u32, u32, u32) {
     grid((n as u32).div_ceil(64))
-}
-
-/// Creates a uniform buffer holding `bytes`. Callers drop it once the
-/// dispatch is recorded, so it is counted as awaiting GPU from the start.
-fn uniform(ctx: &WgpuContext, bytes: &[u8]) -> Buffer {
-    ctx.memory().count_dispatch_buffer(bytes.len() as u64);
-    ctx.counters.uniform_buffers.fetch_add(1, Relaxed);
-    ctx.counters
-        .uniform_bytes
-        .fetch_add(bytes.len() as u64, Relaxed);
-    ctx.device
-        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Uniform"),
-            contents: bytes,
-            usage: wgpu::BufferUsages::UNIFORM,
-        })
 }
 
 /// Compiled WGSL kernels and the methods that dispatch them.
@@ -180,6 +181,9 @@ pub struct ComputeEngine {
     flash_attn_v2: Kernel,
     flash_attn_v2_bw_dq: Kernel,
     flash_attn_v2_bw_dkdv: Kernel,
+    /// A 4-byte storage buffer bound where a kernel needs a buffer it does
+    /// not read: the mask of attention without one.
+    unused_storage: Arc<Buffer>,
 }
 
 impl ComputeEngine {
@@ -237,38 +241,32 @@ impl ComputeEngine {
             flash_attn_v2: k("flash_attention_v2_metal"),
             flash_attn_v2_bw_dq: k("flash_bwd_dq"),
             flash_attn_v2_bw_dkdv: k("flash_bwd_dk_dv"),
+            unused_storage: Arc::new(ctx.device.create_buffer_init(
+                &wgpu::util::BufferInitDescriptor {
+                    label: Some("Unused Storage"),
+                    contents: &[0u8; 4],
+                    usage: wgpu::BufferUsages::STORAGE,
+                },
+            )),
         }
     }
 
-    /// Binds `entries` (binding index, buffer) to `kernel` and records a
-    /// dispatch of `groups` workgroups into `ctx`'s pending work.
+    /// Binds `entries` (binding index, buffer) to `kernel` through the
+    /// context's bind group cache and records a dispatch of `groups`
+    /// workgroups into `ctx`'s pending work.
     fn run(
         &self,
         ctx: &WgpuContext,
         kernel: &Kernel,
-        entries: &[(u32, &Buffer)],
+        entries: &[(u32, &Arc<Buffer>)],
         groups: (u32, u32, u32),
     ) {
-        let entries: Vec<wgpu::BindGroupEntry<'_>> = entries
-            .iter()
-            .map(|(binding, buf)| wgpu::BindGroupEntry {
-                binding: *binding,
-                resource: buf.as_entire_binding(),
-            })
-            .collect();
-        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &kernel.layout,
-            entries: &entries,
-        });
-        ctx.counters.bind_groups.fetch_add(1, Relaxed);
-        ctx.counters.dispatches.fetch_add(1, Relaxed);
-        ctx.record(|encoder| {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
-            pass.set_pipeline(&kernel.pipeline);
-            pass.set_bind_group(0, &bg, &[]);
-            pass.dispatch_workgroups(groups.0, groups.1, groups.2);
-        });
+        record_dispatch(
+            ctx,
+            kernel,
+            &ctx.bind_group(&kernel.layout, entries),
+            groups,
+        );
     }
 
     /// Copies all of `src` into `dst`, starting at byte offset `dst_offset`.
@@ -289,18 +287,6 @@ impl ComputeEngine {
             );
         });
     }
-}
-
-/// A 4-byte storage buffer bound where a kernel needs a buffer that is unused.
-/// Counted like [`uniform`].
-fn dummy_storage(ctx: &WgpuContext) -> Buffer {
-    ctx.memory().count_dispatch_buffer(4);
-    ctx.device
-        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Dummy Storage"),
-            contents: &[0u8; 4],
-            usage: wgpu::BufferUsages::STORAGE,
-        })
 }
 
 #[cfg(test)]
