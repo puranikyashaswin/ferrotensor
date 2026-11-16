@@ -76,10 +76,18 @@ impl<B> Default for FreeLists<B> {
 }
 
 impl<B> FreeLists<B> {
-    /// The most recently returned buffer of exactly `size` bytes.
-    fn take(&mut self, size: u64) -> Option<B> {
+    /// The buffer of exactly `size` bytes with the lowest `key`. A fixed
+    /// order, unlike the order buffers come back in, hands a step that
+    /// repeats the previous one's requests the same buffers again, so the
+    /// bind groups cached for them are reused.
+    fn take<K: Ord>(&mut self, size: u64, key: impl Fn(&B) -> K) -> Option<B> {
         let list = self.free.get_mut(&size)?;
-        let (_, buffer) = list.pop_back()?;
+        let lowest = list
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, (_, buffer))| key(buffer))
+            .map(|(i, _)| i)?;
+        let (_, buffer) = list.remove(lowest)?;
         if list.is_empty() {
             self.free.remove(&size);
         }
@@ -256,7 +264,7 @@ impl BufferPool {
     )]
     pub fn get(&self, device: &Device, size: u64) -> Arc<Buffer> {
         let mut state = self.buffers.lock().unwrap();
-        if let Some(buffer) = state.lists.take(size) {
+        if let Some(buffer) = state.lists.take(size, |b| b.global_id()) {
             self.tracker.pool_take(size);
             self.reused.fetch_add(1, Relaxed);
             return buffer;
@@ -327,17 +335,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn take_matches_exact_size_newest_first() {
+    fn take_matches_exact_size_lowest_key_first() {
         let mut l = FreeLists::default();
-        l.put(64, 1, "a");
-        l.put(64, 2, "b");
+        l.put(64, 1, "b");
+        l.put(64, 2, "a");
         l.put(128, 2, "c");
         assert_eq!(l.pooled_bytes, 256);
-        assert_eq!(l.take(32), None, "no size classes");
-        assert_eq!(l.take(64), Some("b"));
-        assert_eq!(l.take(64), Some("a"));
-        assert_eq!(l.take(64), None);
+        let key = |b: &&str| *b;
+        assert_eq!(l.take(32, key), None, "no size classes");
+        assert_eq!(l.take(64, key), Some("a"));
+        assert_eq!(l.take(64, key), Some("b"));
+        assert_eq!(l.take(64, key), None);
         assert_eq!(l.pooled_bytes, 128);
+    }
+
+    #[test]
+    fn a_repeated_step_gets_the_same_buffers_whatever_order_they_came_back() {
+        let mut l = FreeLists::default();
+        // Two tensors of one size, freed first-in first-out after step 1.
+        l.put(64, 1, 1);
+        l.put(64, 1, 2);
+        let step = |l: &mut FreeLists<u32>| {
+            let first = l.take(64, |b| *b);
+            let second = l.take(64, |b| *b);
+            for buffer in [first, second].into_iter().flatten() {
+                l.put(64, 2, buffer);
+            }
+            (first, second)
+        };
+        assert_eq!(step(&mut l), (Some(1), Some(2)));
+        assert_eq!(step(&mut l), (Some(1), Some(2)));
     }
 
     #[test]
@@ -367,7 +394,7 @@ mod tests {
         let mut l = FreeLists::default();
         let mut created = 0;
         let mut get = |l: &mut FreeLists<u32>, size: u64| {
-            l.take(size).unwrap_or_else(|| {
+            l.take(size, |b| *b).unwrap_or_else(|| {
                 created += 1;
                 created
             })
