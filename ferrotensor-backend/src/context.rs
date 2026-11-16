@@ -14,7 +14,7 @@ const MAX_PENDING_OPS: u32 = 128;
 
 /// Queued dispatches are encoded into a pass once this many are waiting, so
 /// encoding keeps pace with recording and no pass grows past this length.
-const MAX_PASS_DISPATCHES: usize = 16;
+const MAX_PASS_DISPATCHES: usize = 8;
 
 /// Uploaded bytes after which [`WgpuContext::note_upload`] waits for the
 /// staging copies to finish so wgpu can free them.
