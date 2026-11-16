@@ -196,7 +196,7 @@ fn train_writes_adapter_state_and_metrics() {
         .expect("compute_passes_per_step is a count");
     assert!(
         passes > 0 && passes * 4 <= dispatches,
-        "dispatches share compute passes, cut only by copies and submits: {profile}"
+        "up to 8 dispatches share a compute pass: {profile}"
     );
     assert!(
         profile["device_polls_per_step"].as_u64() > Some(0),

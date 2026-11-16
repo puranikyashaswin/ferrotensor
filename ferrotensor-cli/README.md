@@ -477,7 +477,8 @@ The values in angle brackets are placeholders. Step time minus the time
 waiting on the GPU is roughly the time the host spends recording work;
 waiting includes the wait inside each readback, and forced synchronizes
 are the waits that free upload staging memory every 256 MiB of uploads.
-Consecutive dispatches share one compute pass until a copy or a submit;
+Up to 8 consecutive dispatches share one compute pass, which a copy or a
+submit ends early;
 device polls are the polls made while waiting for the GPU (each submit
 also runs wgpu's device maintenance).
 

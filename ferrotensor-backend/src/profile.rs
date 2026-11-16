@@ -62,8 +62,8 @@ impl GpuCounters {
 pub struct GpuCounterSnapshot {
     /// Compute kernel dispatches recorded (buffer copies are not counted).
     pub dispatches: u64,
-    /// Compute passes the dispatches were encoded in: one per run of
-    /// dispatches between copies and submissions.
+    /// Compute passes the dispatches were encoded in: one per run of at most
+    /// 8 dispatches between copies and submissions.
     pub compute_passes: u64,
     /// Bind groups created, one per dispatch.
     pub bind_groups: u64,

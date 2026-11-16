@@ -62,7 +62,7 @@ fn counters_match_a_known_sequence_of_ops() {
 
 #[test]
 #[ignore = "needs a GPU"]
-fn dispatches_in_one_pass_see_each_others_writes() {
+fn dispatches_sharing_a_pass_see_each_others_writes() {
     let ctx = pollster::block_on(WgpuContext::new());
     let engine = ComputeEngine::new(&ctx);
     let x = UnifiedTensor::new(&ctx, &[1.0; N], &[N]);
@@ -83,6 +83,6 @@ fn dispatches_in_one_pass_see_each_others_writes() {
     // (1 * 2^10 + 3) * 0.5
     assert_eq!(values, vec![513.5; N]);
     assert_eq!(ops.dispatches, 12);
-    assert_eq!(ops.compute_passes, 1, "no copy or submit came between them");
+    assert_eq!(ops.compute_passes, 2, "12 dispatches, at most 8 per pass");
     assert_eq!(ops.submits, 1);
 }

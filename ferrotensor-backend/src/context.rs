@@ -12,6 +12,11 @@ use wgpu::{Adapter, BindGroup, CommandEncoder, ComputePipeline, Device, Instance
 /// starts on long sequences without waiting for a sync point.
 const MAX_PENDING_OPS: u32 = 128;
 
+/// Queued dispatches are encoded into a pass once this many are waiting. A
+/// long pass delays GPU work: on an A10G (16 Nov 2026) passes of up to 32
+/// dispatches made SmolLM2-1.7B steps slower than one pass per dispatch.
+const MAX_PASS_DISPATCHES: usize = 8;
+
 /// Uploaded bytes after which [`WgpuContext::note_upload`] waits for the
 /// staging copies to finish so wgpu can free them.
 pub const UPLOAD_RELEASE_BYTES: u64 = 256 << 20;
@@ -20,8 +25,8 @@ pub const UPLOAD_RELEASE_BYTES: u64 = 256 << 20;
 ///
 /// Kernel dispatches and copies from [`ComputeEngine`](crate::ComputeEngine)
 /// are recorded into one pending command encoder and submitted together:
-/// consecutive dispatches share one compute pass, cut only by a copy or a
-/// submission. They are submitted every 128 ops, and whenever a result is read
+/// up to 8 consecutive dispatches share one compute pass, which a copy or a
+/// submission also ends. They are submitted every 128 ops, and whenever a result is read
 /// ([`UnifiedTensor::to_vec`](crate::UnifiedTensor::to_vec)) or a buffer is
 /// written ([`UnifiedTensor::write_data`](crate::UnifiedTensor::write_data)).
 /// Call [`flush`](Self::flush) before submitting work of your own on
@@ -267,6 +272,9 @@ impl WgpuContext {
     pub(crate) fn record_dispatch(&self, dispatch: Dispatch) {
         let mut pending = self.pending.lock().unwrap();
         pending.dispatches.push(dispatch);
+        if pending.dispatches.len() >= MAX_PASS_DISPATCHES {
+            self.encoder(&mut pending);
+        }
         self.count_op(&mut pending);
     }
 
