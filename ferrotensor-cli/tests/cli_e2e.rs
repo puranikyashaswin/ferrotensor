@@ -191,6 +191,17 @@ fn train_writes_adapter_state_and_metrics() {
         .as_u64()
         .expect("dispatches_per_step is a count");
     assert!(dispatches > 0, "profile: {profile}");
+    let passes = profile["compute_passes_per_step"]
+        .as_u64()
+        .expect("compute_passes_per_step is a count");
+    assert!(
+        passes > 0 && passes * 4 <= dispatches,
+        "dispatches share compute passes, cut only by copies and submits: {profile}"
+    );
+    assert!(
+        profile["device_polls_per_step"].as_u64() > Some(0),
+        "each step waits for the GPU at least once: {profile}"
+    );
 
     for name in RUN_FILES {
         let path = out.path().join(name);

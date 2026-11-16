@@ -6,7 +6,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use wgpu::{Adapter, CommandEncoder, Device, Instance, Queue};
+use wgpu::{Adapter, BindGroup, CommandEncoder, ComputePipeline, Device, Instance, Queue};
 
 /// Recorded GPU work is submitted once this many ops are pending, so the GPU
 /// starts on long sequences without waiting for a sync point.
@@ -20,7 +20,8 @@ pub const UPLOAD_RELEASE_BYTES: u64 = 256 << 20;
 ///
 /// Kernel dispatches and copies from [`ComputeEngine`](crate::ComputeEngine)
 /// are recorded into one pending command encoder and submitted together:
-/// every 128 ops, and whenever a result is read
+/// consecutive dispatches share one compute pass, cut only by a copy or a
+/// submission. They are submitted every 128 ops, and whenever a result is read
 /// ([`UnifiedTensor::to_vec`](crate::UnifiedTensor::to_vec)) or a buffer is
 /// written ([`UnifiedTensor::write_data`](crate::UnifiedTensor::write_data)).
 /// Call [`flush`](Self::flush) before submitting work of your own on
@@ -55,17 +56,29 @@ pub struct WgpuContext {
     pub(crate) counters: GpuCounters,
 }
 
-/// Recorded work not yet submitted.
+/// Recorded work not yet submitted: the encoder, and the dispatches not yet
+/// encoded into it.
 #[derive(Default)]
 struct Pending {
     encoder: Option<CommandEncoder>,
+    dispatches: Vec<Dispatch>,
     ops: u32,
 }
 
 impl std::fmt::Debug for Pending {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Pending").field("ops", &self.ops).finish()
+        f.debug_struct("Pending")
+            .field("ops", &self.ops)
+            .field("dispatches", &self.dispatches.len())
+            .finish()
     }
+}
+
+/// One kernel dispatch waiting to be encoded.
+pub(crate) struct Dispatch {
+    pub(crate) pipeline: Arc<ComputePipeline>,
+    pub(crate) bind_group: BindGroup,
+    pub(crate) groups: (u32, u32, u32),
 }
 
 /// Why [`WgpuContext::try_new_with_options`] could not open a GPU.
@@ -241,15 +254,64 @@ impl WgpuContext {
     )]
     pub(crate) fn record(&self, f: impl FnOnce(&mut CommandEncoder)) {
         let mut pending = self.pending.lock().unwrap();
-        let encoder = pending.encoder.get_or_insert_with(|| {
+        f(self.encoder(&mut pending));
+        self.count_op(&mut pending);
+    }
+
+    /// Records a kernel dispatch into the open compute pass; it runs after
+    /// everything recorded before it. Submits once enough ops are pending.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "lock poisoning means another thread panicked while holding the lock"
+    )]
+    pub(crate) fn record_dispatch(&self, dispatch: Dispatch) {
+        let mut pending = self.pending.lock().unwrap();
+        pending.dispatches.push(dispatch);
+        self.count_op(&mut pending);
+    }
+
+    fn count_op(&self, pending: &mut Pending) {
+        pending.ops += 1;
+        if pending.ops >= MAX_PENDING_OPS {
+            self.submit(pending);
+        }
+    }
+
+    /// The pending encoder, with the pending dispatches encoded into it as
+    /// one compute pass.
+    ///
+    /// wgpu-core 0.19 builds usage trackers sized by the highest live buffer
+    /// id for every pass and drops them at its end, so one pass per dispatch
+    /// cost more host time than the dispatch. Within a pass wgpu still checks
+    /// usage per dispatch and puts a barrier between a write and a later
+    /// access, so each dispatch sees the results of those before it.
+    fn encoder<'p>(&self, pending: &'p mut Pending) -> &'p mut CommandEncoder {
+        let Pending {
+            encoder,
+            dispatches,
+            ..
+        } = pending;
+        let encoder = encoder.get_or_insert_with(|| {
             self.device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor::default())
         });
-        f(encoder);
-        pending.ops += 1;
-        if pending.ops >= MAX_PENDING_OPS {
-            self.submit(&mut pending);
+        if !dispatches.is_empty() {
+            self.counters.compute_passes.fetch_add(1, Ordering::Relaxed);
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            let mut bound: Option<&Arc<ComputePipeline>> = None;
+            for dispatch in dispatches.iter() {
+                if !bound.is_some_and(|pipeline| Arc::ptr_eq(pipeline, &dispatch.pipeline)) {
+                    pass.set_pipeline(&dispatch.pipeline);
+                    bound = Some(&dispatch.pipeline);
+                }
+                pass.set_bind_group(0, &dispatch.bind_group, &[]);
+                let (x, y, z) = dispatch.groups;
+                pass.dispatch_workgroups(x, y, z);
+            }
+            drop(pass);
+            dispatches.clear();
         }
+        encoder
     }
 
     /// Submits all recorded work to the queue. Reads and writes through
@@ -307,7 +369,7 @@ impl WgpuContext {
         let start = Instant::now();
         let mut polls = 0u32;
         loop {
-            self.device.poll(wgpu::Maintain::Poll);
+            self.poll();
             if done() {
                 GpuCounters::add_elapsed(&self.counters.gpu_wait_nanos, start);
                 // Callers wait for the last submitted work, so that poll let
@@ -327,6 +389,9 @@ impl WgpuContext {
 
     fn submit(&self, pending: &mut Pending) {
         pending.ops = 0;
+        if !pending.dispatches.is_empty() {
+            self.encoder(pending);
+        }
         if let Some(encoder) = pending.encoder.take() {
             let memory = self.memory();
             let serial = memory.begin_submission();
@@ -346,8 +411,15 @@ impl WgpuContext {
     /// than at the next submission.
     fn release_idle_buffers(&self) {
         if self.pool.trim() > 0 {
-            self.device.poll(wgpu::Maintain::Poll);
+            self.poll();
         }
+    }
+
+    /// Polls the device without blocking. Each poll runs wgpu's device
+    /// maintenance, whose cost grows with the number of live buffers.
+    fn poll(&self) {
+        self.counters.device_polls.fetch_add(1, Ordering::Relaxed);
+        self.device.poll(wgpu::Maintain::Poll);
     }
 
     /// Byte counters of this context's tensors: live, peak, idle in the
