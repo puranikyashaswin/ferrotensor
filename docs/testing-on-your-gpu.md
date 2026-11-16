@@ -8,6 +8,15 @@ the kernel benchmarks also ran on a Tesla T4 through Vulkan
 AMD and Intel GPUs, and from DX12, are the most useful thing you can
 contribute.
 
+On 16 November 2026 one A10G (24 GB) ran `info --check` (passed), the gradient
+parity tests (4 passed, worst absolute difference 9.239e-7) and the forward
+parity tests (10 passed), then the commands `plan`, `finetune`, `chat`,
+`merge`, `export-gguf` and `pretrain`; the numbers are in
+[benchmarks/RESULTS.md](../benchmarks/RESULTS.md#real-hardware-run-16-november-2026).
+The full GPU test suite did not finish in that run: it stopped at the Qwen2
+tests, which need the fixture described in section 3 (they now skip when it
+is missing).
+
 ## 1. See which GPU Ferrotensor uses
 
 ```bash
@@ -59,6 +68,23 @@ cargo run -p ferrotensor-benchmarks --release --bin tensor-api
 
 The first command runs the GPU test suites on your GPU, which compare the kernels with CPU references and the LoRA gradients with PyTorch fixtures.
 The second prints CPU and GPU timings for the Tensor API.
+
+### The Qwen2 fixture (four tests)
+
+The four tests in `ferrotensor-trainer/tests/qwen2_family.rs` compare a tiny
+random Qwen2 model with Hugging Face transformers. They need a fixture that
+`scripts/gen_qwen2_fixture.py` writes, which needs PyTorch and Transformers
+(`pip install torch transformers safetensors`):
+
+```bash
+python scripts/gen_qwen2_fixture.py /tmp/qwen2-fixture
+FERROTENSOR_QWEN2_FIXTURE=/tmp/qwen2-fixture \
+  cargo test --release -p ferrotensor-trainer --test qwen2_family -- --ignored --test-threads=1
+```
+
+Without `FERROTENSOR_QWEN2_FIXTURE` the four tests print a skip message and
+pass, so the rest of the suite still runs. A path that is set but wrong makes
+them fail. CI generates the fixture and sets the variable.
 
 ## 4. Or measure everything in one go
 

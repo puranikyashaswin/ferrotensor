@@ -13,6 +13,9 @@ It has been tested on an NVIDIA A10G (24 GB)
 through Vulkan, an Apple M2 (8 GB) through Metal, and software Vulkan (Mesa
 lavapipe) in CI; other GPUs are untested, and
 [reports are welcome](../docs/testing-on-your-gpu.md).
+On 16 November 2026 one A10G ran `plan`, `finetune`, `eval`, `chat`, `merge`,
+`export-gguf` and byte-level `pretrain` once each; the numbers are in
+[benchmarks/RESULTS.md](../benchmarks/RESULTS.md#real-hardware-run-16-november-2026).
 
 Install it from crates.io (the binary is called `ferrotensor`), or run it from
 a checkout with `cargo run -p ferrotensor-cli --release --`:
@@ -233,6 +236,13 @@ ferrotensor finetune --model ./data/models/SmolLM2-360M --data train.jsonl --seq
   difference in percent.
 - `--lite` is refused; it sets memory flags itself.
 
+On one A10G (16 November 2026, 30 steps, no memory flags) it chose 8 × 1 for
+SmolLM2-135M and 360M, and 4 × 2 for SmolLM2-1.7B, which peaked at 15,064 MiB;
+a budget of 3,000 MiB on SmolLM2-1.7B was refused with exit code 2. A 250-step
+run of the one-command path on SmolLM2-1.7B (`--lr 5e-4 --warmup-steps 20`)
+took the held-out loss from 2.6474 to 1.0612. The full table is in
+[benchmarks/RESULTS.md](../benchmarks/RESULTS.md#real-hardware-run-16-november-2026).
+
 ## What fits this machine: `plan`
 
 `plan` estimates the peak GPU memory of LoRA training and prints the
@@ -449,6 +459,12 @@ or `.scales` tensors), files of trained base weights, and adapter tensors
 whose base weight is missing or has another shape are refused before
 anything is written.
 
+On the A10G run of 16 November 2026, `merge` of the SmolLM2-1.7B adapter wrote
+96 merged and 122 copied tensors. `eval` gave 1.0605 on the merged model and
+1.0612 with the adapter on the base; the merged weights are rounded to the
+base's f16. `chat` gave the same three greedy replies from both
+([results](../benchmarks/RESULTS.md#real-hardware-run-16-november-2026)).
+
 ## llama.cpp and Ollama: `export-gguf`
 
 `export-gguf` writes a Llama-style model directory, such as a `merge`
@@ -473,10 +489,13 @@ SmolLM (llama.cpp `gpt-2` and `smollm`); SentencePiece-style tokenizers such
 as TinyLlama's are refused. An existing `--out`, a `model_type` other than
 `llama`, a scaled `rope_scaling` or `rope_parameters` (Llama 3.1 and
 later), projection biases (Qwen2), a quantized base and tensors without a
-llama.cpp name are refused too, with exit code 2. The file is written to the GGUF v3 specification;
-loading in llama.cpp is checked on the next hardware run, with
-`scripts/check_gguf.sh`, which compares a greedy completion of llama.cpp's
-`llama-simple` with `ferrotensor generate`.
+llama.cpp name are refused too, with exit code 2. The file is written to the GGUF v3 specification.
+On the A10G run of 16 November 2026, llama.cpp (commit `9fba51d`, CPU build,
+`llama-simple`) loaded the SmolLM2-1.7B file of 218 tensors, and its greedy
+completion of "The capital of France is" (" Paris.") matched
+`ferrotensor generate`. That compares two tokens of one prompt. `scripts/check_gguf.sh` runs this
+comparison; the numbers are in
+[benchmarks/RESULTS.md](../benchmarks/RESULTS.md#real-hardware-run-16-november-2026).
 
 ## Train from scratch: `pretrain`
 
@@ -485,7 +504,7 @@ file, with a byte-level tokenizer or a BPE tokenizer learned from the same
 file, and leaves a model directory that `generate --raw` loads. It
 is meant for learning and experiments: f32 weights, untied embeddings,
 training defaults that are conservative and not tuned, and no claim about
-speed or about quality beyond the CI test below.
+speed or about quality beyond the CI test and the measured runs below.
 
 ```bash
 cargo run -p ferrotensor-cli --release -- pretrain \
@@ -564,6 +583,16 @@ brown" with " fox jumps". This shows the path learns; it says nothing about
 quality on real text. The exported directory gives the same eval loss as
 the trained weights it came from, and loads in Transformers with the same
 loss within 1e-3.
+
+On one NVIDIA A10G (16 November 2026, byte-level tokenizer, a 1 MB English text
+file built from the Alpaca training examples) the defaults (1,116,032
+parameters, 2,000 steps) took the loss from 4.5239 at the first logged step to
+1.2271 in 51.1 s, peaking at 431 MiB; 8 blocks, width 384 and 6 heads
+(19,079,808 parameters, 3,000 steps) went from 3.5511 to 0.7507 in 385.1 s,
+peaking at 1,672 MiB. `generate --raw` from both produced English-like text,
+and `--resume` at the saved step trained 0 steps and exported. `--tokenizer bpe`
+was not run on that machine
+([results](../benchmarks/RESULTS.md#real-hardware-run-16-november-2026)).
 
 ## Sample from a model: `generate`
 

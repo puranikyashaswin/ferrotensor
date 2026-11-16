@@ -25,5 +25,5 @@
 ## Optional
 
 - [Changelog](CHANGELOG.md)
-- [Kernel benchmarks](benchmarks/RESULTS.md)
+- [Benchmarks](benchmarks/RESULTS.md): kernel timings, and one A10G run of the commands on 16 November 2026
 - [Mac benchmark harness](docs/benchmarks-mac.md)
