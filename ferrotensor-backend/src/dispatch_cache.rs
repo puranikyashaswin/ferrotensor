@@ -69,7 +69,8 @@ impl<K: Hash + Eq, V> RecentlyUsed<K, V> {
     fn insert(&mut self, key: K, value: V) {
         if self.entries.len() >= self.cap {
             let mut stamps: Vec<u64> = self.entries.values().map(|(stamp, _)| *stamp).collect();
-            let (_, &mut cutoff, _) = stamps.select_nth_unstable(stamps.len() / 2);
+            let middle = stamps.len() / 2;
+            let (_, &mut cutoff, _) = stamps.select_nth_unstable(middle);
             self.entries.retain(|_, (stamp, _)| *stamp >= cutoff);
         }
         self.clock += 1;
@@ -151,7 +152,7 @@ impl WgpuContext {
             self.counters.bind_groups_reused.fetch_add(1, Relaxed);
             return cached.bind_group.clone();
         }
-        let plain: Vec<(u32, &Buffer)> = entries.iter().map(|(i, b)| (*i, b.as_ref())).collect();
+        let plain: Vec<(u32, &Buffer)> = entries.iter().map(|&(i, b)| (i, &**b)).collect();
         let bind_group = Arc::new(self.create_bind_group(layout, &plain));
         let buffers = entries.iter().map(|(_, b)| Arc::downgrade(b)).collect();
         cache.insert(
