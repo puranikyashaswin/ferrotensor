@@ -19,17 +19,93 @@
 //! Base weights are frozen ([`Tensor::frozen`]) unless
 //! [`Lfm2ModelBuilder::with_trainable_base`] is set, so LoRA training skips
 //! their gradients. Frozen linear-layer weights can be stored as f16
-//! ([`Lfm2ModelBuilder::with_f16_weights`]), and those of the decoder blocks
-//! at 4 bits ([`Lfm2ModelBuilder::with_q4_weights`], which changes the
-//! model's outputs). Pre-quantized checkpoints (`<name>.scales` tensors) are
+//! ([`Lfm2ModelBuilder::with_f16_weights`]), and those of the decoder blocks,
+//! or any [`Q4Selection`] of linear weights, at 4 bits
+//! ([`Lfm2ModelBuilder::with_q4_weights`], which changes the model's
+//! outputs). Pre-quantized checkpoints (`<name>.scales` tensors) are
 //! rejected.
 
 use crate::lfm::{Lfm2Block, Lfm2Conv, Lfm2LayerOp, Lfm2Model};
 use crate::{Attention, Linear, LoRAAdapter, RMSNorm, MLP};
 use ferrotensor_autograd::Tensor;
+use ferrotensor_backend::q4::Q4Group;
 use ferrotensor_backend::{ComputeEngine, DType, UnifiedTensor, WgpuContext};
 use ferrotensor_loader::{Lfm2Config, WeightsContext};
+use std::ops::RangeInclusive;
 use std::sync::Arc;
+
+/// Whether the parameter `name` (a Hugging Face name such as
+/// `model.layers.3.mlp.up_proj.weight`) belongs to the module group `key`.
+///
+/// `key` is case-insensitive: `all` is every weight but the token
+/// embedding, `full` every weight, `embed` (or `embedding`) the token
+/// embedding, `attn` (or `attention`) the attention or LFM2 attention
+/// blocks, `mlp` the MLPs (`mlp` in Llama blocks, `feed_forward` in LFM2),
+/// `head` the `lm_head`, `layers.N` the blocks of layer `N` and
+/// `layers.A-B` those of layers `A` to `B` inclusive. Any other key matches
+/// the names that contain it, such as `q_proj` or `norm`.
+pub fn module_matches(key: &str, name: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    if let Some(layers) = layer_range(&key) {
+        return layer_index(name).is_some_and(|i| layers.contains(&i));
+    }
+    let parts: &[&str] = match key.as_str() {
+        "all" => return !name.contains("embed_tokens"),
+        "full" => return true,
+        "embed" | "embedding" => &["embed_tokens"],
+        "attn" | "attention" => &["self_attn"],
+        "mlp" => &[".mlp.", ".feed_forward."],
+        "head" => &["lm_head"],
+        other => return name.contains(other),
+    };
+    parts.iter().any(|p| name.contains(p))
+}
+
+/// The layers `layers.N` or `layers.A-B` names, or `None` for other keys.
+fn layer_range(key: &str) -> Option<RangeInclusive<usize>> {
+    let spec = key.strip_prefix("layers.")?;
+    let (first, last) = spec.split_once('-').unwrap_or((spec, spec));
+    Some(first.parse().ok()?..=last.parse().ok()?)
+}
+
+/// The block index in a `...layers.N....` parameter name.
+fn layer_index(name: &str) -> Option<usize> {
+    let mut parts = name.split('.');
+    parts.find(|p| *p == "layers")?;
+    parts.next()?.parse().ok()
+}
+
+/// Which frozen linear weights [`Lfm2ModelBuilder::with_q4_selection`]
+/// stores at 4 bits, and how many weights share a scale.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Q4Selection {
+    /// [`module_matches`] keys; a weight matching any of them is quantised.
+    pub modules: Vec<String>,
+    /// Keys that keep a weight out even when `modules` matches it.
+    pub skip: Vec<String>,
+    /// Weights per scale and minimum.
+    pub group: Q4Group,
+}
+
+impl Default for Q4Selection {
+    /// Every decoder-block projection in groups of 64: what
+    /// [`Lfm2ModelBuilder::with_q4_weights`] stores at 4 bits.
+    fn default() -> Self {
+        Self {
+            modules: vec!["layers".to_string()],
+            skip: Vec::new(),
+            group: Q4Group::DEFAULT,
+        }
+    }
+}
+
+impl Q4Selection {
+    /// Whether the linear weight `name` (e.g. `lm_head.weight`) is selected.
+    pub fn selects(&self, name: &str) -> bool {
+        self.modules.iter().any(|k| module_matches(k, name))
+            && !self.skip.iter().any(|k| module_matches(k, name))
+    }
+}
 
 /// Configuration for LoRA adapters
 pub struct LoRaConfig {
@@ -157,7 +233,7 @@ pub struct Lfm2ModelBuilder<'a> {
     lora_config: Option<LoRaConfig>,
     trainable_base: bool,
     f16_weights: bool,
-    q4_weights: bool,
+    q4: Option<Q4Selection>,
 }
 
 impl<'a> Lfm2ModelBuilder<'a> {
@@ -186,7 +262,7 @@ impl<'a> Lfm2ModelBuilder<'a> {
             lora_config: None,
             trainable_base: false,
             f16_weights: false,
-            q4_weights: false,
+            q4: None,
         }
     }
 
@@ -221,27 +297,39 @@ impl<'a> Lfm2ModelBuilder<'a> {
     /// [`build`](Self::build) fails when this is combined with
     /// [`with_trainable_base`](Self::with_trainable_base) (4-bit weights
     /// cannot train) and when a weight cannot be quantised (NaN, infinite or
-    /// beyond the f16 range). Off by default.
+    /// beyond the f16 range). Off by default; the same as
+    /// [`with_q4_selection`](Self::with_q4_selection) with
+    /// [`Q4Selection::default`].
     pub fn with_q4_weights(mut self, q4: bool) -> Self {
-        self.q4_weights = q4;
+        self.q4 = q4.then(Q4Selection::default);
         self
     }
 
+    /// Store the frozen linear weights `selection` picks at 4 bits, in its
+    /// group size, including `lm_head` (tied or not) when selected. As
+    /// [`with_q4_weights`](Self::with_q4_weights) otherwise; the token
+    /// embedding is a host lookup table and never quantised.
+    pub fn with_q4_selection(mut self, selection: Q4Selection) -> Self {
+        self.q4 = Some(selection);
+        self
+    }
+
+    /// The 4-bit settings for the linear weight `name` of `shape`, if
+    /// [`with_q4_selection`](Self::with_q4_selection) selects it.
+    fn q4_for(&self, name: &str, shape: &[usize]) -> Option<&Q4Selection> {
+        self.q4
+            .as_ref()
+            .filter(|q4| shape.len() == 2 && q4.selects(name))
+    }
+
     /// Uploads the linear-layer weight `name`: f32 when the base trains,
-    /// 4-bit when [`with_q4_weights`](Self::with_q4_weights) applies and the
-    /// weight is `quantisable` (a 2-D decoder-block projection), else f16
-    /// when [`with_f16_weights`](Self::with_f16_weights) applies, else f32.
-    fn upload_linear(
-        &self,
-        name: &str,
-        data: &[f32],
-        shape: &[usize],
-        quantisable: bool,
-    ) -> Result<UnifiedTensor> {
+    /// 4-bit when the 4-bit selection picks it, else f16 when
+    /// [`with_f16_weights`](Self::with_f16_weights) applies, else f32.
+    fn upload_linear(&self, name: &str, data: &[f32], shape: &[usize]) -> Result<UnifiedTensor> {
         Ok(if self.trainable_base {
             UnifiedTensor::new(&self.ctx, data, shape)
-        } else if self.q4_weights && quantisable && shape.len() == 2 {
-            UnifiedTensor::from_f32_as_q4(&self.ctx, data, shape)
+        } else if let Some(q4) = self.q4_for(name, shape) {
+            UnifiedTensor::from_f32_as_q4(&self.ctx, data, shape, q4.group)
                 .map_err(|e| BuildError(format!("{name}: {e}")))?
         } else if self.f16_weights {
             UnifiedTensor::from_f32_as_f16(&self.ctx, data, shape)
@@ -251,7 +339,7 @@ impl<'a> Lfm2ModelBuilder<'a> {
     }
 
     /// The element type [`upload_linear`](Self::upload_linear) stores for a
-    /// weight that is not `quantisable` (such as `lm_head`).
+    /// weight the 4-bit selection leaves out.
     fn linear_dtype(&self) -> DType {
         if self.f16_weights && !self.trainable_base {
             DType::FP16
@@ -323,8 +411,7 @@ impl<'a> Lfm2ModelBuilder<'a> {
         Ok(self.wrap(UnifiedTensor::new(&self.ctx, &data, &shape)))
     }
 
-    /// Load a PyTorch `[out, in]` weight transposed to `[in, out]`. Every
-    /// linear weight but `lm_head` may be stored at 4 bits.
+    /// Load a PyTorch `[out, in]` weight transposed to `[in, out]`.
     fn load_linear_weight_tensor(&self, prefix: &str) -> Result<Tensor> {
         let name = format!("{prefix}.weight");
         let (data, shape) = self.read(&name)?;
@@ -333,8 +420,7 @@ impl<'a> Lfm2ModelBuilder<'a> {
         } else {
             (data, shape)
         };
-        let quantisable = prefix != "lm_head";
-        Ok(self.wrap(self.upload_linear(&name, &data, &shape, quantisable)?))
+        Ok(self.wrap(self.upload_linear(&name, &data, &shape)?))
     }
 
     fn maybe_add_lora(&self, linear: Linear, module_name: &str, seed: u64) -> Linear {
@@ -535,7 +621,7 @@ impl<'a> Lfm2ModelBuilder<'a> {
     /// Build the complete model, or explain which weight or setting is
     /// missing or unsupported.
     pub fn build(self) -> Result<Lfm2Model> {
-        if self.q4_weights && self.trainable_base {
+        if self.q4.is_some() && self.trainable_base {
             return Err(BuildError(
                 "4-bit base weights (with_q4_weights / --q4-weights) cannot train: \
                  use them with LoRA adapters only, or load the base weights without 4-bit storage"
@@ -582,21 +668,40 @@ impl<'a> Lfm2ModelBuilder<'a> {
                     "model.embed_tokens.weight must be 2-D, got {shape:?}"
                 )));
             };
-            // Transposed and converted while it is written to the GPU buffer:
-            // no transposed copy of the table on the host. Never 4-bit:
-            // `lm_head` follows the f16 setting only.
-            let weight = self.wrap(UnifiedTensor::from_f32_transposed(
-                &self.ctx,
-                data,
-                vocab,
-                hidden,
-                self.linear_dtype(),
-            ));
-            self.maybe_add_lora(Linear::new(weight), "lm_head", 0)
+            let head = "lm_head.weight";
+            let weight = if self.q4_for(head, &[hidden, vocab]).is_some() {
+                // Quantising needs the logical [hidden, vocab] order, so this
+                // path holds one transposed copy of the table on the host.
+                let transposed = Self::transpose_2d(data, vocab, hidden);
+                self.upload_linear(head, &transposed, &[hidden, vocab])?
+            } else {
+                // Transposed and converted while it is written to the GPU
+                // buffer: no transposed copy of the table on the host.
+                UnifiedTensor::from_f32_transposed(
+                    &self.ctx,
+                    data,
+                    vocab,
+                    hidden,
+                    self.linear_dtype(),
+                )
+            };
+            self.maybe_add_lora(Linear::new(self.wrap(weight)), "lm_head", 0)
         };
 
         let model =
             Lfm2Model::new(embed_tokens, None, layers, norm_f, lm_head).with_architecture(arch);
+        if let Some(q4) = &self.q4 {
+            if !model
+                .named_params()
+                .values()
+                .any(|t| t.data.dtype == DType::Q4)
+            {
+                return Err(BuildError(format!(
+                    "the 4-bit selection (modules {:?}, skip {:?}) matches no linear weight",
+                    q4.modules, q4.skip
+                )));
+            }
+        }
         Ok(match embed_table {
             Some((table, _)) => model.with_host_embeddings(table),
             None => model,
@@ -656,7 +761,10 @@ fn lora_seed(layer_seed: u64, module_name: &str) -> u64 {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use super::{check_supported, lora_seed, BuildError, Lfm2ModelBuilder};
+    use super::{
+        check_supported, lora_seed, module_matches, BuildError, Lfm2ModelBuilder, Q4Group,
+        Q4Selection,
+    };
     use ferrotensor_loader::Lfm2Config;
 
     /// The `config.json` of Qwen2.5-0.5B on the Hugging Face hub.
@@ -801,5 +909,89 @@ mod tests {
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         let transposed = Lfm2ModelBuilder::transpose_2d(&data, 2, 3);
         assert_eq!(transposed, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+    }
+
+    /// The linear weights of a three-layer Llama model and an LFM2 block.
+    const LINEARS: [&str; 10] = [
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.0.mlp.down_proj.weight",
+        "model.layers.1.self_attn.k_proj.weight",
+        "model.layers.1.mlp.up_proj.weight",
+        "model.layers.2.self_attn.o_proj.weight",
+        "model.layers.12.self_attn.q_proj.weight",
+        "model.layers.12.mlp.gate_proj.weight",
+        "model.layers.3.feed_forward.w1.weight",
+        "model.layers.3.conv.in_proj.weight",
+        "lm_head.weight",
+    ];
+
+    fn selected(keys: &[&str], skip: &[&str]) -> Vec<&'static str> {
+        let selection = Q4Selection {
+            modules: keys.iter().map(|k| k.to_string()).collect(),
+            skip: skip.iter().map(|k| k.to_string()).collect(),
+            group: Q4Group::DEFAULT,
+        };
+        LINEARS
+            .into_iter()
+            .filter(|n| selection.selects(n))
+            .collect()
+    }
+
+    #[test]
+    fn module_keys_match_groups_names_and_layer_ranges() {
+        let blocks = &LINEARS[..9];
+        assert_eq!(selected(&["layers"], &[]), blocks);
+        assert_eq!(Q4Selection::default().modules, ["layers"]);
+        assert_eq!(selected(&["all"], &[]), LINEARS);
+        assert_eq!(selected(&["head"], &[]), ["lm_head.weight"]);
+        assert_eq!(selected(&["lm_head"], &[]), ["lm_head.weight"]);
+        assert_eq!(
+            selected(&["q_proj"], &[]),
+            [LINEARS[0], LINEARS[5]],
+            "a name part"
+        );
+        assert_eq!(
+            selected(&["mlp"], &[]),
+            [LINEARS[1], LINEARS[3], LINEARS[6], LINEARS[7]],
+            "Llama mlp and LFM2 feed_forward"
+        );
+        assert_eq!(
+            selected(&["ATTN"], &[]),
+            [LINEARS[0], LINEARS[2], LINEARS[4], LINEARS[5]]
+        );
+        // `layers.1` is layer 1 alone, not 1x; a range is inclusive.
+        assert_eq!(selected(&["layers.1"], &[]), [LINEARS[2], LINEARS[3]]);
+        assert_eq!(selected(&["layers.0-1"], &[]), &LINEARS[..4]);
+        assert_eq!(selected(&["layers.2-12"], &[]), &LINEARS[4..9]);
+        assert_eq!(
+            selected(&["q_proj", "head"], &[]),
+            [LINEARS[0], LINEARS[5], LINEARS[9]],
+            "keys add up"
+        );
+        assert!(selected(&["v_proj"], &[]).is_empty());
+        assert!(selected(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn skip_keys_remove_weights_from_the_selection() {
+        assert_eq!(
+            selected(&["all"], &["mlp", "layers.12"]),
+            [LINEARS[0], LINEARS[2], LINEARS[4], LINEARS[8], LINEARS[9]]
+        );
+        assert_eq!(selected(&["layers"], &["layers.0-11"]), &LINEARS[5..7]);
+        assert!(selected(&["head"], &["lm_head"]).is_empty());
+    }
+
+    #[test]
+    fn train_module_keys_cover_every_parameter_kind() {
+        let embed = "model.embed_tokens.weight";
+        let norm = "model.layers.0.input_layernorm.weight";
+        assert!(module_matches("embed", embed) && module_matches("Embedding", embed));
+        assert!(!module_matches("all", embed) && module_matches("full", embed));
+        assert!(module_matches("all", norm) && module_matches("norm", norm));
+        assert!(!module_matches("attn", norm));
+        assert!(module_matches("layers.0", norm) && !module_matches("layers.1-9", norm));
+        // Not a layer range: matched as a name part.
+        assert!(module_matches("layers.", norm) && !module_matches("layers.x", norm));
     }
 }

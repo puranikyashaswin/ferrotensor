@@ -15,6 +15,7 @@ use ferrotensor_backend::{
     q4, AdamParams, AttentionOptions, ComputeEngine, DType, MemoryCategory, UnifiedTensor,
     WgpuContext, MASKED_CE_SKIP, SUM_SQUARES_CHUNK,
 };
+use q4::Q4Group;
 use std::io::Write as _;
 use std::sync::OnceLock;
 
@@ -322,8 +323,8 @@ fn max_abs_diff(got: &[f32], want: &[f32]) -> f32 {
 
 /// `w` through the 4-bit round trip on the host, as the `*_q4b` matmuls
 /// see it.
-fn q4_round(w: &[f32], k: usize, n: usize) -> Vec<f32> {
-    q4::dequantize(&q4::quantize(w, k, n).unwrap(), k, n)
+fn q4_round(w: &[f32], k: usize, n: usize, group: Q4Group) -> Vec<f32> {
+    q4::dequantize(&q4::quantize(w, k, n, group).unwrap(), k, n, group)
 }
 
 #[test]
@@ -348,11 +349,14 @@ fn matmul_with_q4_b_matches_cpu() {
             .iter()
             .map(|v| v * 0.1)
             .collect();
-        let w_q = UnifiedTensor::from_f32_as_q4(&g.ctx, &w, &[k, n]).unwrap();
+        let w_q = UnifiedTensor::from_f32_as_q4(&g.ctx, &w, &[k, n], Q4Group::DEFAULT).unwrap();
         assert_eq!(w_q.dtype, DType::Q4);
         assert_eq!(w_q.shape, vec![k, n]);
-        assert_eq!(w_q.size_in_bytes(), 4 * q4::packed_words(k, n) as u64);
-        let w_dq = q4_round(&w, k, n);
+        assert_eq!(
+            w_q.size_in_bytes(),
+            4 * q4::packed_words(k, n, Q4Group::DEFAULT) as u64
+        );
+        let w_dq = q4_round(&w, k, n, Q4Group::DEFAULT);
         quant_err = quant_err.max(max_abs_diff(&w_dq, &w));
 
         let y = zeros(&[m, n]);
@@ -389,6 +393,64 @@ fn matmul_with_q4_b_matches_cpu() {
 
 #[test]
 #[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn matmul_with_q4_b_matches_cpu_for_every_group_size() {
+    // Each size moves the scale words and the group boundaries, so a kernel
+    // that ignored the size would fail every size but 64. Shapes with k a
+    // multiple of every size, k off all of them, and k * n off the largest
+    // group, in both modes.
+    let g = gpu();
+    for size in Q4Group::SIZES {
+        let group = Q4Group::new(size).unwrap();
+        for (seed, &(m, k, n)) in [
+            (1, 1, 1),
+            (3, 5, 7),
+            (17, 128, 9),
+            (65, 33, 129),
+            (64, 256, 64),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let x = rand_vec(m * k, 1500 + seed as u64);
+            let w: Vec<f32> = rand_vec(k * n, 1600 + seed as u64)
+                .iter()
+                .map(|v| v * 0.1)
+                .collect();
+            let w_q = UnifiedTensor::from_f32_as_q4(&g.ctx, &w, &[k, n], group).unwrap();
+            assert_eq!(w_q.q4_group(), Some(group));
+            assert_eq!(
+                w_q.size_in_bytes(),
+                4 * q4::packed_words(k, n, group) as u64
+            );
+            let w_dq = q4_round(&w, k, n, group);
+
+            let y = zeros(&[m, n]);
+            g.engine.matmul_q4b(&g.ctx, &upload(&x, &[m, k]), &w_q, &y);
+            assert_close(
+                &format!("matmul_q4b G={size} {m}x{k}x{n}"),
+                &read(&y),
+                &cpu_matmul(&x, &w_dq, m, k, n),
+                1e-4,
+                1e-4,
+            );
+
+            let dy = rand_vec(m * n, 1700 + seed as u64);
+            let dx = zeros(&[m, k]);
+            g.engine
+                .matmul_bt_q4b(&g.ctx, &upload(&dy, &[m, n]), &w_q, &dx);
+            assert_close(
+                &format!("matmul_bt_q4b G={size} {m}x{n}x{k}"),
+                &read(&dx),
+                &cpu_matmul(&dy, &transpose(&w_dq, k, n), m, n, k),
+                1e-4,
+                1e-4,
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
 fn q4_weights_take_four_and_a_half_bits_each() {
     // 4-bit codes plus one 32-bit scale/min word per 64 weights, counted by
     // the memory tracker under the current category, apart from f16.
@@ -402,7 +464,7 @@ fn q4_weights_take_four_and_a_half_bits_each() {
         .category(MemoryCategory::BaseWeights);
     let w_q = {
         let _tag = g.ctx.memory().scope(MemoryCategory::BaseWeights);
-        UnifiedTensor::from_f32_as_q4(&g.ctx, &w, &[k, n]).unwrap()
+        UnifiedTensor::from_f32_as_q4(&g.ctx, &w, &[k, n], Q4Group::DEFAULT).unwrap()
     };
     let bytes = (k * n / 2 + 4 * (k * n / 64)) as u64;
     assert_eq!(bytes, 2_359_296);
@@ -431,8 +493,13 @@ fn q4_weights_take_four_and_a_half_bits_each() {
 fn q4_upload_rejects_non_finite_weights() {
     let g = gpu();
     let live = g.ctx.memory().live_bytes();
-    let err =
-        UnifiedTensor::from_f32_as_q4(&g.ctx, &[0.0, f32::NAN, 1.0, 2.0], &[2, 2]).unwrap_err();
+    let err = UnifiedTensor::from_f32_as_q4(
+        &g.ctx,
+        &[0.0, f32::NAN, 1.0, 2.0],
+        &[2, 2],
+        Q4Group::DEFAULT,
+    )
+    .unwrap_err();
     assert!(
         matches!(err, q4::Q4Error::NonFinite { row: 0, col: 1, .. }),
         "{err:?}"
@@ -1819,6 +1886,7 @@ fn long_op_chains_keep_their_order() {
 #[ignore = "needs a GPU; run with --ignored --test-threads=1"]
 fn q4_upload_rejects_non_matrix_shapes() {
     let g = gpu();
-    let err = UnifiedTensor::from_f32_as_q4(&g.ctx, &[0.0; 8], &[2, 2, 2]).unwrap_err();
+    let err =
+        UnifiedTensor::from_f32_as_q4(&g.ctx, &[0.0; 8], &[2, 2, 2], Q4Group::DEFAULT).unwrap_err();
     assert_eq!(err, q4::Q4Error::NotMatrix { rank: 3 });
 }

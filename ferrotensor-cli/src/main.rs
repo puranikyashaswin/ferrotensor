@@ -27,19 +27,23 @@ mod model_id;
 mod plan;
 mod pretrain;
 mod profile_report;
+mod q4_report;
 
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use ferrotensor_autograd::{no_grad, AdamW, OptimizerLoad, WarmupCosineScheduler};
+use ferrotensor_backend::q4::Q4Group;
 use ferrotensor_backend::{
-    ComputeEngine, ContextError, MemoryCategory, UnifiedTensor, WgpuContext,
+    ComputeEngine, ContextError, DType, MemoryCategory, UnifiedTensor, WgpuContext,
 };
 use ferrotensor_graph::lfm::{legacy_llama_name, Lfm2Model};
-use ferrotensor_graph::model_builder::{check_supported, Lfm2ModelBuilder, LoRaConfig};
+use ferrotensor_graph::model_builder::{
+    check_supported, module_matches, Lfm2ModelBuilder, LoRaConfig, Q4Selection,
+};
 use ferrotensor_graph::{KVCache, KVCacheLayer};
 use ferrotensor_loader::{Lfm2Config, ModelLoader, Sampler, Tokenizer, WeightsContext};
 use ferrotensor_trainer::checkpoint::{
     apply_checkpoint, load_lora_checkpoint, save_lora_checkpoint, upgrade_optimizer_names,
-    LoraCheckpoint, LoraMetadata, TrainingCheckpoint, TrainingState,
+    LoraCheckpoint, LoraMetadata, Q4Record, TrainingCheckpoint, TrainingState,
 };
 use ferrotensor_trainer::peft::{export_peft_adapter, is_peft_adapter_dir, load_peft_adapter};
 use ferrotensor_trainer::{
@@ -174,6 +178,9 @@ enum Command {
     Merge(merge::MergeArgs),
     /// Write a Llama-style model as one GGUF file for llama.cpp and Ollama.
     ExportGguf(export_gguf::ExportGgufArgs),
+    /// How much 4-bit storage (--q4-weights) changes each weight matrix of
+    /// a checkpoint, measured on the host without a GPU.
+    Q4Report(q4_report::Q4ReportArgs),
     /// Train a small byte-level Llama-style model from random weights on a
     /// text file, into a model directory that generate loads.
     Pretrain(Box<pretrain::PretrainArgs>),
@@ -233,9 +240,65 @@ struct ModelArgs {
     /// This changes the model's outputs: it computes with the decoded
     /// weights. lm_head stays f16; embeddings, norms and LoRA adapters stay
     /// f32. Not allowed when base weights train. Use the same setting to
-    /// evaluate or generate with an adapter trained this way.
+    /// evaluate or generate with an adapter trained this way. Experimental:
+    /// held-out loss is worse than with f16; --q4-modules, --q4-skip and
+    /// --q4-group exist to find out why.
     #[arg(long, conflicts_with = "f32_weights")]
     q4_weights: bool,
+    #[command(flatten)]
+    q4: Q4Args,
+}
+
+/// Which weights `--q4-weights` stores at 4 bits, and in what groups.
+#[derive(Args, Debug, Clone, Default)]
+struct Q4Args {
+    /// With --q4-weights: the linear weights stored at 4 bits, as
+    /// comma-separated keys matched like --train-modules: attn, mlp, head
+    /// (lm_head, also when tied to the embedding), all, layers.N,
+    /// layers.A-B, or a name part such as q_proj. Default: layers, every
+    /// decoder-block projection. The other linear weights stay f16.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        value_name = "KEYS",
+        requires = "q4_weights"
+    )]
+    q4_modules: Option<Vec<String>>,
+    /// With --q4-weights: keys (as --q4-modules) of weights kept out of
+    /// 4-bit storage even when --q4-modules selects them.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        value_name = "KEYS",
+        requires = "q4_weights"
+    )]
+    q4_skip: Vec<String>,
+    /// With --q4-weights: weights per scale and minimum: 16, 32, 64 or 128
+    /// (4 + 32 / N bits per weight). Default 64.
+    #[arg(long, value_name = "N", value_parser = parse_q4_group, requires = "q4_weights")]
+    q4_group: Option<Q4Group>,
+}
+
+/// Parses `--q4-group`.
+fn parse_q4_group(value: &str) -> std::result::Result<Q4Group, String> {
+    let size = value
+        .parse::<usize>()
+        .map_err(|e| format!("{value:?} is not a group size: {e}"))?;
+    Q4Group::new(size).map_err(|e| e.to_string())
+}
+
+impl ModelArgs {
+    /// The 4-bit selection `--q4-weights` asks for, if it is given.
+    fn q4_selection(&self) -> Option<Q4Selection> {
+        self.q4_weights.then(|| {
+            let default = Q4Selection::default();
+            Q4Selection {
+                modules: self.q4.q4_modules.clone().unwrap_or(default.modules),
+                skip: self.q4.q4_skip.clone(),
+                group: self.q4.q4_group.unwrap_or(default.group),
+            }
+        })
+    }
 }
 
 #[derive(Args, Debug, Clone)]
@@ -322,7 +385,8 @@ struct TrainArgs {
     )]
     lora_targets: Vec<String>,
     /// What to train: lora, or base weights by group (all, attn, mlp, norm,
-    /// lm_head, embed). `all` is every base weight but the token embedding,
+    /// lm_head, embed, layers.N, layers.A-B, or another name part such as
+    /// q_proj). `all` is every base weight but the token embedding,
     /// `embed` only the embedding, `full` both. With tied embeddings lm_head
     /// is a separate copy: training one does not change the other. Trained
     /// base weights are saved in f32, only the tensors that trained, and load
@@ -543,6 +607,7 @@ fn main() {
         Command::Plan(args) => args.json,
         Command::Merge(args) => args.json,
         Command::ExportGguf(args) => args.json,
+        Command::Q4Report(args) => args.json,
         Command::Pretrain(args) => args.json,
         _ => false,
     };
@@ -592,6 +657,7 @@ fn run(command: Command, matches: &clap::ArgMatches, json: bool) -> Result<Exit>
         Command::ExportAdapter(args) => export_adapter(args)?,
         Command::Merge(args) => merge::run(args, json)?,
         Command::ExportGguf(args) => export_gguf::run(args, json)?,
+        Command::Q4Report(args) => q4_report::run(args, json)?,
         Command::Pretrain(args) => pollster::block_on(pretrain::run(*args))?,
         Command::Monitor => ferrotensor_monitor::run().map_err(|e| format!("monitor: {e}"))?,
         Command::Benchmark => {
@@ -614,7 +680,8 @@ struct Loaded {
     /// The memory-mapped checkpoint, until `build_model` takes it.
     weights: std::cell::Cell<Option<WeightsContext>>,
     f16_weights: bool,
-    q4_weights: bool,
+    /// The weights `--q4-weights` stores at 4 bits; `None` without it.
+    q4: Option<Q4Selection>,
 }
 
 async fn load_base(args: &ModelArgs) -> Result<Loaded> {
@@ -653,8 +720,18 @@ async fn load_base(args: &ModelArgs) -> Result<Loaded> {
         config.hidden_size,
         config.vocab_size
     );
-    if args.q4_weights {
-        eprintln!("weights: 4-bit decoder blocks, f16 lm_head");
+    let q4 = args.q4_selection();
+    if let Some(q4) = &q4 {
+        eprintln!(
+            "weights: 4-bit {} (skip {}) in groups of {}, other linear weights f16",
+            q4.modules.join(","),
+            if q4.skip.is_empty() {
+                "none".to_string()
+            } else {
+                q4.skip.join(",")
+            },
+            q4.group.size()
+        );
     }
     Ok(Loaded {
         ctx,
@@ -663,7 +740,21 @@ async fn load_base(args: &ModelArgs) -> Result<Loaded> {
         config,
         weights: std::cell::Cell::new(Some(weights)),
         f16_weights: !args.f32_weights,
-        q4_weights: args.q4_weights,
+        q4,
+    })
+}
+
+/// What a run of `base` stored at 4 bits in `model`, for its records.
+fn q4_record(base: &Loaded, model: &Lfm2Model) -> Option<Q4Record> {
+    base.q4.as_ref().map(|q4| Q4Record {
+        modules: q4.modules.clone(),
+        skip: q4.skip.clone(),
+        group: q4.group.size(),
+        tensors: model
+            .named_params()
+            .values()
+            .filter(|t| t.data.dtype == DType::Q4)
+            .count(),
     })
 }
 
@@ -691,8 +782,10 @@ fn build_model(
         base.config.clone(),
     )
     .with_trainable_base(trainable_base)
-    .with_f16_weights(base.f16_weights && !weights_file)
-    .with_q4_weights(base.q4_weights && !weights_file);
+    .with_f16_weights(base.f16_weights && !weights_file);
+    if let Some(q4) = base.q4.clone().filter(|_| !weights_file) {
+        builder = builder.with_q4_selection(q4);
+    }
     if let Some(meta) = saved.filter(|m| m.trained_modules.is_none()) {
         builder = builder.with_lora(LoRaConfig {
             rank: meta.rank,
@@ -1385,29 +1478,13 @@ fn select_train_params(
         model
             .named_params()
             .into_iter()
-            .filter(|(n, _)| trains_base_weight(&mode, n))
+            .filter(|(n, _)| module_matches(&mode, n))
             .collect()
     };
     if params.is_empty() {
         return Err(format!("--train-modules {modules} selects no parameters").into());
     }
     Ok(params)
-}
-
-/// Whether `--train-modules` value `mode` (lowercase, not `lora`) trains the
-/// base weight `name`.
-fn trains_base_weight(mode: &str, name: &str) -> bool {
-    // Llama blocks name the MLP `mlp`, LFM2 blocks `feed_forward`.
-    let keys: &[&str] = match mode {
-        "all" => return !name.contains("embed_tokens"),
-        "full" => return true,
-        "embed" | "embedding" => &["embed_tokens"],
-        "attn" | "attention" => &["self_attn"],
-        "mlp" => &[".mlp.", ".feed_forward."],
-        "head" => &["lm_head"],
-        other => return name.contains(other),
-    };
-    keys.iter().any(|k| name.contains(k))
 }
 
 fn param_count(params: &HashMap<String, ferrotensor_autograd::Tensor>) -> usize {
@@ -1440,6 +1517,9 @@ struct TrainSummary {
     out_dir: PathBuf,
     /// `None` on ranks other than 0, which save nothing.
     adapter: Option<PathBuf>,
+    /// The base weights stored at 4 bits; left out without `--q4-weights`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    q4_weights: Option<Q4Record>,
 }
 
 /// Runs `train` and returns its summary.
@@ -1501,6 +1581,7 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
         let _tag = base.ctx.memory().scope(MemoryCategory::BaseWeights);
         build_model(&base, lora_on.then_some(&meta), !lora_on)?
     };
+    let q4_weights = q4_record(&base, &model);
     let named_params = select_train_params(&model, &args.train_modules)?;
     // Base weights outside the selection are frozen, so backward neither
     // computes nor keeps a gradient the optimizer would never use.
@@ -1707,6 +1788,7 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
             model_path: args.model.model.display().to_string(),
             dataset_path: args.data.data.display().to_string(),
             seed: args.seed,
+            q4_weights: q4_weights.clone(),
         };
         state.save(args.out.join("training_state.json"))?;
         TrainingCheckpoint {
@@ -1914,6 +1996,7 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
         seconds: elapsed.as_secs_f32(),
         out_dir: args.out,
         adapter: is_root.then_some(adapter_path),
+        q4_weights,
     })
 }
 
@@ -2259,6 +2342,55 @@ mod tests {
     }
 
     #[test]
+    fn q4_selection_flags_parse_on_every_command_and_need_q4_weights() {
+        let model = |args: &[&str]| match parse(args).expect("parse").command {
+            Command::Train(t) => t.model,
+            Command::Eval(e) => e.model,
+            Command::Generate(g) => g.model,
+            _ => panic!("expected train, eval or generate"),
+        };
+        let train = ["train", "--model", "m", "--data", "d.jsonl"];
+        let eval = ["eval", "--model", "m", "--data", "d.jsonl"];
+        let generate = ["generate", "--model", "m"];
+        let flags = [
+            "--q4-weights",
+            "--q4-modules",
+            "attn,head",
+            "--q4-skip",
+            "layers.0",
+            "--q4-group",
+            "32",
+        ];
+        for cmd in [&train[..], &eval[..], &generate[..]] {
+            assert_eq!(model(cmd).q4_selection(), None, "{cmd:?}");
+            let with = |extra: &[&'static str]| [cmd, extra].concat();
+            assert_eq!(
+                model(&with(&["--q4-weights"])).q4_selection(),
+                Some(Q4Selection::default()),
+                "{cmd:?}: the default is every decoder-block projection in groups of 64"
+            );
+            assert_eq!(
+                model(&with(&flags)).q4_selection(),
+                Some(Q4Selection {
+                    modules: vec!["attn".to_string(), "head".to_string()],
+                    skip: vec!["layers.0".to_string()],
+                    group: Q4Group::new(32).unwrap(),
+                }),
+                "{cmd:?}"
+            );
+            for alone in [&flags[1..3], &flags[3..5], &flags[5..]] {
+                assert!(parse(&with(alone)).is_err(), "{alone:?} needs --q4-weights");
+            }
+            for bad in ["48", "256", "x"] {
+                let err = parse(&with(&["--q4-weights", "--q4-group", bad]))
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("--q4-group"), "{err}");
+            }
+        }
+    }
+
+    #[test]
     fn state_path_sits_next_to_adapter() {
         assert_eq!(
             state_path_for(Path::new("out/a.safetensors")),
@@ -2333,10 +2465,9 @@ mod tests {
             let Command::Train(args) = cli.command else {
                 panic!("not a train command");
             };
-            let mode = args.train_modules.to_ascii_lowercase();
             names
                 .into_iter()
-                .filter(|n| trains_base_weight(&mode, n))
+                .filter(|n| module_matches(&args.train_modules, n))
                 .collect()
         };
         assert_eq!(selected("all"), &names[1..]);
@@ -2436,6 +2567,7 @@ mod tests {
             seconds: 1.5,
             out_dir: PathBuf::from("runs/a"),
             adapter: Some(PathBuf::from("runs/a/lora_adapters.safetensors")),
+            q4_weights: None,
         };
         assert_eq!(
             serde_json::to_value(&summary).unwrap(),
@@ -2608,6 +2740,7 @@ mod tests {
             f32_weights: true,
             f16_weights: false,
             q4_weights: false,
+            q4: Q4Args::default(),
         }))
         .unwrap()
     }

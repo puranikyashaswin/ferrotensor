@@ -359,6 +359,7 @@ mod tests {
                 seconds: 1.5,
                 out_dir: "runs/a".into(),
                 adapter: Some("runs/a/lora_adapters.safetensors".into()),
+                q4_weights: None,
             },
         };
         assert_eq!(
