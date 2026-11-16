@@ -340,7 +340,7 @@ fn tokenizer_metadata(
     let mut special_ids = Vec::new();
     for (kind, key, from_config) in [
         ("bos", "bos_token_id", config.bos_token_id),
-        ("eos", "eos_token_id", config.eos_token_id),
+        ("eos", "eos_token_id", config.eos_token_ids.first().copied()),
         ("unk", "unknown_token_id", None),
         ("pad", "padding_token_id", None),
     ] {

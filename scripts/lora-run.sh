@@ -150,7 +150,7 @@ linux = find(r"Maximum resident set size \(kbytes\):\s*(\d+)", train, int)
 peak_bytes = mac if mac is not None else (linux * 1024 if linux is not None else None)
 
 # Each block is the command's stderr header (device/model/weights/lora lines), the
-# generated text, then a "[N prompt + M new tokens, R tok/s, ...]" line.
+# generated text, then a "[N prompt + M new tokens, prefill Ss, R tok/s, ...]" line.
 generations = []
 for block in (run / "generate.log").read_text().split("### ")[1:]:
     head, _, body = block.partition("\n")

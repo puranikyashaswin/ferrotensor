@@ -1088,18 +1088,21 @@ async fn generate(args: GenerateArgs) -> Result<()> {
         eprintln!("{}", loaded_line(path, n, meta.as_ref()));
     }
     let mut sampler = args.sampling.sampler()?;
-    let prompt_ids = if args.raw {
-        base.tokenizer.encode(&args.prompt)?
+    let prompt = if args.raw {
+        let ids = base.tokenizer.encode(&args.prompt)?;
+        Prompt::raw(&base.tokenizer, &base.config, ids)
     } else {
-        base.tokenizer
-            .encode_chat(args.system.as_deref(), &args.prompt)?
+        let ids = base
+            .tokenizer
+            .encode_chat(args.system.as_deref(), &args.prompt)?;
+        Prompt::chatml(&base.tokenizer, &base.config, ids)
     };
     let mut max_new = args.sampling.max_new_tokens;
     if let Some(limit) = base.config.max_position_embeddings {
-        let fits = new_tokens_within(limit, prompt_ids.len(), max_new).ok_or_else(|| {
+        let fits = new_tokens_within(limit, prompt.ids.len(), max_new).ok_or_else(|| {
             unmet(format!(
                 "the prompt is {} tokens, longer than the model's {limit} positions",
-                prompt_ids.len()
+                prompt.ids.len()
             ))
         })?;
         if fits < max_new {
@@ -1112,14 +1115,14 @@ async fn generate(args: GenerateArgs) -> Result<()> {
     let mut cache = if args.no_kv_cache {
         None
     } else {
-        DecodeCache::new(&model, prompt_ids.len() + max_new)
+        DecodeCache::new(&model, prompt.ids.len() + max_new)
     };
     let kv_cache = cache.is_some();
     let mut text = String::new();
-    let (new_tokens, decode_time, _) = generate_tokens(
+    let decoded = generate_tokens(
         &base,
         &model,
-        &prompt_ids,
+        &prompt,
         max_new,
         &mut sampler,
         cache.as_mut(),
@@ -1130,7 +1133,7 @@ async fn generate(args: GenerateArgs) -> Result<()> {
     )
     .await?;
     stream_text("\n", args.json);
-    let summary = GenerateSummary::new(text, prompt_ids.len(), new_tokens, decode_time, kv_cache);
+    let summary = GenerateSummary::new(text, prompt.ids.len(), &decoded, kv_cache);
     eprintln!("{}", summary.stats_line());
     if args.json {
         print_json(&summary)?;
@@ -1144,34 +1147,41 @@ struct GenerateSummary {
     text: String,
     prompt_tokens: usize,
     new_tokens: usize,
+    /// Decode speed after the prompt; NaN (null) when no decode step ran.
     tokens_per_second: f32,
+    prefill_seconds: f32,
     kv_cache: bool,
 }
 
 impl GenerateSummary {
-    fn new(
-        text: String,
-        prompt_tokens: usize,
-        new_tokens: usize,
-        decode_time: Duration,
-        kv_cache: bool,
-    ) -> Self {
+    fn new(text: String, prompt_tokens: usize, decoded: &Decoded, kv_cache: bool) -> Self {
+        let tokens_per_second = if decoded.decode_steps == 0 {
+            f32::NAN
+        } else {
+            decoded.decode_steps as f32 / decoded.decode.as_secs_f32().max(1e-6)
+        };
         Self {
             text,
             prompt_tokens,
-            new_tokens,
-            tokens_per_second: new_tokens as f32 / decode_time.as_secs_f32().max(1e-6),
+            new_tokens: decoded.new_tokens,
+            tokens_per_second,
+            prefill_seconds: decoded.prefill.as_secs_f32(),
             kv_cache,
         }
     }
 
     /// The line `generate` and `chat` print to stderr after a reply.
     fn stats_line(&self) -> String {
+        let speed = if self.tokens_per_second.is_nan() {
+            "no decode step".to_string()
+        } else {
+            format!("{:.1} tok/s", self.tokens_per_second)
+        };
         format!(
-            "[{} prompt + {} new tokens, {:.1} tok/s, kv cache {}]",
+            "[{} prompt + {} new tokens, prefill {:.2}s, {speed}, kv cache {}]",
             self.prompt_tokens,
             self.new_tokens,
-            self.tokens_per_second,
+            self.prefill_seconds,
             if self.kv_cache { "on" } else { "off" }
         )
     }
@@ -1247,54 +1257,88 @@ impl DecodeCache {
     }
 }
 
+/// Prompt token ids and the token ids that end the reply to them.
+struct Prompt {
+    ids: Vec<u32>,
+    stop: Vec<u32>,
+}
+
+impl Prompt {
+    /// A prompt used as is: the reply ends at the tokenizer's EOS, an
+    /// `eos_token_id` of the config or `<|endoftext|>`.
+    fn raw(tokenizer: &Tokenizer, config: &Lfm2Config, ids: Vec<u32>) -> Self {
+        let mut stop = vec![tokenizer.eos_token_id];
+        stop.extend(&config.eos_token_ids);
+        stop.extend(
+            tokenizer
+                .hf_tokenizer
+                .as_ref()
+                .and_then(|t| t.token_to_id("<|endoftext|>")),
+        );
+        Self { ids, stop }
+    }
+
+    /// A prompt in the ChatML template: the reply also ends at `<|im_end|>`,
+    /// which closes the assistant turn even when the config names another
+    /// EOS.
+    fn chatml(tokenizer: &Tokenizer, config: &Lfm2Config, ids: Vec<u32>) -> Self {
+        let mut prompt = Self::raw(tokenizer, config, ids);
+        prompt.stop.extend(tokenizer.vocab.get("<|im_end|>"));
+        prompt
+    }
+}
+
+/// What [`generate_tokens`] did.
+struct Decoded {
+    new_tokens: usize,
+    /// Prompt tokens taken from the cache rather than run.
+    cached_tokens: usize,
+    /// Time to run the prompt and read back its logits.
+    prefill: Duration,
+    /// One-token forward passes after the prompt.
+    decode_steps: usize,
+    /// Time from the end of the prefill to the last new token.
+    decode: Duration,
+}
+
 /// Sample up to `max_new` tokens after `prompt`, streaming decoded text to
 /// `emit`. With `cache`, only the prompt tokens it does not already hold are
-/// run. Returns (tokens generated, decode time, prompt tokens taken from the
-/// cache).
+/// run.
 ///
 /// # Errors
 /// [`Unmet`] when `prompt` is empty.
 async fn generate_tokens(
     base: &Loaded,
     model: &Lfm2Model,
-    prompt: &[u32],
+    prompt: &Prompt,
     max_new: usize,
     sampler: &mut Sampler,
     mut cache: Option<&mut DecodeCache>,
     mut emit: impl FnMut(&str),
-) -> Result<(usize, Duration, usize)> {
-    if prompt.is_empty() {
+) -> Result<Decoded> {
+    if prompt.ids.is_empty() {
         return Err(unmet("the prompt encodes to no tokens"));
     }
     let vocab = base.config.vocab_size;
-    let stop: Vec<u32> = [
-        Some(base.tokenizer.eos_token_id),
-        base.config.eos_token_id,
-        base.tokenizer
-            .hf_tokenizer
-            .as_ref()
-            .and_then(|t| t.token_to_id("<|endoftext|>")),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-    let mut tokens = prompt.to_vec();
+    let mut tokens = prompt.ids.clone();
     let mut generated: Vec<u32> = Vec::new();
     let mut printed = String::new();
     let start = Instant::now();
-    let cached = cache
-        .as_deref_mut()
-        .map_or(0, |c| c.reuse(base, prompt, prompt.len() + max_new));
-    let mut logits = no_grad(|| match cache.as_deref_mut() {
-        Some(c) => c.feed(base, model, &prompt[cached..]),
+    let cached_tokens = cache.as_deref_mut().map_or(0, |c| {
+        c.reuse(base, &prompt.ids, prompt.ids.len() + max_new)
+    });
+    let logits = no_grad(|| match cache.as_deref_mut() {
+        Some(c) => c.feed(base, model, &prompt.ids[cached_tokens..]),
         None => model.forward(&base.engine, &tokens, 0, None, None),
     });
-    for _ in 0..max_new {
-        let host = logits.data.to_vec(&base.ctx).await;
+    let mut host = logits.data.to_vec(&base.ctx).await;
+    let prefill = start.elapsed();
+    let decode_start = Instant::now();
+    let mut decode_steps = 0;
+    while generated.len() < max_new {
         let rows = host.len() / vocab;
-        let last = &host[(rows - 1) * vocab..rows * vocab];
-        let next = sampler.sample(last);
-        if stop.contains(&next) {
+        let next = sampler.sample(&host[(rows - 1) * vocab..rows * vocab]);
+        if prompt.stop.contains(&next) {
             break;
         }
         generated.push(next);
@@ -1304,12 +1348,24 @@ async fn generate_tokens(
             emit(delta);
             printed = text;
         }
-        logits = no_grad(|| match cache.as_deref_mut() {
+        // Nothing would sample from the logits after the last token.
+        if generated.len() == max_new {
+            break;
+        }
+        let logits = no_grad(|| match cache.as_deref_mut() {
             Some(c) => c.feed(base, model, &[next]),
             None => model.forward(&base.engine, &tokens, 0, None, None),
         });
+        host = logits.data.to_vec(&base.ctx).await;
+        decode_steps += 1;
     }
-    Ok((generated.len(), start.elapsed(), cached))
+    Ok(Decoded {
+        new_tokens: generated.len(),
+        cached_tokens,
+        prefill,
+        decode_steps,
+        decode: decode_start.elapsed(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1822,13 +1878,14 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
 
     if let Some(prompt) = &args.sample_prompt {
         let ids = base.tokenizer.encode_chat(None, prompt)?;
+        let sample_prompt = Prompt::chatml(&base.tokenizer, &base.config, ids);
         let mut sampler = Sampler::new(0.0, 0, 1.0, None);
         eprintln!("sample ({prompt:?}):");
-        let mut cache = DecodeCache::new(&trainer.model, ids.len() + 96);
+        let mut cache = DecodeCache::new(&trainer.model, sample_prompt.ids.len() + 96);
         generate_tokens(
             &base,
             &trainer.model,
-            &ids,
+            &sample_prompt,
             96,
             &mut sampler,
             cache.as_mut(),
@@ -2416,14 +2473,82 @@ mod tests {
             prompt_tokens: 3,
             new_tokens: 2,
             tokens_per_second: 8.0,
+            prefill_seconds: 0.5,
             kv_cache: true,
         };
         assert_eq!(
             serde_json::to_value(&generate).unwrap(),
             serde_json::json!({
                 "text": "w5 w6", "prompt_tokens": 3, "new_tokens": 2,
-                "tokens_per_second": 8.0, "kv_cache": true,
+                "tokens_per_second": 8.0, "prefill_seconds": 0.5, "kv_cache": true,
             })
+        );
+    }
+
+    #[test]
+    fn a_chatml_prompt_also_stops_at_im_end() {
+        let dir = std::env::temp_dir().join(format!("ferrotensor-stop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tokenizer.json");
+        let vocab = serde_json::json!({
+            "<unk>": 0, "</s>": 1, "<|im_start|>": 2, "<|im_end|>": 3, "<|endoftext|>": 4,
+        });
+        let tokenizer_json = serde_json::json!({
+            "version": "1.0", "truncation": null, "padding": null, "added_tokens": [],
+            "normalizer": null, "pre_tokenizer": { "type": "Whitespace" },
+            "post_processor": null, "decoder": null,
+            "model": { "type": "WordLevel", "vocab": vocab, "unk_token": "<unk>" },
+        });
+        std::fs::write(&path, tokenizer_json.to_string()).unwrap();
+        let mut tokenizer = Tokenizer::from_file(&path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        // A base model's tokenizer can name `</s>` as its EOS.
+        tokenizer.eos_token_id = 1;
+        let config: Lfm2Config = serde_json::from_value(serde_json::json!({
+            "hidden_size": 8, "intermediate_size": 16, "num_attention_heads": 2,
+            "num_hidden_layers": 1, "vocab_size": 5, "eos_token_id": [1, 4],
+        }))
+        .unwrap();
+        assert_eq!(Prompt::raw(&tokenizer, &config, vec![2]).stop, [1, 1, 4, 4]);
+        assert_eq!(
+            Prompt::chatml(&tokenizer, &config, vec![2]).stop,
+            [1, 1, 4, 4, 3]
+        );
+    }
+
+    fn decoded(new_tokens: usize, decode_steps: usize, decode_ms: u64) -> Decoded {
+        Decoded {
+            new_tokens,
+            cached_tokens: 0,
+            prefill: Duration::from_millis(250),
+            decode_steps,
+            decode: Duration::from_millis(decode_ms),
+        }
+    }
+
+    #[test]
+    fn decode_speed_leaves_out_the_prefill() {
+        // 4 tokens with max_new 4: the first comes from the prefill logits and
+        // 3 one-token passes give the rest.
+        let summary = GenerateSummary::new(String::new(), 7, &decoded(4, 3, 1500), true);
+        assert_eq!(summary.tokens_per_second, 2.0);
+        assert_eq!(summary.prefill_seconds, 0.25);
+        assert_eq!(
+            summary.stats_line(),
+            "[7 prompt + 4 new tokens, prefill 0.25s, 2.0 tok/s, kv cache on]"
+        );
+    }
+
+    #[test]
+    fn decode_speed_is_null_without_a_decode_step() {
+        let summary = GenerateSummary::new(String::new(), 7, &decoded(1, 0, 3), false);
+        assert!(summary.tokens_per_second.is_nan());
+        let json = serde_json::to_value(&summary).unwrap();
+        assert_eq!(json["tokens_per_second"], serde_json::Value::Null);
+        assert_eq!(json["new_tokens"], 1);
+        assert_eq!(
+            summary.stats_line(),
+            "[7 prompt + 1 new tokens, prefill 0.25s, no decode step, kv cache off]"
         );
     }
 
