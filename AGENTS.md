@@ -175,7 +175,9 @@ weight matrix on the host, without a GPU. See
 - GPU tests are skipped unless `FERROTENSOR_RUN_GPU_TESTS=1`; CLI tests that
   need a GPU are `#[ignore]` and run in CI with `--ignored` on software Vulkan,
   on Metal (GitHub's Apple silicon runners) and on DX12 (WARP; there without
-  the `ferrotensor-cli` tests, which take too long).
+  the `ferrotensor-cli` tests, which take too long, and on pull requests only
+  the backend kernel and parity tests; the rest runs on `main`, weekly and by
+  `workflow_dispatch`).
   The four Qwen2 parity tests also read `FERROTENSOR_QWEN2_FIXTURE` (CI sets
   it) and skip with a message when it is unset.
 - No `unwrap`, `expect` or `panic!` outside tests; propagate errors with `?`.
