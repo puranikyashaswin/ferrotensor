@@ -1130,7 +1130,13 @@ fn chat_answers_each_line_until_exit() {
         keys.sort_unstable();
         assert_eq!(
             keys,
-            ["new_tokens", "prompt_tokens", "reply", "tokens_per_second"]
+            [
+                "cached_tokens",
+                "new_tokens",
+                "prompt_tokens",
+                "reply",
+                "tokens_per_second"
+            ]
         );
         assert_eq!(reply["prompt_tokens"], 7, "{reply}");
         assert!(
@@ -1140,6 +1146,81 @@ fn chat_answers_each_line_until_exit() {
         let streamed = reply["reply"].as_str().expect("reply text");
         assert!(stderr.contains(streamed), "{reply}\nstderr: {stderr}");
     }
+    // The cache still holds the first prompt; only its last token runs again.
+    assert_eq!(replies[0]["cached_tokens"], 0);
+    assert_eq!(replies[1]["cached_tokens"], 6);
+}
+
+/// The reply objects a `chat --json` run printed, one per stdout line.
+fn chat_replies(run: &Output) -> Vec<serde_json::Value> {
+    assert_success(run);
+    text(&run.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("one JSON object per line"))
+        .collect()
+}
+
+/// Greedy replies of `chat` on `input` with the KV cache kept across turns,
+/// after checking them against a run of the whole conversation every turn.
+fn kept_cache_replies(model: &Path, input: &str) -> Vec<serde_json::Value> {
+    let greedy = ["--json", "--temperature", "0"];
+    let kept = chat_replies(&chat(model, &greedy, input));
+    let rerun_flags = [&greedy[..], &["--rerun-conversation"][..]].concat();
+    let rerun = chat_replies(&chat(model, &rerun_flags, input));
+    assert_eq!(kept.len(), rerun.len());
+    // Each id of the word-level vocabulary decodes to its own word, so equal
+    // replies are equal token ids.
+    for (turn, (k, r)) in kept.iter().zip(&rerun).enumerate() {
+        for key in ["reply", "new_tokens", "prompt_tokens"] {
+            assert_eq!(k[key], r[key], "turn {turn}: {k} vs {r}");
+        }
+        assert_eq!(r["cached_tokens"], 0, "turn {turn}: {r}");
+    }
+    kept
+}
+
+/// A token count from a reply object.
+fn as_count(value: &serde_json::Value) -> u64 {
+    value.as_u64().expect("a token count")
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn chat_with_the_kept_kv_cache_replies_like_a_full_rerun() {
+    let model = chatml_model_dir("chat-cache");
+    let kept = kept_cache_replies(model.path(), "w5 w6\nw7\nw8 w9 w10\nw11\n");
+    assert_eq!(kept.len(), 4);
+    assert!(
+        kept.iter().any(|r| as_count(&r["new_tokens"]) > 0),
+        "every reply is empty: {kept:?}"
+    );
+    assert_eq!(kept[0]["cached_tokens"], 0);
+    // The cache holds the previous prompt and every reply token run after it.
+    for pair in kept.windows(2) {
+        let prompt = as_count(&pair[0]["prompt_tokens"]);
+        let held = prompt + as_count(&pair[0]["new_tokens"]);
+        let cached = as_count(&pair[1]["cached_tokens"]);
+        assert!(
+            (prompt..=held).contains(&cached),
+            "{cached} cached tokens after {pair:?}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn chat_rebuilds_the_kv_cache_after_dropping_turns() {
+    let model = chatml_model_dir("chat-cache-trim");
+    let config_path = model.path().join("config.json");
+    let mut config = read_json(&config_path);
+    config["max_position_embeddings"] = serde_json::json!(18);
+    std::fs::write(&config_path, config.to_string()).expect("write config");
+    // 14 prompt positions: turns 2 and 3 each drop the exchange before them.
+    let kept = kept_cache_replies(model.path(), "w5 w6\nw7 w8 w9\nw10\n");
+    let counts = |key: &str| kept.iter().map(|r| as_count(&r[key])).collect::<Vec<_>>();
+    assert_eq!(counts("prompt_tokens"), [7, 8, 6], "{kept:?}");
+    // After a drop only `<|im_start|>user` still starts the conversation.
+    assert_eq!(counts("cached_tokens"), [0, 2, 2], "{kept:?}");
 }
 
 #[test]

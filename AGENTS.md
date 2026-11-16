@@ -63,7 +63,7 @@ is `null`. On an error stdout carries `{"error": "<message>"}` instead.
 | `train` | `steps`, `first_loss`, `final_loss`, `eval_loss_before`, `eval_loss_after` (null without `--eval-data`), `measured_peak_mib`, `seconds`, `out_dir`, `adapter` (null on ranks above 0, which save nothing) |
 | `eval` | `examples`, `tokens`, `loss`, `perplexity`, `seconds` |
 | `generate` | `text`, `prompt_tokens`, `new_tokens`, `tokens_per_second`, `kv_cache` |
-| `chat` | one object per reply, each on its own line: `reply`, `prompt_tokens`, `new_tokens`, `tokens_per_second` |
+| `chat` | one object per reply, each on its own line: `reply`, `prompt_tokens` (the whole conversation), `cached_tokens` (prompt tokens taken from the KV cache of earlier turns, not run again), `new_tokens`, `tokens_per_second` |
 | `merge` | `out_dir`, `merged` (tensors with the adapter added), `copied` (tensors copied byte for byte) |
 | `export-gguf` | `out_file`, `tensors` (tensors in the GGUF file), `merged` (tensors with the `--lora` adapter added; 0 without it) |
 | `pretrain` | every `train` key, then `parameters` and `vocab_size` (259: a byte-level tokenizer) |

@@ -3,7 +3,7 @@
 
 use crate::{
     adapter_metadata, build_model, generate_tokens, load_base, loaded_line, restore_adapter,
-    stream_text, unmet, GenerateSummary, ModelArgs, Result, SamplingArgs,
+    stream_text, unmet, DecodeCache, GenerateSummary, ModelArgs, Result, SamplingArgs,
 };
 use clap::Args;
 use ferrotensor_loader::Tokenizer;
@@ -27,6 +27,10 @@ pub struct ChatArgs {
     /// stdout.
     #[arg(long)]
     pub json: bool,
+    /// Run the whole conversation through the model every turn, with a new
+    /// KV cache; tests compare it with the kept cache.
+    #[arg(long, hide = true)]
+    rerun_conversation: bool,
 }
 
 /// Runs the conversation until end of input, `/exit` or `/quit`.
@@ -55,6 +59,7 @@ pub async fn run(args: ChatArgs) -> Result<()> {
         eprintln!("/reset clears the conversation, /exit ends it");
     }
     let mut turns: Vec<String> = Vec::new();
+    let mut cache: Option<DecodeCache> = None;
     let mut said_dropped = false;
     let mut lines = std::io::stdin().lock().lines();
     loop {
@@ -90,14 +95,17 @@ pub async fn run(args: ChatArgs) -> Result<()> {
                 }
             }
         }
+        if args.rerun_conversation || cache.is_none() {
+            cache = DecodeCache::new(&model, prompt_ids.len() + max_new);
+        }
         let mut reply = String::new();
-        let (new_tokens, decode_time, kv_cache) = generate_tokens(
+        let (new_tokens, decode_time, cached_tokens) = generate_tokens(
             &base,
             &model,
             &prompt_ids,
             max_new,
             &mut sampler,
-            true,
+            cache.as_mut(),
             |delta| {
                 reply.push_str(delta);
                 stream_text(delta, args.json);
@@ -105,6 +113,7 @@ pub async fn run(args: ChatArgs) -> Result<()> {
         )
         .await?;
         stream_text("\n", args.json);
+        let kv_cache = cache.is_some();
         let summary =
             GenerateSummary::new(reply, prompt_ids.len(), new_tokens, decode_time, kv_cache);
         eprintln!("{}", summary.stats_line());
@@ -112,6 +121,7 @@ pub async fn run(args: ChatArgs) -> Result<()> {
             let line = serde_json::json!({
                 "reply": summary.text,
                 "prompt_tokens": summary.prompt_tokens,
+                "cached_tokens": cached_tokens,
                 "new_tokens": summary.new_tokens,
                 "tokens_per_second": summary.tokens_per_second,
             });
