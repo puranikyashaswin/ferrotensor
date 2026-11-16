@@ -413,6 +413,129 @@ fn generate_emits_tokens() {
     assert!(stderr.contains(generated), "{json}\nstderr: {stderr}");
 }
 
+/// Greedy `generate --json` of up to `max_new` tokens after `prompt`.
+fn greedy_generate(model: &Path, prompt: &str, max_new: &str, extra: &[&str]) -> serde_json::Value {
+    let mut args = vec![
+        "generate",
+        "--model",
+        s(model),
+        "--prompt",
+        prompt,
+        "--max-new-tokens",
+        max_new,
+        "--temperature",
+        "0",
+        "--json",
+    ];
+    args.extend_from_slice(extra);
+    let run = ferrotensor(&args);
+    assert_success(&run);
+    serde_json::from_str(&text(&run.stdout)).expect("generate json")
+}
+
+fn words(json: &serde_json::Value) -> Vec<String> {
+    let text = json["text"].as_str().expect("text");
+    text.split_whitespace().map(str::to_owned).collect()
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn greedy_tokens_do_not_depend_on_where_generation_stops() {
+    let model = model_dir("generate-prefix");
+    let short = greedy_generate(model.path(), "w5 w6 w7", "3", &["--raw"]);
+    let long = greedy_generate(model.path(), "w5 w6 w7", "6", &["--raw"]);
+    let uncached = greedy_generate(model.path(), "w5 w6 w7", "6", &["--raw", "--no-kv-cache"]);
+    // Each id of the word-level vocabulary decodes to its own word.
+    assert_eq!(words(&long), words(&uncached), "{long}\n{uncached}");
+    assert!(words(&long).starts_with(&words(&short)), "{short}\n{long}");
+    assert_eq!(
+        as_count(&short["new_tokens"]),
+        as_count(&long["new_tokens"]).min(3),
+        "{short}\n{long}"
+    );
+    for json in [&short, &long, &uncached] {
+        let speed = &json["tokens_per_second"];
+        assert!(speed.is_number() || speed.is_null(), "{json}");
+        assert!(
+            json["prefill_seconds"].as_f64().is_some_and(|s| s >= 0.0),
+            "{json}"
+        );
+    }
+}
+
+/// Zeroes the final norm weight of the tiny model in `dir`, so every logit
+/// is 0 and greedy decoding picks the last id, 63.
+fn zero_final_norm(dir: &Path) {
+    let path = dir.join("model.safetensors");
+    let bytes = std::fs::read(&path).expect("read weights");
+    let weights = safetensors::SafeTensors::deserialize(&bytes).expect("parse weights");
+    let name = "model.norm.weight";
+    let len = weights.tensor(name).expect("final norm").data().len();
+    let zeros = vec![0u8; len];
+    let tensors: Vec<_> = weights
+        .tensors()
+        .into_iter()
+        .map(|(n, view)| {
+            if n == name {
+                let shape = vec![len / 4];
+                let zero =
+                    safetensors::tensor::TensorView::new(safetensors::Dtype::F32, shape, &zeros)
+                        .expect("zero view");
+                (n, zero)
+            } else {
+                (n, view)
+            }
+        })
+        .collect();
+    let out = safetensors::tensor::serialize(tensors, &None).expect("serialize");
+    std::fs::write(&path, out).expect("write weights");
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn a_chatml_prompt_stops_at_im_end_when_the_config_names_another_eos() {
+    // Without the ChatML tokens id 63 is the word w63, and nothing stops it.
+    let plain = model_dir("stop-plain");
+    zero_final_norm(plain.path());
+    let run = greedy_generate(plain.path(), "w5 w6", "4", &[]);
+    assert_eq!(words(&run), ["w63"; 4], "{run}");
+
+    let model = chatml_model_dir("stop-chatml");
+    zero_final_norm(model.path());
+    let config_path = model.path().join("config.json");
+    let mut config = read_json(&config_path);
+    config["eos_token_id"] = serde_json::json!([2, 0]);
+    std::fs::write(&config_path, config.to_string()).expect("write config");
+
+    let templated = greedy_generate(model.path(), "w5 w6", "4", &[]);
+    assert_eq!(templated["new_tokens"], 0, "{templated}");
+    assert_eq!(templated["text"], "", "{templated}");
+    // The only sampled token came from the prefill: no decode step ran.
+    assert!(templated["tokens_per_second"].is_null(), "{templated}");
+    assert!(
+        templated["prefill_seconds"]
+            .as_f64()
+            .is_some_and(|s| s >= 0.0),
+        "{templated}"
+    );
+
+    let replies = chat_replies(&chat(
+        model.path(),
+        &["--json", "--temperature", "0"],
+        "w5 w6\nw7\n",
+    ));
+    assert_eq!(replies.len(), 2);
+    for reply in &replies {
+        assert_eq!(reply["new_tokens"], 0, "{reply}");
+        assert_eq!(reply["reply"], "", "{reply}");
+    }
+
+    // --raw keeps its stop set, whose tokenizer EOS the loader takes to be
+    // <|im_end|> whenever the vocabulary has it.
+    let raw = greedy_generate(model.path(), "w5 w6", "4", &["--raw"]);
+    assert_eq!(raw["new_tokens"], 0, "{raw}");
+}
+
 #[test]
 #[ignore = "needs a GPU"]
 fn generate_refuses_a_prompt_that_encodes_to_no_tokens() {
@@ -1133,6 +1256,7 @@ fn chat_answers_each_line_until_exit() {
             [
                 "cached_tokens",
                 "new_tokens",
+                "prefill_seconds",
                 "prompt_tokens",
                 "reply",
                 "tokens_per_second"
@@ -1195,10 +1319,12 @@ fn chat_with_the_kept_kv_cache_replies_like_a_full_rerun() {
         "every reply is empty: {kept:?}"
     );
     assert_eq!(kept[0]["cached_tokens"], 0);
-    // The cache holds the previous prompt and every reply token run after it.
+    // The cache holds the previous prompt and every reply token run after
+    // it; a reply that reached --max-new-tokens 4 never ran its last token.
     for pair in kept.windows(2) {
         let prompt = as_count(&pair[0]["prompt_tokens"]);
-        let held = prompt + as_count(&pair[0]["new_tokens"]);
+        let new = as_count(&pair[0]["new_tokens"]);
+        let held = prompt + new - u64::from(new == 4);
         let cached = as_count(&pair[1]["cached_tokens"]);
         assert!(
             (prompt..=held).contains(&cached),

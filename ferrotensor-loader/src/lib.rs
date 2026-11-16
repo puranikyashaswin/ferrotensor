@@ -106,9 +106,9 @@ pub struct Lfm2Config {
     /// Beginning-of-sequence token id, if set.
     #[serde(default)]
     pub bos_token_id: Option<u32>,
-    /// End-of-sequence token id, if set.
-    #[serde(default)]
-    pub eos_token_id: Option<u32>,
+    /// End-of-sequence token ids: `eos_token_id` may be one id or a list.
+    #[serde(default, rename = "eos_token_id", deserialize_with = "one_or_more_ids")]
+    pub eos_token_ids: Vec<u32>,
     /// Attention dropout probability, if set.
     #[serde(default)]
     pub attention_dropout: Option<f32>,
@@ -167,6 +167,21 @@ impl RopeConfig {
 
 fn default_norm_eps() -> f32 {
     1e-5
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum OneOrMoreIds {
+    One(u32),
+    More(Vec<u32>),
+}
+
+fn one_or_more_ids<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Vec<u32>, D::Error> {
+    Ok(match Option::<OneOrMoreIds>::deserialize(de)? {
+        None => Vec::new(),
+        Some(OneOrMoreIds::One(id)) => vec![id],
+        Some(OneOrMoreIds::More(ids)) => ids,
+    })
 }
 
 /// Largest `config.json` or shard index file the loader will read.
@@ -719,6 +734,23 @@ mod tests {
             .collect();
         assert_eq!(le_bytes_to_f32("s", &bytes).unwrap(), vec![1.5, -2.0]);
         assert!(le_bytes_to_f32("s", &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn eos_token_id_reads_one_id_a_list_or_nothing() {
+        let sizes = r#""hidden_size": 8, "intermediate_size": 16, "num_attention_heads": 2,
+            "num_hidden_layers": 1, "vocab_size": 32"#;
+        for (eos, want) in [
+            (r#", "eos_token_id": 2"#, vec![2]),
+            (r#", "eos_token_id": [2, 7]"#, vec![2, 7]),
+            (r#", "eos_token_id": null"#, vec![]),
+            ("", vec![]),
+        ] {
+            let config: Lfm2Config = serde_json::from_str(&format!("{{{sizes}{eos}}}")).unwrap();
+            assert_eq!(config.eos_token_ids, want, "{eos}");
+        }
+        let bad = format!(r#"{{{sizes}, "eos_token_id": "</s>"}}"#);
+        assert!(serde_json::from_str::<Lfm2Config>(&bad).is_err());
     }
 
     #[test]
