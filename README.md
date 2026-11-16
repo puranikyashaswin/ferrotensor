@@ -16,9 +16,11 @@ Ferrotensor (Ferro Tensor) runs tensors, autograd and LoRA fine-tuning of
 small language models on the GPU using [wgpu](https://wgpu.rs) and
 hand-written WGSL compute kernels, which run through Vulkan, Metal or DX12.
 It has been tested on an NVIDIA A10G (24 GB) through Vulkan, an Apple M2
-(8 GB) through Metal, and software Vulkan (Mesa lavapipe) in CI; other GPUs
-are untested, and [reports are welcome](docs/testing-on-your-gpu.md). There
-is no CUDA, cuDNN or libtorch to install and no Python at runtime:
+(8 GB) through Metal, and software Vulkan (Mesa lavapipe) in CI. The GPU test
+suite also runs in CI through Metal on GitHub's Apple silicon runners (a
+virtualised GPU) and through DX12 on WARP, Microsoft's software adapter;
+neither is a real-hardware result. Other GPUs are untested, and
+[reports are welcome](docs/testing-on-your-gpu.md). There is no CUDA, cuDNN or libtorch to install and no Python at runtime:
 `cargo build` is the whole toolchain. The same tensor API also runs on a CPU
 device, which the test suite uses as the reference for the GPU. It is built
 for anyone who wants to read, and change, every layer from the API down to
@@ -234,7 +236,7 @@ tested, incomplete, or only checked on one machine.
 | Convolutions, sort/top-k, cumsum in the `ferrotensor` API | Planned | |
 | Batched GPU dispatch in the `ferrotensor` API | **Stable** | Ops submit together at each read back; `char_transformer` trains faster on the GPU than the CPU, but chains of tiny ops are still faster on the CPU ([numbers](benchmarks/RESULTS.md#ferrotensor-tensor-api-cpu-and-gpu-devices)) |
 | Python bindings (`ferrotensor-py`) | **Experimental** | Tensors, autograd, `nn`, `optim`, safetensors; wheels for macOS arm64 and Linux x86_64 on PyPI |
-| GPU report and kernel self-check (`ferrotensor info`) | **Experimental** | Lists adapters and checks matmul, softmax and RMSNorm against the CPU; passes on an Apple M2 (Metal), an NVIDIA A10G and a Tesla T4 (Vulkan; the T4 at the commit in [benchmarks/RESULTS.md](benchmarks/RESULTS.md#nvidia-gpus-through-vulkan)), and software Vulkan in CI. AMD and Intel GPUs, and DX12, are untested ([help test it](docs/testing-on-your-gpu.md)) |
+| GPU report and kernel self-check (`ferrotensor info`) | **Experimental** | Lists adapters and checks matmul, softmax and RMSNorm against the CPU; passes on an Apple M2 (Metal), an NVIDIA A10G and a Tesla T4 (Vulkan; the T4 at the commit in [benchmarks/RESULTS.md](benchmarks/RESULTS.md#nvidia-gpus-through-vulkan)), and software Vulkan in CI; also passes in CI through Metal on a virtualised Apple GPU and through DX12 on the software adapter WARP. AMD and Intel GPUs, and DX12 on real hardware, are untested ([help test it](docs/testing-on-your-gpu.md)) |
 | Op fusion in the `ferrotensor` API | **Experimental** | Off by default; `FERROTENSOR_FUSION=1` runs chains of same-size element-wise ops as one dispatch, bit-identical to unfused ([design](docs/design/op-fusion.md)) |
 | Multi-GPU / distributed training | Planned | `ferrotensor-cli` has a file-based gradient sync flag (`--world-size`) that is a prototype |
 | A CUDA backend | Not planned | wgpu is the point of the project |
@@ -379,14 +381,14 @@ against them. Kernel-level numbers for Ferrotensor alone are in
 - [x] Python bindings (`ferrotensor-py`)
 - [x] Python wheels on PyPI
 - [x] Fuse element-wise op chains into one kernel (opt-in with `FERROTENSOR_FUSION=1`)
-- [x] Tested on NVIDIA GPUs through Vulkan, and the GPU suites run in CI on software Vulkan ([results](benchmarks/RESULTS.md))
+- [x] Tested on NVIDIA GPUs through Vulkan, and the GPU suites run in CI on software Vulkan, on Metal (a virtualised Apple GPU) and on DX12 (WARP, without the CLI end-to-end tests) ([results](benchmarks/RESULTS.md))
 - [x] LoRA measured up to SmolLM2-1.7B, with the backward passes and the loss on the GPU ([walkthrough](docs/examples/lora-sft.md#on-an-nvidia-gpu-three-model-sizes))
 - [ ] Op fusion on by default (needs a measurement on more GPUs)
 - [x] Lower host memory when loading models (SmolLM2-1.7B LoRA peak host memory 5,087 MiB before, 1,575 MiB after)
 - [x] Batched LoRA training and f16 base weights ([measured](docs/examples/lora-sft.md#batching-f16-base-weights-and-lower-host-memory-06))
 - [x] Gradient parity with PyTorch autograd in CI, PEFT adapter export
 - [x] Lower GPU memory for LoRA: gradients released early, freed buffers reused, `--checkpoint-blocks`
-- [ ] Results from AMD and Intel GPUs, and from DX12
+- [ ] Results from AMD and Intel GPUs, and from DX12 on a real GPU
 - [ ] Parallel-reduction softmax and layer norm kernels
 - [ ] `f16`/`bf16` tensors in the `ferrotensor` API, convolutions, sort/top-k
 - [ ] Unify the `ferrotensor` tensor API with the LLM stack

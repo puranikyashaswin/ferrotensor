@@ -72,7 +72,7 @@ fn flat_index(gid: vec3<u32>, nwg: vec3<u32>) -> u32 {
 }
 
 // WGSL's tanh becomes HLSL tanh on DX12, and with it the GELU and Tanh
-// gradients on WARP (Microsoft's software adapter) were up to 2e-3 off the
+// gradients on WARP (Microsoft's software adapter) were about 1e-3 off the
 // CPU. This form uses only exp, which every backend computes closely.
 fn tanh_f(x: f32) -> f32 {
     let ax = abs(x);
