@@ -9,8 +9,8 @@ chat-template encoding and a `Sampler`.
 use ferrotensor_loader::Tokenizer;
 
 let tok = Tokenizer::from_file("./models/tinyllama/tokenizer.json")?;
-let ids = tok.encode("Hello, world");
-println!("{}", tok.decode(&ids));
+let ids = tok.encode("Hello, world")?;
+println!("{}", tok.decode(&ids)?);
 ```
 
 The snippet needs a model directory on disk, so it is not run in CI.

@@ -275,8 +275,11 @@ impl<'a> Lfm2ModelBuilder<'a> {
         }
     }
 
-    fn has(&self, name: &str) -> bool {
-        self.weights.get_tensor_info(name).is_some()
+    fn has(&self, name: &str) -> Result<bool> {
+        self.weights
+            .get_tensor_info(name)
+            .map(|meta| meta.is_some())
+            .map_err(|e| BuildError(format!("cannot read {name} from the checkpoint: {e}")))
     }
 
     fn read(&self, name: &str) -> Result<(Vec<f32>, Vec<usize>)> {
@@ -287,7 +290,7 @@ impl<'a> Lfm2ModelBuilder<'a> {
 
     /// Fails if `name` is stored pre-quantized (a `<name>.scales` tensor).
     fn reject_pre_quantized(&self, name: &str) -> Result<()> {
-        if self.has(&format!("{name}.scales")) {
+        if self.has(&format!("{name}.scales"))? {
             return Err(BuildError(format!(
                 "{name} is pre-quantized ({name}.scales found); pre-quantized checkpoints are not supported. Load the f16/f32 checkpoint and use 4-bit base weights (with_q4_weights / --q4-weights) instead"
             )));
@@ -307,7 +310,7 @@ impl<'a> Lfm2ModelBuilder<'a> {
     /// checkpoint's table is read once and never read back from the GPU.
     #[allow(clippy::type_complexity)]
     fn load_embeddings(&self) -> Result<(Tensor, Option<(Vec<f32>, Vec<usize>)>)> {
-        if self.has("model.embed_tokens.scales") {
+        if self.has("model.embed_tokens.scales")? {
             return Ok((self.load_tensor("model.embed_tokens")?, None));
         }
         let (data, shape) = self.read("model.embed_tokens.weight")?;
@@ -363,7 +366,7 @@ impl<'a> Lfm2ModelBuilder<'a> {
         self.reject_pre_quantized(prefix)?;
         let weight = self.load_linear_weight_tensor(prefix)?;
         let bias_name = format!("{prefix}.bias");
-        let bias = if self.has(&bias_name) {
+        let bias = if self.has(&bias_name)? {
             let bias = self.load_raw_tensor(&bias_name)?;
             let out_dim = weight.data.shape[1];
             if bias.data.shape != [out_dim] {
@@ -388,7 +391,7 @@ impl<'a> Lfm2ModelBuilder<'a> {
     /// The per-head norm `{prefix}.weight` (`[head_dim]`) if the checkpoint
     /// has it.
     fn build_head_norm(&self, prefix: &str, head_dim: usize) -> Result<Option<RMSNorm>> {
-        if !self.has(&format!("{prefix}.weight")) {
+        if !self.has(&format!("{prefix}.weight"))? {
             return Ok(None);
         }
         let norm = self.build_rms_norm(prefix)?;
@@ -431,7 +434,7 @@ impl<'a> Lfm2ModelBuilder<'a> {
                 "head_dim {head_dim} is not supported (RoPE needs an even size, and the attention kernel handles at most 128)"
             )));
         }
-        if self.has(&format!("{prefix}.q_layernorm.weight")) {
+        if self.has(&format!("{prefix}.q_layernorm.weight"))? {
             return Err(BuildError(
                 "LFM2 per-head q/k layernorm is not supported yet".into(),
             ));
@@ -551,9 +554,9 @@ impl<'a> Lfm2ModelBuilder<'a> {
         }
 
         // Hugging Face LFM2 applies `embedding_norm` after the last block.
-        let norm_f = if self.has("model.norm.weight") {
+        let norm_f = if self.has("model.norm.weight")? {
             self.build_rms_norm("model.norm")?
-        } else if self.has("model.embedding_norm.weight") {
+        } else if self.has("model.embedding_norm.weight")? {
             self.build_rms_norm("model.embedding_norm")?
         } else {
             return Err(BuildError(
@@ -561,7 +564,7 @@ impl<'a> Lfm2ModelBuilder<'a> {
             ));
         };
 
-        let lm_head = if self.has("lm_head.weight") {
+        let lm_head = if self.has("lm_head.weight")? {
             self.build_linear("lm_head", "lm_head", 0)?
         } else {
             // Tied embeddings: the head is embed_tokens^T, `[hidden, vocab]`,

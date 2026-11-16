@@ -25,7 +25,9 @@ pub struct Tokenizer {
     pub eos_token_id: u32,
     /// Padding token id.
     pub pad_token_id: u32,
-    /// Underlying Hugging Face tokenizer, if it loaded.
+    /// Underlying Hugging Face tokenizer; `None` only for a `tokenizer.json`
+    /// that is a plain `model.vocab` map with no model `type`, which encodes
+    /// with the whitespace and character reader of [`Tokenizer::encode`].
     pub hf_tokenizer: Option<Arc<tokenizers::Tokenizer>>,
 }
 
@@ -39,6 +41,8 @@ struct TokenizerJson {
 
 #[derive(Deserialize)]
 struct TokenizerModel {
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
     vocab: HashMap<String, u32>,
 }
 
@@ -48,43 +52,49 @@ impl Tokenizer {
     /// Fails, with a message naming the file, if it or the
     /// `tokenizer_config.json` beside it is not a regular file, is too large
     /// or is not valid, or if the vocabulary is empty.
-    /// In the fallback reader (a plain `model.vocab` map) two tokens sharing
-    /// one id are rejected; gaps between ids are fine.
+    /// A file the Hugging Face reader refuses is read as a plain `model.vocab`
+    /// map only when its model names no `type`; a typed model the Hugging Face
+    /// reader refuses is an error, not a silent switch to the plain reader.
+    /// In the plain reader two tokens sharing one id are rejected; gaps
+    /// between ids are fine.
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, String> {
         let path = path.as_ref();
         let file = crate::open_regular_file(path, Some(MAX_TOKENIZER_FILE_BYTES))
             .map_err(|e| format!("Failed to read tokenizer.json: {e}"))?;
         let declared_bos = declared_bos_token(path)?;
 
-        if let Ok(hf_tokenizer) = tokenizers::Tokenizer::from_file(path) {
-            drop(file);
-            let vocab = hf_tokenizer.get_vocab(true);
-            if vocab.is_empty() {
-                return Err(format!("{}: tokenizer vocabulary is empty", path.display()));
-            }
-            let id_to_token: HashMap<u32, String> =
-                vocab.iter().map(|(k, v)| (*v, k.clone())).collect();
-            let bos_token_id = declared_bos
-                .as_deref()
-                .and_then(|token| hf_tokenizer.token_to_id(token))
-                .or_else(|| hf_tokenizer.token_to_id("<|im_start|>"))
-                .or_else(|| hf_tokenizer.token_to_id("<s>"))
-                .unwrap_or(1);
-            let eos_token_id = hf_tokenizer
-                .token_to_id("<|im_end|>")
-                .or_else(|| hf_tokenizer.token_to_id("</s>"))
-                .unwrap_or(2);
-            let pad_token_id = hf_tokenizer.token_to_id("<pad>").unwrap_or(0);
+        let hf_error = match tokenizers::Tokenizer::from_file(path) {
+            Ok(hf_tokenizer) => {
+                drop(file);
+                let vocab = hf_tokenizer.get_vocab(true);
+                if vocab.is_empty() {
+                    return Err(format!("{}: tokenizer vocabulary is empty", path.display()));
+                }
+                let id_to_token: HashMap<u32, String> =
+                    vocab.iter().map(|(k, v)| (*v, k.clone())).collect();
+                let bos_token_id = declared_bos
+                    .as_deref()
+                    .and_then(|token| hf_tokenizer.token_to_id(token))
+                    .or_else(|| hf_tokenizer.token_to_id("<|im_start|>"))
+                    .or_else(|| hf_tokenizer.token_to_id("<s>"))
+                    .unwrap_or(1);
+                let eos_token_id = hf_tokenizer
+                    .token_to_id("<|im_end|>")
+                    .or_else(|| hf_tokenizer.token_to_id("</s>"))
+                    .unwrap_or(2);
+                let pad_token_id = hf_tokenizer.token_to_id("<pad>").unwrap_or(0);
 
-            return Ok(Self {
-                vocab,
-                id_to_token,
-                bos_token_id,
-                eos_token_id,
-                pad_token_id,
-                hf_tokenizer: Some(Arc::new(hf_tokenizer)),
-            });
-        }
+                return Ok(Self {
+                    vocab,
+                    id_to_token,
+                    bos_token_id,
+                    eos_token_id,
+                    pad_token_id,
+                    hf_tokenizer: Some(Arc::new(hf_tokenizer)),
+                });
+            }
+            Err(e) => e,
+        };
 
         let mut content = String::new();
         std::io::Read::read_to_string(&mut std::io::BufReader::new(file), &mut content)
@@ -92,6 +102,12 @@ impl Tokenizer {
 
         let parsed: TokenizerJson = serde_json::from_str(&content)
             .map_err(|e| format!("Failed to parse {}: {}", path.display(), e))?;
+        if let Some(kind) = parsed.model.kind {
+            return Err(format!(
+                "{}: cannot load the {kind} tokenizer: {hf_error}",
+                path.display()
+            ));
+        }
 
         let vocab = parsed.model.vocab;
         if vocab.is_empty() {
@@ -131,21 +147,30 @@ impl Tokenizer {
 
     /// Encode text to token IDs, adding the tokenizer's special tokens
     /// (e.g. a leading BOS) when it defines any.
-    pub fn encode(&self, text: &str) -> Vec<u32> {
+    ///
+    /// # Errors
+    ///
+    /// If the Hugging Face tokenizer fails to encode the text.
+    pub fn encode(&self, text: &str) -> Result<Vec<u32>, String> {
         self.encode_with(text, true)
     }
 
     /// Encode text without adding special tokens; use this for text that
     /// continues a sequence (an SFT response after its prompt).
-    pub fn encode_continuation(&self, text: &str) -> Vec<u32> {
+    ///
+    /// # Errors
+    ///
+    /// If the Hugging Face tokenizer fails to encode the text.
+    pub fn encode_continuation(&self, text: &str) -> Result<Vec<u32>, String> {
         self.encode_with(text, false)
     }
 
-    fn encode_with(&self, text: &str, add_special_tokens: bool) -> Vec<u32> {
+    fn encode_with(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>, String> {
         if let Some(tokenizer) = &self.hf_tokenizer {
-            if let Ok(encoding) = tokenizer.encode(text, add_special_tokens) {
-                return encoding.get_ids().to_vec();
-            }
+            return tokenizer
+                .encode(text, add_special_tokens)
+                .map(|encoding| encoding.get_ids().to_vec())
+                .map_err(|e| format!("tokenizer cannot encode the text: {e}"));
         }
 
         let mut tokens = if add_special_tokens {
@@ -154,40 +179,37 @@ impl Tokenizer {
             Vec::new()
         };
 
-        // Simple character/byte fallback encoding
-        // Real BPE would be more complex, but this works for basic testing
+        // A plain `model.vocab` map has no merges: whole words, then the
+        // word after a space, then single characters, then `<unk>`.
         for word in text.split_whitespace() {
-            // Try exact match first
             if let Some(&id) = self.vocab.get(word) {
                 tokens.push(id);
+            } else if let Some(&id) = self.vocab.get(&format!("Ġ{word}")) {
+                tokens.push(id);
             } else {
-                // Fallback: encode character by character with Ġ prefix for space
-                let word_with_space = format!("Ġ{}", word);
-                if let Some(&id) = self.vocab.get(&word_with_space) {
-                    tokens.push(id);
-                } else {
-                    // Character by character
-                    for c in word.chars() {
-                        if let Some(&id) = self.vocab.get(&c.to_string()) {
-                            tokens.push(id);
-                        } else {
-                            // Unknown token - use a common fallback
-                            tokens.push(self.vocab.get("<unk>").copied().unwrap_or(0));
-                        }
+                for c in word.chars() {
+                    if let Some(&id) = self.vocab.get(&c.to_string()) {
+                        tokens.push(id);
+                    } else {
+                        tokens.push(self.vocab.get("<unk>").copied().unwrap_or(0));
                     }
                 }
             }
         }
 
-        tokens
+        Ok(tokens)
     }
 
-    /// Decode token IDs back to text
-    pub fn decode(&self, tokens: &[u32]) -> String {
+    /// Decode token IDs back to text.
+    ///
+    /// # Errors
+    ///
+    /// If the Hugging Face tokenizer fails to decode the ids.
+    pub fn decode(&self, tokens: &[u32]) -> Result<String, String> {
         if let Some(tokenizer) = &self.hf_tokenizer {
-            if let Ok(decoded) = tokenizer.decode(tokens, true) {
-                return decoded;
-            }
+            return tokenizer
+                .decode(tokens, true)
+                .map_err(|e| format!("tokenizer cannot decode {} ids: {e}", tokens.len()));
         }
 
         let mut result = String::new();
@@ -207,7 +229,7 @@ impl Tokenizer {
                 }
             }
         }
-        result
+        Ok(result)
     }
 
     /// The ChatML prompt for one user turn (with an optional system turn),
@@ -232,12 +254,24 @@ impl Tokenizer {
     }
 
     /// Encode [`chat_prompt`](Self::chat_prompt).
-    pub fn encode_chat(&self, system: Option<&str>, user: &str) -> Vec<u32> {
+    ///
+    /// # Errors
+    ///
+    /// If the Hugging Face tokenizer fails to encode the prompt.
+    pub fn encode_chat(&self, system: Option<&str>, user: &str) -> Result<Vec<u32>, String> {
         self.encode_conversation(system, &[user])
     }
 
     /// Encode [`conversation_prompt`](Self::conversation_prompt).
-    pub fn encode_conversation(&self, system: Option<&str>, turns: &[impl AsRef<str>]) -> Vec<u32> {
+    ///
+    /// # Errors
+    ///
+    /// If the Hugging Face tokenizer fails to encode the prompt.
+    pub fn encode_conversation(
+        &self,
+        system: Option<&str>,
+        turns: &[impl AsRef<str>],
+    ) -> Result<Vec<u32>, String> {
         self.encode(&Self::conversation_prompt(system, turns))
     }
 }
@@ -722,8 +756,8 @@ mod tests {
             assert_eq!(tok.eos_token_id, 2, "{config}");
             assert_eq!(tok.pad_token_id, 0, "{config}");
             // The Hugging Face encoder never reads bos_token_id.
-            assert_eq!(tok.encode("Hi Hi"), guessed.encode("Hi Hi"), "{config}");
-            assert_eq!(tok.encode("Hi Hi"), [3, 3], "{config}");
+            assert_eq!(tok.encode("Hi Hi")?, guessed.encode("Hi Hi")?, "{config}");
+            assert_eq!(tok.encode("Hi Hi")?, [3, 3], "{config}");
         }
         Ok(())
     }
@@ -734,14 +768,14 @@ mod tests {
             serde_json::json!({ "model": { "vocab": endoftext_chatml_json()["model"]["vocab"] } });
         let guessed = load_with_config("fallback-none", &json, None)?;
         assert!(guessed.hf_tokenizer.is_none());
-        assert_eq!(guessed.encode("Hi"), [1, 3]);
+        assert_eq!(guessed.encode("Hi")?, [1, 3]);
         let declared = load_with_config(
             "fallback-declared",
             &json,
             Some(r#"{"bos_token": "<|endoftext|>"}"#),
         )?;
-        assert_eq!(declared.encode("Hi"), [0, 3]);
-        assert_eq!(declared.decode(&[1, 3, 2]), "<|im_start|>Hi");
+        assert_eq!(declared.encode("Hi")?, [0, 3]);
+        assert_eq!(declared.decode(&[1, 3, 2])?, "<|im_start|>Hi");
         Ok(())
     }
 
@@ -758,11 +792,11 @@ mod tests {
             (0, 1, 2)
         );
         // By hand: 'H' 72, 'i' 105, ' ' 32, '\n' 10, 'é' is C3 A9; each plus 3.
-        assert_eq!(tok.encode("Hi \n"), [75, 108, 35, 13]);
-        assert_eq!(tok.encode("é"), [0xC3 + 3, 0xA9 + 3]);
+        assert_eq!(tok.encode("Hi \n")?, [75, 108, 35, 13]);
+        assert_eq!(tok.encode("é")?, [0xC3 + 3, 0xA9 + 3]);
         assert_eq!(tok.vocab["Ġ"], 35, "GPT-2's character for the space byte");
         assert_eq!(
-            tok.encode("<s></s>").len(),
+            tok.encode("<s></s>")?.len(),
             7,
             "specials in text stay bytes"
         );
@@ -777,8 +811,8 @@ mod tests {
         for scalar in 0u32..=0xFF {
             let text = char::from_u32(scalar).ok_or("scalar")?.to_string();
             let expected: Vec<u32> = text.bytes().map(|b| u32::from(b) + 3).collect();
-            assert_eq!(tok.encode(&text), expected, "U+{scalar:04X}");
-            assert_eq!(tok.decode(&expected), text, "U+{scalar:04X}");
+            assert_eq!(tok.encode(&text)?, expected, "U+{scalar:04X}");
+            assert_eq!(tok.decode(&expected)?, text, "U+{scalar:04X}");
         }
         for text in [
             "plain ASCII.",
@@ -786,8 +820,8 @@ mod tests {
             "  two spaces\r\n",
             "🦀<pad>",
         ] {
-            assert_eq!(tok.decode(&tok.encode(text)), text);
-            assert_eq!(tok.encode(text).len(), text.len());
+            assert_eq!(tok.decode(&tok.encode(text)?)?, text);
+            assert_eq!(tok.encode(text)?.len(), text.len());
         }
         Ok(())
     }
@@ -820,7 +854,7 @@ mod tests {
         assert_eq!(json["model"]["vocab"]["ab"], 259);
         assert_eq!(json["model"]["vocab"]["Ġab"], 260);
         let tok = load_with_config("bpe-merges", &json, None)?;
-        assert_eq!(tok.encode("ab ab"), [259, 260]);
+        assert_eq!(tok.encode("ab ab")?, [259, 260]);
         assert_eq!(
             train_byte_level_bpe("ab ab ab", 262).err().as_deref(),
             Some("the corpus yields 261 tokens, fewer than 262")
@@ -849,7 +883,7 @@ mod tests {
             assert_eq!(tok.vocab[token], id, "{token:?}");
         }
         let words = ["the", "Ġsat", "Ġon", "Ġthe"].map(|word| tok.vocab[word]);
-        assert_eq!(tok.encode("the sat on the"), words);
+        assert_eq!(tok.encode("the sat on the")?, words);
         for text in [
             corpus.as_str(),
             "\n",
@@ -857,7 +891,7 @@ mod tests {
             "unseen: 🦀 Ωμέγα <s></s><pad>",
             "\u{0}\u{7f}\u{80}\u{ff}",
         ] {
-            assert_eq!(tok.decode(&tok.encode(text)), text, "{text:?}");
+            assert_eq!(tok.decode(&tok.encode(text)?)?, text, "{text:?}");
         }
         Ok(())
     }
@@ -885,16 +919,54 @@ mod tests {
     }
 
     #[test]
+    fn a_failing_encoder_is_an_error_not_the_plain_reader() -> TestResult {
+        // A WordLevel model whose `unk_token` is missing from its vocabulary
+        // fails on any word it does not know.
+        let json = serde_json::json!({
+            "model": { "type": "WordLevel", "vocab": {"Hi": 0, "<s>": 1}, "unk_token": "<unk>" }
+        });
+        let tok = load_with_config("encoder-fails", &json, None)?;
+        assert!(tok.hf_tokenizer.is_some());
+        assert_eq!(tok.encode_continuation("Hi")?, [0]);
+        for err in [tok.encode("Bye"), tok.encode_continuation("Bye")] {
+            let err = err.err().ok_or("an unknown word encoded")?;
+            assert!(
+                err.starts_with("tokenizer cannot encode the text: "),
+                "{err}"
+            );
+            assert!(err.contains("[UNK]"), "{err}");
+        }
+        let chat = tok.encode_chat(None, "Hi").err().ok_or("chat encoded")?;
+        assert!(chat.starts_with("tokenizer cannot encode"), "{chat}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_typed_model_the_hugging_face_reader_refuses_is_an_error() {
+        // A vocabulary the plain reader could use, under a model type the
+        // Hugging Face reader does not know.
+        let json = serde_json::json!({ "model": { "type": "NoSuchModel", "vocab": {"Hi": 0} } });
+        let err = load_with_config("typed-refused", &json, None)
+            .err()
+            .map(|e| e.to_string());
+        assert!(
+            err.as_deref().is_some_and(|e| e.contains("tokenizer.json")
+                && e.contains("cannot load the NoSuchModel tokenizer")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
     fn one_turn_conversation_encodes_like_encode_chat(
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let tok = chatml_tokenizer()?;
         for system in [None, Some("Be brief.")] {
             assert_eq!(
-                tok.encode_conversation(system, &["Hi"]),
-                tok.encode_chat(system, "Hi")
+                tok.encode_conversation(system, &["Hi"])?,
+                tok.encode_chat(system, "Hi")?
             );
         }
-        assert_eq!(tok.encode_chat(None, "Hi"), [1, 4, 6, 2, 1, 5]);
+        assert_eq!(tok.encode_chat(None, "Hi")?, [1, 4, 6, 2, 1, 5]);
         Ok(())
     }
 
@@ -908,10 +980,10 @@ mod tests {
         let user_bye = [1, 4, 8, 2];
         let header = [1, 5];
         let without_system = [&user_hi[..], &assistant_hello, &user_bye, &header].concat();
-        assert_eq!(tok.encode_conversation(None, &turns), without_system);
+        assert_eq!(tok.encode_conversation(None, &turns)?, without_system);
         let system = [1, 3, 9, 10, 11, 2];
         assert_eq!(
-            tok.encode_conversation(Some("Be brief."), &turns),
+            tok.encode_conversation(Some("Be brief."), &turns)?,
             [&system[..], &without_system].concat()
         );
         Ok(())

@@ -923,7 +923,7 @@ fn load_dataset(args: &DataArgs, tokenizer: &Tokenizer) -> Result<TextDataset> {
                     .iter()
                     .filter(|l| !l.trim().is_empty())
                     .map(|l| tokenizer.encode(l))
-                    .collect();
+                    .collect::<std::result::Result<_, _>>()?;
                 TextDataset::pack_sequences(seqs, seq)
             } else {
                 return Err(unmet(
@@ -937,7 +937,7 @@ fn load_dataset(args: &DataArgs, tokenizer: &Tokenizer) -> Result<TextDataset> {
                 .lines()
                 .filter(|l| !l.trim().is_empty())
                 .map(|l| tokenizer.encode(l))
-                .collect();
+                .collect::<std::result::Result<_, _>>()?;
             TextDataset::pack_sequences(seqs, seq)
         }
     };
@@ -991,7 +991,7 @@ fn load_json_sft(
             s.system.as_deref(),
             chat,
             seq,
-        ) {
+        )? {
             ds.add_example(ex);
         }
     }
@@ -1089,10 +1089,10 @@ async fn generate(args: GenerateArgs) -> Result<()> {
     }
     let mut sampler = args.sampling.sampler()?;
     let prompt_ids = if args.raw {
-        base.tokenizer.encode(&args.prompt)
+        base.tokenizer.encode(&args.prompt)?
     } else {
         base.tokenizer
-            .encode_chat(args.system.as_deref(), &args.prompt)
+            .encode_chat(args.system.as_deref(), &args.prompt)?
     };
     let mut max_new = args.sampling.max_new_tokens;
     if let Some(limit) = base.config.max_position_embeddings {
@@ -1299,7 +1299,7 @@ async fn generate_tokens(
         }
         generated.push(next);
         tokens.push(next);
-        let text = base.tokenizer.decode(&generated);
+        let text = base.tokenizer.decode(&generated)?;
         if let Some(delta) = text.strip_prefix(printed.as_str()) {
             emit(delta);
             printed = text;
@@ -1821,7 +1821,7 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
     };
 
     if let Some(prompt) = &args.sample_prompt {
-        let ids = base.tokenizer.encode_chat(None, prompt);
+        let ids = base.tokenizer.encode_chat(None, prompt)?;
         let mut sampler = Sampler::new(0.0, 0, 1.0, None);
         eprintln!("sample ({prompt:?}):");
         let mut cache = DecodeCache::new(&trainer.model, ids.len() + 96);

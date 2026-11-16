@@ -79,16 +79,16 @@ pub async fn run(args: ChatArgs) -> Result<()> {
             _ => {}
         }
         turns.push(line);
-        let mut prompt_ids = tokenizer.encode_conversation(system, &turns);
+        let mut prompt_ids = tokenizer.encode_conversation(system, &turns)?;
         if let Some(limit) = base.config.max_position_embeddings {
             let budget = limit.saturating_sub(max_new);
             if prompt_ids.len() > budget {
-                drop_oldest_exchanges(tokenizer, system, &mut turns, budget).ok_or_else(|| {
+                drop_oldest_exchanges(tokenizer, system, &mut turns, budget)?.ok_or_else(|| {
                     unmet(format!(
                         "the message does not fit the model's {limit} positions with --max-new-tokens {max_new}"
                     ))
                 })?;
-                prompt_ids = tokenizer.encode_conversation(system, &turns);
+                prompt_ids = tokenizer.encode_conversation(system, &turns)?;
                 if !said_dropped {
                     eprintln!("dropped the oldest turns to fit the model's {limit} positions");
                     said_dropped = true;
@@ -141,18 +141,24 @@ fn drop_oldest_exchanges(
     system: Option<&str>,
     turns: &mut Vec<String>,
     budget: usize,
-) -> Option<()> {
+) -> Result<Option<()>> {
     // Encodings of growing prefixes give the token count of the system turn
     // and of each exchange; special tokens split ChatML turns, so the counts
     // add up.
     let ends = (0..turns.len()).step_by(2).chain([turns.len()]);
     let lens: Vec<usize> = ends
-        .map(|end| tokenizer.encode_conversation(system, &turns[..end]).len())
-        .collect();
+        .map(|end| {
+            tokenizer
+                .encode_conversation(system, &turns[..end])
+                .map(|ids| ids.len())
+        })
+        .collect::<std::result::Result<_, _>>()?;
     let exchanges: Vec<usize> = lens.windows(2).map(|w| w[1].saturating_sub(w[0])).collect();
-    let drop = exchanges_to_drop(lens[0], &exchanges, budget)?;
+    let Some(drop) = exchanges_to_drop(lens[0], &exchanges, budget) else {
+        return Ok(None);
+    };
     turns.drain(..2 * drop);
-    Some(())
+    Ok(Some(()))
 }
 
 /// How many of the oldest exchanges to drop so that `fixed` tokens plus the

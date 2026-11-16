@@ -348,16 +348,18 @@ fn tokenize_corpus(args: &PretrainArgs, size: &LlamaSize) -> Result<()> {
 
     let tokens_path = args.out.join("tokens.bin");
     // Lines are encoded one at a time, as the BPE tokenizer learned them.
-    let ids: Box<dyn Iterator<Item = u32> + '_> = match bpe_text {
+    let ids: Box<dyn Iterator<Item = std::result::Result<u32, String>> + '_> = match bpe_text {
         None => Box::new(
             corpus
                 .iter()
-                .map(|&byte| u32::from(byte) + BYTE_LEVEL_FIRST_BYTE_ID),
+                .map(|&byte| Ok::<_, String>(u32::from(byte) + BYTE_LEVEL_FIRST_BYTE_ID)),
         ),
-        Some(text) => Box::new(
-            text.split_inclusive('\n')
-                .flat_map(|line| tokenizer.encode_continuation(line)),
-        ),
+        Some(text) => Box::new(text.split_inclusive('\n').flat_map(|line| {
+            match tokenizer.encode_continuation(line) {
+                Ok(ids) => ids.into_iter().map(Ok).collect(),
+                Err(e) => vec![Err(e)],
+            }
+        })),
     };
     let token_count = write_tokens(ids, &tokens_path)?;
     eprintln!(
@@ -395,12 +397,16 @@ fn write_initial_model(args: &PretrainArgs, size: &LlamaSize, tokenizer: &str) -
     Ok(())
 }
 
-/// Writes `ids` to `path` as packed little-endian `u32`, returning how many.
-fn write_tokens(ids: impl Iterator<Item = u32>, path: &Path) -> Result<usize> {
+/// Writes `ids` to `path` as packed little-endian `u32`, returning how many;
+/// stops at the first id that is an encoding error.
+fn write_tokens(
+    ids: impl Iterator<Item = std::result::Result<u32, String>>,
+    path: &Path,
+) -> Result<usize> {
     let mut tokens = BufWriter::new(File::create(path)?);
     let mut count = 0;
     for id in ids {
-        tokens.write_all(&id.to_le_bytes())?;
+        tokens.write_all(&id?.to_le_bytes())?;
         count += 1;
     }
     tokens
