@@ -9,6 +9,8 @@
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
+use std::sync::OnceLock;
+
 use crate::{no_grad, Device, Tensor};
 
 /// Input generator for one argument of a case.
@@ -293,7 +295,7 @@ pub(crate) fn check_gpu_parity(cases: &[Case]) {
         eprintln!("skipping GPU parity; set FERROTENSOR_RUN_GPU_TESTS=1 to enable");
         return;
     }
-    let gpu = Device::gpu().expect("FERROTENSOR_RUN_GPU_TESTS=1 but no GPU is available");
+    let gpu = shared_gpu();
     let cpu = Device::cpu();
     let close = |a: &[f32], b: &[f32], what: &str| {
         assert_eq!(a.len(), b.len(), "{what}: length");
@@ -483,33 +485,18 @@ fn test_gpu() -> Option<Device> {
         eprintln!("skipping GPU reductions; set FERROTENSOR_RUN_GPU_TESTS=1 to enable");
         return None;
     }
-    Some(Device::gpu().unwrap_or_else(|| panic!("no GPU: {}", why_no_gpu())))
+    Some(shared_gpu())
 }
 
-fn why_no_gpu() -> String {
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::util::backend_bits_from_env().unwrap_or(wgpu::Backends::all()),
-        dx12_shader_compiler: wgpu::util::dx12_shader_compiler_from_env().unwrap_or_default(),
-        ..Default::default()
-    });
-    let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
-        return "request_adapter returned None".into();
-    };
-    let limits = adapter.limits();
-    match pollster::block_on(adapter.request_device(
-        &wgpu::DeviceDescriptor {
-            label: None,
-            required_features: wgpu::Features::empty(),
-            required_limits: limits,
-        },
-        None,
-    )) {
-        Ok(_) => format!(
-            "{:?}: request_device worked on the second try",
-            adapter.get_info()
-        ),
-        Err(e) => format!("{:?}: request_device failed: {e:?}", adapter.get_info()),
-    }
+/// One GPU device for every test in the process. On WARP, the DX12 software
+/// adapter, creating a device per test failed with `OutOfMemory` after about
+/// 20 devices in one process; lavapipe and Metal did not, and a program uses
+/// one device anyway.
+pub(crate) fn shared_gpu() -> Device {
+    static GPU: OnceLock<Option<Device>> = OnceLock::new();
+    GPU.get_or_init(Device::gpu)
+        .clone()
+        .expect("FERROTENSOR_RUN_GPU_TESTS=1 but no GPU is available")
 }
 
 #[test]
