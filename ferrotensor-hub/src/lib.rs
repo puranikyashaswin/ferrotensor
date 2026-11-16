@@ -16,6 +16,7 @@
 //! # }
 //! ```
 
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -92,7 +93,7 @@ impl FerrotensorHub {
     /// variables count as unset.
     pub fn new() -> Self {
         Self {
-            cache_dir: cache_dir_from(|name| std::env::var(name).ok()),
+            cache_dir: cache_dir_from(|name| std::env::var_os(name)),
         }
     }
 
@@ -170,22 +171,26 @@ impl FerrotensorHub {
         self.get_model_path(model_id).exists()
     }
 
-    /// List all cached models.
-    pub fn list_cached(&self) -> Vec<String> {
+    /// List all cached models; none when the cache directory does not exist.
+    ///
+    /// # Errors
+    ///
+    /// If the cache directory exists but cannot be read.
+    pub fn list_cached(&self) -> HubResult<Vec<String>> {
         if !self.cache_dir.exists() {
-            return vec![];
+            return Ok(vec![]);
         }
 
-        fs::read_dir(&self.cache_dir)
-            .map(|entries| {
-                entries
-                    .filter_map(|e| e.ok())
-                    .filter_map(|e| e.file_name().into_string().ok())
-                    .filter(|name| name.starts_with("models--"))
-                    .map(|name| name.trim_start_matches("models--").replace("--", "/"))
-                    .collect()
-            })
-            .unwrap_or_default()
+        let mut models = Vec::new();
+        for entry in fs::read_dir(&self.cache_dir)? {
+            // A folder name that is not UTF-8 cannot be a model id.
+            if let Some(folder) = entry?.file_name().to_str() {
+                if let Some(id) = folder.strip_prefix("models--") {
+                    models.push(id.replace("--", "/"));
+                }
+            }
+        }
+        Ok(models)
     }
 
     /// Get safetensors file paths for a model.
@@ -215,7 +220,7 @@ impl Default for FerrotensorHub {
 
 /// The Hugging Face hub cache directory, in the order Hugging Face documents;
 /// `var` looks up an environment variable.
-fn cache_dir_from(var: impl Fn(&str) -> Option<String>) -> PathBuf {
+fn cache_dir_from(var: impl Fn(&str) -> Option<OsString>) -> PathBuf {
     let var = |name: &str| var(name).filter(|value| !value.is_empty());
     if let Some(hub) = var("HF_HUB_CACHE") {
         return PathBuf::from(hub);
@@ -243,7 +248,7 @@ mod tests {
         cache_dir_from(|name| {
             vars.iter()
                 .find(|(key, _)| *key == name)
-                .map(|(_, value)| value.to_string())
+                .map(|(_, value)| OsString::from(value))
         })
     }
 
@@ -309,6 +314,35 @@ mod tests {
             cache_for(&vars),
             PathBuf::from("/home/u/.cache/huggingface/hub")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cache_path_that_is_not_utf8_is_kept() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let hub = std::ffi::OsStr::from_bytes(b"/hub-\xff");
+        let cache = cache_dir_from(|name| (name == "HF_HUB_CACHE").then(|| hub.to_owned()));
+        assert_eq!(cache.as_os_str(), hub);
+    }
+
+    #[test]
+    fn list_cached_names_the_models_and_reports_an_unreadable_cache() {
+        let cache = TempCache::new("list");
+        cache.snapshot("abc");
+        fs::create_dir_all(cache.0.join("not-a-model")).expect("create folder");
+        let hub = FerrotensorHub::with_cache_dir(cache.0.clone());
+        assert_eq!(hub.list_cached().expect("list"), ["org/name"]);
+
+        let missing = FerrotensorHub::with_cache_dir(cache.0.join("missing"));
+        assert!(missing.list_cached().expect("list").is_empty());
+
+        // A file where the cache directory should be cannot be listed.
+        let file = cache.0.join("file");
+        fs::write(&file, "").expect("write file");
+        let err = FerrotensorHub::with_cache_dir(file)
+            .list_cached()
+            .expect_err("a file listed as a cache");
+        assert!(matches!(err, HubError::Io(_)), "{err}");
     }
 
     /// A cache directory under the system temp dir, removed on drop.

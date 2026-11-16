@@ -94,7 +94,10 @@ fn reads_f32_f16_and_bf16_tensors_as_f32() {
     let meta = weights.get_tensor_metadata("a.f16").expect("metadata");
     assert_eq!(meta.dtype, Dtype::F16);
     assert_eq!(
-        weights.get_tensor_info("a.bf16").map(|(s, _)| s),
+        weights
+            .get_tensor_info("a.bf16")
+            .expect("probe")
+            .map(|m| m.shape),
         Some(vec![6])
     );
 }

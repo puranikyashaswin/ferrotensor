@@ -343,7 +343,7 @@ impl ModelLoader {
         // SAFETY: the file is opened read-only and the mapping is only read.
         // The one hazard is another process truncating the file while it is
         // mapped; `open_regular_file` has already ruled out directories and pipes.
-        #[allow(unsafe_code)]
+        #[expect(unsafe_code, reason = "memory-mapping a file is unsafe in memmap2")]
         let mmap = unsafe { MmapOptions::new().map(&file) }.map_err(|e| {
             LoaderError::Io(std::io::Error::new(
                 e.kind(),
@@ -493,37 +493,37 @@ impl WeightsContext {
         self.weight_map.keys().map(String::as_str)
     }
 
-    /// Returns the shape and dtype name of a tensor.
+    /// Returns the shape and dtype of a tensor, or `None` when no loaded file
+    /// holds it; use it to probe for optional tensors.
     ///
-    /// Every failure is reported as `None`: a name no loaded file holds, and
-    /// a mapped file that no longer parses. Use [`WeightsContext::get_tensor_metadata`]
-    /// to tell them apart.
-    pub fn get_tensor_info(&self, name: &str) -> Option<(Vec<usize>, String)> {
-        // Shape, Dtype(str)
-        if let Some(filename) = self.weight_map.get(name) {
-            let mmap = self.mmaps.get(filename)?;
-            let st = SafeTensors::deserialize(mmap).ok()?;
-            let view = st.tensor(name).ok()?;
-            return Some((view.shape().to_vec(), format!("{:?}", view.dtype())));
-        }
-        None
+    /// # Errors
+    ///
+    /// If the file that holds the tensor no longer parses.
+    pub fn get_tensor_info(&self, name: &str) -> Result<Option<TensorMetadata>, LoaderError> {
+        let Some(filename) = self.weight_map.get(name) else {
+            return Ok(None);
+        };
+        let mmap = self
+            .mmaps
+            .get(filename)
+            .ok_or_else(|| LoaderError::MissingWeight(name.to_string()))?;
+        let st = SafeTensors::deserialize(mmap)?;
+        let view = st.tensor(name)?;
+        Ok(Some(TensorMetadata {
+            shape: view.shape().to_vec(),
+            dtype: view.dtype(),
+        }))
     }
 
-    /// Returns the shape and dtype of a tensor, or an error if it is missing.
+    /// Returns the shape and dtype of a tensor.
+    ///
+    /// # Errors
+    ///
+    /// [`LoaderError::MissingWeight`] when no loaded file holds it, or the
+    /// parse error of the file that does.
     pub fn get_tensor_metadata(&self, name: &str) -> Result<TensorMetadata, LoaderError> {
-        if let Some(filename) = self.weight_map.get(name) {
-            let mmap = self
-                .mmaps
-                .get(filename)
-                .ok_or_else(|| LoaderError::MissingWeight(name.to_string()))?;
-            let st = SafeTensors::deserialize(mmap)?;
-            let view = st.tensor(name)?;
-            return Ok(TensorMetadata {
-                shape: view.shape().to_vec(),
-                dtype: view.dtype(),
-            });
-        }
-        Err(LoaderError::MissingWeight(name.to_string()))
+        self.get_tensor_info(name)?
+            .ok_or_else(|| LoaderError::MissingWeight(name.to_string()))
     }
 
     // We can't return TensorView because it borrows from local mmap variable inside function
@@ -535,6 +535,11 @@ impl WeightsContext {
     /// released from the process (on Unix), so a model load does not keep
     /// the whole file resident; reading the tensor again faults them back
     /// in from the file.
+    ///
+    /// # Errors
+    ///
+    /// If no loaded file holds the tensor, the file no longer parses, or the
+    /// kernel refuses to release the pages.
     pub fn read_bytes<F>(&self, name: &str, callback: F) -> Result<(), LoaderError>
     where
         F: FnOnce(&[u8], &[usize]),
@@ -547,8 +552,12 @@ impl WeightsContext {
             let st = SafeTensors::deserialize(mmap)?;
             let view = st.tensor(name)?;
             callback(view.data(), view.shape());
-            release::release(mmap, view.data());
-            Ok(())
+            release::release(mmap, view.data()).map_err(|e| {
+                LoaderError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("cannot release the pages of {name} ({filename}): {e}"),
+                ))
+            })
         } else {
             Err(LoaderError::MissingWeight(name.to_string()))
         }
@@ -719,6 +728,57 @@ mod tests {
             .collect();
         assert_eq!(le_bytes_to_f32("s", &bytes).unwrap(), vec![1.5, -2.0]);
         assert!(le_bytes_to_f32("s", &[]).unwrap().is_empty());
+    }
+
+    /// A safetensors file holding one F32 tensor `a` of shape `[1]`.
+    fn one_tensor_file() -> Vec<u8> {
+        let header = br#"{"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header);
+        bytes.extend_from_slice(&1.5f32.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn a_probe_tells_an_absent_tensor_from_a_corrupt_file() {
+        let dir = std::env::temp_dir().join(format!("ferrotensor-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = dir.join("model.safetensors");
+        let corrupt = dir.join("corrupt.safetensors");
+        let full = one_tensor_file();
+        std::fs::write(&good, &full).unwrap();
+        // The header length still says the whole header, but the file ends
+        // halfway through it.
+        std::fs::write(&corrupt, &full[..20]).unwrap();
+
+        let mut weights = WeightsContext::new();
+        weights.load_file(&good).unwrap();
+        let a = weights.get_tensor_info("a").unwrap().unwrap();
+        assert_eq!((a.shape, a.dtype), (vec![1], safetensors::Dtype::F32));
+        assert!(weights.get_tensor_info("a.bias").unwrap().is_none());
+        assert!(matches!(
+            weights.get_tensor_metadata("a.bias"),
+            Err(LoaderError::MissingWeight(name)) if name == "a.bias"
+        ));
+
+        let load = WeightsContext::new().load_file(&corrupt);
+        assert!(matches!(load, Err(LoaderError::Safetensors(_))), "{load:?}");
+        // The indexed file is replaced by the corrupt one, as when a
+        // checkpoint changes on disk after it was loaded.
+        let corrupt_map = ModelLoader::load_safetensors(&corrupt).unwrap();
+        weights
+            .mmaps
+            .insert("model.safetensors".to_string(), corrupt_map);
+        let probe = weights.get_tensor_info("a");
+        assert!(
+            matches!(probe, Err(LoaderError::Safetensors(_))),
+            "{probe:?}"
+        );
+        assert!(matches!(
+            weights.get_tensor_metadata("a"),
+            Err(LoaderError::Safetensors(_))
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

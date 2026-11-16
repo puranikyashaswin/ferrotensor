@@ -538,7 +538,7 @@ fn a_tensor_the_model_needs_but_the_file_lacks_is_an_error() {
         weights.read_bytes(name, |_, _| panic!("callback must not run")),
         Err(LoaderError::MissingWeight(n)) if n == name
     ));
-    assert!(weights.get_tensor_info(name).is_none());
+    assert!(matches!(weights.get_tensor_info(name), Ok(None)));
     // Names are matched exactly, not by prefix.
     assert!(weights.read_f32_tensor("present.weight").is_err());
     assert!(weights.read_f32_tensor("").is_err());
@@ -644,7 +644,10 @@ fn index_shard_paths_that_leave_the_model_directory_are_refused() {
             "{shard}: {msg}"
         );
         assert!(msg.contains("model directory"), "{shard}: {msg}");
-        assert!(weights.get_tensor_info("secret").is_none(), "{shard}");
+        assert!(
+            matches!(weights.get_tensor_info("secret"), Ok(None)),
+            "{shard}"
+        );
         assert!(weights.read_f32_tensor("secret").is_err(), "{shard}");
     }
 }
@@ -667,8 +670,8 @@ fn one_bad_shard_path_stops_the_load_before_any_shard_is_read() {
     );
     let mut weights = WeightsContext::new();
     assert!(weights.load_model_dir(&model).is_err());
-    assert!(weights.get_tensor_info("x").is_none());
-    assert!(weights.get_tensor_info("secret").is_none());
+    assert!(matches!(weights.get_tensor_info("x"), Ok(None)));
+    assert!(matches!(weights.get_tensor_info("secret"), Ok(None)));
 }
 
 #[test]
@@ -805,36 +808,47 @@ fn tokenizer_ids_with_gaps_are_accepted_and_decode_safely() {
     // than the vocabulary), so gaps are fine. The ids that are missing must
     // simply decode to nothing.
     let tok = tokenizer_with_vocab(&json!({"x": 10, "y": 30, "<unk>": 50}));
-    assert_eq!(tok.encode_continuation("x y"), vec![10, 30]);
-    assert_eq!(tok.decode(&[10, 30]), "xy");
-    assert_eq!(tok.decode(&[10, 20, 30, 49]), "xy");
+    assert_eq!(
+        tok.encode_continuation("x y").expect("encode"),
+        vec![10, 30]
+    );
+    assert_eq!(tok.decode(&[10, 30]).expect("decode"), "xy");
+    assert_eq!(tok.decode(&[10, 20, 30, 49]).expect("decode"), "xy");
 }
 
 #[test]
 fn encoding_empty_text_does_not_panic() {
     let tok = tokenizer_with_vocab(&json!({"x": 10, "y": 30}));
-    assert!(tok.encode_continuation("").is_empty());
-    assert!(tok.encode_continuation("   \n\t ").is_empty());
+    assert!(tok.encode_continuation("").expect("encode").is_empty());
+    assert!(tok
+        .encode_continuation("   \n\t ")
+        .expect("encode")
+        .is_empty());
     // With special tokens: at most the beginning-of-sequence token.
-    assert!(tok.encode("").len() <= 1);
-    assert!(tok.encode("   ").len() <= 1);
+    assert!(tok.encode("").expect("encode").len() <= 1);
+    assert!(tok.encode("   ").expect("encode").len() <= 1);
 }
 
 #[test]
 fn encoding_text_with_unknown_characters_does_not_panic() {
     let tok = tokenizer_with_vocab(&json!({"x": 10, "y": 30}));
-    let ids = tok.encode_continuation("zz \u{1F600} \u{0} \u{202e}x");
+    let ids = tok
+        .encode_continuation("zz \u{1F600} \u{0} \u{202e}x")
+        .expect("encode");
     assert!(!ids.is_empty());
     let long = "q".repeat(100_000);
-    assert!(!tok.encode_continuation(&long).is_empty());
+    assert!(!tok.encode_continuation(&long).expect("encode").is_empty());
 }
 
 #[test]
 fn decoding_ids_outside_the_vocabulary_does_not_panic() {
     let tok = tokenizer_with_vocab(&json!({"x": 10, "y": 30}));
-    assert_eq!(tok.decode(&[]), "");
-    assert_eq!(tok.decode(&[999_999, u32::MAX]), "");
-    assert_eq!(tok.decode(&[u32::MAX, 10, 999_999, 30]), "xy");
+    assert_eq!(tok.decode(&[]).expect("decode"), "");
+    assert_eq!(tok.decode(&[999_999, u32::MAX]).expect("decode"), "");
+    assert_eq!(
+        tok.decode(&[u32::MAX, 10, 999_999, 30]).expect("decode"),
+        "xy"
+    );
 }
 
 #[test]
@@ -844,10 +858,10 @@ fn hugging_face_tokenizer_survives_empty_text_and_unknown_ids() {
     )
     .expect("hugging face tokenizer");
     assert!(tok.hf_tokenizer.is_some());
-    let _ = tok.encode("");
-    let _ = tok.encode_continuation("");
-    assert_eq!(tok.decode(&[]), "");
-    assert_eq!(tok.decode(&[99, 1_000_000, u32::MAX]), "");
+    assert!(tok.encode("").expect("encode").is_empty());
+    assert!(tok.encode_continuation("").expect("encode").is_empty());
+    assert_eq!(tok.decode(&[]).expect("decode"), "");
+    assert_eq!(tok.decode(&[99, 1_000_000, u32::MAX]).expect("decode"), "");
 }
 
 #[test]

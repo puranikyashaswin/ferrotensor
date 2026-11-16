@@ -108,7 +108,7 @@ fn llama_models_use_hugging_face_parameter_names() {
             continue;
         }
         assert!(
-            weights.get_tensor_info(name).is_some(),
+            matches!(weights.get_tensor_info(name), Ok(Some(_))),
             "{name} is not a Hugging Face name of the checkpoint"
         );
     }

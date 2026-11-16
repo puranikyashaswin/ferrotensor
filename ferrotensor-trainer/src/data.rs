@@ -172,7 +172,9 @@ impl TextDataset {
                 sample.system.as_deref(),
                 use_chat_template,
                 max_len,
-            ) {
+            )
+            .map_err(|e| std::io::Error::other(format!("line {}: {e}", line_no + 1)))?
+            {
                 samples.push(example);
             }
         }
@@ -197,7 +199,8 @@ impl TextDataset {
             .lines()
             .filter(|line| !line.trim().is_empty())
             .map(|line| tokenizer.encode(line))
-            .collect();
+            .collect::<Result<_, _>>()
+            .map_err(std::io::Error::other)?;
         Ok(Self::from_sequences(sequences))
     }
 
@@ -251,7 +254,12 @@ impl TextDataset {
 /// and the response is followed by the end-of-turn token, so the model also
 /// learns where to stop. The response is tokenized without special tokens.
 /// Long examples are truncated at the end (the prompt is kept whole);
-/// examples whose prompt leaves no room for a response token are dropped.
+/// examples whose prompt leaves no room for a response token are dropped
+/// (`Ok(None)`).
+///
+/// # Errors
+///
+/// If the tokenizer fails to encode the prompt or the response.
 pub fn build_sft_example(
     tokenizer: &Tokenizer,
     prompt: &str,
@@ -259,24 +267,24 @@ pub fn build_sft_example(
     system: Option<&str>,
     use_chat_template: bool,
     max_len: usize,
-) -> Option<TrainingExample> {
+) -> Result<Option<TrainingExample>, String> {
     let (prompt_tokens, response_tokens) = if use_chat_template {
-        let mut response_part = tokenizer.encode_continuation(response);
+        let mut response_part = tokenizer.encode_continuation(response)?;
         response_part.push(tokenizer.eos_token_id);
-        (tokenizer.encode_chat(system, prompt), response_part)
+        (tokenizer.encode_chat(system, prompt)?, response_part)
     } else {
         (
-            tokenizer.encode(prompt),
-            tokenizer.encode_continuation(response),
+            tokenizer.encode(prompt)?,
+            tokenizer.encode_continuation(response)?,
         )
     };
 
     if prompt_tokens.is_empty() || response_tokens.is_empty() {
-        return None;
+        return Ok(None);
     }
     // The first supervised target sits at index prompt_len - 1.
     if max_len < 2 || prompt_tokens.len() > max_len {
-        return None;
+        return Ok(None);
     }
 
     let mut example = TrainingExample::from_sft_prompt_response(prompt_tokens, response_tokens);
@@ -286,9 +294,9 @@ pub fn build_sft_example(
         example.loss_mask.truncate(max_len);
     }
     if example.input_ids.len() < 2 || !example.loss_mask.contains(&1) {
-        return None;
+        return Ok(None);
     }
-    Some(example)
+    Ok(Some(example))
 }
 
 impl Default for TextDataset {
