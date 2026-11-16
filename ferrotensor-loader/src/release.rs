@@ -36,43 +36,43 @@ pub(crate) fn inner_aligned(start: usize, end: usize, align: usize) -> Range<usi
 }
 
 /// Advises the kernel that the whole pages of `mmap` covered by `data` (a
-/// sub-slice of it whose borrow has ended) are no longer needed. Best
-/// effort: errors are ignored, and it does nothing outside Unix.
-pub(crate) fn release(mmap: &memmap2::Mmap, data: &[u8]) {
-    #[cfg(unix)]
-    {
-        let base = mmap.as_ptr() as usize;
-        let Some(start) = (data.as_ptr() as usize).checked_sub(base) else {
-            return;
-        };
-        let end = start + data.len();
-        if end > mmap.len() {
-            return;
-        }
-        // The mapping starts on a page boundary, so offsets that are
-        // multiples of RELEASE_ALIGN are page-aligned addresses too.
-        let range = inner_aligned(start, end, RELEASE_ALIGN);
-        if range.is_empty() {
-            return;
-        }
-        // SAFETY: the mapping is a read-only, shared mapping of a file
-        // (`MmapOptions::map`), and no reference into `range` outlives this
-        // call (the caller's borrow of `data` has ended). MADV_DONTNEED
-        // only drops the process's page-table entries for it; the next
-        // access faults the pages in again from the file, unchanged.
-        #[allow(unsafe_code)]
-        let _ = unsafe {
-            mmap.unchecked_advise_range(
-                memmap2::UncheckedAdvice::DontNeed,
-                range.start,
-                range.len(),
-            )
-        };
+/// sub-slice of it whose borrow has ended) are no longer needed.
+///
+/// # Errors
+///
+/// The `madvise` error. The range is page-aligned and inside the mapping,
+/// so it fails only for pages the kernel will not drop, such as locked ones.
+#[cfg(unix)]
+pub(crate) fn release(mmap: &memmap2::Mmap, data: &[u8]) -> std::io::Result<()> {
+    let base = mmap.as_ptr() as usize;
+    let Some(start) = (data.as_ptr() as usize).checked_sub(base) else {
+        return Ok(());
+    };
+    let end = start + data.len();
+    if end > mmap.len() {
+        return Ok(());
     }
-    #[cfg(not(unix))]
-    {
-        let _ = (mmap, data);
+    // The mapping starts on a page boundary, so offsets that are
+    // multiples of RELEASE_ALIGN are page-aligned addresses too.
+    let range = inner_aligned(start, end, RELEASE_ALIGN);
+    if range.is_empty() {
+        return Ok(());
     }
+    // SAFETY: the mapping is a read-only, shared mapping of a file
+    // (`MmapOptions::map`), and no reference into `range` outlives this
+    // call (the caller's borrow of `data` has ended). MADV_DONTNEED
+    // only drops the process's page-table entries for it; the next
+    // access faults the pages in again from the file, unchanged.
+    #[expect(unsafe_code, reason = "madvise on a mapping is unsafe in memmap2")]
+    unsafe {
+        mmap.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, range.start, range.len())
+    }
+}
+
+/// Does nothing: page release is only implemented on Unix.
+#[cfg(not(unix))]
+pub(crate) fn release(_mmap: &memmap2::Mmap, _data: &[u8]) -> std::io::Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -80,6 +80,22 @@ mod tests {
     use super::{inner_aligned, RELEASE_ALIGN};
 
     const A: usize = RELEASE_ALIGN;
+
+    #[test]
+    fn released_pages_read_back_unchanged() -> std::io::Result<()> {
+        let path =
+            std::env::temp_dir().join(format!("ferrotensor-release-{}.bin", std::process::id()));
+        let bytes: Vec<u8> = (0..3 * A).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &bytes)?;
+        let mmap = crate::ModelLoader::load_safetensors(&path).map_err(std::io::Error::other)?;
+        let released = super::release(&mmap, &mmap[1..]);
+        let read_back = mmap[..] == bytes[..];
+        drop(mmap);
+        std::fs::remove_file(&path)?;
+        released?;
+        assert!(read_back);
+        Ok(())
+    }
 
     #[test]
     fn ranges_inside_one_block_are_empty() {

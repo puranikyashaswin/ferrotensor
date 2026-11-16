@@ -538,6 +538,38 @@ fn a_chatml_prompt_stops_at_im_end_when_the_config_names_another_eos() {
 
 #[test]
 #[ignore = "needs a GPU"]
+fn a_tokenizer_that_cannot_encode_the_prompt_exits_with_1_and_names_the_error() {
+    let model = model_dir("generate-encoder-fails");
+    // An `unk_token` missing from the vocabulary makes the word-level model
+    // fail on any word it does not know.
+    let path = model.path().join("tokenizer.json");
+    let mut json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("read tokenizer"))
+            .expect("parse tokenizer");
+    json["model"]["unk_token"] = serde_json::json!("<missing>");
+    std::fs::write(&path, json.to_string()).expect("write tokenizer");
+
+    let run = ferrotensor(&[
+        "generate",
+        "--model",
+        s(model.path()),
+        "--prompt",
+        "not-a-word",
+        "--raw",
+        "--json",
+    ]);
+    let stdout = text(&run.stdout);
+    assert_eq!(run.status.code(), Some(1), "stdout: {stdout}");
+    let error: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON object");
+    let message = error["error"].as_str().expect("error message");
+    assert!(
+        message.contains("tokenizer cannot encode the text") && message.contains("[UNK]"),
+        "{message}"
+    );
+}
+
+#[test]
+#[ignore = "needs a GPU"]
 fn generate_refuses_a_prompt_that_encodes_to_no_tokens() {
     let model = model_dir("generate-empty-prompt");
     let run = ferrotensor(&[

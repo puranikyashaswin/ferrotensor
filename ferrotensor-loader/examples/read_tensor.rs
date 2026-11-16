@@ -26,13 +26,17 @@ fn main() {
         ("tensor_a", [1u8, 2, 3, 4]),
         ("tensor_b", [10u8, 20, 30, 40]),
     ] {
-        let (shape, dtype) = ctx
+        let meta = ctx
             .get_tensor_info(name)
+            .unwrap()
             .unwrap_or_else(|| panic!("{path} has no tensor {name}"));
         ctx.read_bytes(name, |bytes, _| {
-            println!("{name}: shape {shape:?}, dtype {dtype}, bytes {bytes:?}");
-            assert_eq!(shape, [4]);
-            assert_eq!(dtype, "U8");
+            println!(
+                "{name}: shape {:?}, dtype {:?}, bytes {bytes:?}",
+                meta.shape, meta.dtype
+            );
+            assert_eq!(meta.shape, [4]);
+            assert_eq!(meta.dtype, safetensors::Dtype::U8);
             assert_eq!(bytes, want);
         })
         .unwrap();

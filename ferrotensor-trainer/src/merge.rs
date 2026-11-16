@@ -239,17 +239,22 @@ pub(crate) fn adapters_by_target<'a>(
             .into_iter()
             .flatten()
             .map(|m| format!("{m}.weight"))
-            .find(|t| weights.get_tensor_info(t).is_some())
+            .find_map(|t| {
+                weights
+                    .get_tensor_info(&t)
+                    .map(|m| m.map(|_| t))
+                    .transpose()
+            })
+            .transpose()?
             .unwrap_or_else(|| format!("{module}.weight"));
-        let source = if target == "lm_head.weight" && weights.get_tensor_info(&target).is_none() {
+        let source = if target == "lm_head.weight" && weights.get_tensor_info(&target)?.is_none() {
             "model.embed_tokens.weight".to_string()
         } else {
             target.clone()
         };
-        if weights.get_tensor_info(&source).is_none() {
-            return Err(format!("{name}: the base model has no tensor {target}").into());
-        }
-        let base = weights.get_tensor_metadata(&source)?;
+        let base = weights
+            .get_tensor_info(&source)?
+            .ok_or_else(|| format!("{name}: the base model has no tensor {target}"))?;
         if base.shape != [out_dim, in_dim] {
             return Err(format!(
                 "{name}: the adapter changes a [{out_dim}, {in_dim}] weight, but {source} is {:?}",

@@ -165,7 +165,7 @@ fn tokenize(
     let mut rows = Vec::with_capacity(records.len());
     let mut cut = 0;
     for (row, record) in records.iter().enumerate() {
-        let mut ids = base.tokenizer.encode_continuation(&record.text);
+        let mut ids = base.tokenizer.encode_continuation(&record.text)?;
         if ids.is_empty() {
             return Err(format!(
                 "{}: row {row} (id {}) has no tokens",
