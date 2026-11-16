@@ -12,19 +12,23 @@ use std::path::{Path, PathBuf};
 
 const MIB: f64 = 1024.0 * 1024.0;
 
-/// Fixed GPU memory every run holds: the driver context and the buffer
-/// pool's idle buffers (cap 512 MiB). Fitted to the measured peaks.
-const OVERHEAD_MIB: u64 = 1350;
-/// f32 values kept per token per decoder block for backward, per unit of
-/// hidden size, FFN width and attention row (n_heads x seq_len). Fitted to
-/// the measured peaks; the ratio follows the tensors a Llama block keeps.
-const ACTIVATION_FLOATS_PER_HIDDEN: f64 = 16.0;
-const ACTIVATION_FLOATS_PER_FFN: f64 = 6.0;
-const ACTIVATION_FLOATS_PER_ATTENTION_ROW: f64 = 3.0;
+/// Fixed GPU memory every run holds: the driver context, the buffer pool's
+/// idle buffers (cap 512 MiB) and allocator slack. Fitted to the measured
+/// peaks.
+const OVERHEAD_MIB: u64 = 1480;
+/// Measured activation bytes over 4 bytes per value that
+/// [`estimate_peak_mib`] counts (pool rounding and the gradients of the
+/// block backward is working on). Fitted to the measured peaks.
+const ACTIVATION_SCALE: f64 = 1.07;
+/// Extra activations when an optimizer step accumulates several forward
+/// passes: nothing waits for the GPU between them, so the next forward
+/// allocates while the buffers the last backward freed still await the
+/// GPU. Fitted to the measured peaks.
+const ACCUMULATION_OVERLAP: f64 = 0.18;
 /// The logits and their gradient, both f32 and vocab-sized per token.
 const LOGIT_FLOATS_PER_VOCAB: f64 = 2.0;
-/// Fraction of the budget a plan leaves free; above the estimator's worst
-/// error on the measured peaks (13.3%).
+/// Fraction of the budget a plan leaves free; above the estimator's largest
+/// underestimate of the measured peaks (8.7%).
 const SAFETY_MARGIN: f64 = 0.15;
 /// Share of system RAM budgeted for a GPU that shares it (the training
 /// process itself needs the rest).
@@ -214,6 +218,8 @@ impl ModelShape {
 pub struct TrainConfig {
     /// Sequences per forward pass.
     pub batch_size: usize,
+    /// Forward passes per optimizer step.
+    pub grad_accum: usize,
     /// Tokens per sequence.
     pub seq_len: usize,
     /// LoRA rank (adapters on q, k, v and o projections).
@@ -268,15 +274,24 @@ pub fn estimate_peak_mib(shape: &ModelShape, config: &TrainConfig) -> Estimate {
     // f32 weight, gradient and the two AdamW moments.
     let adapters = adapter_weights * 4.0 * 4.0;
 
-    let floats_per_block = ACTIVATION_FLOATS_PER_HIDDEN * h
-        + ACTIVATION_FLOATS_PER_FFN * shape.ffn as f64
-        + ACTIVATION_FLOATS_PER_ATTENTION_ROW * (shape.n_heads * config.seq_len) as f64;
-    let activations = match config.checkpointing {
-        Checkpointing::Off => tokens * layers * floats_per_block * 4.0,
+    // Each op output stays alive until backward, held by the node that
+    // reads it. Per token: the two norms, the two residual sums and the down
+    // projection; q, k, v and o each as base output, LoRA output, scaled
+    // LoRA output and their sum; RoPE of q and k; the attention output
+    // (flash attention keeps no scores); gate, up and their product.
+    let values_per_block = 9.0 * h + 6.0 * q_width + 9.0 * kv_width + 3.0 * shape.ffn as f64;
+    let values_per_token = match config.checkpointing {
+        Checkpointing::Off => layers * values_per_block,
         // Every block's input, plus one block's activations while it is
         // recomputed.
-        Checkpointing::Blocks => tokens * (layers * h + floats_per_block) * 4.0,
+        Checkpointing::Blocks => layers * h + values_per_block,
     };
+    let overlap = if config.grad_accum > 1 {
+        1.0 + ACCUMULATION_OVERLAP
+    } else {
+        1.0
+    };
+    let activations = tokens * values_per_token * 4.0 * ACTIVATION_SCALE * overlap;
     let logits = LOGIT_FLOATS_PER_VOCAB * tokens * vocab * 4.0;
 
     let parts = [
@@ -348,6 +363,7 @@ pub fn choose(
     let plan_for = |checkpointing, batch_size, seq_len| {
         let config = TrainConfig {
             batch_size,
+            grad_accum: grad_accum_for(batch_size),
             seq_len,
             lora_rank,
             precision,
@@ -537,17 +553,17 @@ pub fn grad_accum_for(batch_size: usize) -> usize {
     (SEQUENCES_PER_STEP / batch_size).max(1)
 }
 
-/// The `ferrotensor train` line for a plan, keeping 8 sequences per step.
+/// The `ferrotensor train` line for a plan.
 pub fn train_command(model: &str, config: &TrainConfig) -> String {
-    let grad_accum = grad_accum_for(config.batch_size);
     let checkpoint = match config.checkpointing {
         Checkpointing::Off => "",
         Checkpointing::Blocks => " --checkpoint-blocks",
     };
     format!(
         "ferrotensor train --model {model} --data train.jsonl --batch-size {} \
-         --grad-accum {grad_accum} --seq-len {} --lora-rank {}{checkpoint}{}",
+         --grad-accum {} --seq-len {} --lora-rank {}{checkpoint}{}",
         config.batch_size,
+        config.grad_accum,
         config.seq_len,
         config.lora_rank,
         config.precision.train_flag()
@@ -712,8 +728,9 @@ fn machine_budget(
 
 fn push_common_notes(notes: &mut Vec<String>, budget: &Budget) {
     notes.push(
-        "the estimate is calibrated on 8 measured peaks (SmolLM2 135M, 360M and 1.7B, \
-         f16 weights, seq 256, one A10G); its worst error there is 13.3%"
+        "the estimate is fitted to 15 measured peaks (SmolLM2 135M, 360M and 1.7B, \
+         Qwen2.5-0.5B, f16 weights, 8 sequences per step, one A10G); it is at most \
+         8.7% below and 17% above them"
             .into(),
     );
     notes.push("replace train.jsonl in the train command with your dataset".into());
@@ -860,9 +877,28 @@ mod tests {
             .expect("documented shape")
     }
 
+    /// A documented SmolLM2 size, or a measured model given here.
+    fn shape(name: &str) -> ModelShape {
+        match name {
+            "Qwen2.5-0.5B-Instruct" => ModelShape {
+                name: name.into(),
+                hidden: 896,
+                ffn: 4864,
+                n_layers: 24,
+                n_heads: 14,
+                n_kv_heads: 2,
+                head_dim: 64,
+                vocab: 151_936,
+                tied_embeddings: true,
+            },
+            _ => smollm2(name),
+        }
+    }
+
     fn config(batch_size: usize, checkpointing: Checkpointing) -> TrainConfig {
         TrainConfig {
             batch_size,
+            grad_accum: grad_accum_for(batch_size),
             seq_len: 256,
             lora_rank: 8,
             precision: Precision::F16,
@@ -870,40 +906,106 @@ mod tests {
         }
     }
 
-    /// Peak GPU memory (MiB) measured with `nvidia-smi` on an A10G, f16
-    /// weights, seq 256, rank 8: docs/examples/lora-sft.md, "Confirmation
-    /// run of merged main". The last column is the estimate, worked out by
-    /// hand from the same formula.
-    const MEASURED: [(&str, usize, Checkpointing, u64, u64); 8] = [
-        ("SmolLM2-135M", 1, Checkpointing::Off, 2306, 2569),
-        ("SmolLM2-135M", 1, Checkpointing::Blocks, 1890, 1868),
-        ("SmolLM2-360M", 1, Checkpointing::Off, 3579, 3661),
-        ("SmolLM2-360M", 1, Checkpointing::Blocks, 2783, 2413),
-        ("SmolLM2-1.7B", 1, Checkpointing::Off, 8142, 7638),
-        ("SmolLM2-1.7B", 1, Checkpointing::Blocks, 5313, 5294),
-        ("SmolLM2-135M", 8, Checkpointing::Off, 9441, 8438),
-        ("SmolLM2-135M", 8, Checkpointing::Blocks, 2767, 2831),
+    /// Peak GPU memory (MiB, largest `nvidia-smi` sample at 200 ms) of
+    /// LoRA training on one A10G, f16 weights, rank 8: model, batch size,
+    /// gradient accumulation, sequence length, checkpointing, peak. A new
+    /// run adds a row; a new model also goes into [`shape`].
+    const MEASURED: [(&str, usize, usize, usize, Checkpointing, u64); 17] = [
+        // 30 steps of `train` on main at af41068, 15 Nov:
+        // docs/examples/lora-sft.md, "Confirmation run of merged main".
+        ("SmolLM2-135M", 1, 8, 256, Checkpointing::Off, 2306),
+        ("SmolLM2-135M", 1, 8, 256, Checkpointing::Blocks, 1890),
+        ("SmolLM2-360M", 1, 8, 256, Checkpointing::Off, 3579),
+        ("SmolLM2-360M", 1, 8, 256, Checkpointing::Blocks, 2783),
+        ("SmolLM2-1.7B", 1, 8, 256, Checkpointing::Off, 8142),
+        ("SmolLM2-1.7B", 1, 8, 256, Checkpointing::Blocks, 5313),
+        ("SmolLM2-135M", 8, 8, 256, Checkpointing::Off, 9441),
+        ("SmolLM2-135M", 8, 8, 256, Checkpointing::Blocks, 2767),
+        // Main at ca9630a, 16 Nov: 30 steps of `finetune`, then 250 steps,
+        // then 30 steps of `train --profile`.
+        ("SmolLM2-135M", 8, 1, 256, Checkpointing::Off, 6331),
+        ("SmolLM2-360M", 8, 1, 256, Checkpointing::Off, 9104),
+        ("SmolLM2-360M", 4, 2, 256, Checkpointing::Off, 7220),
+        ("SmolLM2-1.7B", 4, 2, 256, Checkpointing::Off, 15064),
+        ("SmolLM2-1.7B", 8, 1, 128, Checkpointing::Off, 14196),
+        (
+            "Qwen2.5-0.5B-Instruct",
+            8,
+            1,
+            256,
+            Checkpointing::Off,
+            11197,
+        ),
+        ("SmolLM2-1.7B", 4, 2, 256, Checkpointing::Off, 15128),
+        ("SmolLM2-135M", 1, 8, 256, Checkpointing::Off, 2146),
+        ("SmolLM2-1.7B", 1, 8, 256, Checkpointing::Off, 7710),
     ];
 
+    /// Every peak of a configuration `plan` can choose (8 sequences per
+    /// step) is estimated at most 9% low, under the safety margin, and at
+    /// most 17% high. The two 64-sequence rows are data only: 135M at
+    /// batch 8 x 8 measured 9,441 MiB on af41068, against 6,331 MiB at
+    /// batch 8 x 1 on ca9630a.
     #[test]
-    fn estimate_is_within_15_percent_of_every_measured_peak() {
-        let mut worst = 0.0_f64;
-        for (name, batch, checkpointing, measured, expected) in MEASURED {
-            let estimate = estimate_peak_mib(&smollm2(name), &config(batch, checkpointing));
-            assert_eq!(
-                estimate.peak_mib, expected,
-                "{name} batch {batch} {checkpointing:?}"
-            );
-            let error = (estimate.peak_mib as f64 - measured as f64).abs() / measured as f64;
+    fn estimate_error_on_every_measured_peak() {
+        let (mut lowest, mut highest) = (0.0_f64, 0.0_f64);
+        for (name, batch_size, grad_accum, seq_len, checkpointing, measured) in MEASURED {
+            if batch_size * grad_accum != SEQUENCES_PER_STEP {
+                continue;
+            }
+            let config = TrainConfig {
+                batch_size,
+                grad_accum,
+                seq_len,
+                lora_rank: 8,
+                precision: Precision::F16,
+                checkpointing,
+            };
+            let estimate = estimate_peak_mib(&shape(name), &config).peak_mib;
+            let error = (estimate as f64 - measured as f64) / measured as f64;
             assert!(
-                error <= 0.15,
-                "{name} batch {batch} {checkpointing:?}: {error}"
+                (-0.09..=0.17).contains(&error),
+                "{name} {batch_size} x {grad_accum} seq {seq_len} {checkpointing:?}: \
+                 estimate {estimate} MiB, measured {measured} MiB"
             );
-            worst = worst.max(error);
+            lowest = lowest.min(error);
+            highest = highest.max(error);
         }
-        // 360M with --checkpoint-blocks: 2,413 against 2,783 MiB.
-        assert!((worst - 0.1330).abs() < 1e-3, "worst error {worst}");
-        assert!(worst < SAFETY_MARGIN);
+        // 360M with --checkpoint-blocks (2,540 against 2,783 MiB) and 1.7B
+        // at seq 128 (12,956 against 14,196 MiB).
+        assert!((lowest + 0.0873).abs() < 1e-3, "lowest error {lowest}");
+        assert!(-lowest < SAFETY_MARGIN);
+        // 135M at batch 1 with --profile: 2,510 against 2,146 MiB.
+        assert!((highest - 0.1696).abs() < 1e-3, "highest error {highest}");
+    }
+
+    #[test]
+    fn estimate_parts_for_smollm2_360m_at_batch_4() {
+        // Activations by hand: 24,960 values per token and block x 32 blocks
+        // x 1,024 tokens x 4 bytes = 3,120 MiB, x 1.07, x 1.18 for the two
+        // accumulated passes. Logits: 2 x 1,024 x 49,152 x 4 bytes.
+        let estimate = estimate_peak_mib(&smollm2("SmolLM2-360M"), &config(4, Checkpointing::Off));
+        assert_eq!(
+            (
+                estimate.weights_mib,
+                estimate.adapters_mib,
+                estimate.activations_mib,
+                estimate.logits_mib,
+                estimate.overhead_mib,
+                estimate.peak_mib
+            ),
+            (870, 25, 3940, 384, 1480, 6699)
+        );
+    }
+
+    #[test]
+    fn logits_use_the_model_vocabulary() {
+        let qwen = shape("Qwen2.5-0.5B-Instruct");
+        // 2 x 2,048 tokens x 151,936 x 4 bytes.
+        assert_eq!(
+            estimate_peak_mib(&qwen, &config(8, Checkpointing::Off)).logits_mib,
+            2374
+        );
     }
 
     #[test]
@@ -923,7 +1025,7 @@ mod tests {
         assert_eq!(estimate_peak_mib(&shape, &c).weights_mib, 6912);
         c.precision = Precision::Q4;
         assert_eq!(estimate_peak_mib(&shape, &c).weights_mib, 1440);
-        assert_eq!(estimate_peak_mib(&shape, &c).activations_mib, 2496);
+        assert_eq!(estimate_peak_mib(&shape, &c).activations_mib, 2182);
     }
 
     #[test]
@@ -935,10 +1037,10 @@ mod tests {
 
     #[test]
     fn chooser_prefers_the_longer_sequence_then_no_checkpointing_then_batch() {
-        // Batch 8 at seq 128 (4,679 MiB) also fits, but seq 256 wins.
+        // Batch 8 at seq 128 (4,122 MiB) also fits, but seq 256 wins.
         let p = choose(
             &smollm2("SmolLM2-135M"),
-            8000,
+            6000,
             Precision::F16,
             8,
             Pinned::default(),
@@ -951,18 +1053,18 @@ mod tests {
                 p.estimate.peak_mib,
                 p.fits
             ),
-            (Checkpointing::Off, 4, 256, 5084, true)
+            (Checkpointing::Off, 4, 256, 4460, true)
         );
         assert_eq!(short_seq_note("m", p.config.seq_len), None);
     }
 
     #[test]
     fn chooser_drops_to_seq_128_only_when_256_fails_with_checkpointing() {
-        // Seq 256 needs 5,294 MiB even with checkpointing at batch 1; 6,150
-        // MiB leaves 5,227 usable.
+        // Seq 256 needs 5,424 MiB even with checkpointing at batch 1; 6,300
+        // MiB leaves 5,355 usable.
         let p = choose(
             &smollm2("SmolLM2-1.7B"),
-            6150,
+            6300,
             Precision::F16,
             8,
             Pinned::default(),
@@ -975,7 +1077,7 @@ mod tests {
                 p.estimate.peak_mib,
                 p.fits
             ),
-            (Checkpointing::Blocks, 1, 128, 5164, true)
+            (Checkpointing::Blocks, 1, 128, 5300, true)
         );
         assert_eq!(
             short_seq_note("SmolLM2-1.7B", p.config.seq_len).as_deref(),
@@ -1003,7 +1105,7 @@ mod tests {
                 p.estimate.peak_mib,
                 p.fits
             ),
-            (Checkpointing::Blocks, 1, 256, 2413, true)
+            (Checkpointing::Blocks, 1, 256, 2540, true)
         );
     }
 
@@ -1018,7 +1120,7 @@ mod tests {
                 p.config.seq_len,
                 p.estimate.peak_mib
             ),
-            (Checkpointing::Blocks, 4, 256, 6038)
+            (Checkpointing::Blocks, 4, 256, 6167)
         );
         let seq = Pinned {
             seq_len: NonZeroUsize::new(128),
@@ -1032,7 +1134,7 @@ mod tests {
                 p.config.seq_len,
                 p.estimate.peak_mib
             ),
-            (Checkpointing::Off, 1, 128, 6198)
+            (Checkpointing::Off, 1, 128, 6315)
         );
     }
 
@@ -1048,15 +1150,15 @@ mod tests {
                 p.fits,
             )
         };
-        // Unpinned this is batch 4 at 5,084 MiB. Batch 2 by hand: weights
-        // 365 + adapters 15 + activations 1,485 + logits 192 + overhead 1,350.
+        // Unpinned this is batch 8 at 6,384 MiB. Batch 2 by hand: weights
+        // 365 + adapters 15 + activations 1,108 + logits 192 + overhead 1,480.
         let batch_2 = Pinned {
             batch_size: NonZeroUsize::new(2),
             ..Pinned::default()
         };
         assert_eq!(
             summary(choose(&shape, 8000, Precision::F16, 8, batch_2)),
-            (Checkpointing::Off, 2, 256, 3407, true)
+            (Checkpointing::Off, 2, 256, 3160, true)
         );
         let blocks = Pinned {
             checkpointing: Some(Checkpointing::Blocks),
@@ -1064,17 +1166,17 @@ mod tests {
         };
         assert_eq!(
             summary(choose(&shape, 8000, Precision::F16, 8, blocks)),
-            (Checkpointing::Blocks, 8, 256, 2831, true)
+            (Checkpointing::Blocks, 8, 256, 2898, true)
         );
         // Nothing fits 500 MiB: the smallest plan keeps the pinned batch.
-        // Activations 77 and logits 192 at 512 tokens of seq 128.
+        // Activations 80 and logits 192 at 512 tokens of seq 128.
         let batch_4 = Pinned {
             batch_size: NonZeroUsize::new(4),
             ..Pinned::default()
         };
         assert_eq!(
             summary(choose(&shape, 500, Precision::F16, 8, batch_4)),
-            (Checkpointing::Blocks, 4, 128, 1999, false)
+            (Checkpointing::Blocks, 4, 128, 2132, false)
         );
     }
 
@@ -1095,9 +1197,9 @@ mod tests {
                 p.estimate.peak_mib,
                 p.fits
             ),
-            (Checkpointing::Blocks, 1, 128, 1798, false)
+            (Checkpointing::Blocks, 1, 128, 1928, false)
         );
-        // 1.7B on 6,000 MiB: f16 needs 5,164 MiB plus the margin; 4-bit fits.
+        // 1.7B on 6,000 MiB: f16 needs 5,300 MiB plus the margin; 4-bit fits.
         let shape = smollm2("SmolLM2-1.7B");
         assert!(!choose(&shape, 6000, Precision::F16, 8, Pinned::default()).fits);
         let q4 = choose(&shape, 6000, Precision::Q4, 8, Pinned::default());
@@ -1109,7 +1211,7 @@ mod tests {
                 q4.estimate.peak_mib,
                 q4.fits
             ),
-            (Checkpointing::Blocks, 8, 256, 4822, true)
+            (Checkpointing::Blocks, 8, 256, 4764, true)
         );
     }
 
