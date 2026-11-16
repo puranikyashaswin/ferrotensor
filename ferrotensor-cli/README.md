@@ -569,6 +569,15 @@ the prompt plus `--max-new-tokens` does not, it lowers the number of new
 tokens to what fits and says so on stderr. A model without a
 `max_position_embeddings` entry is not checked.
 
+Without `--raw` the prompt is wrapped in ChatML, and the reply also ends at
+`<|im_end|>` when the tokenizer has it, whatever EOS the config names; with
+`--raw` it ends at the tokenizer's EOS, the config's `eos_token_id` (one id
+or a list) or `<|endoftext|>`. The stats line on stderr gives the prompt and
+new token counts, the prefill time (running the prompt) and the decode speed,
+which counts the one-token forward passes after the prompt and leaves the
+prefill out; `--json` reports them as `prefill_seconds` and
+`tokens_per_second` (null when no such pass ran).
+
 ## Talk to a model: `chat`
 
 `chat` holds a multi-turn conversation with a base model or, with `--lora`,
@@ -584,7 +593,7 @@ cargo run -p ferrotensor-cli --release -- chat \
 
 `/reset` clears the conversation, and `/exit`, `/quit` or the end of input
 ends it. After each reply stderr gets the same line `generate` prints (prompt
-tokens, new tokens, tokens per second). `--temperature`, `--top-k`,
+tokens, new tokens, prefill time, decode speed). `--temperature`, `--top-k`,
 `--top-p`, `--seed` and `--max-new-tokens` work as in `generate`.
 
 Each turn encodes the whole conversation in ChatML: the system message,
@@ -604,6 +613,7 @@ Only models whose tokenizer has the ChatML tokens `<|im_start|>` and
 
 Input can be piped, which is how scripts and the tests drive it. With
 `--json` each reply is one JSON object per line on stdout,
-`{"reply", "prompt_tokens", "cached_tokens", "new_tokens", "tokens_per_second"}`
-(`cached_tokens`: prompt tokens taken from the cache, not run again), and the
+`{"reply", "prompt_tokens", "cached_tokens", "new_tokens", "tokens_per_second", "prefill_seconds"}`
+(`cached_tokens`: prompt tokens taken from the cache, not run again, so the
+prefill runs only the rest), and the
 streamed text goes to stderr.

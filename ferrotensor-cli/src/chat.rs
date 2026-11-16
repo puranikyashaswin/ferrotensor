@@ -3,7 +3,7 @@
 
 use crate::{
     adapter_metadata, build_model, generate_tokens, load_base, loaded_line, restore_adapter,
-    stream_text, unmet, DecodeCache, GenerateSummary, ModelArgs, Result, SamplingArgs,
+    stream_text, unmet, DecodeCache, GenerateSummary, ModelArgs, Prompt, Result, SamplingArgs,
 };
 use clap::Args;
 use ferrotensor_loader::Tokenizer;
@@ -95,14 +95,15 @@ pub async fn run(args: ChatArgs) -> Result<()> {
                 }
             }
         }
+        let prompt = Prompt::chatml(&base.tokenizer, &base.config, prompt_ids);
         if args.rerun_conversation || cache.is_none() {
-            cache = DecodeCache::new(&model, prompt_ids.len() + max_new);
+            cache = DecodeCache::new(&model, prompt.ids.len() + max_new);
         }
         let mut reply = String::new();
-        let (new_tokens, decode_time, cached_tokens) = generate_tokens(
+        let decoded = generate_tokens(
             &base,
             &model,
-            &prompt_ids,
+            &prompt,
             max_new,
             &mut sampler,
             cache.as_mut(),
@@ -114,16 +115,16 @@ pub async fn run(args: ChatArgs) -> Result<()> {
         .await?;
         stream_text("\n", args.json);
         let kv_cache = cache.is_some();
-        let summary =
-            GenerateSummary::new(reply, prompt_ids.len(), new_tokens, decode_time, kv_cache);
+        let summary = GenerateSummary::new(reply, prompt.ids.len(), &decoded, kv_cache);
         eprintln!("{}", summary.stats_line());
         if args.json {
             let line = serde_json::json!({
                 "reply": summary.text,
                 "prompt_tokens": summary.prompt_tokens,
-                "cached_tokens": cached_tokens,
+                "cached_tokens": decoded.cached_tokens,
                 "new_tokens": summary.new_tokens,
                 "tokens_per_second": summary.tokens_per_second,
+                "prefill_seconds": summary.prefill_seconds,
             });
             println!("{line}");
         }
