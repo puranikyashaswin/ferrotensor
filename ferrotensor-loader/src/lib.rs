@@ -124,6 +124,45 @@ pub struct Lfm2Config {
     /// Longest sequence, in tokens, the model was trained on, if set.
     #[serde(default)]
     pub max_position_embeddings: Option<usize>,
+    /// MLP activation, e.g. `"silu"`.
+    #[serde(default)]
+    pub hidden_act: Option<String>,
+    /// RoPE scaling (`transformers` 4 layout); `null` means none.
+    #[serde(default)]
+    pub rope_scaling: Option<RopeConfig>,
+    /// RoPE type and base (`transformers` 5 layout).
+    #[serde(default)]
+    pub rope_parameters: Option<RopeConfig>,
+    /// Attention window of sliding-window layers, if set.
+    #[serde(default)]
+    pub sliding_window: Option<usize>,
+    /// Whether `sliding_window` applies (Qwen2 sets it to `false`).
+    #[serde(default)]
+    pub use_sliding_window: Option<bool>,
+}
+
+/// A `rope_scaling` or `rope_parameters` object of `config.json`.
+#[derive(Debug, Deserialize, Clone)]
+pub struct RopeConfig {
+    /// `"default"` for unscaled RoPE, else a scaling scheme such as `"llama3"`.
+    #[serde(default)]
+    pub rope_type: Option<String>,
+    /// The older name of `rope_type`; some configs carry both.
+    #[serde(default, rename = "type")]
+    pub legacy_type: Option<String>,
+    /// RoPE base frequency, if given here.
+    #[serde(default)]
+    pub rope_theta: Option<f64>,
+    /// Scaling factor of a scaled RoPE, if any.
+    #[serde(default)]
+    pub factor: Option<f64>,
+}
+
+impl RopeConfig {
+    /// `rope_type`, or else the older `type`.
+    pub fn kind(&self) -> Option<&str> {
+        self.rope_type.as_deref().or(self.legacy_type.as_deref())
+    }
 }
 
 fn default_norm_eps() -> f32 {

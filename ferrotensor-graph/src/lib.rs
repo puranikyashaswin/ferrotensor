@@ -97,11 +97,13 @@ impl LoRAAdapter {
     }
 }
 
-/// Bias-free linear layer `y = x @ weight` with an optional LoRA adapter.
+/// Linear layer `y = x @ weight + bias` with an optional bias and LoRA adapter.
 #[derive(Debug, Clone)]
 pub struct Linear {
     /// Weight `[in, out]` (already transposed from the PyTorch `[out, in]`).
     pub weight: Tensor,
+    /// Optional bias `[out]` (Qwen2 query, key and value projections).
+    pub bias: Option<Tensor>,
     /// Optional low-rank adapter added to the output.
     pub lora: Option<LoRAAdapter>,
 }
@@ -117,18 +119,36 @@ impl Linear {
             out = Tensor::add(&out, &scaled_lora, engine);
         }
 
+        if let Some(bias) = &self.bias {
+            // The autograd ops have no broadcasting add: `ones[rows, 1] @
+            // bias[1, out]` repeats the bias on every row exactly, and its
+            // backward sums the output gradient over rows into the bias.
+            let rows = x.data.shape[0];
+            let ones = Tensor::frozen(
+                x.ctx.clone(),
+                UnifiedTensor::new(&x.ctx, &vec![1.0; rows], &[rows, 1]),
+            );
+            let bias_row = Tensor::reshape(bias, &[1, bias.data.shape[0]]);
+            out = Tensor::add(&out, &Tensor::matmul(&ones, &bias_row, engine), engine);
+        }
+
         out
     }
 
-    /// A layer without LoRA.
+    /// A layer without bias or LoRA.
     pub fn new(weight: Tensor) -> Self {
-        Self { weight, lora: None }
+        Self {
+            weight,
+            bias: None,
+            lora: None,
+        }
     }
 
-    /// A layer with a LoRA adapter.
+    /// A layer with a LoRA adapter and no bias.
     pub fn with_lora(weight: Tensor, lora: LoRAAdapter) -> Self {
         Self {
             weight,
+            bias: None,
             lora: Some(lora),
         }
     }
@@ -151,9 +171,10 @@ impl Linear {
         }
     }
 
-    /// Trainable tensors (weights, then any LoRA adapters).
+    /// Trainable tensors (weight, bias, then any LoRA adapters).
     pub fn params(&self) -> Vec<Tensor> {
         let mut p = vec![self.weight.clone()];
+        p.extend(self.bias.clone());
         if let Some(lora) = &self.lora {
             p.extend(lora.params());
         }
@@ -164,6 +185,9 @@ impl Linear {
     pub fn named_params(&self, prefix: &str) -> HashMap<String, Tensor> {
         let mut map = HashMap::new();
         map.insert(format!("{}.weight", prefix), self.weight.clone());
+        if let Some(bias) = &self.bias {
+            map.insert(format!("{prefix}.bias"), bias.clone());
+        }
         if let Some(lora) = &self.lora {
             map.insert(format!("{}.lora_A.weight", prefix), lora.a.clone());
             map.insert(format!("{}.lora_B.weight", prefix), lora.b.clone());
