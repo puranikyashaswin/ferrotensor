@@ -71,14 +71,28 @@ fn flat_index(gid: vec3<u32>, nwg: vec3<u32>) -> u32 {
     return gid.x + gid.y * nwg.x * 256u;
 }
 
+// WGSL's tanh becomes HLSL tanh on DX12, and with it the GELU and Tanh
+// gradients on WARP (Microsoft's software adapter) were about 1e-3 off the
+// CPU. This form uses only exp, which every backend computes closely.
+fn tanh_f(x: f32) -> f32 {
+    let ax = abs(x);
+    if (ax < 0.0625) {
+        // Taylor series; (1 - e) / (1 + e) loses relative precision near 0.
+        let x2 = x * x;
+        return x * (1.0 - x2 * (1.0 / 3.0 - x2 * (2.0 / 15.0)));
+    }
+    let e = exp(-2.0 * ax);
+    return sign(x) * (1.0 - e) / (1.0 + e);
+}
+
 fn gelu_tanh(x: f32) -> f32 {
     let c = 0.7978845608;
-    return 0.5 * x * (1.0 + tanh(c * (x + 0.044715 * x * x * x)));
+    return 0.5 * x * (1.0 + tanh_f(c * (x + 0.044715 * x * x * x)));
 }
 
 fn gelu_tanh_grad(x: f32) -> f32 {
     let c = 0.7978845608;
-    let t = tanh(c * (x + 0.044715 * x * x * x));
+    let t = tanh_f(c * (x + 0.044715 * x * x * x));
     let dt = (1.0 - t * t) * c * (1.0 + 3.0 * 0.044715 * x * x);
     return 0.5 * (1.0 + t) + 0.5 * x * dt;
 }
@@ -107,7 +121,7 @@ fn unary_apply(op: u32, x: f32, a: f32, b: f32) -> f32 {
         case 1u: { y = x * sigmoid_f(x); }
         case 2u: { y = gelu_tanh(x); }
         case 3u: { y = sigmoid_f(x); }
-        case 4u: { y = tanh(x); }
+        case 4u: { y = tanh_f(x); }
         case 5u: { y = exp(x); }
         case 6u: { y = log(x); }
         case 7u: { y = abs(x); }

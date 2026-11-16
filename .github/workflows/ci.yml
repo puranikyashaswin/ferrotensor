@@ -7,6 +7,7 @@ on:
     branches: [main]
   schedule:
     - cron: "0 0 * * 0"
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -166,6 +167,99 @@ jobs:
         with:
           name: hardware-report-lavapipe
           path: reports/
+
+  gpu-other-backends:
+    name: GPU tests (${{ matrix.name }})
+    # The same GPU suites through the other two wgpu backends. macOS arm64
+    # runners expose Metal on a paravirtualised Apple GPU; Windows runners have
+    # no GPU, but DX12 lists WARP, Microsoft's software adapter, and wgpu picks
+    # it when nothing else is there (as Vulkan picks lavapipe above). Neither
+    # is real hardware and neither says anything about speed. The Qwen2
+    # fixture is not generated here, so those four tests skip.
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    # The full DX12 run is not reliably green yet (docs/testing-on-your-gpu.md
+    # has the failure): its failures show in the job but do not fail the
+    # workflow on main. The pull-request subset and Metal are blocking.
+    continue-on-error: ${{ matrix.backend == 'dx12' && github.event_name != 'pull_request' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Metal, Apple silicon runner
+            os: macos-latest
+            backend: metal
+            skip_cli: false
+          - name: DX12, WARP
+            os: windows-latest
+            backend: dx12
+            skip_cli: true
+    env:
+      WGPU_BACKEND: ${{ matrix.backend }}
+      FERROTENSOR_RUN_GPU_TESTS: "1"
+      FULL_SUITE: ${{ matrix.backend != 'dx12' || github.event_name != 'pull_request' }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4.2.2
+      # wgpu's default DX12 shader compiler, FXC, took about 9 minutes to
+      # build the engine's pipelines on WARP, so each test that opens a GPU
+      # took that long. WGPU_DX12_COMPILER=dxc selects DXC, whose two DLLs
+      # come with the Windows SDK on the runner; wgpu falls back to FXC with
+      # a warning in the log if it cannot load them.
+      - name: DXC from the Windows SDK
+        if: matrix.backend == 'dx12'
+        run: |
+          dll=$(ls "/c/Program Files (x86)/Windows Kits/10/bin/"10.*/x64/dxcompiler.dll | sort -V | tail -n 1)
+          dir=$(dirname "$dll")
+          ls -l "$dir/dxcompiler.dll" "$dir/dxil.dll"
+          cygpath -w "$dir" >> "$GITHUB_PATH"
+          echo "WGPU_DX12_COMPILER=dxc" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.2
+      # The JSON names the adapter, backend and device type that ran the tests.
+      - name: Adapter and kernel self-check
+        run: cargo run --release -p ferrotensor-cli -- info --check --json
+      # Runs even when the self-check fails, and --no-fail-fast goes on past
+      # a failing test binary, so every failing test on a backend shows.
+      # On WARP, with DXC, a test of a large kernel took far longer than on
+      # lavapipe (flash_attention_single_head_matches_cpu 153 s against
+      # milliseconds), most trainer test binaries took about 6 minutes, and
+      # each ferrotensor-cli end-to-end test, which starts the CLI as a new
+      # process, took up to 14 minutes. So on DX12 the CLI's 25 GPU tests are
+      # skipped (they run on Metal and Vulkan), and the rest of the suite, 2 h
+      # 22 min on WARP, runs only on main, weekly and by hand; a pull request
+      # runs the subset in the next step.
+      - name: GPU suites (ignored tests)
+        if: ${{ !cancelled() && env.FULL_SUITE == 'true' }}
+        run: |
+          exclude=()
+          if [ "${{ matrix.skip_cli }}" = true ]; then
+            echo "skipping the ferrotensor-cli end-to-end tests on this backend (see the comment in ci.yml)"
+            exclude=(--exclude ferrotensor-cli)
+          fi
+          cargo test --release --workspace "${exclude[@]}" --no-fail-fast -- --ignored --test-threads=1
+      # Pull requests on DX12: every backend kernel against its CPU reference
+      # (9 min on WARP); with the two Tensor API steps below, which check
+      # forward values and gradients against the CPU, the job took 14
+      # minutes. The PyTorch gradient parity binary alone took 7 more.
+      - name: GPU kernels (DX12 pull-request subset)
+        if: ${{ !cancelled() && env.FULL_SUITE != 'true' }}
+        run: |
+          echo "pull request on DX12: running the subset; the full suite runs on main, weekly and by workflow_dispatch"
+          cargo test --release -p ferrotensor-backend --test gpu_kernels --no-fail-fast -- --ignored --test-threads=1
+      - name: Autograd finite-difference checks
+        if: ${{ !cancelled() && env.FULL_SUITE == 'true' }}
+        run: cargo test --release -p ferrotensor-autograd --test grad_check -- --test-threads=1
+      - name: Tensor API GPU parity
+        if: ${{ !cancelled() }}
+        run: cargo test --release -p ferrotensor --lib -- --test-threads=1
+      - name: Tensor API GPU parity with op fusion on
+        if: ${{ !cancelled() }}
+        run: cargo test --release -p ferrotensor --lib -- --test-threads=1
+        env:
+          FERROTENSOR_FUSION: "1"
 
   doc:
     name: Docs

@@ -225,18 +225,26 @@ fn dequantize(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
 
 @compute @workgroup_size(1)
 fn top_k(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    // The previous pick is kept in registers, not read back from tk_out_idx:
+    // reading back the indices this invocation had just written gave the top
+    // index twice on Metal (Apple's paravirtual GPU in CI). Order: larger
+    // value first, then lower index.
     let k = tk_params;
     let len = arrayLength(&tk_input);
+    var prev_v = 0.0;
+    var prev_idx = 0u;
     for (var i = 0u; i < k; i = i + 1u) {
-        var max_v = -1e9;
+        var found = false;
+        var max_v = 0.0;
         var max_idx = 0u;
         for (var j = 0u; j < len; j = j + 1u) {
             let v = tk_input[j];
-            var used = false;
-            for (var p = 0u; p < i; p = p + 1u) { if (tk_out_idx[p] == j) { used = true; break; } }
-            if (!used && v > max_v) { max_v = v; max_idx = j; }
+            let after_prev = i == 0u || v < prev_v || (v == prev_v && j > prev_idx);
+            if (after_prev && (!found || v > max_v)) { found = true; max_v = v; max_idx = j; }
         }
         tk_out_idx[i] = max_idx;
+        prev_v = max_v;
+        prev_idx = max_idx;
     }
 }
 

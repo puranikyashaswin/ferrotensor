@@ -314,7 +314,7 @@ mod tests {
             eprintln!("skipping GPU KV cache test; set FERROTENSOR_RUN_GPU_TESTS=1 to enable");
             return;
         }
-        let gpu = Device::gpu().expect("FERROTENSOR_RUN_GPU_TESTS=1 but no GPU is available");
+        let gpu = crate::tensor::tests::shared_gpu();
         check_incremental_matches_full(&gpu);
     }
 }

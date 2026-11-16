@@ -19,7 +19,9 @@ pub use training::{AdamParams, MASKED_CE_SKIP, SUM_SQUARES_CHUNK};
 /// The full WGSL source compiled into the engine's shader module.
 fn shader_source() -> String {
     let kernels_src = include_str!("../shaders/kernels.wgsl");
-    let matmul_src = include_str!("../shaders/matmul.wgsl");
+    // A Windows checkout with core.autocrlf has CRLF line ends, which the
+    // multi-line patterns of half_b_matmul and q4_b_matmul would not match.
+    let matmul_src = &include_str!("../shaders/matmul.wgsl").replace("\r\n", "\n");
     let flash_v2_src = include_str!("../shaders/flash_attention_v2.wgsl");
     let flash_v2_bw_src = include_str!("../shaders/flash_attention_v2_backward.wgsl");
     let matmul_h_src = half_b_matmul(matmul_src);

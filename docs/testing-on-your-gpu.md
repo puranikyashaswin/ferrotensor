@@ -4,9 +4,29 @@ Ferrotensor runs through wgpu: Metal on macOS, Vulkan on Linux and Windows,
 DX12 on Windows. It has been tested on an NVIDIA A10G (24 GB) through Vulkan,
 an Apple M2 (8 GB) through Metal, and software Vulkan (Mesa lavapipe) in CI;
 the kernel benchmarks also ran on a Tesla T4 through Vulkan
-([results](../benchmarks/RESULTS.md)). Other GPUs are untested. Results from
-AMD and Intel GPUs, and from DX12, are the most useful thing you can
+([results](../benchmarks/RESULTS.md)). The GPU test suite also runs in CI
+through Metal on GitHub's Apple silicon runners (a virtualised GPU, reported
+as `Apple Paravirtual device`) and through DX12 on WARP (`Microsoft Basic
+Render Driver`, Microsoft's software adapter). On WARP the CLI end-to-end
+tests are skipped because they take too long there, and the rest of the suite
+(2 h 22 min) runs on `main`, weekly and on demand; a pull request runs only
+the backend kernel tests and the Tensor API parity tests (forward values and
+gradients against the CPU) there. These runs check
+correctness on the two backends; they are not real-hardware results and say
+nothing about speed. Other GPUs are untested. Results from AMD and Intel
+GPUs, and from DX12 on a real GPU, are the most useful thing you can
 contribute.
+
+The full DX12 run is not a merge gate and does not fail the workflow, because
+it is not reliably green. Its workspace GPU suite passed once (16 November
+2026, before a merge of `main`). In the next full run every test passed except
+`block_checkpointing` (6 of 7) and `no_grad_inference` (2 of 3) in
+`ferrotensor-trainer`: in each the second test's readback panicked with
+`Error in Buffer::get_mapped_range: Validation Error` (`Buffer is not
+mapped`), and every later test in that binary failed with `no GPU adapter
+found for backends dx12`. The cause is not known; the readback ignores the
+map error, so the log does not show why mapping failed. A rerun of that job
+had not finished when this was written.
 
 On 16 November 2026 one A10G (24 GB) ran `info --check` (passed), the gradient
 parity tests (4 passed, worst absolute difference 9.239e-7) and the forward
@@ -38,7 +58,11 @@ WGPU_BACKEND=vulkan ferrotensor info --check
 ```
 
 Ferrotensor's tests and the CLI respect it too. On Windows this is the way to
-compare Vulkan with DX12 on the same GPU.
+compare Vulkan with DX12 on the same GPU. On DX12, `WGPU_DX12_COMPILER=dxc`
+builds the kernels with DXC instead of the default FXC; it needs
+`dxcompiler.dll` and `dxil.dll` (from the Windows SDK) on the `PATH`, and
+without them wgpu falls back to FXC with a warning. With FXC, opening the GPU
+took about 9 minutes on the software adapter WARP in CI.
 
 If the CLI says `no GPU adapter found for backends ...`, wgpu saw no GPU on
 those backends: update the GPU driver (on Linux, install the Vulkan driver for
