@@ -483,7 +483,33 @@ fn test_gpu() -> Option<Device> {
         eprintln!("skipping GPU reductions; set FERROTENSOR_RUN_GPU_TESTS=1 to enable");
         return None;
     }
-    Some(Device::gpu().expect("FERROTENSOR_RUN_GPU_TESTS=1 but no GPU is available"))
+    Some(Device::gpu().unwrap_or_else(|| panic!("no GPU: {}", why_no_gpu())))
+}
+
+fn why_no_gpu() -> String {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::util::backend_bits_from_env().unwrap_or(wgpu::Backends::all()),
+        dx12_shader_compiler: wgpu::util::dx12_shader_compiler_from_env().unwrap_or_default(),
+        ..Default::default()
+    });
+    let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+        return "request_adapter returned None".into();
+    };
+    let limits = adapter.limits();
+    match pollster::block_on(adapter.request_device(
+        &wgpu::DeviceDescriptor {
+            label: None,
+            required_features: wgpu::Features::empty(),
+            required_limits: limits,
+        },
+        None,
+    )) {
+        Ok(_) => format!(
+            "{:?}: request_device worked on the second try",
+            adapter.get_info()
+        ),
+        Err(e) => format!("{:?}: request_device failed: {e:?}", adapter.get_info()),
+    }
 }
 
 #[test]
