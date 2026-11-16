@@ -89,7 +89,7 @@ no `--json`.
 Code 2 covers: a missing model directory, `config.json` or data file; a
 checkpoint the model builder cannot load (a missing or misshapen weight, or a
 `config.json` feature the forward pass lacks: a `hidden_act` other than SiLU,
-`rope_scaling`, sliding-window attention, a head size above 128); a model
+`rope_scaling`, `use_sliding_window: true`, a head size above 128); a model
 id that is not in the Hugging Face cache or whose snapshot has no `config.json` (`error` names the cache and
 `hf download <id>`); a flag
 value out of range; a dataset with no usable examples; no GPU adapter;

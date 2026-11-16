@@ -153,6 +153,9 @@ pub struct RopeConfig {
     /// RoPE base frequency, if given here.
     #[serde(default)]
     pub rope_theta: Option<f64>,
+    /// Scaling factor of a scaled RoPE, if any.
+    #[serde(default)]
+    pub factor: Option<f64>,
 }
 
 impl RopeConfig {

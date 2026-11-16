@@ -451,7 +451,7 @@ training normally (losses 1.4960 and 1.6540).
   `Qwen2ForCausalLM` matches the logits and LoRA gradients of Hugging Face
   transformers in CI, but real Qwen2.5 checkpoints are not measured yet.
   Config features the forward pass lacks (an activation other than SiLU,
-  scaled RoPE, sliding-window attention) are refused with exit code 2.
+  scaled RoPE, `use_sliding_window: true`) are refused with exit code 2.
   Qwen3-style attention (per-head
   RMSNorm of queries and keys before RoPE, `q_norm`/`k_norm`) is implemented
   and checked on a small synthetic model against a CPU reference of the

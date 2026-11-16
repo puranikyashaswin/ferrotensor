@@ -122,17 +122,23 @@ pub fn check_supported(config: &Lfm2Config) -> Result<()> {
         ("rope_scaling", &config.rope_scaling),
         ("rope_parameters", &config.rope_parameters),
     ] {
-        let kind = rope.as_ref().map(|r| r.kind().unwrap_or("unnamed"));
+        // An object without a type is plain RoPE unless it scales by a factor.
+        let kind = rope.as_ref().map(|r| match r.kind() {
+            None if r.factor.is_none() => "default",
+            kind => kind.unwrap_or("unnamed"),
+        });
         if let Some(kind) = kind.filter(|k| *k != "default") {
             return Err(BuildError(format!(
                 "{field} type {kind:?} is not supported: RoPE runs unscaled"
             )));
         }
     }
-    if let Some(window) = config
-        .sliding_window
-        .filter(|_| config.use_sliding_window != Some(false))
-    {
+    // Only `use_sliding_window: true` turns the window on: Hugging Face's
+    // Mistral sets `sliding_window` alone and still attends over everything.
+    if config.use_sliding_window == Some(true) {
+        let window = config
+            .sliding_window
+            .map_or_else(|| "unset".to_owned(), |w| w.to_string());
         return Err(BuildError(format!(
             "sliding_window {window} is not supported: attention always covers the whole sequence"
         )));
@@ -699,6 +705,17 @@ mod tests {
             })),
             Ok(())
         );
+        // Mistral-7B-v0.1 sets a window without use_sliding_window; Hugging
+        // Face does not apply it either.
+        assert_eq!(
+            check_with(serde_json::json!({"use_sliding_window": null, "sliding_window": 4096})),
+            Ok(())
+        );
+        // A RoPE object with neither a type nor a factor is plain RoPE.
+        assert_eq!(
+            check_with(serde_json::json!({"rope_scaling": {"rope_theta": 1000000.0}})),
+            Ok(())
+        );
     }
 
     #[test]
@@ -725,9 +742,8 @@ mod tests {
                 "sliding_window 32768 is not supported: attention always covers the whole sequence",
             ),
             (
-                // Mistral-7B-v0.1 sets a window and no use_sliding_window.
-                serde_json::json!({"use_sliding_window": null, "sliding_window": 4096}),
-                "sliding_window 4096 is not supported: attention always covers the whole sequence",
+                serde_json::json!({"rope_scaling": {"factor": 4.0}}),
+                "rope_scaling type \"unnamed\" is not supported: RoPE runs unscaled",
             ),
         ];
         for (changes, message) in cases {
