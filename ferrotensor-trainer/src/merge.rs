@@ -56,14 +56,14 @@ pub struct MergeReport {
 
 /// The element types an adapter can be added to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Float {
+pub(crate) enum Float {
     F32,
     F16,
     Bf16,
 }
 
 impl Float {
-    fn of(dtype: Dtype) -> Option<Self> {
+    pub(crate) fn of(dtype: Dtype) -> Option<Self> {
         match dtype {
             Dtype::F32 => Some(Self::F32),
             Dtype::F16 => Some(Self::F16),
@@ -72,14 +72,14 @@ impl Float {
         }
     }
 
-    fn width(self) -> usize {
+    pub(crate) fn width(self) -> usize {
         match self {
             Self::F32 => 4,
             Self::F16 | Self::Bf16 => 2,
         }
     }
 
-    fn decode(self, bytes: &[u8], values: &mut [f32]) {
+    pub(crate) fn decode(self, bytes: &[u8], values: &mut [f32]) {
         match self {
             Self::F32 => {
                 for (v, c) in values.iter_mut().zip(bytes.as_chunks::<4>().0) {
@@ -99,7 +99,7 @@ impl Float {
         }
     }
 
-    fn encode(self, values: &[f32], bytes: &mut Vec<u8>) {
+    pub(crate) fn encode(self, values: &[f32], bytes: &mut Vec<u8>) {
         match self {
             Self::F32 => bytes.extend(values.iter().flat_map(|v| v.to_le_bytes())),
             Self::F16 => {
@@ -121,7 +121,7 @@ impl Float {
 }
 
 /// One adapter, checked against the base weight it is added to.
-struct LowRank<'a> {
+pub(crate) struct LowRank<'a> {
     /// `lora_A` transposed to `[rank, in]`, so a row of the delta reads it
     /// contiguously.
     a_t: Vec<f32>,
@@ -136,7 +136,7 @@ struct LowRank<'a> {
 
 impl LowRank<'_> {
     /// Adds row `o` of `scale * (A B)^T` to `row` (`[in]`).
-    fn add_to_row(&self, o: usize, row: &mut [f32]) {
+    pub(crate) fn add_to_row(&self, o: usize, row: &mut [f32]) {
         for (r, a_row) in self.a_t.chunks_exact(self.in_dim).enumerate() {
             let coeff = self.scale * self.b[r * self.out_dim + o];
             for (w, a) in row.iter_mut().zip(a_row) {
@@ -176,7 +176,7 @@ struct Entry<'a> {
 
 /// The adapters of `adapter` keyed by the output tensor they change, each
 /// with the tensor of `weights` it is added to.
-fn adapters_by_target<'a>(
+pub(crate) fn adapters_by_target<'a>(
     adapter: &'a LoraCheckpoint,
     weights: &WeightsContext,
 ) -> Result<HashMap<String, (String, LowRank<'a>)>> {
@@ -311,15 +311,17 @@ pub(crate) fn safetensors_header<'a>(
     Ok(header)
 }
 
-/// Writes `path` through `<path>.safetensors.tmp`: `write` fills the
-/// temporary file, which is synced and renamed to `path`. On an error the
-/// temporary file is removed, `path` is left as it was, and the error keeps
-/// its kind and names the temporary file.
+/// Writes `path` through `<path>.tmp`: `write` fills the temporary file,
+/// which is synced and renamed to `path`. On an error the temporary file is
+/// removed, `path` is left as it was, and the error keeps its kind and names
+/// the temporary file.
 pub(crate) fn write_through_temp_file(
     path: &Path,
     write: impl FnOnce(&mut BufWriter<File>) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    let tmp = path.with_extension("safetensors.tmp");
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
     let mut file = BufWriter::new(File::create(&tmp)?);
     let finished = write(&mut file)
         .and_then(|()| file.into_inner().map_err(|e| e.into_error()))

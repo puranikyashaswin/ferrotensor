@@ -45,7 +45,8 @@ is in the [CLI README](ferrotensor-cli/README.md).
 | 3 | `ferrotensor finetune --model DIR --data train.jsonl --out outputs/run` | Runs LoRA fine-tuning with the settings `plan` chose and writes `lora_adapters.safetensors` |
 | 4 | `ferrotensor chat --model DIR --lora outputs/run/lora_adapters.safetensors` | Talks to the result, one message per line (ChatML models such as SmolLM2) |
 | 5 | `ferrotensor merge --model DIR --lora outputs/run/lora_adapters.safetensors --out outputs/merged` | Folds the adapter into the base weights and writes a standalone model directory; `export-adapter` writes a PEFT adapter for PyTorch instead |
-| 6 | `ferrotensor pretrain --data corpus.txt --out outputs/tiny` | Trains a small byte-level model from random weights, for learning and experiments; `generate --raw` loads the result |
+| 6 | `ferrotensor export-gguf --model outputs/merged --out model.gguf` | Writes the model as one GGUF v3 file (f16, or `--f32`) for llama.cpp and Ollama; `--lora` adds an adapter while writing. Written to the GGUF v3 specification; loading in llama.cpp is checked on the next hardware run |
+| 7 | `ferrotensor pretrain --data corpus.txt --out outputs/tiny` | Trains a small byte-level model from random weights, for learning and experiments; `generate --raw` loads the result |
 
 `eval`, `generate` and `train` (every setting chosen by hand) are in the same
 CLI. For scripts and coding agents, `--json` and shared exit codes are listed
@@ -274,8 +275,8 @@ tensor op reaches a WGSL kernel, are in [docs/architecture.md](docs/architecture
 | [`ferrotensor-autograd`](ferrotensor-autograd) | Gradient tape for the backend tensors |
 | [`ferrotensor-graph`](ferrotensor-graph) | Transformer building blocks and the Llama/LFM2-style model builder |
 | [`ferrotensor-loader`](ferrotensor-loader) | Safetensors (single and sharded) and tokenizer loading |
-| [`ferrotensor-trainer`](ferrotensor-trainer) | Training loops, LoRA, checkpoints, PEFT export, adapter merging, from-scratch initialisation, an optional `GradScaler` |
-| [`ferrotensor-cli`](ferrotensor-cli) | The `ferrotensor` command: `info`, `plan`, `finetune`, `train`, `eval`, `generate` (alias `infer`), `chat`, `export-adapter`, `merge`, `pretrain`, `classify-train`, `classify-predict`, `monitor`, `demo`, `benchmark` |
+| [`ferrotensor-trainer`](ferrotensor-trainer) | Training loops, LoRA, checkpoints, PEFT export, adapter merging, GGUF export, from-scratch initialisation, an optional `GradScaler` |
+| [`ferrotensor-cli`](ferrotensor-cli) | The `ferrotensor` command: `info`, `plan`, `finetune`, `train`, `eval`, `generate` (alias `infer`), `chat`, `export-adapter`, `merge`, `export-gguf`, `pretrain`, `classify-train`, `classify-predict`, `monitor`, `demo`, `benchmark` |
 | [`ferrotensor-monitor`](ferrotensor-monitor) | Terminal dashboard |
 | [`ferrotensor-hub`](ferrotensor-hub) | Finds a model in the local Hugging Face cache and reads its `config.json`; downloads nothing |
 | [`ferrotensor-py`](ferrotensor-py) | Python bindings for the `ferrotensor` crate (not published to crates.io) |

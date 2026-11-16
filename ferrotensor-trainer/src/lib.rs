@@ -8,7 +8,8 @@
 //! averaging. [`data`] builds SFT and
 //! pretraining datasets, [`checkpoint`] saves and restores LoRA adapters and
 //! optimizer state, [`peft`] converts adapters to and from the Hugging Face
-//! PEFT format, [`merge`] folds an adapter into the base weights,
+//! PEFT format, [`merge`] folds an adapter into the base weights, [`gguf`]
+//! writes a model as a GGUF file for llama.cpp,
 //! [`pretrain`] writes a randomly initialised model and exports trained
 //! weights as a Hugging Face checkpoint, and [`classify`] fine-tunes a decoder with LoRA as a sequence
 //! classifier ([`ClassifierTrainer`]).
@@ -25,6 +26,7 @@ pub mod classify;
 pub mod data;
 pub mod demo;
 pub mod distributed;
+pub mod gguf;
 pub mod memory;
 pub mod merge;
 pub mod peft;
