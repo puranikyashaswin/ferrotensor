@@ -83,6 +83,6 @@ fn dispatches_in_one_pass_see_each_others_writes() {
     // (1 * 2^10 + 3) * 0.5
     assert_eq!(values, vec![513.5; N]);
     assert_eq!(ops.dispatches, 12);
-    assert_eq!(ops.compute_passes, 1, "no copy or submit came between them");
+    assert_eq!(ops.compute_passes, 3, "12 dispatches, at most 4 per pass");
     assert_eq!(ops.submits, 1);
 }
