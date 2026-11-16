@@ -269,13 +269,17 @@ ferrotensor plan                 # the documented SmolLM2 sizes and which fit
   a `models` array instead.
 
 The peak is an estimate: base weights at their precision, LoRA adapters
-with gradients and AdamW state, activations kept for backward (only block
-inputs with `--checkpoint-blocks`), the logits and their gradient, and a
-fixed 1,350 MiB for the driver context and buffer pool. Its constants are
-calibrated on the eight A10G peaks in the table below (SmolLM2 135M, 360M
-and 1.7B, f16 weights, sequence length 256); the estimate is within 13.3%
-of each of them. Other GPUs, f32 and 4-bit weights, LFM2 models and other
-sequence lengths are not calibrated.
+with gradients and AdamW state, activations kept for backward (every op
+output of every decoder block, or only block inputs with
+`--checkpoint-blocks`), the logits and their gradient at the model's
+vocabulary size, and a fixed 1,480 MiB for the driver context, buffer pool
+and allocator slack. Activations count 7% above their f32 size, and 18%
+more again when a step accumulates several forward passes, since nothing
+waits for the GPU between them. These three constants are fitted to 15
+A10G peaks with 8 sequences per step (SmolLM2 135M, 360M and 1.7B and
+Qwen2.5-0.5B, f16 weights, sequence length 256 and 128); the estimate is at
+most 8.7% below and 17% above each of them. Other GPUs, f32 and 4-bit
+weights and LFM2 models are not calibrated.
 
 ## Less GPU memory: `--checkpoint-blocks`
 

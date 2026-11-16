@@ -139,8 +139,10 @@ base weights, batch 1 x 8-step accumulation, sequence length 256:
 - 24 GB: all three sizes were measured on the A10G (24 GB). Models larger than
   SmolLM2-1.7B are untested.
 
-The `plan` estimate is calibrated on these A10G peaks; its worst error there is
-13.3%. Other GPUs, f32 and 4-bit weights and LFM2 models are not calibrated.
+The `plan` estimate is fitted to 15 A10G peaks with 8 sequences per step: these,
+and batch 4 and 8 runs of SmolLM2 and Qwen2.5-0.5B. It is at most 8.7% below and
+17% above them. Other GPUs, f32 and 4-bit weights and LFM2 models are not
+calibrated.
 
 ## Working on the code
 

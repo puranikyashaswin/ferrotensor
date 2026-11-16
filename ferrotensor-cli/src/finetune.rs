@@ -225,6 +225,7 @@ mod tests {
     fn config(batch_size: usize, seq_len: usize, checkpointing: Checkpointing) -> TrainConfig {
         TrainConfig {
             batch_size,
+            grad_accum: plan::grad_accum_for(batch_size),
             seq_len,
             lora_rank: 8,
             precision: Precision::F16,

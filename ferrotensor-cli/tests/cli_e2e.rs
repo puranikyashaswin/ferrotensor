@@ -606,8 +606,8 @@ fn plan_picks_the_largest_batch_that_fits_a_given_budget() {
             "checkpoint_blocks": false,
         })
     );
-    // weights 1 + adapters 1 + activations 62 + logits 1 + overhead 1350.
-    assert_eq!(plan["estimated_peak_mib"], 1415);
+    // weights 1 + adapters 1 + activations 14 + logits 1 + overhead 1480.
+    assert_eq!(plan["estimated_peak_mib"], 1497);
     let command = plan["train_command"].as_str().expect("train_command");
     assert!(
         command.ends_with("--batch-size 8 --grad-accum 1 --seq-len 256 --lora-rank 8"),
@@ -631,8 +631,8 @@ fn plan_exits_with_2_when_nothing_fits() {
     assert_eq!(plan["chosen"]["checkpoint_blocks"], true);
     assert_eq!(plan["chosen"]["batch_size"], 1);
     assert_eq!(plan["chosen"]["seq_len"], 128);
-    // weights 1 + adapters 1 + activations 2 + logits 1 + overhead 1350.
-    assert_eq!(plan["estimated_peak_mib"], 1355);
+    // weights 1 + adapters 1 + activations 1 + logits 1 + overhead 1480.
+    assert_eq!(plan["estimated_peak_mib"], 1484);
     let notes = plan["notes"].as_array().expect("notes array");
     assert!(
         notes
@@ -651,13 +651,13 @@ fn plan_without_a_model_lists_the_documented_sizes() {
     let models = plan["models"].as_array().expect("models array");
     let names: Vec<&str> = models.iter().filter_map(|m| m["model"].as_str()).collect();
     assert_eq!(names, ["SmolLM2-135M", "SmolLM2-360M", "SmolLM2-1.7B"]);
-    assert_eq!(models[0]["chosen"]["batch_size"], 4);
+    assert_eq!(models[0]["chosen"]["batch_size"], 8);
     assert_eq!(models[0]["chosen"]["seq_len"], 256);
-    assert_eq!(models[0]["estimated_peak_mib"], 5084);
+    assert_eq!(models[0]["estimated_peak_mib"], 6384);
     assert_eq!(models[2]["chosen"]["batch_size"], 4);
     assert_eq!(models[2]["chosen"]["seq_len"], 256);
     assert_eq!(models[2]["chosen"]["checkpoint_blocks"], true);
-    assert_eq!(models[2]["estimated_peak_mib"], 6038);
+    assert_eq!(models[2]["estimated_peak_mib"], 6167);
     assert_eq!(models[2]["fits"], true);
 }
 
@@ -894,12 +894,12 @@ fn finetune_exits_with_2_and_does_not_train_when_nothing_fits() {
     let run = finetune(model.path(), &data, out.path(), &["--memory-mib", "1"]);
     let stderr = text(&run.stderr);
     assert_eq!(run.status.code(), Some(2), "stderr: {stderr}");
-    // weights 1 + adapters 1 + activations 1 + logits 1 + overhead 1350;
-    // 1354 / 0.85 rounds up to 1593.
+    // weights 1 + adapters 1 + activations 1 + logits 1 + overhead 1480;
+    // 1484 / 0.85 rounds up to 1746.
     assert!(
         stderr.contains(
-            "error: no configuration fits the 1 MiB budget; the smallest needs 1354 MiB, \
-             which fits a budget of 1593 MiB or more; pass --force to train anyway"
+            "error: no configuration fits the 1 MiB budget; the smallest needs 1484 MiB, \
+             which fits a budget of 1746 MiB or more; pass --force to train anyway"
         ),
         "stderr: {stderr}"
     );
