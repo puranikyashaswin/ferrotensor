@@ -145,6 +145,35 @@ fn json_errors_are_one_object_on_stdout() {
     }
 }
 
+/// A config feature the forward pass lacks is refused before the GPU is
+/// touched, with exit code 2 and the field named, for every model command.
+#[test]
+fn unsupported_config_feature_exits_with_2() {
+    let model = model_dir("unsupported-act");
+    let config_path = model.path().join("config.json");
+    let mut config = read_json(&config_path);
+    config["hidden_act"] = serde_json::json!("gelu");
+    std::fs::write(&config_path, config.to_string()).expect("write config");
+    let dir = s(model.path());
+    for args in [
+        &[
+            "generate", "--model", dir, "--raw", "--prompt", "w5", "--json",
+        ][..],
+        &["eval", "--model", dir, "--data", dir, "--json"][..],
+        &["train", "--model", dir, "--data", dir, "--json"][..],
+    ] {
+        let out = ferrotensor(args);
+        let stdout = text(&out.stdout);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {stdout}");
+        let json: serde_json::Value = serde_json::from_str(&stdout).expect("error json");
+        let error = json["error"].as_str().expect("error string");
+        assert!(
+            error.contains("hidden_act \"gelu\" is not supported"),
+            "{args:?}: {error}"
+        );
+    }
+}
+
 #[test]
 #[ignore = "needs a GPU"]
 fn train_writes_adapter_state_and_metrics() {

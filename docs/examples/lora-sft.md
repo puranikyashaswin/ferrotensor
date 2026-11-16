@@ -446,7 +446,13 @@ training normally (losses 1.4960 and 1.6540).
   a Llama-style model in one pass, padded to the longest, with the same
   result as one at a time; the logits and their gradient grow with N (about
   50 MB each per SmolLM2 sequence of 256 tokens), so GPU memory grows with N.
-- The tested architecture is Llama-style. Qwen3-style attention (per-head
+- The tested architecture is Llama-style. Qwen2 checkpoints, whose query,
+  key and value projections have a bias, load; a tiny random
+  `Qwen2ForCausalLM` matches the logits and LoRA gradients of Hugging Face
+  transformers in CI, but real Qwen2.5 checkpoints are not measured yet.
+  Config features the forward pass lacks (an activation other than SiLU,
+  scaled RoPE, `use_sliding_window: true`) are refused with exit code 2.
+  Qwen3-style attention (per-head
   RMSNorm of queries and keys before RoPE, `q_norm`/`k_norm`) is implemented
   and checked on a small synthetic model against a CPU reference of the
   forward pass; real Qwen3 checkpoints are not measured yet. Released LFM2

@@ -10,6 +10,7 @@
 
 use crate::checkpoint::LoraCheckpoint;
 use crate::merge::{adapters_by_target, write_through_temp_file, Float, LowRank};
+use ferrotensor_graph::model_builder::check_supported;
 use ferrotensor_loader::{Lfm2Config, ModelLoader, WeightsContext};
 use serde_json::Value as Json;
 use std::collections::HashMap;
@@ -165,6 +166,13 @@ fn describe_tensor<'a>(
     config: &Lfm2Config,
     precision: GgufPrecision,
 ) -> Result<GgufTensor<'a>> {
+    if hf_name.ends_with(".bias") {
+        return Err(format!(
+            "tensor {hf_name} is a projection bias; export-gguf writes Llama weights without \
+             biases, so Qwen2-style models (q/k/v biases) are not exported"
+        )
+        .into());
+    }
     let name = gguf_tensor_name(hf_name).ok_or_else(|| {
         format!("tensor {hf_name} has no llama.cpp name; export-gguf writes Llama weights only")
     })?;
@@ -487,6 +495,9 @@ pub fn export_gguf(
         )
         .into());
     }
+    // The file carries no rotary scaling, so a scaled RoPE would load and
+    // give wrong logits.
+    check_supported(&config).map_err(|e| format!("{}: {e}", config_path.display()))?;
     if config.quantization.is_some() {
         return Err(format!(
             "{} has quantization: the base is quantized; export-gguf needs an F32, F16 or BF16 checkpoint",
@@ -577,7 +588,12 @@ pub fn export_gguf(
         ),
         (
             "llama.rope.freq_base".to_string(),
-            MetaValue::F32(config.rope_theta.unwrap_or(10_000.0) as f32),
+            MetaValue::F32(
+                config
+                    .rope_theta
+                    .or_else(|| config.rope_parameters.as_ref()?.rope_theta)
+                    .unwrap_or(10_000.0) as f32,
+            ),
         ),
         u32_of("llama.rope.dimension_count", head_dim),
         u32_of("llama.vocab_size", n_vocab),
@@ -1104,6 +1120,44 @@ mod tests {
                 "has quantization: the base is quantized; export-gguf needs an F32, F16 or BF16 checkpoint"
             ),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn refuses_scaled_rope_and_qwen2_style_biases() {
+        let err = refusal("rope-scaling", |dir| {
+            let mut config = tiny_config();
+            config["rope_scaling"] = serde_json::json!({ "rope_type": "llama3", "factor": 8.0 });
+            write_json(&dir.join("config.json"), &config);
+        });
+        assert!(
+            err.ends_with(
+                "config.json: rope_scaling type \"llama3\" is not supported: RoPE runs unscaled"
+            ),
+            "{err}"
+        );
+
+        // A second shard, listed in the index, adds the bias.
+        let err = refusal("bias", |dir| {
+            let bias = [0u8; 32];
+            let view =
+                safetensors::tensor::TensorView::new(safetensors::Dtype::F32, vec![8], &bias)
+                    .unwrap();
+            let name = "model.layers.0.self_attn.q_proj.bias";
+            let file = safetensors::tensor::serialize([(name, view)], &None).unwrap();
+            std::fs::write(dir.join("bias.safetensors"), file).unwrap();
+            write_json(
+                &dir.join("model.safetensors.index.json"),
+                &serde_json::json!({ "weight_map": {
+                    "model.embed_tokens.weight": "model.safetensors",
+                    "model.layers.0.self_attn.q_proj.bias": "bias.safetensors"
+                } }),
+            );
+        });
+        assert_eq!(
+            err,
+            "tensor model.layers.0.self_attn.q_proj.bias is a projection bias; export-gguf writes \
+             Llama weights without biases, so Qwen2-style models (q/k/v biases) are not exported"
         );
     }
 }

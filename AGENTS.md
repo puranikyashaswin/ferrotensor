@@ -4,7 +4,8 @@ Ferrotensor is a Rust framework for tensors, autograd and LoRA fine-tuning of
 small language models on the GPU, through wgpu and hand-written WGSL kernels
 (Vulkan, Metal or DX12; no CUDA). The `ferrotensor` command (crate
 `ferrotensor-cli`) plans, trains, evaluates, samples and merges LoRA adapters
-for Llama-style models such as SmolLM2 and TinyLlama, and trains a small
+for Llama-style models such as SmolLM2, TinyLlama and Qwen2 (Qwen2.5 checkpoints
+are not measured yet), and trains a small
 byte-level model from scratch.
 
 ## Install
@@ -87,7 +88,10 @@ no `--json`.
 | 2 | The request cannot be met on this machine, or the input is invalid | Change the request: fix the path or flag named in `error`; when nothing fits, use a smaller model, `--q4-weights`, or `--force` to try the smallest configuration. |
 | 101 | A panic, with no JSON on stdout | wgpu panics when the GPU device is lost, most often because it ran out of memory (stderr then ends with a hint). Lower `--batch-size` or `--seq-len`, or use `finetune`. |
 
-Code 2 covers: a missing model directory, `config.json` or data file; a model
+Code 2 covers: a missing model directory, `config.json` or data file; a
+checkpoint the model builder cannot load (a missing or misshapen weight, or a
+`config.json` feature the forward pass lacks: a `hidden_act` other than SiLU,
+`rope_scaling`, `use_sliding_window: true`, a head size above 128); a model
 id that is not in the Hugging Face cache or whose snapshot has no `config.json` (`error` names the cache and
 `hf download <id>`); a flag
 value out of range; a dataset with no usable examples; no GPU adapter;
@@ -97,7 +101,8 @@ refusing a tokenizer without ChatML tokens or a message longer than the
 model's context; and `merge`
 refusing its input (a non-empty `--out`, a quantized base, an adapter that
 does not match the base); `export-gguf` refusing its input (an `--out` that
-exists, a `model_type` other than `llama`, a quantized base, a tokenizer that
+exists, a `model_type` other than `llama`, a config `check_supported`
+refuses such as scaled RoPE, projection biases (Qwen2), a quantized base, a tokenizer that
 is not byte-level BPE with the GPT-2 or SmolLM pre-tokenizer, an adapter that
 does not match the base); and `pretrain` refusing a model size the kernels
 cannot run (`--hidden` not a multiple of `--heads`, an odd head size or one

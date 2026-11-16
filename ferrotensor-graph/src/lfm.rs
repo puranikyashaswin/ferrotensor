@@ -385,6 +385,7 @@ impl Lfm2Model {
             &mut self.lm_head.weight,
         ];
         weights.extend(self.embedding_norm.iter_mut().map(|n| &mut n.weight));
+        weights.extend(self.lm_head.bias.iter_mut());
         for layer in &mut self.layers {
             let mlp = &mut layer.mlp;
             weights.extend([
@@ -394,6 +395,11 @@ impl Lfm2Model {
                 &mut mlp.up_proj.weight,
                 &mut mlp.down_proj.weight,
             ]);
+            let mut biases = vec![
+                &mut mlp.gate_proj.bias,
+                &mut mlp.up_proj.bias,
+                &mut mlp.down_proj.bias,
+            ];
             match &mut layer.op {
                 Lfm2LayerOp::Attention(a) => {
                     weights.extend([
@@ -408,14 +414,24 @@ impl Lfm2Model {
                             .flatten()
                             .map(|n| &mut n.weight),
                     );
+                    biases.extend([
+                        &mut a.q_proj.bias,
+                        &mut a.k_proj.bias,
+                        &mut a.v_proj.bias,
+                        &mut a.o_proj.bias,
+                    ]);
                 }
-                Lfm2LayerOp::Conv(c) => weights.extend([
-                    &mut c.in_proj.weight,
-                    &mut c.conv_weight,
-                    &mut c.conv_bias,
-                    &mut c.out_proj.weight,
-                ]),
+                Lfm2LayerOp::Conv(c) => {
+                    weights.extend([
+                        &mut c.in_proj.weight,
+                        &mut c.conv_weight,
+                        &mut c.conv_bias,
+                        &mut c.out_proj.weight,
+                    ]);
+                    biases.extend([&mut c.in_proj.bias, &mut c.out_proj.bias]);
+                }
             }
+            weights.extend(biases.into_iter().flatten());
         }
         for weight in weights {
             weight.requires_grad = trainable.contains(&Arc::as_ptr(&weight.data));

@@ -463,8 +463,9 @@ one row at a time, like `merge`. `--json` prints
 The tokenizer must be byte-level BPE with the pre-tokenizer of GPT-2 or of
 SmolLM (llama.cpp `gpt-2` and `smollm`); SentencePiece-style tokenizers such
 as TinyLlama's are refused. An existing `--out`, a `model_type` other than
-`llama`, a quantized base and tensors without a llama.cpp name are refused
-too, with exit code 2. The file is written to the GGUF v3 specification;
+`llama`, a scaled `rope_scaling` or `rope_parameters` (Llama 3.1 and
+later), projection biases (Qwen2), a quantized base and tensors without a
+llama.cpp name are refused too, with exit code 2. The file is written to the GGUF v3 specification;
 loading in llama.cpp is checked on the next hardware run, with
 `scripts/check_gguf.sh`, which compares a greedy completion of llama.cpp's
 `llama-simple` with `ferrotensor generate`.
