@@ -278,7 +278,7 @@ tensor op reaches a WGSL kernel, are in [docs/architecture.md](docs/architecture
 | [`ferrotensor-graph`](ferrotensor-graph) | Transformer building blocks and the Llama/LFM2-style model builder |
 | [`ferrotensor-loader`](ferrotensor-loader) | Safetensors (single and sharded) and tokenizer loading |
 | [`ferrotensor-trainer`](ferrotensor-trainer) | Training loops, LoRA, checkpoints, PEFT export, adapter merging, GGUF export, from-scratch initialisation, an optional `GradScaler` |
-| [`ferrotensor-cli`](ferrotensor-cli) | The `ferrotensor` command: `info`, `plan`, `finetune`, `train`, `eval`, `generate` (alias `infer`), `chat`, `export-adapter`, `merge`, `export-gguf`, `pretrain`, `classify-train`, `classify-predict`, `monitor`, `demo`, `benchmark` |
+| [`ferrotensor-cli`](ferrotensor-cli) | The `ferrotensor` command: `info`, `plan`, `finetune`, `train`, `eval`, `generate` (alias `infer`), `chat`, `export-adapter`, `merge`, `export-gguf`, `q4-report`, `pretrain`, `classify-train`, `classify-predict`, `monitor`, `demo`, `benchmark` |
 | [`ferrotensor-monitor`](ferrotensor-monitor) | Terminal dashboard |
 | [`ferrotensor-hub`](ferrotensor-hub) | Finds a model in the local Hugging Face cache and reads its `config.json`; downloads nothing |
 | [`ferrotensor-py`](ferrotensor-py) | Python bindings for the `ferrotensor` crate (not published to crates.io) |
@@ -322,7 +322,7 @@ then trains. `train` sets nothing for you; use it to choose every setting
 by hand.
 
 For scripts and coding agents, `plan`, `finetune`, `train`, `pretrain`, `merge`,
-`export-gguf`, `eval`, `generate` and `info` take `--json` and print one JSON object (`chat` prints
+`export-gguf`, `eval`, `generate`, `q4-report` and `info` take `--json` and print one JSON object (`chat` prints
 one per reply), and exit codes are the same across commands;
 [AGENTS.md](AGENTS.md) lists both.
 

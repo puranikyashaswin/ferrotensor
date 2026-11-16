@@ -342,6 +342,23 @@ pub struct TrainingState {
     /// Data-order seed of the run, so a resume replays the same order.
     #[serde(default)]
     pub seed: u64,
+    /// The base weights the run stored at 4 bits; absent without
+    /// `--q4-weights`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub q4_weights: Option<Q4Record>,
+}
+
+/// Which frozen base weights a run stored at 4 bits, so it can be repeated.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Q4Record {
+    /// The `--q4-modules` keys.
+    pub modules: Vec<String>,
+    /// The `--q4-skip` keys.
+    pub skip: Vec<String>,
+    /// Weights per scale (`--q4-group`).
+    pub group: usize,
+    /// Number of weight tensors stored at 4 bits.
+    pub tensors: usize,
 }
 
 fn default_task() -> String {
@@ -366,6 +383,7 @@ impl TrainingState {
             model_path: String::new(),
             dataset_path: String::new(),
             seed: 0,
+            q4_weights: None,
         }
     }
 
@@ -605,7 +623,7 @@ fn read_moments(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{moments_path, LoraMetadata, TrainingCheckpoint, TrainingState};
+    use super::{moments_path, LoraMetadata, Q4Record, TrainingCheckpoint, TrainingState};
     use crate::scaler::GradScalerCheckpoint;
     use ferrotensor_autograd::{AdamWCheckpoint, OptimizerCheckpoint, OptimizerTensorState};
     use std::collections::HashMap;
@@ -643,6 +661,36 @@ mod tests {
             .validate_resume("lora", "sft", 128, "/models/b")
             .unwrap_err()
             .contains("model_path"));
+    }
+
+    #[test]
+    fn training_state_records_the_4_bit_weights_only_when_used() {
+        let state = TrainingState::new(10);
+        let json = serde_json::to_value(&state).unwrap();
+        assert!(json.get("q4_weights").is_none(), "{json}");
+        let mut q4 = state.clone();
+        q4.q4_weights = Some(Q4Record {
+            modules: vec!["attn".into(), "head".into()],
+            skip: vec!["layers.0".into()],
+            group: 32,
+            tensors: 97,
+        });
+        let json = serde_json::to_value(&q4).unwrap();
+        assert_eq!(
+            json["q4_weights"],
+            serde_json::json!({
+                "modules": ["attn", "head"],
+                "skip": ["layers.0"],
+                "group": 32,
+                "tensors": 97,
+            })
+        );
+        let back: TrainingState = serde_json::from_value(json).unwrap();
+        assert_eq!(back.q4_weights, q4.q4_weights);
+        // States written before the field existed load without it.
+        let old: TrainingState =
+            serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+        assert_eq!(old.q4_weights, None);
     }
 
     #[test]

@@ -21,9 +21,10 @@ mod common;
 use common::*;
 use ferrotensor_autograd::Tensor;
 use ferrotensor_backend::memory::wgpu_buffer_size;
+use ferrotensor_backend::q4::Q4Group;
 use ferrotensor_backend::{q4, DType, MemoryCategory, UnifiedTensor};
 use ferrotensor_graph::lfm::{Lfm2LayerOp, Lfm2Model};
-use ferrotensor_graph::model_builder::Lfm2ModelBuilder;
+use ferrotensor_graph::model_builder::{Lfm2ModelBuilder, Q4Selection};
 use ferrotensor_loader::{ModelLoader, WeightsContext};
 use ferrotensor_trainer::memory::{tag_trainable, MemoryRecorder};
 use std::collections::HashMap;
@@ -113,10 +114,10 @@ fn write_model(src: &Path, dst: &Path, tensors: &[(String, Vec<usize>, Vec<f32>)
 /// The builder's 4-bit round trip of a PyTorch-order `[out, in]` weight:
 /// transposed to the logical `[in, out]`, quantised and decoded there, and
 /// transposed back.
-fn round_trip(values: &[f32], out: usize, inp: usize) -> Vec<f32> {
+fn round_trip(values: &[f32], out: usize, inp: usize, group: Q4Group) -> Vec<f32> {
     let logical = transpose(values, out, inp);
-    let words = q4::quantize(&logical, inp, out).expect("quantise");
-    transpose(&q4::dequantize(&words, inp, out), inp, out)
+    let words = q4::quantize(&logical, inp, out, group).expect("quantise");
+    transpose(&q4::dequantize(&words, inp, out, group), inp, out)
 }
 
 /// Copies the model in `src` to `dst` with every decoder-block projection
@@ -132,7 +133,7 @@ fn write_dequantised_copy(src: &Path, dst: &Path) -> usize {
                     panic!("{name} is not 2-D: {shape:?}");
                 };
                 replaced += 1;
-                let values = round_trip(&values, out, inp);
+                let values = round_trip(&values, out, inp, Q4Group::DEFAULT);
                 (name, shape, values)
             } else {
                 (name, shape, values)
@@ -382,7 +383,7 @@ fn q4_weights_are_stored_at_four_bits() {
                 assert_eq!(w.data.shape, vec![k, n], "{name}: logical shape");
                 assert_eq!(
                     w.data.size_in_bytes(),
-                    4 * q4::packed_words(k, n) as u64,
+                    4 * q4::packed_words(k, n, Q4Group::DEFAULT) as u64,
                     "{name}"
                 );
                 assert!(!w.requires_grad, "{name} must be frozen");
@@ -396,7 +397,7 @@ fn q4_weights_are_stored_at_four_bits() {
         }
         // 32 x 32 at 4 bits: 1024 / 64 = 16 groups of 8 code words and 1
         // scale word each.
-        assert_eq!(4 * q4::packed_words(HIDDEN, HIDDEN), 576);
+        assert_eq!(4 * q4::packed_words(HIDDEN, HIDDEN, Q4Group::DEFAULT), 576);
         let head = if f16 { DType::FP16 } else { DType::FP32 };
         assert_eq!(model.lm_head.weight.data.dtype, head, "lm_head (f16 {f16})");
         assert_eq!(model.embed_tokens.data.dtype, DType::FP32);
@@ -416,6 +417,96 @@ fn q4_model_matches_dequantised_f32_model_batch_1() {
 fn q4_model_matches_dequantised_f32_model_batch_3() {
     let (rows, targets) = three_rows();
     compare_with_dequantised("batch 3", &rows, &targets);
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn q4_selection_matches_dequantising_exactly_those_weights() {
+    // Attention and the tied head at 4 bits in groups of 16, k_proj left
+    // out. The reference dequantises the same weights, named here without
+    // the selection matcher, and stores the head untied so the embedding
+    // stays exact.
+    let a = TempDir::new("q4-select-orig");
+    let b = TempDir::new("q4-select-deq");
+    write_tiny_llama(a.path());
+    let group = Q4Group::new(16).expect("group size");
+    let chosen = ["q_proj.weight", "v_proj.weight", "o_proj.weight"];
+    let mut tensors = read_tensors(a.path());
+    let mut replaced = 0;
+    for (name, shape, values) in &mut tensors {
+        if chosen.iter().any(|s| name.ends_with(s)) {
+            *values = round_trip(values, shape[0], shape[1], group);
+            replaced += 1;
+        }
+    }
+    assert_eq!(replaced, LAYERS * 3);
+    let (_, shape, embed) = tensors
+        .iter()
+        .find(|t| t.0 == "model.embed_tokens.weight")
+        .expect("embedding");
+    let head = round_trip(embed, VOCAB, HIDDEN, group);
+    tensors.push(("lm_head.weight".to_string(), shape.clone(), head));
+    write_model(a.path(), b.path(), &tensors);
+
+    let gpu = gpu();
+    let weights = load_weights(a.path());
+    let m_q4 = builder(&gpu, &weights, a.path())
+        .with_lora(lora_config())
+        .with_q4_selection(Q4Selection {
+            modules: vec!["attn".to_string(), "head".to_string()],
+            skip: vec!["k_proj".to_string()],
+            group,
+        })
+        .build()
+        .expect("build");
+    let mut quantised: Vec<String> = m_q4
+        .named_params()
+        .into_iter()
+        .filter(|(_, t)| t.data.dtype == DType::Q4)
+        .map(|(name, t)| {
+            assert_eq!(t.data.q4_group(), Some(group), "{name}");
+            name
+        })
+        .collect();
+    quantised.sort();
+    let mut want: Vec<String> = (0..LAYERS)
+        .flat_map(|l| {
+            ["q_proj", "v_proj", "o_proj"].map(|p| format!("model.layers.{l}.self_attn.{p}.weight"))
+        })
+        .chain(["lm_head.weight".to_string()])
+        .collect();
+    want.sort();
+    assert_eq!(quantised, want);
+
+    let m_ref = build(&gpu, b.path(), false);
+    for m in [&m_q4, &m_ref] {
+        set_lora_b(&gpu, m);
+    }
+    let (rows, targets) = three_rows();
+    let q = pass(&gpu, &m_q4, &rows, &targets);
+    let r = pass(&gpu, &m_ref, &rows, &targets);
+    assert_matches("attn and head at 4 bits, groups of 16", &q, &r);
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn q4_selection_that_matches_nothing_is_an_error() {
+    let dir = TempDir::new("q4-select-none");
+    write_tiny_llama(dir.path());
+    let gpu = gpu();
+    let weights = load_weights(dir.path());
+    let err = builder(&gpu, &weights, dir.path())
+        .with_q4_selection(Q4Selection {
+            modules: vec!["qproj".to_string()],
+            ..Q4Selection::default()
+        })
+        .build()
+        .err()
+        .expect("no weight is named qproj");
+    assert!(
+        err.to_string().contains("matches no linear weight"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -694,8 +785,13 @@ fn pre_quantized_checkpoints_are_rejected() {
 #[should_panic(expected = "a 4-bit right operand must not require a gradient")]
 fn q4_weight_that_requires_a_gradient_is_rejected() {
     let gpu = gpu();
-    let w = UnifiedTensor::from_f32_as_q4(&gpu.ctx, &pseudo_random(64 * 2, 7, 0.1), &[64, 2])
-        .expect("quantise");
+    let w = UnifiedTensor::from_f32_as_q4(
+        &gpu.ctx,
+        &pseudo_random(64 * 2, 7, 0.1),
+        &[64, 2],
+        Q4Group::DEFAULT,
+    )
+    .expect("quantise");
     let w = Tensor::new(gpu.ctx.clone(), w);
     assert!(w.requires_grad);
     let x = Tensor::frozen(
@@ -743,7 +839,7 @@ fn memory_report_counts_the_q4_weights() {
     let q4_bytes: u64 = LAYERS as u64
         * shapes
             .iter()
-            .map(|&(k, n)| 4 * q4::packed_words(k, n) as u64)
+            .map(|&(k, n)| 4 * q4::packed_words(k, n, Q4Group::DEFAULT) as u64)
             .sum::<u64>();
     // The tied lm_head [HIDDEN, VOCAB] is the only f16 weight.
     let f16_bytes = wgpu_buffer_size(((HIDDEN * VOCAB) as u64 * 2).next_multiple_of(4));

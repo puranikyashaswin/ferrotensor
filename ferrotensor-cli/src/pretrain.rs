@@ -4,7 +4,8 @@
 //! loads.
 
 use crate::{
-    print_json, train, unmet, DataArgs, Device, ModelArgs, Result, Task, TrainArgs, TrainSummary,
+    print_json, train, unmet, DataArgs, Device, ModelArgs, Q4Args, Result, Task, TrainArgs,
+    TrainSummary,
 };
 use clap::{Args, ValueEnum};
 use ferrotensor_loader::tokenizer::{
@@ -197,6 +198,7 @@ fn train_args(args: &PretrainArgs, seq_len: usize) -> TrainArgs {
             f32_weights: true,
             f16_weights: false,
             q4_weights: false,
+            q4: Q4Args::default(),
         },
         data: DataArgs {
             data: args.out.join("tokens.bin"),

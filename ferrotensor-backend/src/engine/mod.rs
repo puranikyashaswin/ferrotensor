@@ -58,20 +58,24 @@ fn half_b_matmul(src: &str) -> String {
 /// buffer; logical `b[K, N]` stored in `[N, K]` order). Generated from
 /// matmul.wgsl like [`half_b_matmul`]; only the `b` binding and its loader
 /// differ. The storage index is `gn * k + gk` in mode 0 and `gk * n + gn`
-/// in mode 1 (the reverse of the f16 kernel, because of the `[N, K]` order);
-/// the scale words start at `((k * n + 63) / 64) * 8`, after the codes.
+/// in mode 1 (the reverse of the f16 kernel, because of the `[N, K]` order).
+/// The params' last word carries the layout in its low 8 bits and log2 of
+/// the group size `G` above them; the scale words start after the codes, at
+/// `ceil(k * n / G) * G / 8`.
 fn q4_b_matmul(src: &str) -> String {
     const B_DECL: &str = "var<storage, read> mmb_b: array<f32>;";
     const B_LOAD: &str =
         "    if (mode == 1u) { return mmb_b[gn * k + gk]; }\n    return mmb_b[gk * n + gn];";
+    const MODE: &str = "    let mode = mmb_params.w;";
     assert!(
-        src.contains(B_DECL) && src.contains(B_LOAD),
+        src.contains(B_DECL) && src.contains(B_LOAD) && src.contains(MODE),
         "matmul.wgsl changed"
     );
     src.replace(
         B_LOAD,
-        "    var j = gn * k + gk;\n    if (mode == 1u) { j = gk * n + gn; }\n    let q = (mmb_b[j >> 3u] >> ((j & 7u) * 4u)) & 15u;\n    let sm = unpack2x16float(mmb_b[((k * n + 63u) >> 6u) * 8u + (j >> 6u)]);\n    return f32(q) * sm.x + sm.y;",
+        "    var j = gn * k + gk;\n    if (mode == 1u) { j = gk * n + gn; }\n    let lg = mmb_params.w >> 8u;\n    let q = (mmb_b[j >> 3u] >> ((j & 7u) * 4u)) & 15u;\n    let groups = (k * n + (1u << lg) - 1u) >> lg;\n    let sm = unpack2x16float(mmb_b[(groups << (lg - 3u)) + (j >> lg)]);\n    return f32(q) * sm.x + sm.y;",
     )
+    .replace(MODE, "    let mode = mmb_params.w & 255u;")
     .replace(B_DECL, "var<storage, read> mmb_b: array<u32>;")
     .replace("matmul_blocked", "matmul_blocked_q4")
     .replace("mmb_", "mmq_")
