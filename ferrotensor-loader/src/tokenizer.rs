@@ -300,10 +300,11 @@ pub fn train_byte_level_bpe(corpus: &str, vocab_size: usize) -> Result<serde_jso
             ));
         };
         let current = pair_counts.get(&pair).copied().unwrap_or(0);
+        if current == 0 {
+            continue;
+        }
         if count != current {
-            if current > 0 {
-                queue.push((current, Reverse(pair)));
-            }
+            queue.push((current, Reverse(pair)));
             continue;
         }
         let (left, right) = (&tokens[pair.0 as usize], &tokens[pair.1 as usize]);
@@ -339,7 +340,8 @@ pub fn train_byte_level_bpe(corpus: &str, vocab_size: usize) -> Result<serde_jso
         queue.extend(
             grown
                 .into_iter()
-                .map(|new| (pair_counts[&new], Reverse(new))),
+                .map(|new| (pair_counts[&new], Reverse(new)))
+                .filter(|&(count, _)| count > 0),
         );
     }
     Ok(byte_level_bpe_json(tokens, merges))
@@ -787,6 +789,25 @@ mod tests {
             assert_eq!(tok.decode(&tok.encode(text)), text);
             assert_eq!(tok.encode(text).len(), text.len());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn bpe_skips_pairs_a_merge_used_up_and_counts_what_the_corpus_yields() -> TestResult {
+        // Words "aaaa" and " aab". Merging "a a" (4 times) turns "aaaa" into
+        // "aa aa" and " aab" into " aa b", so (' ', a) and (a, b) drop to 0
+        // with their queue entries left behind. The three count-1 pairs then
+        // merge in id order (' ' 35, "aa" 259, 'b' 101), and " aa b" uses up
+        // (aa, b) on the way. That is four merges, 263 tokens in all.
+        let json = train_byte_level_bpe("aaaa aab", 263)?;
+        assert_eq!(
+            json["model"]["merges"],
+            serde_json::json!(["a a", "Ġ aa", "aa aa", "Ġaa b"])
+        );
+        assert_eq!(
+            train_byte_level_bpe("aaaa aab", 264).err().as_deref(),
+            Some("the corpus yields 263 tokens, fewer than 264")
+        );
         Ok(())
     }
 
