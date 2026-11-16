@@ -176,7 +176,7 @@ jobs:
     # is real hardware and neither says anything about speed. The Qwen2
     # fixture is not generated here, so those four tests skip.
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
+    timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:
@@ -184,9 +184,11 @@ jobs:
           - name: Metal, Apple silicon runner
             os: macos-latest
             backend: metal
+            skip_cli: false
           - name: DX12, WARP
             os: windows-latest
             backend: dx12
+            skip_cli: true
     env:
       WGPU_BACKEND: ${{ matrix.backend }}
       FERROTENSOR_RUN_GPU_TESTS: "1"
@@ -215,9 +217,22 @@ jobs:
         run: cargo run --release -p ferrotensor-cli -- info --check --json
       # Runs even when the self-check fails, and --no-fail-fast goes on past
       # a failing test binary, so every failing test on a backend shows.
+      # On WARP, with DXC, a test of a large kernel took far longer than on
+      # lavapipe (flash_attention_single_head_matches_cpu 153 s against
+      # milliseconds) and each ferrotensor-cli end-to-end test, which starts
+      # the CLI as a new process, took up to 14 minutes, so the CLI's 25 GPU
+      # tests would not finish in the job. On DX12 they are skipped; the
+      # library suites still run every kernel and the trainer through DX12,
+      # and the CLI tests run on Metal and Vulkan.
       - name: GPU suites (ignored tests)
         if: ${{ !cancelled() }}
-        run: cargo test --release --workspace --no-fail-fast -- --ignored --test-threads=1
+        run: |
+          exclude=()
+          if [ "${{ matrix.skip_cli }}" = true ]; then
+            echo "skipping the ferrotensor-cli end-to-end tests on this backend (see the comment in ci.yml)"
+            exclude=(--exclude ferrotensor-cli)
+          fi
+          cargo test --release --workspace "${exclude[@]}" --no-fail-fast -- --ignored --test-threads=1
       - name: Autograd finite-difference checks
         if: ${{ !cancelled() }}
         run: cargo test --release -p ferrotensor-autograd --test grad_check -- --test-threads=1
