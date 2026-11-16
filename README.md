@@ -45,7 +45,7 @@ is in the [CLI README](ferrotensor-cli/README.md).
 | 3 | `ferrotensor finetune --model DIR --data train.jsonl --out outputs/run` | Runs LoRA fine-tuning with the settings `plan` chose and writes `lora_adapters.safetensors` |
 | 4 | `ferrotensor chat --model DIR --lora outputs/run/lora_adapters.safetensors` | Talks to the result, one message per line (ChatML models such as SmolLM2) |
 | 5 | `ferrotensor merge --model DIR --lora outputs/run/lora_adapters.safetensors --out outputs/merged` | Folds the adapter into the base weights and writes a standalone model directory; `export-adapter` writes a PEFT adapter for PyTorch instead |
-| 6 | `ferrotensor export-gguf --model outputs/merged --out model.gguf` | Writes the model as one GGUF v3 file (f16, or `--f32`) for llama.cpp and Ollama; `--lora` adds an adapter while writing. Written to the GGUF v3 specification; loading in llama.cpp is checked on the next hardware run |
+| 6 | `ferrotensor export-gguf --model outputs/merged --out model.gguf` | Writes the model as one GGUF v3 file (f16, or `--f32`) for llama.cpp and Ollama; `--lora` adds an adapter while writing. Written to the GGUF v3 specification; llama.cpp loaded the SmolLM2-1.7B file on one A10G run and matched Ferrotensor's greedy completion of one prompt, two tokens ([results](benchmarks/RESULTS.md#real-hardware-run-16-november-2026)) |
 | 7 | `ferrotensor pretrain --data corpus.txt --out outputs/tiny` | Trains a small model from random weights with a byte-level tokenizer, or with `--tokenizer bpe` a BPE one learned from the corpus, for learning and experiments; `generate --raw` loads the result |
 
 `eval`, `generate` and `train` (every setting chosen by hand) are in the same
@@ -223,8 +223,8 @@ tested, incomplete, or only checked on one machine.
 | Safetensors save/load, state dicts | **Stable** | `ferrotensor::serialize` |
 | `DataLoader` | **Stable** | Batching, seeded shuffling, optional prefetching on a background thread (`epoch_prefetched`) |
 | Reproducible randomness | **Stable** | `manual_seed` (Rust and Python) seeds random tensors, layer initialisation and dropout |
-| LoRA fine-tuning of Llama-style models (`ferrotensor-cli`) | **Experimental** | Measured with SmolLM2-135M, 360M and 1.7B on an NVIDIA A10G (24 GB), and SmolLM2-135M on an Apple M2 (8 GB) with a 0.4 build; see the [LoRA walkthrough](docs/examples/lora-sft.md). Larger models are untested |
-| Llama / LFM2-style blocks (`ferrotensor-graph`) | **Experimental** | Attention with RoPE, SwiGLU MLP, RMSNorm, KV cache. Qwen2 checkpoints (biased query, key and value projections, tied embeddings) load: a tiny random `Qwen2ForCausalLM` gives the logits and LoRA gradients of Hugging Face transformers in CI; real Qwen2.5 checkpoints are not measured yet. Qwen3-style per-head q/k norms are implemented and checked on a small synthetic model against a CPU reference; real Qwen3 checkpoints are not measured yet |
+| LoRA fine-tuning of Llama-style models (`ferrotensor-cli`) | **Experimental** | Measured with SmolLM2-135M, 360M and 1.7B on an NVIDIA A10G (24 GB), Qwen2.5-0.5B-Instruct on the A10G (one 30-step run), and SmolLM2-135M on an Apple M2 (8 GB) with a 0.4 build; see the [LoRA walkthrough](docs/examples/lora-sft.md). Larger models are untested |
+| Llama / LFM2-style blocks (`ferrotensor-graph`) | **Experimental** | Attention with RoPE, SwiGLU MLP, RMSNorm, KV cache. Qwen2 checkpoints (biased query, key and value projections, tied embeddings) load: a tiny random `Qwen2ForCausalLM` gives the logits and LoRA gradients of Hugging Face transformers in CI; the real Qwen2.5-0.5B-Instruct checkpoint loads on an A10G (held-out loss 1.3359, and greedy `generate` answers "The capital of France is Paris."; one run, [results](benchmarks/RESULTS.md#real-hardware-run-16-november-2026)). Qwen3-style per-head q/k norms are implemented and checked on a small synthetic model against a CPU reference; real Qwen3 checkpoints are not measured yet |
 | Flash attention kernels (`ferrotensor-backend`) | **Experimental** | Forward v2 and a backward kernel; see the `flash_attention_*` cases in `ferrotensor-autograd/tests/grad_check.rs` |
 | Checkpoint/resume (`ferrotensor-trainer`) | **Experimental** | |
 | Loss scaler (`GradScaler` in `ferrotensor-trainer`) | **Experimental** | A library type: `Trainer::with_grad_scaler` attaches it, the CLI does not use it, and `ferrotensor demo` only constructs one. Gradients are f32, so there is no f16 underflow for it to guard against |
@@ -320,13 +320,18 @@ then trains. `train` sets nothing for you; use it to choose every setting
 by hand.
 
 For scripts and coding agents, `plan`, `finetune`, `train`, `pretrain`, `merge`,
-`eval`, `generate` and `info` take `--json` and print one JSON object (`chat` prints
+`export-gguf`, `eval`, `generate` and `info` take `--json` and print one JSON object (`chat` prints
 one per reply), and exit codes are the same across commands;
 [AGENTS.md](AGENTS.md) lists both.
 
 `--help` lists every flag. A step-by-step walkthrough with real output is in
 [docs/examples/lora-sft.md](docs/examples/lora-sft.md).
-This path is experimental.
+This path is experimental. On 16 November 2026 one A10G (24 GB) ran `plan`,
+`finetune`, `chat`, `merge`, `export-gguf` and byte-level `pretrain` once each
+at commit `8b814c1`. SmolLM2-1.7B went from held-out loss 2.6474 to 1.0612 in
+250 steps with the planner's 4 × 2 batch
+([all numbers](benchmarks/RESULTS.md#real-hardware-run-16-november-2026)).
+That is one GPU and one run.
 
 `pretrain` trains a small model from random weights on a text file, with a
 byte-level tokenizer or (`--tokenizer bpe --vocab-size N`) a BPE tokenizer

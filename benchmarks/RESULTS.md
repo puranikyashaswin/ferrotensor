@@ -311,3 +311,113 @@ A10G, 0.668 to 0.305 ms on the T4) and takes 21% off the A10G's MLP step.
 Ops that are not element-wise chains (matmul, `cross_entropy`, reductions)
 are unchanged, as expected. The chain is still about 4x the CPU time here,
 down from about 8x unfused.
+
+# Real hardware run, 16 November 2026
+
+One NVIDIA A10G (24 GB), driver 595.112.07, Vulkan backend, rustc 1.100.0,
+release build of `main` at commit `8b814c1`. Every command below ran once:
+these are single runs, not medians over repeats, except where a table says
+"median of 30". Peak GPU memory is the largest `nvidia-smi` sample, in MiB.
+Held-out loss is the loss `eval` reports on the held-out examples. The
+commands covered are `info`, `plan`, `finetune`, `eval`, `chat`, `merge`,
+`export-gguf`, `generate`, `train --profile` and `pretrain` with the
+byte-level tokenizer, plus the gradient and forward parity tests.
+
+## Self-check and parity
+
+- `ferrotensor info --check` passed.
+- Gradient parity against PyTorch fixtures: 4 tests passed, worst absolute
+  difference 9.239e-7.
+- Forward parity: 10 tests passed.
+
+## `finetune` with no memory flags
+
+30 steps at the default learning rate. "Chosen" is the batch size times the
+gradient accumulation that the planner picked.
+
+| Model | Chosen batch × accumulation | Sequence length | Peak GPU memory | Held-out loss before → after |
+|---|---|---:|---:|---|
+| SmolLM2-135M | 8 × 1 | 256 | 6,331 MiB | 2.4250 → 2.2775 |
+| SmolLM2-360M | 8 × 1 | 256 | 9,104 MiB | 2.0852 → 1.8187 |
+| SmolLM2-360M, `--batch-size 4` | 4 × 2 | 256 | 7,220 MiB | 2.0852 → 1.8187 |
+| SmolLM2-1.7B | 4 × 2 | 256 | 15,064 MiB | 2.6474 → 2.0299 |
+| SmolLM2-1.7B, `--seq-len 128` | 8 × 1 | 128 | 14,196 MiB | 2.6635 → 2.0389 |
+| Qwen2.5-0.5B-Instruct | 8 × 1 | 256 | 11,197 MiB | 1.3359 → 1.2682 |
+
+A memory budget of 3,000 MiB on SmolLM2-1.7B is refused with exit code 2.
+
+## One command on SmolLM2-1.7B, then use the result
+
+`finetune` with `--lr 5e-4 --warmup-steps 20` for 250 steps. The planner
+chose batch 4 × accumulation 2 at sequence length 256.
+
+| Step | Result |
+|---|---|
+| `finetune` | held-out loss 2.6474 → 1.0612; peak GPU memory 15,128 MiB; peak host memory 1,576 MiB (1,613,876 kB maximum resident set size); 334.6 s of training |
+| `eval` with the adapter | 1.0612 |
+| `merge` | wrote 96 merged and 122 copied tensors |
+| `eval` on the merged model | 1.0605 |
+| `chat` | the adapter and the merged model gave the same three greedy replies |
+| `export-gguf` | wrote 218 tensors (3,424,735,104 bytes) |
+| llama.cpp (commit `9fba51d`, CPU build, `llama-simple`) | loaded the file; its greedy completion of "The capital of France is" was " Paris.", the same as Ferrotensor's |
+
+The merged model's loss is 0.0007 from the adapter on the base. The merged
+weights are rounded to the base's f16. The llama.cpp check compares two
+tokens of one prompt, so it shows that the file loads and starts the same
+way, not that the two agree on longer text.
+
+## Qwen2.5-0.5B-Instruct, a real checkpoint
+
+The checkpoint loads. Its held-out loss is 1.3359 on 64 held-out examples, the
+"before" figure in the `finetune` table above. Greedy `generate` answered "The capital of France is
+Paris." The `finetune` row above is the 30-step run of this model.
+
+## 4-bit weights: the gap is there before training
+
+Held-out loss of the untouched base model, with no training:
+
+| Model | f32 | f16 | 4-bit |
+|---|---:|---:|---:|
+| SmolLM2-135M | 2.4250 | 2.4250 | 2.6139 |
+| SmolLM2-360M | 2.0852 | 2.0852 | 2.2575 |
+| SmolLM2-1.7B | 2.6474 | 2.6474 | 3.7470 |
+
+The 4-bit loss is already higher before any adapter is trained. 4-bit still
+fails its quality gate, so it stays experimental.
+
+## Where step time goes, `train --profile`
+
+Batch 1 × 8-step accumulation, sequence length 256, per optimizer step
+(median of 30 steps):
+
+| Model | Dispatches | Step wall time | Of which waiting for the GPU |
+|---|---:|---:|---:|
+| SmolLM2-135M | 22,264 | 1.176 s | 0.459 s |
+| SmolLM2-1.7B | 17,800 | 2.219 s | 1.675 s |
+
+The loss and gradient norm at step 30 equal those of the 15 November 2026 run
+of the same command: 135M 2.5320 and 1.476, 1.7B 1.4793 and 1.665.
+
+## `pretrain`, byte-level tokenizer
+
+The corpus is a 1 MB English text file built from the Alpaca training
+examples.
+
+| Model | Parameters | Steps | Loss, first logged step → last | Time | Peak GPU memory |
+|---|---:|---:|---|---:|---:|
+| Defaults (4 blocks, width 128) | 1,116,032 | 2,000 | 4.5239 → 1.2271 | 51.1 s | 431 MiB |
+| 8 blocks, width 384, 6 heads | 19,079,808 | 3,000 | 3.5511 → 0.7507 | 385.1 s | 1,672 MiB |
+
+`generate --raw` from both models produced English-like text.
+`pretrain --resume` at the saved step trained 0 steps and exported.
+
+## Not measured in this run
+
+- `pretrain --tokenizer bpe`.
+- The speed of the kept chat cache.
+- Any Apple, AMD or Intel GPU.
+- Any comparison with PyTorch speed or memory.
+- The full GPU test suite. It stopped at the Qwen2 fixture tests, which need
+  `FERROTENSOR_QWEN2_FIXTURE` (see
+  [testing on your GPU](../docs/testing-on-your-gpu.md)), so this run does not
+  show that the whole suite passes on this GPU at this commit.

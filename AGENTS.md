@@ -4,9 +4,10 @@ Ferrotensor is a Rust framework for tensors, autograd and LoRA fine-tuning of
 small language models on the GPU, through wgpu and hand-written WGSL kernels
 (Vulkan, Metal or DX12; no CUDA). The `ferrotensor` command (crate
 `ferrotensor-cli`) plans, trains, evaluates, samples and merges LoRA adapters
-for Llama-style models such as SmolLM2, TinyLlama and Qwen2 (Qwen2.5 checkpoints
-are not measured yet), and trains a small
-model from scratch with a byte-level or a learned BPE tokenizer.
+for Llama-style models such as SmolLM2, TinyLlama and Qwen2, and trains a small
+model from scratch with a byte-level or a learned BPE tokenizer. One A10G run
+of the commands, with the numbers, is in
+[benchmarks/RESULTS.md](benchmarks/RESULTS.md#real-hardware-run-16-november-2026).
 
 ## Install
 
@@ -137,7 +138,11 @@ base weights, batch 1 x 8-step accumulation, sequence length 256:
 - 16 GB: no 16 GB machine has been measured. The table above is the guide;
   `plan` adds `--checkpoint-blocks` when the default does not fit.
 - 24 GB: all three sizes were measured on the A10G (24 GB). Models larger than
-  SmolLM2-1.7B are untested.
+  SmolLM2-1.7B are untested. A 16 November 2026 run of
+  `finetune` with no memory flags on the A10G is in
+  [benchmarks/RESULTS.md](benchmarks/RESULTS.md#real-hardware-run-16-november-2026):
+  SmolLM2-1.7B chose batch 4 x accumulation 2 and peaked at 15,064 MiB, and a
+  budget of 3,000 MiB was refused with exit code 2.
 
 The `plan` estimate is fitted to 15 A10G peaks with 8 sequences per step: these,
 and batch 4 and 8 runs of SmolLM2 and Qwen2.5-0.5B. It is at most 8.7% below and
@@ -151,6 +156,8 @@ calibrated.
   docs and MSRV. Format with `cargo fmt --all` before every commit.
 - GPU tests are skipped unless `FERROTENSOR_RUN_GPU_TESTS=1`; CLI tests that
   need a GPU are `#[ignore]` and run in CI with `--ignored` on software Vulkan.
+  The four Qwen2 parity tests also read `FERROTENSOR_QWEN2_FIXTURE` (CI sets
+  it) and skip with a message when it is unset.
 - No `unwrap`, `expect` or `panic!` outside tests; propagate errors with `?`.
   No `let _ =`, `.ok()` or `unwrap_or_default()` to silence a `Result`.
 - In library code a lint is suppressed with `#[expect(lint, reason = "...")]`.

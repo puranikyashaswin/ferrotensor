@@ -258,6 +258,30 @@ the release:
   their gradients and the AdamW state together stay under 50 MiB.
   [What each row means](../../ferrotensor-cli/README.md#where-gpu-memory-goes---memory-report).
 
+## One command, then use the result (16 November 2026)
+
+One run on the A10G (driver 595.112.07, Vulkan, rustc 1.100.0), release
+build of `main` at commit `8b814c1`, covering the commands after `train`.
+`ferrotensor finetune --model SmolLM2-1.7B` with `--lr 5e-4 --warmup-steps 20`
+for 250 steps, where the planner chose batch 4 × accumulation 2 at sequence
+length 256:
+
+- Held-out loss 2.6474 → 1.0612; peak GPU memory 15,128 MiB (`nvidia-smi`);
+  peak host memory 1,576 MiB; 334.6 s of training.
+- `eval` with the adapter gave 1.0612. `merge` wrote 96 merged and 122 copied
+  tensors, and `eval` on the merged model gave 1.0605: 0.0007 from the adapter
+  on the base, because the merged weights are rounded to the base's f16.
+- `chat` gave the same three greedy replies from the adapter and from the
+  merged model.
+- `export-gguf` wrote 218 tensors (3,424,735,104 bytes). llama.cpp (commit
+  `9fba51d`, CPU build, `llama-simple`) loaded the file, and its greedy
+  completion of "The capital of France is" was " Paris.", the same as
+  Ferrotensor's. That is a two-token check of one prompt.
+
+The 30-step `finetune` runs with no memory flags for the other sizes, the
+4-bit loss of the untouched base models and the `pretrain` runs are in
+[benchmarks/RESULTS.md](../../benchmarks/RESULTS.md#real-hardware-run-16-november-2026).
+
 ## Correctness checks
 
 Besides the full PyTorch run above, the LoRA training path is checked
@@ -441,6 +465,9 @@ training normally (losses 1.4960 and 1.6540).
 - 4-bit base weights (`--q4-weights`) are experimental and give a worse
   held-out loss than f16 after 250 steps: 1.8000 vs 1.6521 (135M), 1.4087
   vs 1.3228 (360M), 1.1198 vs 1.0640 (1.7B)
+  (the 4-bit base is already worse before training: held-out loss 2.6139,
+  2.2575 and 3.7470 against 2.4250, 2.0852 and 2.6474 for f16; 4-bit still
+  fails its quality gate)
   ([details](../../ferrotensor-cli/README.md#frozen-base-weights-f16-f32-or-4-bit-experimental)).
 - `--batch-size 1` is the default. `--batch-size N` runs N sequences through
   a Llama-style model in one pass, padded to the longest, with the same
@@ -449,7 +476,10 @@ training normally (losses 1.4960 and 1.6540).
 - The tested architecture is Llama-style. Qwen2 checkpoints, whose query,
   key and value projections have a bias, load; a tiny random
   `Qwen2ForCausalLM` matches the logits and LoRA gradients of Hugging Face
-  transformers in CI, but real Qwen2.5 checkpoints are not measured yet.
+  transformers in CI. The real Qwen2.5-0.5B-Instruct checkpoint loads on the
+  A10G: held-out loss 1.3359, greedy `generate` answers "The capital of France
+  is Paris.", and a 30-step `finetune` took the loss to 1.2682 (one run,
+  [results](../../benchmarks/RESULTS.md#real-hardware-run-16-november-2026)).
   Config features the forward pass lacks (an activation other than SiLU,
   scaled RoPE, `use_sliding_window: true`) are refused with exit code 2.
   Qwen3-style attention (per-head

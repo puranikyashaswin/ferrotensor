@@ -6,7 +6,8 @@
 //! loss with respect to every decoder-block linear weight. These tests load
 //! the saved checkpoint through [`Lfm2ModelBuilder`] and compare.
 //!
-//! They need a GPU and the fixture, so they are `#[ignore]`d by default:
+//! They need a GPU, so they are `#[ignore]`d by default. Without
+//! `FERROTENSOR_QWEN2_FIXTURE` they print a message and skip; CI sets it:
 //!
 //! ```text
 //! python scripts/gen_qwen2_fixture.py /tmp/qwen2-fixture
@@ -65,10 +66,16 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn load() -> Self {
-        let dir = std::env::var_os("FERROTENSOR_QWEN2_FIXTURE")
-            .map(PathBuf::from)
-            .expect("set FERROTENSOR_QWEN2_FIXTURE to the output of scripts/gen_qwen2_fixture.py");
+    /// `None`, with a message, when `FERROTENSOR_QWEN2_FIXTURE` is unset, so the
+    /// suite still runs on a machine without PyTorch. A path that is set but
+    /// wrong fails, which keeps CI strict.
+    fn load() -> Option<Self> {
+        let Some(dir) = std::env::var_os("FERROTENSOR_QWEN2_FIXTURE").map(PathBuf::from) else {
+            eprintln!(
+                "skipping Qwen2 parity; set FERROTENSOR_QWEN2_FIXTURE to the output of scripts/gen_qwen2_fixture.py"
+            );
+            return None;
+        };
         let case = std::fs::read_to_string(dir.join("cases.json")).expect("read cases.json");
         let bytes = std::fs::read(dir.join("expected.safetensors")).expect("read expected");
         let file = safetensors::SafeTensors::deserialize(&bytes).expect("parse expected");
@@ -87,11 +94,11 @@ impl Fixture {
                 (name, (view.shape().to_vec(), values))
             })
             .collect();
-        Self {
+        Some(Self {
             dir,
             case: serde_json::from_str(&case).expect("parse cases.json"),
             expected,
-        }
+        })
     }
 
     fn expected(&self, name: &str) -> &(Vec<usize>, Vec<f32>) {
@@ -154,9 +161,11 @@ fn assert_close(actual: &[f32], expected: &[f32], tol: f32, what: &str) {
 }
 
 #[test]
-#[ignore = "needs a GPU and FERROTENSOR_QWEN2_FIXTURE"]
+#[ignore = "needs a GPU; skipped without FERROTENSOR_QWEN2_FIXTURE"]
 fn logits_match_transformers() {
-    let fixture = Fixture::load();
+    let Some(fixture) = Fixture::load() else {
+        return;
+    };
     let gpu = gpu();
     let mut model = fixture.build(&gpu, None, false);
     for (name, linear) in linears(&model) {
@@ -193,9 +202,11 @@ fn logits_match_transformers() {
 }
 
 #[test]
-#[ignore = "needs a GPU and FERROTENSOR_QWEN2_FIXTURE"]
+#[ignore = "needs a GPU; skipped without FERROTENSOR_QWEN2_FIXTURE"]
 fn kv_cache_and_batched_forward_match_transformers() {
-    let fixture = Fixture::load();
+    let Some(fixture) = Fixture::load() else {
+        return;
+    };
     let gpu = gpu();
     let model = fixture.build(&gpu, None, false);
     let ids = &fixture.case.ids;
@@ -219,9 +230,11 @@ fn kv_cache_and_batched_forward_match_transformers() {
 }
 
 #[test]
-#[ignore = "needs a GPU and FERROTENSOR_QWEN2_FIXTURE"]
+#[ignore = "needs a GPU; skipped without FERROTENSOR_QWEN2_FIXTURE"]
 fn f16_base_weights_stay_close_to_transformers() {
-    let fixture = Fixture::load();
+    let Some(fixture) = Fixture::load() else {
+        return;
+    };
     let gpu = gpu();
     let model = fixture.build(&gpu, None, true);
     let actual = host(
@@ -239,9 +252,11 @@ fn f16_base_weights_stay_close_to_transformers() {
 /// base weight in Ferrotensor's `[in, out]` layout: transformers' weight
 /// gradient (`[out, in]`) gives the expected value of every B.
 #[test]
-#[ignore = "needs a GPU and FERROTENSOR_QWEN2_FIXTURE"]
+#[ignore = "needs a GPU; skipped without FERROTENSOR_QWEN2_FIXTURE"]
 fn lora_gradients_match_transformers_with_frozen_biases() {
-    let fixture = Fixture::load();
+    let Some(fixture) = Fixture::load() else {
+        return;
+    };
     let gpu = gpu();
     let lora = LoRaConfig {
         rank: 4,
