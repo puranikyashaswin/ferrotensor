@@ -178,6 +178,10 @@ jobs:
     # fixture is not generated here, so those four tests skip.
     runs-on: ${{ matrix.os }}
     timeout-minutes: 180
+    # The full DX12 run is not reliably green yet (docs/testing-on-your-gpu.md
+    # has the failure): its failures show in the job but do not fail the
+    # workflow on main. The pull-request subset and Metal are blocking.
+    continue-on-error: ${{ matrix.backend == 'dx12' && github.event_name != 'pull_request' }}
     strategy:
       fail-fast: false
       matrix:

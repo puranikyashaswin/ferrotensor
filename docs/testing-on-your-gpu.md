@@ -17,6 +17,17 @@ nothing about speed. Other GPUs are untested. Results from AMD and Intel
 GPUs, and from DX12 on a real GPU, are the most useful thing you can
 contribute.
 
+The full DX12 run is not a merge gate and does not fail the workflow, because
+it is not reliably green. Its workspace GPU suite passed once (16 November
+2026, before a merge of `main`). In the next full run every test passed except
+`block_checkpointing` (6 of 7) and `no_grad_inference` (2 of 3) in
+`ferrotensor-trainer`: in each the second test's readback panicked with
+`Error in Buffer::get_mapped_range: Validation Error` (`Buffer is not
+mapped`), and every later test in that binary failed with `no GPU adapter
+found for backends dx12`. The cause is not known; the readback ignores the
+map error, so the log does not show why mapping failed. A rerun of that job
+had not finished when this was written.
+
 On 16 November 2026 one A10G (24 GB) ran `info --check` (passed), the gradient
 parity tests (4 passed, worst absolute difference 9.239e-7) and the forward
 parity tests (10 passed), then the commands `plan`, `finetune`, `chat`,
