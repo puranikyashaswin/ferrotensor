@@ -196,6 +196,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.2
       - run: cargo check --workspace --locked
 
+  # A missing file in a package, a path dependency without a version and a wrong
+  # `include` fail here, on the pull request, and not when the release job runs.
+  # `--workspace` (stable since cargo 1.90) packages the nine crates together, in
+  # dependency order, and builds each from its package against the others' packages,
+  # so a crate need not be on crates.io yet. It skips the crates with `publish = false`
+  # (benchmarks and ferrotensor-py). Nothing is uploaded.
+  package:
+    name: Package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.2
+      - run: cargo --version
+      - run: cargo publish --workspace --dry-run --locked
+
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest
