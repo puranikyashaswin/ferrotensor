@@ -168,7 +168,8 @@ impl WgpuContext {
 
     /// Opens an adapter with the given power preference, optionally forcing
     /// the software fallback adapter. The `WGPU_BACKEND` environment variable
-    /// (e.g. `vulkan`) restricts which backends are tried.
+    /// (e.g. `vulkan`) restricts which backends are tried, and
+    /// `WGPU_DX12_COMPILER` (`dxc` or `fxc`) picks the DX12 shader compiler.
     ///
     /// # Errors
     /// [`ContextError::NoAdapter`] if wgpu finds no adapter, and
@@ -180,6 +181,7 @@ impl WgpuContext {
         let backends = crate::adapters::backends();
         let instance = Instance::new(wgpu::InstanceDescriptor {
             backends,
+            dx12_shader_compiler: wgpu::util::dx12_shader_compiler_from_env().unwrap_or_default(),
             ..Default::default()
         });
         let adapter = instance

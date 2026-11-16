@@ -195,6 +195,19 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v4.2.2
+      # wgpu's default DX12 shader compiler, FXC, took about 9 minutes to
+      # build the engine's pipelines on WARP, so each test that opens a GPU
+      # took that long. WGPU_DX12_COMPILER=dxc selects DXC, whose two DLLs
+      # come with the Windows SDK on the runner; wgpu falls back to FXC with
+      # a warning in the log if it cannot load them.
+      - name: DXC from the Windows SDK
+        if: matrix.backend == 'dx12'
+        run: |
+          dll=$(ls "/c/Program Files (x86)/Windows Kits/10/bin/"10.*/x64/dxcompiler.dll | sort -V | tail -n 1)
+          dir=$(dirname "$dll")
+          ls -l "$dir/dxcompiler.dll" "$dir/dxil.dll"
+          cygpath -w "$dir" >> "$GITHUB_PATH"
+          echo "WGPU_DX12_COMPILER=dxc" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2.9.2
       # The JSON names the adapter, backend and device type that ran the tests.
