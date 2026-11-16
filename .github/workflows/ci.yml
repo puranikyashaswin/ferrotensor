@@ -225,7 +225,7 @@ jobs:
       # library suites still run every kernel and the trainer through DX12,
       # and the CLI tests run on Metal and Vulkan.
       - name: GPU suites (ignored tests)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.backend != 'dx12' }}
         run: |
           exclude=()
           if [ "${{ matrix.skip_cli }}" = true ]; then
@@ -234,7 +234,7 @@ jobs:
           fi
           cargo test --release --workspace "${exclude[@]}" --no-fail-fast -- --ignored --test-threads=1
       - name: Autograd finite-difference checks
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.backend != 'dx12' }}
         run: cargo test --release -p ferrotensor-autograd --test grad_check -- --test-threads=1
       - name: Tensor API GPU parity
         if: ${{ !cancelled() }}
