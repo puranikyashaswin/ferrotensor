@@ -167,6 +167,55 @@ jobs:
           name: hardware-report-lavapipe
           path: reports/
 
+  gpu-other-backends:
+    name: GPU tests (${{ matrix.name }})
+    # The same GPU suites through the other two wgpu backends. macOS arm64
+    # runners expose Metal on a paravirtualised Apple GPU; Windows runners have
+    # no GPU, but DX12 lists WARP, Microsoft's software adapter, and wgpu picks
+    # it when nothing else is there (as Vulkan picks lavapipe above). Neither
+    # is real hardware and neither says anything about speed. The Qwen2
+    # fixture is not generated here, so those four tests skip.
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Metal, Apple silicon runner
+            os: macos-latest
+            backend: metal
+          - name: DX12, WARP
+            os: windows-latest
+            backend: dx12
+    env:
+      WGPU_BACKEND: ${{ matrix.backend }}
+      FERROTENSOR_RUN_GPU_TESTS: "1"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.2
+      # The JSON names the adapter, backend and device type that ran the tests.
+      - name: Adapter and kernel self-check
+        run: cargo run --release -p ferrotensor-cli -- info --check --json
+      # Runs even when the self-check fails, so every failing test shows.
+      - name: GPU suites (ignored tests)
+        if: ${{ !cancelled() }}
+        run: cargo test --release --workspace -- --ignored --test-threads=1
+      - name: Autograd finite-difference checks
+        if: ${{ !cancelled() }}
+        run: cargo test --release -p ferrotensor-autograd --test grad_check -- --test-threads=1
+      - name: Tensor API GPU parity
+        if: ${{ !cancelled() }}
+        run: cargo test --release -p ferrotensor --lib -- --test-threads=1
+      - name: Tensor API GPU parity with op fusion on
+        if: ${{ !cancelled() }}
+        run: cargo test --release -p ferrotensor --lib -- --test-threads=1
+        env:
+          FERROTENSOR_FUSION: "1"
+
   doc:
     name: Docs
     runs-on: ubuntu-latest
