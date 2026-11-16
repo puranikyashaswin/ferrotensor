@@ -200,10 +200,11 @@ jobs:
       # The JSON names the adapter, backend and device type that ran the tests.
       - name: Adapter and kernel self-check
         run: cargo run --release -p ferrotensor-cli -- info --check --json
-      # Runs even when the self-check fails, so every failing test shows.
+      # Runs even when the self-check fails, and --no-fail-fast goes on past
+      # a failing test binary, so every failing test on a backend shows.
       - name: GPU suites (ignored tests)
         if: ${{ !cancelled() }}
-        run: cargo test --release --workspace -- --ignored --test-threads=1
+        run: cargo test --release --workspace --no-fail-fast -- --ignored --test-threads=1
       - name: Autograd finite-difference checks
         if: ${{ !cancelled() }}
         run: cargo test --release -p ferrotensor-autograd --test grad_check -- --test-threads=1
