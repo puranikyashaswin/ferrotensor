@@ -10,8 +10,8 @@ as `Apple Paravirtual device`) and through DX12 on WARP (`Microsoft Basic
 Render Driver`, Microsoft's software adapter). On WARP the CLI end-to-end
 tests are skipped because they take too long there, and the rest of the suite
 (2 h 22 min) runs on `main`, weekly and on demand; a pull request runs only
-the backend kernel tests, the gradient parity tests and the Tensor API parity
-tests there. These runs check
+the backend kernel tests and the Tensor API parity tests (forward values and
+gradients against the CPU) there. These runs check
 correctness on the two backends; they are not real-hardware results and say
 nothing about speed. Other GPUs are untested. Results from AMD and Intel
 GPUs, and from DX12 on a real GPU, are the most useful thing you can
