@@ -267,6 +267,7 @@ impl ComputeEngine {
         });
         ctx.counters.bind_groups.fetch_add(1, Relaxed);
         ctx.counters.dispatches.fetch_add(1, Relaxed);
+        ctx.counters.compute_passes.fetch_add(1, Relaxed);
         ctx.record(|encoder| {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
             pass.set_pipeline(&kernel.pipeline);

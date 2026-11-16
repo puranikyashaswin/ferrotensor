@@ -307,7 +307,7 @@ impl WgpuContext {
         let start = Instant::now();
         let mut polls = 0u32;
         loop {
-            self.device.poll(wgpu::Maintain::Poll);
+            self.poll();
             if done() {
                 GpuCounters::add_elapsed(&self.counters.gpu_wait_nanos, start);
                 // Callers wait for the last submitted work, so that poll let
@@ -346,8 +346,15 @@ impl WgpuContext {
     /// than at the next submission.
     fn release_idle_buffers(&self) {
         if self.pool.trim() > 0 {
-            self.device.poll(wgpu::Maintain::Poll);
+            self.poll();
         }
+    }
+
+    /// Polls the device without blocking. Each poll runs wgpu's device
+    /// maintenance, whose cost grows with the number of live buffers.
+    fn poll(&self) {
+        self.counters.device_polls.fetch_add(1, Ordering::Relaxed);
+        self.device.poll(wgpu::Maintain::Poll);
     }
 
     /// Byte counters of this context's tensors: live, peak, idle in the
