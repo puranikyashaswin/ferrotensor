@@ -421,3 +421,39 @@ examples.
   `FERROTENSOR_QWEN2_FIXTURE` (see
   [testing on your GPU](../docs/testing-on-your-gpu.md)), so this run does not
   show that the whole suite passes on this GPU at this commit.
+
+## Second card: NVIDIA Tesla T4 (16 GB)
+
+One NVIDIA Tesla T4 (15,360 MiB), release build of `main` at commit
+`c7a0131`, f16 base weights, LoRA rank 8. Peak GPU memory is the largest
+`nvidia-smi` sample at 200 ms; "tracked" is `measured_peak_mib`, the buffers
+Ferrotensor counts itself.
+
+| Model | Batch × accumulation | Sequence length | Steps | Peak GPU memory | Tracked |
+|---|---|---:|---:|---:|---:|
+| SmolLM2-135M | 8 × 1 | 256 | 30 | 6,146 MiB | 4,447 MiB |
+| SmolLM2-360M | 8 × 1 | 256 | 30 | 8,920 MiB | 7,543 MiB |
+| SmolLM2-360M | 4 × 2 | 256 | 30 | 7,002 MiB | 5,336 MiB |
+| SmolLM2-1.7B | 2 × 4 | 256 | 30 | 9,541 MiB | 8,654 MiB |
+| SmolLM2-1.7B | 2 × 4 | 256 | 250 | 11,138 MiB | 8,879 MiB |
+| SmolLM2-1.7B | 8 × 1 | 128 | 30 | 14,913 MiB | 16,354 MiB |
+| Qwen2.5-0.5B-Instruct | 8 × 1 | 256 | 30 | 11,012 MiB | 9,212 MiB |
+| SmolLM2-135M, `train --profile` | 1 × 8 | 256 | 30 | 1,953 MiB | 1,319 MiB |
+| SmolLM2-1.7B, `train --profile` | 1 × 8 | 256 | 30 | 7,520 MiB | 6,236 MiB |
+
+- The planner chose batch 2 × accumulation 4 for SmolLM2-1.7B on this card.
+  250 steps took the held-out loss from 2.6474 to 1.0598, with a peak of
+  11,138 MiB GPU memory and 1,566 MiB host memory. `eval` gave 1.0598 with
+  the adapter and 1.0596 on the merged model. llama.cpp loaded the exported
+  GGUF file and matched on the same two-token check as above.
+- Qwen2.5-0.5B-Instruct: held-out loss 1.3359; the 30-step fine-tune at
+  batch 8 peaked at 11,012 MiB.
+- The full GPU test suite passed on this card: 58 test binaries, 0
+  failures, the four Qwen2 fixture tests skipped.
+- `train --profile`, per optimizer step: SmolLM2-135M 1.215 s, of which
+  0.420 s waiting for the GPU; SmolLM2-1.7B 3.482 s, of which 2.860 s
+  waiting for the GPU. The loss and gradient norm at step 30 equal those of
+  the A10G run: 135M 2.5320 and 1.476, 1.7B 1.4793 and 1.665.
+- `pretrain` with the defaults reached loss 1.2271 in 71.2 s (peak 246 MiB),
+  and the 19,079,808-parameter model 0.7507 in 916.7 s (peak 1,487 MiB),
+  the same losses as on the A10G.

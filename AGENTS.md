@@ -137,7 +137,9 @@ base weights, batch 1 x 8-step accumulation, sequence length 256:
 
 - 8 GB: an Apple M2 (8 GB) fine-tuned SmolLM2-135M with a 0.4 build; there are
   no current memory numbers for the Mac. Start with SmolLM2-135M.
-- 16 GB: no 16 GB machine has been measured. The table above is the guide;
+- 16 GB: on an NVIDIA Tesla T4 (16 GB) the planner chose batch 2 x
+  accumulation 4 for SmolLM2-1.7B, which peaked at 11,138 MiB over 250 steps
+  ([second card](benchmarks/RESULTS.md#second-card-nvidia-tesla-t4-16-gb)).
   `plan` adds `--checkpoint-blocks` when the default does not fit.
 - 24 GB: all three sizes were measured on the A10G (24 GB). Models larger than
   SmolLM2-1.7B are untested. A 16 November 2026 run of
@@ -146,10 +148,12 @@ base weights, batch 1 x 8-step accumulation, sequence length 256:
   SmolLM2-1.7B chose batch 4 x accumulation 2 and peaked at 15,064 MiB, and a
   budget of 3,000 MiB was refused with exit code 2.
 
-The `plan` estimate is fitted to 15 A10G peaks with 8 sequences per step: these,
-and batch 4 and 8 runs of SmolLM2 and Qwen2.5-0.5B. It is at most 8.7% below and
-17% above them. Other GPUs, f32 and 4-bit weights and LFM2 models are not
-calibrated.
+The `plan` estimate is fitted to 24 peaks with 8 sequences per step, 15 on the
+A10G and 9 on the T4: these, and batch 2, 4 and 8 runs of SmolLM2 and
+Qwen2.5-0.5B. It is at most 4.6% below them and at most 12% above the 250-step
+and single-pass peaks; 30-step runs that accumulate passes have not reached
+their peak, and it is up to 35% above those. Other GPUs, f32 and 4-bit weights
+and LFM2 models are not calibrated.
 
 ## 4-bit weights (experimental)
 

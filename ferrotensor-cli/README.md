@@ -328,13 +328,19 @@ The peak is an estimate: base weights at their precision, LoRA adapters
 with gradients and AdamW state, activations kept for backward (every op
 output of every decoder block, or only block inputs with
 `--checkpoint-blocks`), the logits and their gradient at the model's
-vocabulary size, and a fixed 1,480 MiB for the driver context, buffer pool
-and allocator slack. Activations count 7% above their f32 size, and 18%
-more again when a step accumulates several forward passes, since nothing
-waits for the GPU between them. These three constants are fitted to 15
-A10G peaks with 8 sequences per step (SmolLM2 135M, 360M and 1.7B and
-Qwen2.5-0.5B, f16 weights, sequence length 256 and 128); the estimate is at
-most 8.7% below and 17% above each of them. Other GPUs, f32 and 4-bit
+vocabulary size, and a fixed 1,600 MiB for the driver context, buffer pool
+and allocator slack. Activations count 0.92 times their f32 size plus 13
+values per token and block per unit of key/value width (SmolLM2-1.7B,
+whose keys and values are as wide as its queries, keeps more than the
+counted tensors), and 20% more again when a step accumulates several
+forward passes: each pass is padded to its own longest sequence and nothing
+waits for the GPU between them, so the peak keeps growing for more than 30
+steps. These constants are fitted to 24 peaks with 8 sequences per step, 15
+on an A10G (24 GB) and 9 on a T4 (16 GB) (SmolLM2 135M, 360M and 1.7B and
+Qwen2.5-0.5B, f16 weights, sequence length 256 and 128). The estimate is at
+most 4.6% below each of them and at most 12% above the 250-step and
+single-pass peaks; it is up to 35% above 30-step runs that accumulate
+passes, which have not reached their peak. Other GPUs, f32 and 4-bit
 weights and LFM2 models are not calibrated.
 
 ## Less GPU memory: `--checkpoint-blocks`
