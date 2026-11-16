@@ -16,6 +16,9 @@ const MAX_PENDING_OPS: u32 = 128;
 /// staging copies to finish so wgpu can free them.
 pub const UPLOAD_RELEASE_BYTES: u64 = 256 << 20;
 
+/// Longest pause between two device polls while waiting for the GPU.
+const MAX_POLL_PAUSE: Duration = Duration::from_micros(500);
+
 /// A GPU device, its queue and a buffer pool shared by tensors.
 ///
 /// Kernel dispatches and copies from [`ComputeEngine`](crate::ComputeEngine)
@@ -365,9 +368,14 @@ impl WgpuContext {
     /// there after 5 s and then frees the still-running submission's
     /// resources as if it had finished, which crashes drivers that are still
     /// reading them (seen with long batches on lavapipe).
+    ///
+    /// Each poll walks every live buffer wgpu-core has ever seen bound by a
+    /// dropped bind group, so polling back to back keeps a CPU busy for the
+    /// whole wait. The pause between polls doubles from 20 µs up to
+    /// [`MAX_POLL_PAUSE`], which bounds how late a finished wait is noticed.
     pub(crate) fn poll_until(&self, done: impl Fn() -> bool) {
         let start = Instant::now();
-        let mut polls = 0u32;
+        let mut pause = Duration::from_micros(20);
         loop {
             self.poll();
             if done() {
@@ -378,12 +386,8 @@ impl WgpuContext {
                 self.release_idle_buffers();
                 return;
             }
-            if polls < 100 {
-                std::thread::yield_now();
-            } else {
-                std::thread::sleep(Duration::from_micros(50));
-            }
-            polls += 1;
+            std::thread::sleep(pause);
+            pause = (pause * 2).min(MAX_POLL_PAUSE);
         }
     }
 
