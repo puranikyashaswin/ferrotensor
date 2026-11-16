@@ -1063,7 +1063,7 @@ mod tests {
     }
 
     #[test]
-    fn refuses_an_existing_file_another_model_a_wordpiece_tokenizer_and_a_quantized_base() {
+    fn refuses_an_existing_file_another_model_a_word_level_tokenizer_and_a_quantized_base() {
         let err = refusal("exists", |dir| {
             std::fs::write(dir.join("refused.gguf"), b"keep").unwrap();
         });
