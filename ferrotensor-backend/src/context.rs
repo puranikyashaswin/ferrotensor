@@ -12,6 +12,10 @@ use wgpu::{Adapter, BindGroup, CommandEncoder, ComputePipeline, Device, Instance
 /// starts on long sequences without waiting for a sync point.
 const MAX_PENDING_OPS: u32 = 128;
 
+/// Queued dispatches are encoded into a pass once this many are waiting, so
+/// encoding keeps pace with recording and no pass grows past this length.
+const MAX_PASS_DISPATCHES: usize = 16;
+
 /// Uploaded bytes after which [`WgpuContext::note_upload`] waits for the
 /// staging copies to finish so wgpu can free them.
 pub const UPLOAD_RELEASE_BYTES: u64 = 256 << 20;
@@ -267,6 +271,9 @@ impl WgpuContext {
     pub(crate) fn record_dispatch(&self, dispatch: Dispatch) {
         let mut pending = self.pending.lock().unwrap();
         pending.dispatches.push(dispatch);
+        if pending.dispatches.len() >= MAX_PASS_DISPATCHES {
+            self.encoder(&mut pending);
+        }
         self.count_op(&mut pending);
     }
 
