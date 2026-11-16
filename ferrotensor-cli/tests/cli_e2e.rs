@@ -987,6 +987,41 @@ fn merge_writes_a_model_directory_and_refuses_a_non_empty_output() {
 }
 
 #[test]
+fn export_gguf_refuses_a_word_level_tokenizer_and_an_existing_file_with_2() {
+    let model = model_dir("gguf-model");
+    let config_path = model.path().join("config.json");
+    let mut config = read_json(&config_path);
+    config["max_position_embeddings"] = 64.into();
+    std::fs::write(&config_path, config.to_string()).expect("write config");
+    let out = model.path().join("model.gguf");
+    let run = ferrotensor(&[
+        "export-gguf",
+        "--model",
+        s(model.path()),
+        "--out",
+        s(&out),
+        "--json",
+    ]);
+    assert_eq!(run.status.code(), Some(2), "stderr: {}", text(&run.stderr));
+    let report: serde_json::Value = serde_json::from_slice(&run.stdout).expect("one JSON object");
+    assert_eq!(
+        report["error"],
+        "tokenizer.json has a \"WordLevel\" model; export-gguf needs a byte-level BPE tokenizer"
+    );
+    assert!(!out.exists());
+
+    std::fs::write(&out, b"keep").expect("write file");
+    let run = ferrotensor(&["export-gguf", "--model", s(model.path()), "--out", s(&out)]);
+    assert_eq!(run.status.code(), Some(2));
+    let stderr = text(&run.stderr);
+    assert!(
+        stderr.contains("model.gguf exists; export-gguf writes a new file"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(std::fs::read(&out).expect("read file"), b"keep");
+}
+
+#[test]
 fn chat_on_a_missing_model_exits_with_2() {
     let tmp = common::TempDir::new("chat-missing");
     let missing = tmp.path().join("does-not-exist");

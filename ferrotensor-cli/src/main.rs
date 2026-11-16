@@ -13,10 +13,12 @@
 //! ferrotensor-cli plan --model DIR --json
 //! ferrotensor-cli pretrain --data corpus.txt --out runs/tiny
 //! ferrotensor-cli export-adapter --lora runs/sft/lora_adapters.safetensors --model DIR --output runs/sft/peft
+//! ferrotensor-cli export-gguf --model DIR --out model.gguf
 //! ```
 
 mod chat;
 mod classify;
+mod export_gguf;
 mod finetune;
 mod info;
 mod memory_report;
@@ -167,6 +169,8 @@ enum Command {
     ExportAdapter(ExportAdapterArgs),
     /// Write a model directory with a LoRA adapter folded into the weights.
     Merge(merge::MergeArgs),
+    /// Write a Llama-style model as one GGUF file for llama.cpp and Ollama.
+    ExportGguf(export_gguf::ExportGgufArgs),
     /// Train a small byte-level Llama-style model from random weights on a
     /// text file, into a model directory that generate loads.
     Pretrain(Box<pretrain::PretrainArgs>),
@@ -535,6 +539,7 @@ fn main() {
         Command::Info(args) => args.json,
         Command::Plan(args) => args.json,
         Command::Merge(args) => args.json,
+        Command::ExportGguf(args) => args.json,
         Command::Pretrain(args) => args.json,
         _ => false,
     };
@@ -583,6 +588,7 @@ fn run(command: Command, matches: &clap::ArgMatches, json: bool) -> Result<Exit>
         Command::Plan(args) => return plan::run(args),
         Command::ExportAdapter(args) => export_adapter(args)?,
         Command::Merge(args) => merge::run(args, json)?,
+        Command::ExportGguf(args) => export_gguf::run(args, json)?,
         Command::Pretrain(args) => pollster::block_on(pretrain::run(*args))?,
         Command::Monitor => ferrotensor_monitor::run().map_err(|e| format!("monitor: {e}"))?,
         Command::Benchmark => {

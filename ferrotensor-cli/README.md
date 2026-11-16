@@ -3,7 +3,8 @@
 The `ferrotensor-cli` command line for [Ferrotensor](../README.md): a GPU
 check (`info`), memory planning (`plan`), LoRA fine-tuning (`finetune`, `train`),
 evaluation (`eval`), sampling (`generate`, alias `infer`), conversation (`chat`),
-adapter export and merging (`export-adapter`, `merge`) and training a byte-level
+adapter export and merging (`export-adapter`, `merge`), GGUF export for
+llama.cpp and Ollama (`export-gguf`) and training a byte-level
 model from scratch (`pretrain`), for
 small Llama-style models such as SmolLM2 and TinyLlama, on the GPU through
 wgpu (Vulkan, Metal or DX12). It also has `classify-train` and
@@ -134,8 +135,8 @@ ferrotensor chat --model HuggingFaceTB/SmolLM2-135M
 
 ## Scripting: `--json` and exit codes
 
-`plan`, `finetune`, `train`, `eval`, `generate`, `chat`, `merge`, `pretrain`
-and `info` take `--json`: stdout then carries one JSON object when the
+`plan`, `finetune`, `train`, `eval`, `generate`, `chat`, `merge`,
+`export-gguf`, `pretrain` and `info` take `--json`: stdout then carries one JSON object when the
 command ends, and progress and other text go to stderr (`generate` and `chat`
 stream their text there too). On an error stdout carries
 `{"error": "<message>"}`. `chat --json` is the exception: it prints one JSON
@@ -439,6 +440,34 @@ Quantized bases (`quantization` or `quantization_config` in `config.json`,
 or `.scales` tensors), files of trained base weights, and adapter tensors
 whose base weight is missing or has another shape are refused before
 anything is written.
+
+## llama.cpp and Ollama: `export-gguf`
+
+`export-gguf` writes a Llama-style model directory, such as a `merge`
+output, as one GGUF version 3 file:
+
+```bash
+cargo run -p ferrotensor-cli --release -- export-gguf \
+  --model ./data/models/SmolLM2-135M-sft --out ./data/SmolLM2-135M-sft.gguf
+```
+
+2-D weights are stored in f16 and 1-D tensors and norms in f32, as
+llama.cpp's converter does; `--f32` stores every tensor in f32. The tensor
+names, the dimension order, the reordered query and key rows and the
+metadata keys follow llama.cpp's `convert_hf_to_gguf.py`. `--lora` adds an
+adapter while writing, with the same maths as `merge` (the sum is rounded
+once, to the file's type, not first to the base's). The export runs on the host and streams
+one row at a time, like `merge`. `--json` prints
+`{"out_file", "tensors", "merged"}`.
+
+The tokenizer must be byte-level BPE with the pre-tokenizer of GPT-2 or of
+SmolLM (llama.cpp `gpt-2` and `smollm`); SentencePiece-style tokenizers such
+as TinyLlama's are refused. An existing `--out`, a `model_type` other than
+`llama`, a quantized base and tensors without a llama.cpp name are refused
+too, with exit code 2. The file is written to the GGUF v3 specification;
+loading in llama.cpp is checked on the next hardware run, with
+`scripts/check_gguf.sh`, which compares a greedy completion of llama.cpp's
+`llama-simple` with `ferrotensor generate`.
 
 ## Train from scratch: `pretrain`
 

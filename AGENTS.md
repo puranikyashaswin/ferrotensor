@@ -29,6 +29,7 @@ ferrotensor finetune --model DIR --data train.jsonl --json # train with that pla
 ferrotensor eval --model DIR --data val.jsonl --lora outputs/run/lora_adapters.safetensors --json
 ferrotensor chat --model DIR --lora outputs/run/lora_adapters.safetensors --json < questions.txt
 ferrotensor merge --model DIR --lora outputs/run/lora_adapters.safetensors --out outputs/merged --json
+ferrotensor export-gguf --model outputs/merged --out model.gguf --json  # for llama.cpp and Ollama
 ferrotensor pretrain --data corpus.txt --out outputs/tiny --json  # from random weights; generate --raw loads it
 ```
 
@@ -63,6 +64,7 @@ is `null`. On an error stdout carries `{"error": "<message>"}` instead.
 | `generate` | `text`, `prompt_tokens`, `new_tokens`, `tokens_per_second`, `kv_cache` |
 | `chat` | one object per reply, each on its own line: `reply`, `prompt_tokens`, `new_tokens`, `tokens_per_second` |
 | `merge` | `out_dir`, `merged` (tensors with the adapter added), `copied` (tensors copied byte for byte) |
+| `export-gguf` | `out_file`, `tensors` (tensors in the GGUF file), `merged` (tensors with the `--lora` adapter added; 0 without it) |
 | `pretrain` | every `train` key, then `parameters` and `vocab_size` (259: a byte-level tokenizer) |
 | `info` | `ferrotensor`, `os`, `arch`, `adapters` (one object per GPU, `selected` marks the one used), `checks` (null without `--check`), and `error` only on failure |
 
@@ -94,6 +96,9 @@ prompt that encodes to no tokens or is longer than the model's context; `chat`
 refusing a tokenizer without ChatML tokens or a message longer than the
 model's context; and `merge`
 refusing its input (a non-empty `--out`, a quantized base, an adapter that
+does not match the base); `export-gguf` refusing its input (an `--out` that
+exists, a `model_type` other than `llama`, a quantized base, a tokenizer that
+is not byte-level BPE with the GPT-2 or SmolLM pre-tokenizer, an adapter that
 does not match the base); and `pretrain` refusing a model size the kernels
 cannot run (`--hidden` not a multiple of `--heads`, an odd head size or one
 above 128), a `--seq-len` above `--context`, an `--out` that already holds
