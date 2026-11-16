@@ -398,6 +398,37 @@ Batch 1 × 8-step accumulation, sequence length 256, per optimizer step
 The loss and gradient norm at step 30 equal those of the 15 November 2026 run
 of the same command: 135M 2.5320 and 1.476, 1.7B 1.4793 and 1.665.
 
+## Compute passes shared by consecutive dispatches
+
+`main` at `85b3419` opened one compute pass per kernel dispatch. Builds that
+encode consecutive dispatches into one pass, with at most 4, 8, 16 or 32
+dispatches per pass, were run against it on one NVIDIA A10G. All runs used the
+same machine, with the builds interleaved, two runs each. Loss and gradient
+norm were the same in every build. Step wall time per optimizer step, batch
+1 × 8-step accumulation, sequence length 256, `train --profile`:
+
+| Model | `main` | at most 4 | at most 8 | at most 16 | at most 32 |
+|---|---:|---:|---:|---:|---:|
+| SmolLM2-135M | 1.166 s | 1.001 s | 0.989 s | 0.982 s | 1.018 s |
+| SmolLM2-360M | 1.547 s | 1.353 s | 1.334 s | 1.325 s | 1.393 s |
+| SmolLM2-1.7B | 2.216 s | 2.146 s | 2.169 s | 2.165 s | 2.300 s |
+
+Compute passes per step at 4 / 8 / 16 / 32: 135M 7,305 / 4,435 / 3,295 /
+3,049; 360M 7,733 / 4,695 / 3,491 / 3,243; 1.7B 5,825 / 3,553 / 2,650 / 2,450.
+`main` has one pass per dispatch. The host time per step falls as passes
+are shared. Long passes add GPU time, enough to make 1.7B slower than `main`
+at 32. An earlier box measured 2.227 s at 16 against 2.217 s for `main` on
+1.7B, so 16 is at the edge there. `main` now uses at most 8: 15.2% faster
+on 135M, 13.8% on 360M and 2.1% on 1.7B in this table.
+
+Other measurements with shared passes, on the same machine:
+
+- Greedy `generate`, 120 tokens: 135M 40.6 → 59.5 tokens per second, 1.7B
+  16.1 → 17.5. The cap made no difference here.
+- The 250-step `finetune` of 1.7B at batch 4 × 2 (at most 16 per pass):
+  334.6 s → 327.9 s of training, the same held-out loss 1.0612. The tracked
+  peak rose by 168 MiB on that run (13,893 → 14,061 MiB).
+
 ## `pretrain`, byte-level tokenizer
 
 The corpus is a 1 MB English text file built from the Alpaca training

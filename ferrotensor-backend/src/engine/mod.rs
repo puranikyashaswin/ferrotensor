@@ -1,8 +1,10 @@
 //! The compute engine: compiles the WGSL kernels and dispatches them.
 
+use crate::context::Dispatch;
 use crate::{UnifiedTensor, WgpuContext};
 use std::borrow::Cow;
 use std::sync::atomic::Ordering::Relaxed;
+use std::sync::Arc;
 use wgpu::{util::DeviceExt, Buffer, Device};
 
 mod attention;
@@ -87,18 +89,21 @@ fn q4_b_matmul(src: &str) -> String {
 /// The layout is derived from the shader (`layout: None`), so it always
 /// matches the bindings the entry point actually uses.
 struct Kernel {
-    pipeline: wgpu::ComputePipeline,
+    /// Shared with the dispatches waiting to be encoded.
+    pipeline: Arc<wgpu::ComputePipeline>,
     layout: wgpu::BindGroupLayout,
 }
 
 impl Kernel {
     fn new(device: &Device, module: &wgpu::ShaderModule, entry_point: &str) -> Self {
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some(entry_point),
-            layout: None,
-            module,
-            entry_point,
-        });
+        let pipeline = Arc::new(
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(entry_point),
+                layout: None,
+                module,
+                entry_point,
+            }),
+        );
         let layout = pipeline.get_bind_group_layout(0);
         Self { pipeline, layout }
     }
@@ -262,18 +267,17 @@ impl ComputeEngine {
                 resource: buf.as_entire_binding(),
             })
             .collect();
-        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &kernel.layout,
             entries: &entries,
         });
         ctx.counters.bind_groups.fetch_add(1, Relaxed);
         ctx.counters.dispatches.fetch_add(1, Relaxed);
-        ctx.record(|encoder| {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
-            pass.set_pipeline(&kernel.pipeline);
-            pass.set_bind_group(0, &bg, &[]);
-            pass.dispatch_workgroups(groups.0, groups.1, groups.2);
+        ctx.record_dispatch(Dispatch {
+            pipeline: Arc::clone(&kernel.pipeline),
+            bind_group,
+            groups,
         });
     }
 
