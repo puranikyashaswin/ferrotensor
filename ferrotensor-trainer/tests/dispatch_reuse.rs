@@ -26,7 +26,7 @@ fn steps_after_the_first_reuse_bind_groups_and_uniforms() {
     let (_, params) = sorted_lora_params(&model);
     let mut run_trainer = trainer(&gpu, model, 1e-2);
 
-    let steps: Vec<_> = (0..4)
+    let steps: Vec<_> = (0..5)
         .map(|_| {
             let before = gpu.ctx.gpu_counters();
             run_trainer
@@ -51,7 +51,9 @@ fn steps_after_the_first_reuse_bind_groups_and_uniforms() {
         .expect("write to stderr");
     }
 
-    for s in &steps[1..] {
+    // Step 1 fills the empty pool and step 2 still settles which buffer
+    // each tensor gets; from step 3 every step repeats the one before.
+    for s in &steps[2..] {
         assert_eq!(s.bind_groups + s.bind_groups_reused, s.dispatches);
         // On main every dispatch created a bind group and every dispatch with
         // parameters a uniform buffer (190 and 148 per step). What a later

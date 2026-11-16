@@ -474,8 +474,8 @@ profile: median of <steps> optimizer steps by wall time
 ```
 
 The values in angle brackets are placeholders. Bind groups and uniform
-buffers are created once and reused while their buffers live, so after
-the first step most dispatches count as reused. Step time minus the time
+buffers are created once and reused while their buffers live, so from the
+third step on most dispatches count as reused. Step time minus the time
 waiting on the GPU is roughly the time the host spends recording work;
 waiting includes the wait inside each readback, and forced synchronizes
 are the waits that free upload staging memory every 256 MiB of uploads.
