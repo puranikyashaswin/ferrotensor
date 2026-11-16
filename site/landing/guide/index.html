@@ -71,7 +71,7 @@
   <figure class="sample gpanel"><figcaption><span class="lang">Shell</span><button class="gcopy" type="button" data-copy="cargo add ferrotensor
 cargo install ferrotensor-cli
 pip install ferrotensor">Copy</button></figcaption><pre tabindex="0"><span class="ln"><span class="mk" aria-label="note 1">1</span>cargo add ferrotensor</span><span class="ln"><span class="mk" aria-label="note 2">2</span>cargo install ferrotensor-cli</span><span class="ln"><span class="mk" aria-label="note 3">3</span>pip install ferrotensor</span></pre><p class="gnote">Commands</p></figure>
-  <ol class="notes"><li><span>The tensor API, autograd, <code>nn</code> and optimizers, as a library in your Rust project.</span></li><li><span>The <code>ferrotensor</code> command: LoRA <code>train</code>, <code>eval</code>, <code>generate</code> and <code>info</code>.</span></li><li><span>The Python bindings. Wheels exist for macOS arm64 and Linux x86_64.</span></li></ol>
+  <ol class="notes"><li><span>The tensor API, autograd, <code>nn</code> and optimizers, as a library in your Rust project.</span></li><li><span>The <code>ferrotensor</code> command: <code>info</code>, <code>plan</code>, <code>finetune</code>, <code>train</code>, <code>eval</code>, <code>generate</code>, <code>chat</code>, <code>merge</code>, <code>export-gguf</code> and <code>pretrain</code>.</span></li><li><span>The Python bindings. Wheels exist for macOS arm64 and Linux x86_64.</span></li></ol>
   <h3>Steps</h3>
   <ol class="steps"><li><div><p>Install Rust 1.88 or newer with <a href="https://rustup.rs">rustup</a>. On macOS nothing else is needed: Ferrotensor uses Metal.</p></div></li><li><div><p>On Linux, make sure a Vulkan driver is installed. NVIDIA's driver includes one; for AMD and Intel GPUs install Mesa (<code>mesa-vulkan-drivers</code> on Ubuntu).</p></div></li><li><div><p>To use the tensor API in a Rust project, add the crate:</p><figure class="sample gpanel"><figcaption><span class="lang">Shell</span><button class="gcopy" type="button" data-copy="cargo add ferrotensor">Copy</button></figcaption><pre tabindex="0">cargo add ferrotensor</pre></figure></div></li><li><div><p>To fine-tune and run language models from the terminal, install the command line tool. The binary is called <code>ferrotensor</code>:</p><figure class="sample gpanel"><figcaption><span class="lang">Shell</span><button class="gcopy" type="button" data-copy="cargo install ferrotensor-cli">Copy</button></figcaption><pre tabindex="0">cargo install ferrotensor-cli</pre></figure></div></li><li><div><p>For Python 3.10 or newer:</p><figure class="sample gpanel"><figcaption><span class="lang">Shell</span><button class="gcopy" type="button" data-copy="pip install ferrotensor">Copy</button></figcaption><pre tabindex="0">pip install ferrotensor</pre></figure></div></li></ol>
   
@@ -249,8 +249,12 @@ for name, rs in ((&quot;val&quot;, out[:64]), (&quot;train&quot;, out[64:2064]))
 EOF</pre></figure></div></li></ol>
   
   <h3>Details</h3><div class="gprose"><p>For plain next-token training, use <code>--task pretrain</code> with <code>.txt</code> lines, JSON text or token arrays, or packed little-endian <code>u32</code> <code>.bin</code> tokens.</p>
-<p>Llama-architecture checkpoints have been measured: SmolLM2-135M, 360M and 1.7B. Sharded checkpoints load through <code>model.safetensors.index.json</code>.</p></div>
-  <h3>Limits</h3><p class="gprose">Released LFM2 checkpoints are rejected because per-head q/k layernorm is not implemented yet.</p>
+<p>Llama-architecture checkpoints have been measured: SmolLM2-135M, 360M and 1.7B. Qwen2 checkpoints load too, checked against Hugging Face Transformers on a tiny random model; real Qwen2.5 checkpoints are not measured. Sharded checkpoints load through <code>model.safetensors.index.json</code>.</p>
+<p><code>--model</code> takes a model directory, or a Hugging Face id that is already in the local cache, such as <code>HuggingFaceTB/SmolLM2-135M</code> after <code>hf download HuggingFaceTB/SmolLM2-135M</code>. An existing directory of that name wins, and Ferrotensor downloads nothing.</p>
+<p>To train a small byte-level model from random weights instead, for learning and experiments, run <code>pretrain</code>. <code>generate --raw</code> loads the result:</p>
+<div class="gcmd"><pre><code>ferrotensor pretrain --data corpus.txt --out outputs/tiny
+ferrotensor generate --model outputs/tiny --raw --prompt &quot;Once upon a time&quot;</code></pre></div></div>
+  <h3>Limits</h3><p class="gprose">Released LFM2 checkpoints are rejected because per-head q/k layernorm is not implemented yet. <code>pretrain</code> is byte-level, and its training defaults are not tuned.</p>
   <nav class="pn" aria-label="Previous and next guide"><a class="prev" href="#python"><span>Previous</span>Train a model from Python</a><a class="next" href="#lora-train"><span>Next</span>Fine-tune a model with LoRA</a></nav>
 </article>
 <article class="g" id="lora-train" aria-labelledby="lora-train-t">
@@ -276,7 +280,12 @@ EOF</pre></figure></div></li></ol>
   --log-every 10 --eval-every 50 --save-every 50 \
   --sample-prompt &quot;Give three tips for staying healthy.&quot;</pre></figure></div></li><li><div><p>Watch <code>eval before</code> and <code>eval after</code>. The run writes <code>lora_adapters.safetensors</code>, its <code>.state.json</code> and <code>.state.safetensors</code>, <code>metrics.jsonl</code> and <code>training_state.json</code> to <code>--out</code>.</p></div></li></ol>
   
-  <h3>Details</h3><div class="gprose"><p>Defaults that apply: batch size 1 (so <code>--grad-accum 8</code> means 8 sequences per step), LoRA rank 8 and alpha 16 on <code>q_proj,k_proj,v_proj,o_proj</code>, gradient clipping at a global norm of 1.0, AdamW without weight decay, and warmup then cosine decay to lr/10.</p>
+  <h3>Details</h3><div class="gprose"><p>To let Ferrotensor choose the settings, ask <code>plan</code> what fits this machine, then train with that plan using <code>finetune</code>:</p>
+<div class="gcmd"><pre><code>ferrotensor plan --model DIR
+ferrotensor finetune --model DIR --data train.jsonl --out outputs/run</code></pre></div>
+<p><code>DIR</code> is a model directory or a Hugging Face id already in the local cache. <code>plan</code> estimates the peak GPU memory and picks the batch size, sequence length and checkpointing that fit. <code>finetune</code> takes every <code>train</code> flag, prints the plan, trains with it and writes <code>lora_adapters.safetensors</code>. Settings you pass are kept. When no configuration fits, it exits with 2 and does not train; <code>--force</code> trains the smallest configuration anyway.</p>
+<p>For scripts and coding agents, <code>plan</code>, <code>finetune</code>, <code>train</code>, <code>pretrain</code>, <code>merge</code>, <code>export-gguf</code>, <code>eval</code>, <code>generate</code>, <code>chat</code> and <code>info</code> take <code>--json</code>. Stdout then carries one JSON object (<code>chat</code> prints one per reply) and progress goes to stderr. Commands exit with 0 on success, 1 on a runtime error, and 2 when the input is invalid or this machine cannot meet the request. The keys of each object are listed in <a href="https://github.com/puranikyashaswin/ferrotensor/blob/main/AGENTS.md#json-output">AGENTS.md</a>.</p>
+<p>Defaults that apply: batch size 1 (so <code>--grad-accum 8</code> means 8 sequences per step), LoRA rank 8 and alpha 16 on <code>q_proj,k_proj,v_proj,o_proj</code>, gradient clipping at a global norm of 1.0, AdamW without weight decay, and warmup then cosine decay to lr/10.</p>
 <ul>
 <li><code>--lora-rank</code>, <code>--lora-alpha</code> and <code>--lora-targets</code> change the adapter.</li>
 <li><code>--lite</code> is a preset for small machines: sequence length 128, rank 4 and grad-accum 8, unless you set them.</li>
@@ -318,8 +327,13 @@ EOF</pre></figure></div></li></ol>
 <table class="gt"><thead><tr><th>Prompt</th><th>Base SmolLM2-1.7B</th><th>With the adapter</th></tr></thead><tbody>
 <tr><td>Translate 'good morning' into French.</td><td>Repeats the prompt until the 60-token limit</td><td>Bonjour</td></tr>
 <tr><td>Give three tips for staying healthy.</td><td>Rambles on about a "Healthy Diet"</td><td>A numbered list of three tips</td></tr>
-</tbody></table></div>
-  <h3>Limits</h3><p class="gprose">Small models stay small: answers are fluent but shallow, and sampled output can wander.</p>
+</tbody></table>
+<p><code>chat</code> holds a multi-turn conversation, one message per line of stdin. It needs a ChatML model such as SmolLM2, because TinyLlama's tokenizer lacks the tokens; <code>generate --raw</code> works with any model:</p>
+<div class="gcmd"><pre><code>ferrotensor chat --model DIR --lora outputs/run/lora_adapters.safetensors</code></pre></div>
+<p>To use the result without <code>--lora</code>, <code>merge</code> folds the adapter into the base weights and writes a standalone model directory (<code>export-adapter</code> writes a PEFT adapter for PyTorch instead). <code>export-gguf</code> then writes that model as one GGUF v3 file for llama.cpp and Ollama:</p>
+<div class="gcmd"><pre><code>ferrotensor merge --model DIR --lora outputs/run/lora_adapters.safetensors --out outputs/merged
+ferrotensor export-gguf --model outputs/merged --out model.gguf</code></pre></div></div>
+  <h3>Limits</h3><p class="gprose">Small models stay small: answers are fluent but shallow, and sampled output can wander. The GGUF file is written to the GGUF v3 specification; loading it in llama.cpp is not yet checked. <code>export-gguf</code> refuses Qwen2 models (projection biases), tokenizers that are not byte-level BPE such as TinyLlama's, and scaled RoPE, with exit code 2.</p>
   <nav class="pn" aria-label="Previous and next guide"><a class="prev" href="#lora-train"><span>Previous</span>Fine-tune a model with LoRA</a><a class="next" href="#lora-resume"><span>Next</span>Resume or extend a run</a></nav>
 </article>
 <article class="g" id="lora-resume" aria-labelledby="lora-resume-t">

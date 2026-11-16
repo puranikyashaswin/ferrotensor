@@ -24,12 +24,26 @@ No GPU? `Device::cpu()` runs the same code.
 
 ## Command-line tool
 
-The `ferrotensor` command fine-tunes small Llama-style models with LoRA and
-runs `train`, `eval` and `generate`:
+The `ferrotensor` command fine-tunes small Llama-style models with LoRA. It
+checks the GPU (`info --check`), plans what fits (`plan`), trains (`finetune`,
+`train`), evaluates and samples (`eval`, `generate`), chats (`chat`), merges an
+adapter into the base weights (`merge`), writes a GGUF file (`export-gguf`) and
+trains a small byte-level model from scratch (`pretrain`):
 
 ```bash
 cargo install ferrotensor-cli
+ferrotensor info --check
 ```
+
+`--model` takes a model directory or a Hugging Face id already in the local
+cache; nothing is downloaded. `plan`, `finetune`, `chat`, `merge`,
+`export-gguf` and `pretrain` are tested in CI, on software Vulkan where they
+use the GPU. `export-gguf` writes GGUF v3, and loading the file in llama.cpp
+is not yet checked. Most commands take `--json` and print one JSON object, and
+every command exits with 0 on success, 1 on a runtime error and 2 when the
+input is invalid or the machine cannot meet the request;
+[AGENTS.md](https://github.com/puranikyashaswin/ferrotensor/blob/main/AGENTS.md)
+lists both.
 
 Prebuilt binaries are attached to each
 [GitHub release](https://github.com/puranikyashaswin/ferrotensor/releases).
