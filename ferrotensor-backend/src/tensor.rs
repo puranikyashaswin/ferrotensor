@@ -3,6 +3,7 @@
 use crate::memory::{Allocation, MemoryCategory};
 use crate::pool::BufferPool;
 use crate::profile::GpuCounters;
+use crate::q4::{Q4Error, Q4Group};
 use crate::WgpuContext;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -60,6 +61,7 @@ pub struct UnifiedTensor {
     pub shape: Vec<usize>,
     /// Element type of the buffer.
     pub dtype: DType,
+    q4_group: Option<Q4Group>,
 }
 
 #[derive(Debug)]
@@ -175,6 +177,7 @@ impl UnifiedTensor {
             )),
             shape: shape.to_vec(),
             dtype: DType::FP32,
+            q4_group: None,
         }
     }
 
@@ -202,6 +205,7 @@ impl UnifiedTensor {
             )),
             shape: shape.to_vec(),
             dtype,
+            q4_group: None,
         }
     }
 
@@ -246,6 +250,7 @@ impl UnifiedTensor {
             )),
             shape: shape.to_vec(),
             dtype,
+            q4_group: None,
         }
     }
 
@@ -265,25 +270,32 @@ impl UnifiedTensor {
 
     /// Quantises row-major `data` of 2-D `shape` `[k, n]` to the 4-bit
     /// format of [`crate::q4`] as a [`DType::Q4`] tensor of logical shape
-    /// `shape`: about 4.5 bits per weight. Read it with the `*_q4b`
-    /// matmuls, not [`to_vec`](Self::to_vec). Fails, uploading nothing, on
-    /// NaN or infinite values, on values beyond the f16 range and when
-    /// `shape` is not 2-D.
+    /// `shape`, `group` weights per scale (4 + 32 / `group` bits per weight,
+    /// 4.5 with the default 64). Read it with the `*_q4b` matmuls, not
+    /// [`to_vec`](Self::to_vec). Fails, uploading nothing, on NaN or
+    /// infinite values, on values beyond the f16 range and when `shape` is
+    /// not 2-D.
     pub fn from_f32_as_q4(
         context: &WgpuContext,
         data: &[f32],
         shape: &[usize],
-    ) -> Result<Self, crate::q4::Q4Error> {
+        group: Q4Group,
+    ) -> Result<Self, Q4Error> {
         let [k, n] = shape[..] else {
-            return Err(crate::q4::Q4Error::NotMatrix { rank: shape.len() });
+            return Err(Q4Error::NotMatrix { rank: shape.len() });
         };
-        let words = crate::q4::quantize(data, k, n)?;
-        Ok(Self::from_bytes_with_dtype(
-            context,
-            bytemuck::cast_slice(&words),
-            shape,
-            DType::Q4,
-        ))
+        let words = crate::q4::quantize(data, k, n, group)?;
+        let tensor =
+            Self::from_bytes_with_dtype(context, bytemuck::cast_slice(&words), shape, DType::Q4);
+        Ok(Self {
+            q4_group: Some(group),
+            ..tensor
+        })
+    }
+
+    /// Weights per scale of a [`DType::Q4`] tensor; `None` for other types.
+    pub fn q4_group(&self) -> Option<Q4Group> {
+        self.q4_group
     }
 
     /// Create an empty FP16 tensor. No code in this workspace calls it.
@@ -313,6 +325,7 @@ impl UnifiedTensor {
             data: self.data.clone(),
             shape: new_shape.to_vec(),
             dtype: self.dtype,
+            q4_group: self.q4_group,
         }
     }
 
@@ -446,6 +459,7 @@ impl UnifiedTensor {
             )),
             shape: shape.to_vec(),
             dtype,
+            q4_group: None,
         }
     }
 }
