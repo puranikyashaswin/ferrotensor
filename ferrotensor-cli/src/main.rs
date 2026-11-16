@@ -30,9 +30,12 @@ mod profile_report;
 
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use ferrotensor_autograd::{no_grad, AdamW, OptimizerLoad, WarmupCosineScheduler};
-use ferrotensor_backend::{ComputeEngine, ContextError, MemoryCategory, WgpuContext};
+use ferrotensor_backend::{
+    ComputeEngine, ContextError, MemoryCategory, UnifiedTensor, WgpuContext,
+};
 use ferrotensor_graph::lfm::{legacy_llama_name, Lfm2Model};
 use ferrotensor_graph::model_builder::{check_supported, Lfm2ModelBuilder, LoRaConfig};
+use ferrotensor_graph::{KVCache, KVCacheLayer};
 use ferrotensor_loader::{Lfm2Config, ModelLoader, Sampler, Tokenizer, WeightsContext};
 use ferrotensor_trainer::checkpoint::{
     apply_checkpoint, load_lora_checkpoint, save_lora_checkpoint, upgrade_optimizer_names,
@@ -1106,15 +1109,20 @@ async fn generate(args: GenerateArgs) -> Result<()> {
             max_new = fits;
         }
     }
-    let use_cache = !args.no_kv_cache;
+    let mut cache = if args.no_kv_cache {
+        None
+    } else {
+        DecodeCache::new(&model, prompt_ids.len() + max_new)
+    };
+    let kv_cache = cache.is_some();
     let mut text = String::new();
-    let (new_tokens, decode_time, kv_cache) = generate_tokens(
+    let (new_tokens, decode_time, _) = generate_tokens(
         &base,
         &model,
         &prompt_ids,
         max_new,
         &mut sampler,
-        use_cache,
+        cache.as_mut(),
         |delta| {
             text.push_str(delta);
             stream_text(delta, args.json);
@@ -1176,9 +1184,73 @@ fn new_tokens_within(limit: usize, prompt_len: usize, max_new: usize) -> Option<
     limit.checked_sub(prompt_len).map(|room| room.min(max_new))
 }
 
+/// A KV cache and the token ids whose keys and values it holds, at positions
+/// `0..ids.len()`.
+struct DecodeCache {
+    kv: KVCache,
+    capacity: usize,
+    ids: Vec<u32>,
+}
+
+impl DecodeCache {
+    /// An empty cache for `capacity` positions; `None` when the model has
+    /// conv blocks.
+    fn new(model: &Lfm2Model, capacity: usize) -> Option<Self> {
+        model.new_kv_cache(capacity).map(|kv| Self {
+            kv,
+            capacity,
+            ids: Vec::new(),
+        })
+    }
+
+    /// Keeps the cached ids that `prompt` starts with, leaving at least the
+    /// last prompt token to run for its logits, and makes room for `len`
+    /// positions. Returns how many prompt tokens the cache holds.
+    fn reuse(&mut self, base: &Loaded, prompt: &[u32], len: usize) -> usize {
+        // Keys and values at a position depend only on the tokens up to it,
+        // so they stay valid for any prompt with the same prefix.
+        let common = self.ids.iter().zip(prompt).take_while(|(a, b)| a == b);
+        let keep = common.count().min(prompt.len().saturating_sub(1));
+        self.ids.truncate(keep);
+        if len > self.capacity {
+            let doubled = 2 * self.capacity;
+            let limit = base.config.max_position_embeddings;
+            let capacity = limit.map_or(doubled, |l| doubled.min(l)).max(len);
+            let grow = |old: &UnifiedTensor| {
+                let new = UnifiedTensor::zeros(&base.ctx, &[1, capacity, old.shape[2]]);
+                base.engine.copy_tensor(&base.ctx, old, &new, 0);
+                new
+            };
+            for layer in &mut self.kv.layers {
+                *layer = KVCacheLayer {
+                    key: grow(&layer.key),
+                    value: grow(&layer.value),
+                };
+            }
+            self.capacity = capacity;
+        }
+        keep
+    }
+
+    /// Logits for `ids`, which follow the cached ids; their keys and values
+    /// join the cache.
+    fn feed(
+        &mut self,
+        base: &Loaded,
+        model: &Lfm2Model,
+        ids: &[u32],
+    ) -> ferrotensor_autograd::Tensor {
+        let pos = self.ids.len();
+        let logits = model.forward(&base.engine, ids, pos, Some(&mut self.kv), None);
+        self.ids.extend_from_slice(ids);
+        logits
+    }
+}
+
 /// Sample up to `max_new` tokens after `prompt`, streaming decoded text to
-/// `emit`. Returns (tokens generated, decode time, whether the KV cache was
-/// used).
+/// `emit`. With `cache`, only the prompt tokens it does not already hold are
+/// run. Returns (tokens generated, decode time, prompt tokens taken from the
+/// cache).
 ///
 /// # Errors
 /// [`Unmet`] when `prompt` is empty.
@@ -1188,9 +1260,9 @@ async fn generate_tokens(
     prompt: &[u32],
     max_new: usize,
     sampler: &mut Sampler,
-    use_cache: bool,
+    mut cache: Option<&mut DecodeCache>,
     mut emit: impl FnMut(&str),
-) -> Result<(usize, Duration, bool)> {
+) -> Result<(usize, Duration, usize)> {
     if prompt.is_empty() {
         return Err(unmet("the prompt encodes to no tokens"));
     }
@@ -1206,18 +1278,17 @@ async fn generate_tokens(
     .into_iter()
     .flatten()
     .collect();
-    let mut cache = if use_cache {
-        model.new_kv_cache(prompt.len() + max_new)
-    } else {
-        None
-    };
-    let cached = cache.is_some();
-
     let mut tokens = prompt.to_vec();
     let mut generated: Vec<u32> = Vec::new();
     let mut printed = String::new();
     let start = Instant::now();
-    let mut logits = no_grad(|| model.forward(&base.engine, &tokens, 0, cache.as_mut(), None));
+    let cached = cache
+        .as_deref_mut()
+        .map_or(0, |c| c.reuse(base, prompt, prompt.len() + max_new));
+    let mut logits = no_grad(|| match cache.as_deref_mut() {
+        Some(c) => c.feed(base, model, &prompt[cached..]),
+        None => model.forward(&base.engine, &tokens, 0, None, None),
+    });
     for _ in 0..max_new {
         let host = logits.data.to_vec(&base.ctx).await;
         let rows = host.len() / vocab;
@@ -1233,18 +1304,9 @@ async fn generate_tokens(
             emit(delta);
             printed = text;
         }
-        logits = no_grad(|| {
-            if cached {
-                model.forward(
-                    &base.engine,
-                    &[next],
-                    tokens.len() - 1,
-                    cache.as_mut(),
-                    None,
-                )
-            } else {
-                model.forward(&base.engine, &tokens, 0, None, None)
-            }
+        logits = no_grad(|| match cache.as_deref_mut() {
+            Some(c) => c.feed(base, model, &[next]),
+            None => model.forward(&base.engine, &tokens, 0, None, None),
         });
     }
     Ok((generated.len(), start.elapsed(), cached))
@@ -1762,9 +1824,16 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
         let ids = base.tokenizer.encode_chat(None, prompt);
         let mut sampler = Sampler::new(0.0, 0, 1.0, None);
         eprintln!("sample ({prompt:?}):");
-        generate_tokens(&base, &trainer.model, &ids, 96, &mut sampler, true, |t| {
-            stream_text(t, args.json);
-        })
+        let mut cache = DecodeCache::new(&trainer.model, ids.len() + 96);
+        generate_tokens(
+            &base,
+            &trainer.model,
+            &ids,
+            96,
+            &mut sampler,
+            cache.as_mut(),
+            |t| stream_text(t, args.json),
+        )
         .await?;
         stream_text("\n", args.json);
     }

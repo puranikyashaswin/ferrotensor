@@ -583,13 +583,16 @@ ends it. After each reply stderr gets the same line `generate` prints (prompt
 tokens, new tokens, tokens per second). `--temperature`, `--top-k`,
 `--top-p`, `--seed` and `--max-new-tokens` work as in `generate`.
 
-Each turn re-encodes and re-runs the whole conversation in ChatML: the
-system message, then the user and assistant turns, then the assistant
-header. When the conversation and `--max-new-tokens` no longer fit the
-model's `max_position_embeddings` (from `config.json`), the oldest
-exchanges are dropped, the system message is kept, and stderr says so
-once. A single message that does not fit alone is an error (exit code 2).
-A model without a `max_position_embeddings` entry is not trimmed.
+Each turn encodes the whole conversation in ChatML: the system message,
+then the user and assistant turns, then the assistant header. The KV cache
+is kept across turns, so each turn processes only the new tokens: the new
+message in the template, then the reply. When the conversation and
+`--max-new-tokens` no longer fit the model's `max_position_embeddings`
+(from `config.json`), the oldest exchanges are dropped, the system message
+is kept, and stderr says so once; the cache then keeps only the start the
+trimmed conversation shares with it and runs the rest. A single message
+that does not fit alone is an error (exit code 2). A model without a
+`max_position_embeddings` entry is not trimmed.
 
 Only models whose tokenizer has the ChatML tokens `<|im_start|>` and
 `<|im_end|>` are supported for now (SmolLM2 has them); for other models
@@ -597,5 +600,6 @@ Only models whose tokenizer has the ChatML tokens `<|im_start|>` and
 
 Input can be piped, which is how scripts and the tests drive it. With
 `--json` each reply is one JSON object per line on stdout,
-`{"reply", "prompt_tokens", "new_tokens", "tokens_per_second"}`, and the
+`{"reply", "prompt_tokens", "cached_tokens", "new_tokens", "tokens_per_second"}`
+(`cached_tokens`: prompt tokens taken from the cache, not run again), and the
 streamed text goes to stderr.
