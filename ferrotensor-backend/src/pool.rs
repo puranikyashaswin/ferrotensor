@@ -341,7 +341,7 @@ mod tests {
         l.put(64, 2, "a");
         l.put(128, 2, "c");
         assert_eq!(l.pooled_bytes, 256);
-        let key = |b: &&str| *b;
+        let key = |b: &&'static str| *b;
         assert_eq!(l.take(32, key), None, "no size classes");
         assert_eq!(l.take(64, key), Some("a"));
         assert_eq!(l.take(64, key), Some("b"));
