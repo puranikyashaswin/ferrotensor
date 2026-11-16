@@ -3,12 +3,15 @@
 //! Loads Hugging Face safetensors checkpoints of two families into the same
 //! decoder structure, with optional LoRA adapters:
 //!
-//! * **Llama-style** (`model_type` `llama`/`mistral`/`qwen3`, e.g. SmolLM2,
-//!   TinyLlama): every block is RoPE grouped-query attention plus a SwiGLU
-//!   MLP; weights named `self_attn.{q,k,v,o}_proj`, `mlp.{gate,up,down}_proj`,
-//!   `input_layernorm`, `post_attention_layernorm` and `model.norm`. When a
-//!   checkpoint has `self_attn.q_norm` / `self_attn.k_norm` (Qwen3), they are
-//!   loaded as per-head query/key norms ([`Attention::q_norm`]).
+//! * **Llama-style** (any `model_type` but `lfm2`, e.g. SmolLM2, TinyLlama,
+//!   Qwen2.5, Qwen3): every block is RoPE grouped-query attention plus a
+//!   SwiGLU MLP; weights named `self_attn.{q,k,v,o}_proj`,
+//!   `mlp.{gate,up,down}_proj`, `input_layernorm`, `post_attention_layernorm`
+//!   and `model.norm`. A projection with a `<name>.bias` tensor (Qwen2) gets
+//!   that bias. When a checkpoint has `self_attn.q_norm` / `self_attn.k_norm`
+//!   (Qwen3), they are loaded as per-head query/key norms
+//!   ([`Attention::q_norm`]). Config features the forward pass lacks are
+//!   refused ([`check_supported`]).
 //! * **LFM2** (see [`Architecture::detect`]): blocks are short convolutions or
 //!   attention, named `operator_norm`, `ffn_norm`, `feed_forward.w{1,2,3}`,
 //!   with the final norm stored as `model.embedding_norm`.
@@ -72,7 +75,7 @@ type Result<T> = std::result::Result<T, BuildError>;
 /// Weight-naming family of a checkpoint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Architecture {
-    /// Llama / Mistral / SmolLM2 / Qwen3 naming; every block is attention.
+    /// Llama / Mistral / SmolLM2 / Qwen2 / Qwen3 naming; every block is attention.
     Llama,
     /// Liquid LFM2 naming; conv and attention blocks per `layer_types`.
     Lfm2,
@@ -97,6 +100,44 @@ impl Architecture {
             Self::Llama
         }
     }
+}
+
+/// Refuses `config` when it asks for something the forward pass does not
+/// compute (a non-SiLU activation, scaled RoPE, sliding-window attention),
+/// so such a model fails to load instead of giving wrong logits.
+///
+/// # Errors
+/// A [`BuildError`] naming the config field and its value.
+pub fn check_supported(config: &Lfm2Config) -> Result<()> {
+    if let Some(act) = config
+        .hidden_act
+        .as_deref()
+        .filter(|a| !matches!(*a, "silu" | "swish"))
+    {
+        return Err(BuildError(format!(
+            "hidden_act {act:?} is not supported: the MLP computes SiLU (silu) only"
+        )));
+    }
+    for (field, rope) in [
+        ("rope_scaling", &config.rope_scaling),
+        ("rope_parameters", &config.rope_parameters),
+    ] {
+        let kind = rope.as_ref().map(|r| r.kind().unwrap_or("unnamed"));
+        if let Some(kind) = kind.filter(|k| *k != "default") {
+            return Err(BuildError(format!(
+                "{field} type {kind:?} is not supported: RoPE runs unscaled"
+            )));
+        }
+    }
+    if let Some(window) = config
+        .sliding_window
+        .filter(|_| config.use_sliding_window != Some(false))
+    {
+        return Err(BuildError(format!(
+            "sliding_window {window} is not supported: attention always covers the whole sequence"
+        )));
+    }
+    Ok(())
 }
 
 /// Builds an [`Lfm2Model`] from loaded weights.
@@ -315,7 +356,22 @@ impl<'a> Lfm2ModelBuilder<'a> {
     fn build_linear(&self, prefix: &str, module_name: &str, seed: u64) -> Result<Linear> {
         self.reject_pre_quantized(prefix)?;
         let weight = self.load_linear_weight_tensor(prefix)?;
-        Ok(self.maybe_add_lora(Linear::new(weight), module_name, seed))
+        let bias_name = format!("{prefix}.bias");
+        let bias = if self.has(&bias_name) {
+            let bias = self.load_raw_tensor(&bias_name)?;
+            let out_dim = weight.data.shape[1];
+            if bias.data.shape != [out_dim] {
+                return Err(BuildError(format!(
+                    "{bias_name} has shape {:?}, expected [{out_dim}]",
+                    bias.data.shape
+                )));
+            }
+            Some(bias)
+        } else {
+            None
+        };
+        let linear = self.maybe_add_lora(Linear::new(weight), module_name, seed);
+        Ok(Linear { bias, ..linear })
     }
 
     fn build_rms_norm(&self, prefix: &str) -> Result<RMSNorm> {
@@ -364,15 +420,10 @@ impl<'a> Lfm2ModelBuilder<'a> {
                 "num_attention_heads ({n_heads}) must be a positive multiple of num_key_value_heads ({num_kv_heads})"
             )));
         }
-        if head_dim > 128 {
+        if head_dim > 128 || !head_dim.is_multiple_of(2) {
             return Err(BuildError(format!(
-                "head_dim {head_dim} is not supported (the attention kernel handles at most 128)"
+                "head_dim {head_dim} is not supported (RoPE needs an even size, and the attention kernel handles at most 128)"
             )));
-        }
-        if self.has(&format!("{prefix}.q_proj.bias")) {
-            return Err(BuildError(
-                "attention projections with bias (e.g. Qwen2) are not supported yet".into(),
-            ));
         }
         if self.has(&format!("{prefix}.q_layernorm.weight")) {
             return Err(BuildError(
@@ -393,7 +444,11 @@ impl<'a> Lfm2ModelBuilder<'a> {
             head_dim,
             num_kv_heads,
             dropout_prob: self.config.attention_dropout.unwrap_or(0.0),
-            rope_theta: self.config.rope_theta.unwrap_or(10000.0) as f32,
+            rope_theta: self
+                .config
+                .rope_theta
+                .or_else(|| self.config.rope_parameters.as_ref()?.rope_theta)
+                .unwrap_or(10000.0) as f32,
             q_norm: self.build_head_norm(&format!("{prefix}.q_norm"), head_dim)?,
             k_norm: self.build_head_norm(&format!("{prefix}.k_norm"), head_dim)?,
         })
@@ -478,6 +533,7 @@ impl<'a> Lfm2ModelBuilder<'a> {
                     .into(),
             ));
         }
+        check_supported(&self.config)?;
         let arch = Architecture::detect(&self.config);
         let n_layers = self.config.num_hidden_layers;
         log::info!("building {arch:?} model with {n_layers} layers");
@@ -589,8 +645,99 @@ fn lora_seed(layer_seed: u64, module_name: &str) -> u64 {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
-    use super::{lora_seed, Lfm2ModelBuilder};
+    use super::{check_supported, lora_seed, BuildError, Lfm2ModelBuilder};
+    use ferrotensor_loader::Lfm2Config;
+
+    /// The `config.json` of Qwen2.5-0.5B on the Hugging Face hub.
+    fn qwen2_5_config() -> serde_json::Value {
+        serde_json::json!({
+            "architectures": ["Qwen2ForCausalLM"],
+            "attention_dropout": 0.0,
+            "bos_token_id": 151643,
+            "eos_token_id": 151643,
+            "hidden_act": "silu",
+            "hidden_size": 896,
+            "initializer_range": 0.02,
+            "intermediate_size": 4864,
+            "max_position_embeddings": 32768,
+            "max_window_layers": 24,
+            "model_type": "qwen2",
+            "num_attention_heads": 14,
+            "num_hidden_layers": 24,
+            "num_key_value_heads": 2,
+            "rms_norm_eps": 1e-06,
+            "rope_theta": 1000000.0,
+            "sliding_window": 32768,
+            "tie_word_embeddings": true,
+            "torch_dtype": "bfloat16",
+            "use_cache": true,
+            "use_sliding_window": false,
+            "vocab_size": 151936
+        })
+    }
+
+    fn check_with(changes: serde_json::Value) -> Result<(), BuildError> {
+        let mut json = qwen2_5_config();
+        let fields = json.as_object_mut().expect("object");
+        for (key, value) in changes.as_object().expect("object") {
+            fields.insert(key.clone(), value.clone());
+        }
+        let config: Lfm2Config = serde_json::from_value(json).expect("config");
+        check_supported(&config)
+    }
+
+    #[test]
+    fn qwen2_5_config_is_supported() {
+        assert_eq!(check_with(serde_json::json!({})), Ok(()));
+        // transformers 5 writes the RoPE base inside rope_parameters.
+        assert_eq!(
+            check_with(serde_json::json!({
+                "rope_theta": null,
+                "rope_parameters": {"rope_type": "default", "rope_theta": 1000000.0}
+            })),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn unsupported_config_features_are_named() {
+        let cases = [
+            (
+                serde_json::json!({"hidden_act": "gelu_pytorch_tanh"}),
+                "hidden_act \"gelu_pytorch_tanh\" is not supported: the MLP computes SiLU (silu) only",
+            ),
+            (
+                serde_json::json!({"rope_scaling": {"rope_type": "llama3", "factor": 8.0}}),
+                "rope_scaling type \"llama3\" is not supported: RoPE runs unscaled",
+            ),
+            (
+                serde_json::json!({"rope_scaling": {"type": "linear", "factor": 2.0}}),
+                "rope_scaling type \"linear\" is not supported: RoPE runs unscaled",
+            ),
+            (
+                serde_json::json!({"rope_parameters": {"rope_type": "yarn", "rope_theta": 1e6}}),
+                "rope_parameters type \"yarn\" is not supported: RoPE runs unscaled",
+            ),
+            (
+                serde_json::json!({"use_sliding_window": true}),
+                "sliding_window 32768 is not supported: attention always covers the whole sequence",
+            ),
+            (
+                // Mistral-7B-v0.1 sets a window and no use_sliding_window.
+                serde_json::json!({"use_sliding_window": null, "sliding_window": 4096}),
+                "sliding_window 4096 is not supported: attention always covers the whole sequence",
+            ),
+        ];
+        for (changes, message) in cases {
+            assert_eq!(
+                check_with(changes.clone()),
+                Err(BuildError(message.into())),
+                "{changes}"
+            );
+        }
+    }
 
     #[test]
     fn lora_seed_is_pinned() {

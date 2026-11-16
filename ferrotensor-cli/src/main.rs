@@ -30,7 +30,7 @@ use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use ferrotensor_autograd::{no_grad, AdamW, OptimizerLoad, WarmupCosineScheduler};
 use ferrotensor_backend::{ComputeEngine, ContextError, MemoryCategory, WgpuContext};
 use ferrotensor_graph::lfm::{legacy_llama_name, Lfm2Model};
-use ferrotensor_graph::model_builder::{Lfm2ModelBuilder, LoRaConfig};
+use ferrotensor_graph::model_builder::{check_supported, Lfm2ModelBuilder, LoRaConfig};
 use ferrotensor_loader::{Lfm2Config, ModelLoader, Sampler, Tokenizer, WeightsContext};
 use ferrotensor_trainer::checkpoint::{
     apply_checkpoint, load_lora_checkpoint, save_lora_checkpoint, upgrade_optimizer_names,
@@ -613,6 +613,7 @@ async fn load_base(args: &ModelArgs) -> Result<Loaded> {
     let config_path = dir.join("config.json");
     let config = ModelLoader::load_config(&config_path)
         .map_err(|e| unmet(format!("cannot read {}: {e}", config_path.display())))?;
+    check_supported(&config).map_err(|e| unmet(format!("{}: {e}", config_path.display())))?;
     let tok_path = dir.join("tokenizer.json");
     let tokenizer = Tokenizer::from_file(&tok_path)
         .map_err(|e| format!("cannot load {}: {e}", tok_path.display()))?;
@@ -690,7 +691,9 @@ fn build_model(
             target_modules: meta.target_modules.clone(),
         });
     }
-    Ok(builder.build()?)
+    // Every build error is a checkpoint this code cannot load: a missing or
+    // misshapen weight, or a feature it does not implement.
+    builder.build().map_err(|e| unmet(e.to_string()))
 }
 
 /// Read an adapter: a Ferrotensor safetensors file or a PEFT directory.
