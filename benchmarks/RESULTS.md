@@ -533,8 +533,9 @@ runs of one build differ by less than 0.3%.
 | SmolLM2-1.7B | 1 x 8 | 2.233 | 1.697 |
 | SmolLM2-1.7B | 4 x 2 | 1.348 | 1.261 |
 
-At step 30 the training loss and gradient norm print the same on both builds
-for every model (2.5320 / 1.8838 / 1.4793).
+The training loss at step 30 is the same on both builds: 2.5320 on
+SmolLM2-135M, 1.8838 on 360M and 1.4793 on 1.7B, also 1.4793 at batch 4 x 2.
+The gradient norm at step 30 printed the same on both builds too.
 
 A 250-step `finetune` of SmolLM2-1.7B with the planner's setting (batch 4 x
 accumulation 2) took 328.0 s on `main` and 320.0 s on the branch. The
