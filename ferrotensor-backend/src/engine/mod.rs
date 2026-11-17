@@ -29,9 +29,32 @@ fn shader_source() -> String {
     let flash_v2_bw_src = include_str!("../shaders/flash_attention_v2_backward.wgsl");
     let matmul_h_src = half_b_matmul(matmul_src);
     let matmul_q4_src = q4_b_matmul(matmul_src);
+    let matvec_src = &include_str!("../shaders/matvec.wgsl").replace("\r\n", "\n");
+    let matvec_h_src = half_w_matvec(matvec_src);
+    let matvec_q4_src = include_str!("../shaders/matvec_q4.wgsl");
     format!(
-        "{kernels_src}\n{matmul_src}\n{matmul_h_src}\n{matmul_q4_src}\n{flash_v2_src}\n{flash_v2_bw_src}"
+        "{kernels_src}\n{matmul_src}\n{matmul_h_src}\n{matmul_q4_src}\n{matvec_src}\n{matvec_h_src}\n{matvec_q4_src}\n{flash_v2_src}\n{flash_v2_bw_src}"
     )
+}
+
+/// `matvec_h`: the matrix-vector kernel with `w` stored as f16 pairs packed
+/// into `u32` words, generated from matvec.wgsl like [`half_b_matmul`]. With
+/// an even column count a column pair is one word, read once.
+fn half_w_matvec(src: &str) -> String {
+    const W_DECL: &str = "var<storage, read> mv_w: array<f32>;";
+    const W_LOAD: &str = "    if (n + 1u < cols) { return vec2<f32>(mv_w[i], mv_w[i + 1u]); }\n    return vec2<f32>(mv_w[i], 0.0);";
+    assert!(
+        src.contains(W_DECL) && src.contains(W_LOAD),
+        "matvec.wgsl changed"
+    );
+    src.replace(
+        W_LOAD,
+        "    if ((cols & 1u) == 0u) { return unpack2x16float(mv_w[i >> 1u]); }\n    let lo = unpack2x16float(mv_w[i >> 1u])[i & 1u];\n    if (n + 1u >= cols) { return vec2<f32>(lo, 0.0); }\n    return vec2<f32>(lo, unpack2x16float(mv_w[(i + 1u) >> 1u])[(i + 1u) & 1u]);",
+    )
+    .replace(W_DECL, "var<storage, read> mv_w: array<u32>;")
+    .replace("fn matvec(", "fn matvec_h(")
+    .replace("mv_", "mvh_")
+    .replace("MV_", "MVH_")
 }
 
 /// `matmul_blocked_h`: the matmul kernel with `b` stored as f16 pairs packed
@@ -158,6 +181,9 @@ pub struct ComputeEngine {
     matmul: Kernel,
     matmul_h: Kernel,
     matmul_q4: Kernel,
+    matvec: Kernel,
+    matvec_h: Kernel,
+    matvec_q4: Kernel,
     rope: Kernel,
     rms_norm: Kernel,
     rms_norm_bw: Kernel,
@@ -180,6 +206,7 @@ pub struct ComputeEngine {
     softmax_bw: Kernel,
     dequant: Kernel,
     top_k: Kernel,
+    argmax_rows: Kernel,
     affine_dequant: Kernel,
     conv1d: Kernel,
     conv1d_bw: Kernel,
@@ -195,6 +222,7 @@ pub struct ComputeEngine {
     masked_ce: Kernel,
     sum_squares: Kernel,
     flash_attn_v2: Kernel,
+    flash_attn_decode: Kernel,
     flash_attn_v2_bw_dq: Kernel,
     flash_attn_v2_bw_dkdv: Kernel,
 }
@@ -215,6 +243,9 @@ impl ComputeEngine {
             matmul: k("matmul_blocked"),
             matmul_h: k("matmul_blocked_h"),
             matmul_q4: k("matmul_blocked_q4"),
+            matvec: k("matvec"),
+            matvec_h: k("matvec_h"),
+            matvec_q4: k("matvec_q4"),
             rope: k("rope"),
             rms_norm: k("rms_norm"),
             rms_norm_bw: k("rms_norm_backward"),
@@ -237,6 +268,7 @@ impl ComputeEngine {
             softmax_bw: k("softmax_backward"),
             dequant: k("dequantize"),
             top_k: k("top_k"),
+            argmax_rows: k("argmax_rows"),
             affine_dequant: k("affine_dequantize"),
             conv1d: k("conv1d"),
             conv1d_bw: k("conv1d_backward"),
@@ -252,6 +284,7 @@ impl ComputeEngine {
             masked_ce: k("masked_cross_entropy"),
             sum_squares: k("sum_squares_partial"),
             flash_attn_v2: k("flash_attention_v2_metal"),
+            flash_attn_decode: k("flash_attention_decode"),
             flash_attn_v2_bw_dq: k("flash_bwd_dq"),
             flash_attn_v2_bw_dkdv: k("flash_bwd_dk_dv"),
         }

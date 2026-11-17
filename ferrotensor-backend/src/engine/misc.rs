@@ -1,6 +1,6 @@
-//! Top-k selection and depthwise 1-D convolution.
+//! Top-k and argmax selection, and depthwise 1-D convolution.
 
-use super::{groups64, uniform, ComputeEngine};
+use super::{grid, groups64, uniform, ComputeEngine};
 use crate::{UnifiedTensor, WgpuContext};
 
 impl ComputeEngine {
@@ -14,6 +14,22 @@ impl ComputeEngine {
             &self.top_k,
             &[(0, input.buffer()), (1, out_idx.buffer()), (2, &params)],
             (1, 1, 1),
+        );
+    }
+
+    /// Writes, as a `u32` per row into `out_idx`, the index of the largest
+    /// value in each row (last dimension) of `input`, in the order of
+    /// `f32::total_cmp` with the last index winning ties, as
+    /// `ferrotensor_loader::argmax` picks a greedy token.
+    pub fn argmax_rows(&self, ctx: &WgpuContext, input: &UnifiedTensor, out_idx: &UnifiedTensor) {
+        let len = input.shape.last().map_or(1, |&len| len.max(1));
+        let rows = input.shape.iter().product::<usize>() / len;
+        let params = uniform(ctx, bytemuck::cast_slice(&[len as u32]));
+        self.run(
+            ctx,
+            &self.argmax_rows,
+            &[(0, input.buffer()), (1, out_idx.buffer()), (2, &params)],
+            grid(rows as u32),
         );
     }
 

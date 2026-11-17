@@ -488,6 +488,36 @@ fn generate_profile_times_the_prefill_and_each_decode_token() {
     if decode_tokens > 0 {
         assert_kernels(&decode, "_per_token");
     }
+    if profile["kernel_timing"].is_string() {
+        let names = |section: &serde_json::Value| -> Vec<String> {
+            section["kernels"]
+                .as_array()
+                .expect("kernels")
+                .iter()
+                .map(|k| k["name"].as_str().expect("name").to_owned())
+                .collect()
+        };
+        let has = |names: &[String], name: &str| names.iter().any(|n| n == name);
+        // The prompt runs as one multi-row pass; greedy picks run on the GPU.
+        let prefill_names = names(&prefill);
+        assert!(has(&prefill_names, "flash_attention_v2_metal"), "{prefill}");
+        assert!(has(&prefill_names, "argmax_rows"), "{prefill}");
+        assert!(!has(&prefill_names, "flash_attention_decode"), "{prefill}");
+        // Each decode token is one row: matrix-vector products and the
+        // one-query attention kernel, each under its own name.
+        if decode_tokens > 0 {
+            let decode_names = names(&decode);
+            // f16 base weights by default: matvec_h.
+            assert!(
+                decode_names.iter().any(|n| n.starts_with("matvec")),
+                "{decode}"
+            );
+            for name in ["flash_attention_decode", "argmax_rows"] {
+                assert!(has(&decode_names, name), "{name}: {decode}");
+            }
+            assert!(!has(&decode_names, "flash_attention_v2_metal"), "{decode}");
+        }
+    }
     assert!(prefill["gpu_wait_seconds"].as_f64() >= Some(0.0), "{json}");
     assert!(
         decode["gpu_wait_seconds_per_token"].as_f64() >= Some(0.0),

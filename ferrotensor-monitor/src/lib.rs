@@ -11,7 +11,7 @@ use crossterm::{
 use ratatui::{prelude::*, widgets::*};
 use std::io;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sysinfo::System;
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -183,7 +183,7 @@ impl App {
         let mut sys = System::new_all();
         sys.refresh_all();
 
-        let now = chrono::Local::now().format("%H:%M").to_string();
+        let now = clock_label();
 
         Self {
             running: true,
@@ -528,7 +528,7 @@ pub fn run() -> Result<()> {
                                 app.chat_input.pop();
                             }
                             KeyCode::Enter if !app.chat_input.is_empty() => {
-                                let now = chrono::Local::now().format("%H:%M").to_string();
+                                let now = clock_label();
                                 let msg = std::mem::take(&mut app.chat_input);
                                 app.chat_history.push(ChatMessage {
                                     sender: "You".to_string(),
@@ -1193,4 +1193,42 @@ fn format_duration(seconds: f64) -> String {
     let mins = (seconds / 60.0) as u64;
     let secs = (seconds % 60.0) as u64;
     format!("{}:{:02}", mins, secs)
+}
+
+/// The current UTC time of day as `HH:MM UTC`. A system clock set before the Unix
+/// epoch reads as `00:00 UTC`.
+fn clock_label() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since_epoch| since_epoch.as_secs())
+        .unwrap_or(0);
+    format_utc_clock(secs)
+}
+
+/// Formats seconds since the Unix epoch as the UTC time of day, `HH:MM UTC`.
+fn format_utc_clock(epoch_secs: u64) -> String {
+    let minute_of_day = epoch_secs % 86_400 / 60;
+    format!("{:02}:{:02} UTC", minute_of_day / 60, minute_of_day % 60)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_utc_clock;
+
+    #[test]
+    fn utc_clock_formats_fixed_inputs() {
+        assert_eq!(format_utc_clock(0), "00:00 UTC");
+        assert_eq!(format_utc_clock(59), "00:00 UTC");
+        assert_eq!(format_utc_clock(60), "00:01 UTC");
+        assert_eq!(format_utc_clock(9 * 3600 + 5 * 60), "09:05 UTC");
+        assert_eq!(format_utc_clock(86_399), "23:59 UTC");
+        // 2026-11-17 12:01:31 UTC
+        assert_eq!(format_utc_clock(1_794_916_891), "12:01 UTC");
+        // The time of day repeats every 86,400 seconds.
+        assert_eq!(format_utc_clock(86_400), "00:00 UTC");
+        assert_eq!(
+            format_utc_clock(3 * 86_400 + 13 * 3600 + 7 * 60),
+            "13:07 UTC"
+        );
+    }
 }
