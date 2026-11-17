@@ -4,7 +4,7 @@
 use crate::Exit;
 use clap::Args;
 use ferrotensor_backend::adapters::{self, AdapterReport, CheckResult};
-use ferrotensor_backend::WgpuContext;
+use ferrotensor_backend::{KernelTimingMode, WgpuContext};
 use serde_json::{json, Value};
 
 /// Options for `ferrotensor info`.
@@ -35,6 +35,7 @@ fn adapter_json(a: &AdapterReport) -> Value {
         "max_compute_invocations_per_workgroup": a.max_compute_invocations_per_workgroup,
         "max_compute_workgroup_storage_size": a.max_compute_workgroup_storage_size,
         "shader_f16": a.shader_f16,
+        "kernel_timing": a.kernel_timing.map(KernelTimingMode::name),
         "selected": a.selected,
     })
 }
@@ -118,6 +119,10 @@ pub fn run(args: InfoArgs) -> Result<Exit, Box<dyn std::error::Error>> {
             println!(
                 "    shader f16        {}",
                 if a.shader_f16 { "yes" } else { "no" }
+            );
+            println!(
+                "    kernel timing     {}",
+                a.kernel_timing.map_or("none", KernelTimingMode::name)
             );
         }
         if adapters.iter().any(|a| a.selected) {

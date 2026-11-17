@@ -8,6 +8,7 @@
 use super::{adapter_metadata, build_model, load_base, restore_adapter, Loaded, ModelArgs, Result};
 use clap::Args;
 use ferrotensor_autograd::WarmupCosineScheduler;
+use ferrotensor_backend::KernelTiming;
 use ferrotensor_graph::lfm::Lfm2Model;
 use ferrotensor_graph::ClassifierHead;
 use ferrotensor_trainer::checkpoint::{save_lora_checkpoint, LoraMetadata};
@@ -341,7 +342,7 @@ pub(crate) async fn classify_train(args: ClassifyTrainArgs) -> Result<()> {
         None => None,
     };
 
-    let mut base = load_base(&args.model).await?;
+    let mut base = load_base(&args.model, KernelTiming::Off).await?;
     let taps = args
         .taps
         .clone()
@@ -546,7 +547,7 @@ pub(crate) async fn classify_predict(args: ClassifyPredictArgs) -> Result<()> {
         })
         .collect::<std::result::Result<Vec<Option<u32>>, String>>()?;
 
-    let mut base = load_base(&args.model).await?;
+    let mut base = load_base(&args.model, KernelTiming::Off).await?;
     let name = model_name(&args.model.model);
     if name != meta.base_model {
         eprintln!(

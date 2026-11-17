@@ -33,7 +33,7 @@ use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use ferrotensor_autograd::{no_grad, AdamW, OptimizerLoad, WarmupCosineScheduler};
 use ferrotensor_backend::q4::Q4Group;
 use ferrotensor_backend::{
-    ComputeEngine, ContextError, DType, MemoryCategory, UnifiedTensor, WgpuContext,
+    ComputeEngine, ContextError, DType, KernelTiming, MemoryCategory, UnifiedTensor, WgpuContext,
 };
 use ferrotensor_graph::lfm::{legacy_llama_name, Lfm2Model};
 use ferrotensor_graph::model_builder::{
@@ -443,7 +443,8 @@ struct TrainArgs {
         default_missing_value = "3"
     )]
     memory_report: Option<usize>,
-    /// Count GPU work per optimizer step; after the run, print the step
+    /// Count GPU work per optimizer step, and time each kernel on the GPU
+    /// when the adapter has timestamp queries; after the run, print the step
     /// with the median wall time and write OUT/profile.json.
     #[arg(long)]
     profile: bool,
@@ -521,6 +522,11 @@ struct GenerateArgs {
     /// Recompute the whole sequence every token instead of using the KV cache.
     #[arg(long)]
     no_kv_cache: bool,
+    /// Print the GPU work of the prefill and of a mean decode step, with the
+    /// GPU time of each kernel when the adapter has timestamp queries; with
+    /// --json also under `profile`.
+    #[arg(long)]
+    profile: bool,
     /// Stream the text to stderr and print one JSON object with it to stdout.
     #[arg(long)]
     json: bool,
@@ -684,7 +690,7 @@ struct Loaded {
     q4: Option<Q4Selection>,
 }
 
-async fn load_base(args: &ModelArgs) -> Result<Loaded> {
+async fn load_base(args: &ModelArgs, timing: KernelTiming) -> Result<Loaded> {
     let dir = &resolve_model(&args.model)?;
     let config_path = dir.join("config.json");
     let config = ModelLoader::load_config(&config_path)
@@ -710,7 +716,7 @@ async fn load_base(args: &ModelArgs) -> Result<Loaded> {
         ),
         Device::Cpu => (ferrotensor_backend::wgpu::PowerPreference::LowPower, true),
     };
-    let ctx = Arc::new(WgpuContext::try_new_with_options(power, fallback).await?);
+    let ctx = Arc::new(WgpuContext::try_new_with_timing(power, fallback, timing).await?);
     let engine = Arc::new(ComputeEngine::new(&ctx));
     eprintln!("device: {}", ctx.adapter_info());
     eprintln!(
@@ -1131,7 +1137,7 @@ async fn evaluate(
 }
 
 async fn eval(args: EvalArgs) -> Result<()> {
-    let base = load_base(&args.model).await?;
+    let base = load_base(&args.model, KernelTiming::Off).await?;
     let ds = load_dataset(&args.data, &base.tokenizer)?;
     let meta = args.lora.as_deref().map(adapter_metadata).transpose()?;
     let model = build_model(&base, meta.as_ref(), false)?;
@@ -1173,7 +1179,7 @@ struct EvalSummary {
 // generate
 
 async fn generate(args: GenerateArgs) -> Result<()> {
-    let base = load_base(&args.model).await?;
+    let base = load_base(&args.model, profile_report::kernel_timing(args.profile)).await?;
     let meta = args.lora.as_deref().map(adapter_metadata).transpose()?;
     let model = build_model(&base, meta.as_ref(), false)?;
     if let Some(path) = &args.lora {
@@ -1212,6 +1218,11 @@ async fn generate(args: GenerateArgs) -> Result<()> {
     };
     let kv_cache = cache.is_some();
     let mut text = String::new();
+    if args.profile {
+        // Kernels from loading the model are timed by this wait, not the prefill.
+        base.ctx.synchronize();
+    }
+    let start = profile_report::GpuMark::now(&base.ctx);
     let decoded = generate_tokens(
         &base,
         &model,
@@ -1226,8 +1237,16 @@ async fn generate(args: GenerateArgs) -> Result<()> {
     )
     .await?;
     stream_text("\n", args.json);
-    let summary = GenerateSummary::new(text, prompt.ids.len(), &decoded, kv_cache);
+    let mut summary = GenerateSummary::new(text, prompt.ids.len(), &decoded, kv_cache);
     eprintln!("{}", summary.stats_line());
+    if args.profile {
+        summary.profile = Some(profile_report::generate_report(
+            &base.ctx,
+            &start,
+            &decoded.after_prefill,
+            decoded.decode_steps,
+        ));
+    }
     if args.json {
         print_json(&summary)?;
     }
@@ -1244,6 +1263,9 @@ struct GenerateSummary {
     tokens_per_second: f32,
     prefill_seconds: f32,
     kv_cache: bool,
+    /// With `--profile`: the GPU work of the prefill and of a decode step.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile: Option<serde_json::Value>,
 }
 
 impl GenerateSummary {
@@ -1260,6 +1282,7 @@ impl GenerateSummary {
             tokens_per_second,
             prefill_seconds: decoded.prefill.as_secs_f32(),
             kv_cache,
+            profile: None,
         }
     }
 
@@ -1388,6 +1411,8 @@ struct Decoded {
     cached_tokens: usize,
     /// Time to run the prompt and read back its logits.
     prefill: Duration,
+    /// GPU work totals when the prefill's logits were read.
+    after_prefill: profile_report::GpuMark,
     /// One-token forward passes after the prompt.
     decode_steps: usize,
     /// Time from the end of the prefill to the last new token.
@@ -1426,6 +1451,7 @@ async fn generate_tokens(
     });
     let mut host = logits.data.to_vec(&base.ctx).await;
     let prefill = start.elapsed();
+    let after_prefill = profile_report::GpuMark::now(&base.ctx);
     let decode_start = Instant::now();
     let mut decode_steps = 0;
     while generated.len() < max_new {
@@ -1456,6 +1482,7 @@ async fn generate_tokens(
         new_tokens: generated.len(),
         cached_tokens,
         prefill,
+        after_prefill,
         decode_steps,
         decode: decode_start.elapsed(),
     })
@@ -1554,7 +1581,7 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
     }
     let is_root = args.rank == 0;
 
-    let base = load_base(&args.model).await?;
+    let base = load_base(&args.model, profile_report::kernel_timing(args.profile)).await?;
     let mut dataset = load_dataset(&args.data, &base.tokenizer)?;
     let eval_ds = match &args.eval_data {
         Some(path) => {
@@ -2607,6 +2634,7 @@ mod tests {
             tokens_per_second: 8.0,
             prefill_seconds: 0.5,
             kv_cache: true,
+            profile: None,
         };
         assert_eq!(
             serde_json::to_value(&generate).unwrap(),
@@ -2653,6 +2681,7 @@ mod tests {
             new_tokens,
             cached_tokens: 0,
             prefill: Duration::from_millis(250),
+            after_prefill: profile_report::GpuMark::default(),
             decode_steps,
             decode: Duration::from_millis(decode_ms),
         }
@@ -2734,14 +2763,17 @@ mod tests {
         ferrotensor_trainer::pretrain::write_random_llama(dir, &size, 0).unwrap();
         let tokenizer = ferrotensor_loader::tokenizer::byte_level_tokenizer_json();
         fs::write(dir.join("tokenizer.json"), tokenizer.to_string()).unwrap();
-        pollster::block_on(load_base(&ModelArgs {
-            model: dir.to_path_buf(),
-            device: Device::Auto,
-            f32_weights: true,
-            f16_weights: false,
-            q4_weights: false,
-            q4: Q4Args::default(),
-        }))
+        pollster::block_on(load_base(
+            &ModelArgs {
+                model: dir.to_path_buf(),
+                device: Device::Auto,
+                f32_weights: true,
+                f16_weights: false,
+                q4_weights: false,
+                q4: Q4Args::default(),
+            },
+            KernelTiming::Off,
+        ))
         .unwrap()
     }
 

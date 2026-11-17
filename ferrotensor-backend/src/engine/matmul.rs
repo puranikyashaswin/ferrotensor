@@ -1,6 +1,7 @@
 //! Matrix multiplication kernels.
 
 use super::{uniform, ComputeEngine, Kernel};
+use crate::kernel_timing::KernelLabel;
 use crate::{DType, UnifiedTensor, WgpuContext};
 
 /// Operand layout understood by the `matmul_blocked` kernel.
@@ -139,9 +140,10 @@ impl ComputeEngine {
         let mode = layout as u32 | b.q4_group().map_or(0, |g| g.size().trailing_zeros() << 8);
         let params = uniform(ctx, bytemuck::cast_slice(&[m, k, n, mode]));
         // One 16x16 workgroup per 64x64 output tile.
-        self.run(
+        self.run_labeled(
             ctx,
             kernel,
+            matmul_label(kernel, layout, m, k, n),
             &[
                 (0, a.buffer()),
                 (1, b.buffer()),
@@ -150,5 +152,29 @@ impl ComputeEngine {
             ],
             (n.div_ceil(64), m.div_ceil(64), 1),
         );
+    }
+}
+
+/// The kernel timing label of a matmul: its layout and a size class, since
+/// decode rows (`m <= 4`), LoRA-rank shapes and large products run
+/// differently.
+fn matmul_label(kernel: &Kernel, layout: Layout, m: u32, k: u32, n: u32) -> KernelLabel {
+    let size_class = if m <= 4 {
+        "m<=4"
+    } else if m.min(k).min(n) <= 64 {
+        "min dim<=64"
+    } else if u64::from(m) * u64::from(n) < 1 << 20 {
+        "out<1M"
+    } else {
+        "out>=1M"
+    };
+    KernelLabel {
+        entry: kernel.entry_point,
+        layout: match layout {
+            Layout::Plain => "a@b",
+            Layout::TransposedB => "a@bT",
+            Layout::TransposedA => "aT@b",
+        },
+        size_class,
     }
 }
