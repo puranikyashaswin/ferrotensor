@@ -515,3 +515,33 @@ second per turn: `main` 18.9 / 17.1 / 15.7, decode kernels 56.7 / 55.0 /
 
 Sampled generation still reads the logits row back each step and samples on
 the host; greedy decoding reads back only the token id.
+
+# Real hardware run, 17 November 2026: thin matrix products in training
+
+One NVIDIA A10G (24 GB), Vulkan backend, release builds of `main` at
+`dab3301` and of the branch that adds the thin matmul kernel (`matmul_thin`,
+`matmul_thin_h`: products whose output has at most 64 rows, or with f32 `b`
+at most 64 columns). Same machine, builds interleaved, three runs each; the
+runs of one build differ by less than 0.3%.
+
+`train --profile`, sequence length 256, seconds per optimizer step:
+
+| Model | Batch x accumulation | `main` | Thin kernel |
+|---|---|---:|---:|
+| SmolLM2-135M | 1 x 8 | 1.193 | 0.961 |
+| SmolLM2-360M | 1 x 8 | 1.571 | 1.203 |
+| SmolLM2-1.7B | 1 x 8 | 2.233 | 1.697 |
+| SmolLM2-1.7B | 4 x 2 | 1.348 | 1.261 |
+
+At step 30 the training loss and gradient norm print the same on both builds
+for every model (2.5320 / 1.8838 / 1.4793).
+
+A 250-step `finetune` of SmolLM2-1.7B with the planner's setting (batch 4 x
+accumulation 2) took 328.0 s on `main` and 320.0 s on the branch. The
+held-out loss was 1.0612 on `main` and 1.0607 on the branch; the two differ
+because the thin kernel adds in a different order. The tracked peak was
+14,061 MiB on both.
+
+Greedy generation is unchanged, since one-row products already run the
+matrix-vector kernel: 108.9 and 110.9 tokens per second on SmolLM2-135M,
+57.0 and 57.2 on 1.7B.
