@@ -1412,7 +1412,6 @@ async fn generate_tokens(
     if prompt.ids.is_empty() {
         return Err(unmet("the prompt encodes to no tokens"));
     }
-    let vocab = base.config.vocab_size;
     let mut tokens = prompt.ids.clone();
     let mut generated: Vec<u32> = Vec::new();
     let mut printed = String::new();
@@ -1424,13 +1423,11 @@ async fn generate_tokens(
         Some(c) => c.feed(base, model, &prompt.ids[cached_tokens..]),
         None => model.forward(&base.engine, &tokens, 0, None, None),
     });
-    let mut host = logits.data.to_vec(&base.ctx).await;
+    let mut next = sample_last_row(base, sampler, &logits.data).await;
     let prefill = start.elapsed();
     let decode_start = Instant::now();
     let mut decode_steps = 0;
     while generated.len() < max_new {
-        let rows = host.len() / vocab;
-        let next = sampler.sample(&host[(rows - 1) * vocab..rows * vocab]);
         if prompt.stop.contains(&next) {
             break;
         }
@@ -1449,7 +1446,7 @@ async fn generate_tokens(
             Some(c) => c.feed(base, model, &[next]),
             None => model.forward(&base.engine, &tokens, 0, None, None),
         });
-        host = logits.data.to_vec(&base.ctx).await;
+        next = sample_last_row(base, sampler, &logits.data).await;
         decode_steps += 1;
     }
     Ok(Decoded {
@@ -1459,6 +1456,22 @@ async fn generate_tokens(
         decode_steps,
         decode: decode_start.elapsed(),
     })
+}
+
+/// The token `sampler` picks from the last row of `logits` `[.., vocab]`.
+/// Greedy decoding takes the argmax on the GPU and reads back token ids, not
+/// the logits.
+async fn sample_last_row(base: &Loaded, sampler: &mut Sampler, logits: &UnifiedTensor) -> u32 {
+    let vocab = base.config.vocab_size;
+    if sampler.is_greedy() {
+        let rows = logits.shape.iter().product::<usize>() / vocab;
+        let picks = UnifiedTensor::empty(&base.ctx, &[rows]);
+        base.engine.argmax_rows(&base.ctx, logits, &picks);
+        let picks = picks.to_vec(&base.ctx).await;
+        return picks.last().map_or(0, |id| id.to_bits());
+    }
+    let host = logits.to_vec(&base.ctx).await;
+    sampler.sample(&host[host.len() - vocab..])
 }
 
 // ---------------------------------------------------------------------------
@@ -2864,6 +2877,51 @@ mod tests {
                 assert_eq!(after, before[&name], "{name} moved");
             }
         }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Greedy decoding with the KV cache reads back one token id per step.
+    /// Runs of 1 and 9 new tokens share the prefill, so their difference is
+    /// 8 decode steps.
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn greedy_decoding_reads_back_one_token_id_per_step() {
+        let dir = std::env::temp_dir().join(format!("ferrotensor-decode-{}", std::process::id()));
+        let base = tiny_base(&dir);
+        let model = build_model(&base, None, false).unwrap();
+        let prompt = Prompt {
+            ids: INPUT.to_vec(),
+            stop: Vec::new(),
+        };
+        let work = |max_new: usize| {
+            let mut sampler = Sampler::new(0.0, 0, 1.0, None);
+            let mut cache = DecodeCache::new(&model, INPUT.len() + max_new);
+            assert!(cache.is_some());
+            let before = base.ctx.gpu_counters();
+            let decoded = pollster::block_on(generate_tokens(
+                &base,
+                &model,
+                &prompt,
+                max_new,
+                &mut sampler,
+                cache.as_mut(),
+                |_| {},
+            ))
+            .unwrap();
+            assert_eq!(decoded.new_tokens, max_new);
+            base.ctx.gpu_counters().since(&before)
+        };
+        let (one, nine) = (work(1), work(9));
+        let steps = 8;
+        let dispatches = (nine.dispatches - one.dispatches) / steps;
+        let readback_bytes = (nine.readback_bytes - one.readback_bytes) / steps;
+        let logits_row = 4 * base.config.vocab_size as u64;
+        eprintln!(
+            "per decode step: {dispatches} dispatches, {readback_bytes} readback bytes \
+             (reading the logits row back took {logits_row})"
+        );
+        assert_eq!(nine.readbacks - one.readbacks, steps);
+        assert_eq!(readback_bytes, 4);
         fs::remove_dir_all(&dir).unwrap();
     }
 }
