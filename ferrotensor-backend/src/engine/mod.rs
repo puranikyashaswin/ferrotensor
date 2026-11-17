@@ -1,6 +1,7 @@
 //! The compute engine: compiles the WGSL kernels and dispatches them.
 
 use crate::context::Dispatch;
+use crate::kernel_timing::KernelLabel;
 use crate::{UnifiedTensor, WgpuContext};
 use std::borrow::Cow;
 use std::sync::atomic::Ordering::Relaxed;
@@ -115,10 +116,11 @@ struct Kernel {
     /// Shared with the dispatches waiting to be encoded.
     pipeline: Arc<wgpu::ComputePipeline>,
     layout: wgpu::BindGroupLayout,
+    entry_point: &'static str,
 }
 
 impl Kernel {
-    fn new(device: &Device, module: &wgpu::ShaderModule, entry_point: &str) -> Self {
+    fn new(device: &Device, module: &wgpu::ShaderModule, entry_point: &'static str) -> Self {
         let pipeline = Arc::new(
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(entry_point),
@@ -128,7 +130,11 @@ impl Kernel {
             }),
         );
         let layout = pipeline.get_bind_group_layout(0);
-        Self { pipeline, layout }
+        Self {
+            pipeline,
+            layout,
+            entry_point,
+        }
     }
 }
 
@@ -231,7 +237,7 @@ impl ComputeEngine {
                 label: Some("Kernels"),
                 source: wgpu::ShaderSource::Wgsl(Cow::Owned(combined_src)),
             });
-        let k = |entry: &str| Kernel::new(&ctx.device, &module, entry);
+        let k = |entry: &'static str| Kernel::new(&ctx.device, &module, entry);
 
         Self {
             matmul: k("matmul_blocked"),
@@ -293,6 +299,24 @@ impl ComputeEngine {
         entries: &[(u32, &Buffer)],
         groups: (u32, u32, u32),
     ) {
+        let label = KernelLabel {
+            entry: kernel.entry_point,
+            layout: "",
+            size_class: "",
+        };
+        self.run_labeled(ctx, kernel, label, entries, groups);
+    }
+
+    /// [`run`](Self::run), with the `label` kernel timing reports the
+    /// dispatch under.
+    fn run_labeled(
+        &self,
+        ctx: &WgpuContext,
+        kernel: &Kernel,
+        label: KernelLabel,
+        entries: &[(u32, &Buffer)],
+        groups: (u32, u32, u32),
+    ) {
         let entries: Vec<wgpu::BindGroupEntry<'_>> = entries
             .iter()
             .map(|(binding, buf)| wgpu::BindGroupEntry {
@@ -311,6 +335,7 @@ impl ComputeEngine {
             pipeline: Arc::clone(&kernel.pipeline),
             bind_group,
             groups,
+            label,
         });
     }
 

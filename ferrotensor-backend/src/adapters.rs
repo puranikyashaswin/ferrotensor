@@ -5,7 +5,7 @@
 //! [`self_check`]. Both are meant for bug reports and for trying Ferrotensor
 //! on hardware it has not been tested on yet.
 
-use crate::{ComputeEngine, UnifiedTensor, WgpuContext};
+use crate::{ComputeEngine, KernelTimingMode, UnifiedTensor, WgpuContext};
 
 /// One adapter wgpu found, with the limits that matter for the kernels.
 #[derive(Clone, Debug, PartialEq)]
@@ -30,6 +30,9 @@ pub struct AdapterReport {
     pub max_compute_workgroup_storage_size: u32,
     /// Whether the adapter supports `f16` in shaders.
     pub shader_f16: bool,
+    /// How `--profile` would time kernels here; `None` without timestamp
+    /// queries.
+    pub kernel_timing: Option<KernelTimingMode>,
     /// Whether [`WgpuContext::new`] picks this adapter.
     pub selected: bool,
 }
@@ -76,6 +79,7 @@ fn report(adapter: &wgpu::Adapter, selected: Option<&wgpu::AdapterInfo>) -> Adap
         max_compute_invocations_per_workgroup: limits.max_compute_invocations_per_workgroup,
         max_compute_workgroup_storage_size: limits.max_compute_workgroup_storage_size,
         shader_f16: adapter.features().contains(wgpu::Features::SHADER_F16),
+        kernel_timing: KernelTimingMode::for_features(adapter.features()),
         selected: selected == Some(&info),
     }
 }
