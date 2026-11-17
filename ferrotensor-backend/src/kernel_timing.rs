@@ -152,7 +152,7 @@ fn add_timestamp_pairs(
     ticks: &[u64],
     period_ns: f32,
 ) {
-    for (label, pair) in labels.iter().zip(ticks.chunks_exact(2)) {
+    for (label, pair) in labels.iter().zip(ticks.as_chunks::<2>().0) {
         let total = totals.entry(*label).or_default();
         total.dispatches += 1;
         let nanos = pair[1].saturating_sub(pair[0]) as f64 * f64::from(period_ns);
@@ -360,8 +360,10 @@ impl KernelTimer {
                         .readback
                         .slice(..)
                         .get_mapped_range()
-                        .chunks_exact(8)
-                        .map(bytemuck::pod_read_unaligned)
+                        .as_chunks::<8>()
+                        .0
+                        .iter()
+                        .map(|bytes| u64::from_le_bytes(*bytes))
                         .collect();
                     add_timestamp_pairs(totals, &done.labels, &ticks, self.period_ns);
                     done.slot.readback.unmap();

@@ -199,7 +199,8 @@ fn kernel_times_span_several_submissions() {
 
     assert_eq!(values, vec![1.0; N]);
     assert_eq!(ops.submits, 3);
-    let times = ctx.kernel_times().by_gpu_time();
+    let kernels = ctx.kernel_times();
+    let times = kernels.by_gpu_time();
     assert_eq!(times.len(), 1, "{times:?}");
     assert_eq!(times[0].0, "gradient_scale");
     assert_eq!(times[0].1.dispatches, 300);
