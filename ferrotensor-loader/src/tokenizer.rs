@@ -531,13 +531,18 @@ impl Sampler {
         }
     }
 
+    /// Whether [`sample`](Self::sample) returns the [`argmax`] of the logits.
+    pub fn is_greedy(&self) -> bool {
+        self.temperature <= 0.0 || self.top_k == 1
+    }
+
     /// Pick a token id from one row of logits.
     pub fn sample(&mut self, logits: &[f32]) -> u32 {
         use rand::Rng;
         if logits.is_empty() {
             return 0;
         }
-        if self.temperature <= 0.0 || self.top_k == 1 {
+        if self.is_greedy() {
             return argmax(logits);
         }
 
@@ -599,12 +604,21 @@ mod tests {
     #[test]
     fn greedy_picks_argmax() {
         let mut s = Sampler::new(0.0, 0, 1.0, Some(1));
+        assert!(s.is_greedy());
         assert_eq!(s.sample(&[0.1, 3.0, -1.0, 2.9]), 1);
+    }
+
+    #[test]
+    fn argmax_returns_the_last_of_equal_maxima() {
+        assert_eq!(argmax(&[1.0, 3.0, 2.0, 3.0, 0.0]), 3);
+        assert_eq!(argmax(&[-0.0, 0.0, -0.0]), 1);
     }
 
     #[test]
     fn top_k_one_is_greedy() {
         let mut s = Sampler::new(1.5, 1, 1.0, Some(7));
+        assert!(s.is_greedy());
+        assert!(!Sampler::new(1.5, 2, 1.0, None).is_greedy());
         for _ in 0..20 {
             assert_eq!(s.sample(&[0.0, 0.5, 0.4]), 1);
         }

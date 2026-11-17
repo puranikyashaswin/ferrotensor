@@ -153,9 +153,16 @@ impl ComputeEngine {
                 &dummy
             }
         };
+        // One query (decoding) gets a kernel whose threads split the keys;
+        // the other gives each thread a query, which would leave 127 idle.
+        let kernel = if dims.seq_q == 1 {
+            &self.flash_attn_decode
+        } else {
+            &self.flash_attn_v2
+        };
         self.run(
             ctx,
-            &self.flash_attn_v2,
+            kernel,
             &[
                 (0, q.buffer()),
                 (1, k.buffer()),

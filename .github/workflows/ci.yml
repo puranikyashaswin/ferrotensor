@@ -243,12 +243,13 @@ jobs:
       # Pull requests on DX12: every backend kernel against its CPU reference
       # (9 min on WARP); with the two Tensor API steps below, which check
       # forward values and gradients against the CPU, the job took 14
-      # minutes. The PyTorch gradient parity binary alone took 7 more.
+      # minutes. The PyTorch gradient parity binary alone took 7 more. The
+      # GPU counter and kernel timing tests are small and run here too.
       - name: GPU kernels (DX12 pull-request subset)
         if: ${{ !cancelled() && env.FULL_SUITE != 'true' }}
         run: |
           echo "pull request on DX12: running the subset; the full suite runs on main, weekly and by workflow_dispatch"
-          cargo test --release -p ferrotensor-backend --test gpu_kernels --no-fail-fast -- --ignored --test-threads=1
+          cargo test --release -p ferrotensor-backend --test gpu_kernels --test gpu_counters --no-fail-fast -- --ignored --test-threads=1
       - name: Autograd finite-difference checks
         if: ${{ !cancelled() && env.FULL_SUITE == 'true' }}
         run: cargo test --release -p ferrotensor-autograd --test grad_check -- --test-threads=1

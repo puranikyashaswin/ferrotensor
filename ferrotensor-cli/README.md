@@ -482,6 +482,61 @@ submit ends early;
 device polls are the polls made while waiting for the GPU (each submit
 also runs wgpu's device maintenance).
 
+### GPU time by kernel
+
+When the adapter has timestamp queries, `--profile` also times every
+kernel dispatch on the GPU and prints, after the totals, a table of the
+median step sorted by GPU time:
+
+```text
+profile: kernel timestamps before and after each dispatch, inside passes of up to 8 dispatches
+profile: GPU time by kernel in that step
+  kernel                                       dispatches       GPU ms   share
+  <kernel>                                          <n>         <ms>     <%>
+  ...
+  sum of kernel times <ms> ms; waiting on the GPU <ms> ms
+```
+
+`profile.json` gets `kernel_timing`, `kernel_gpu_seconds_per_step` and a
+`kernels` array of `name`, `dispatches_per_step` and
+`gpu_seconds_per_step`, longest first. A kernel is named by its WGSL entry
+point; matmul also by layout (`a@b`, `a@bT` for `b` transposed, `aT@b` for
+`a` transposed) and a size class: `m<=4` (few rows), `min dim<=64`
+(LoRA-rank shapes), and otherwise fewer (`out<1M`) or at least
+(`out>=1M`) 2^20 output elements. `matmul_blocked_h` reads f16 weights and
+`matmul_blocked_q4` 4-bit weights. A one-row product `a@b` runs as
+`matvec`, `matvec_h` or `matvec_q4` instead, one-query attention as
+`flash_attention_decode`, and greedy picks as `argmax_rows`; in
+`generate --profile` these make up most of the decode table.
+
+`generate --profile` prints the same table for the prefill (one pass over
+the prompt) and per decode token (the mean of the one-token passes), and
+with `--json` adds a `profile` object: `kernel_timing`, `prefill`
+(`gpu_wait_seconds`, `kernel_gpu_seconds`, `kernels` of `name`,
+`dispatches`, `gpu_seconds`) and `decode` (`tokens`,
+`gpu_wait_seconds_per_token`, `kernel_gpu_seconds_per_token`, `kernels` of
+`name`, `dispatches_per_token`, `gpu_seconds_per_token`).
+
+`kernel_timing` says how the timestamps were taken. `inside_passes`
+writes one before and one after each dispatch, inside the usual passes of
+up to 8 dispatches. `pass_boundaries` is for adapters that cannot write
+timestamps inside a pass (Apple GPUs among them): each dispatch then gets
+its own pass, timed at its start and end, so compute passes and wall
+times differ from a run without `--profile`. It is `null`, with one line
+on stderr and an empty `kernels` array, when the adapter has no timestamp
+queries; `ferrotensor info` shows which mode an adapter supports. The
+timestamps are read back at the waits the step already makes; nothing
+waits for them, and without `--profile` no timestamps are written.
+
+A timestamp records when the GPU reached that point of its work, so a
+kernel's time includes the barrier wgpu puts before it, and the sum over
+kernels leaves out time the GPU sat idle between dispatches and
+submissions. The table attributes GPU time to kernels; it is not an exact
+budget. Its sum is printed next to the time the host waited for the GPU.
+The wait leaves out GPU work done while the host was still recording, so
+the sum can be above it; a sum far below it points at idle gaps rather
+than at any one kernel.
+
 ## A standalone model: `merge`
 
 `merge` folds a LoRA adapter into the base weights and writes a model
@@ -664,6 +719,13 @@ new token counts, the prefill time (running the prompt) and the decode speed,
 which counts the one-token forward passes after the prompt and leaves the
 prefill out; `--json` reports them as `prefill_seconds` and
 `tokens_per_second` (null when no such pass ran).
+
+Each decode step runs one token through the model. Its linear layers use a
+matrix-vector kernel (f32, f16 and 4-bit weights) and its attention a kernel
+whose threads split the cached keys, instead of the kernels training uses
+for many rows. Greedy decoding (`--temperature 0` or `--top-k 1`) picks the
+token on the GPU and reads back only its id, 4 bytes per step; other
+sampling reads the logits back and samples on the host as before.
 
 ## Talk to a model: `chat`
 
