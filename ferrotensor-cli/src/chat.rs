@@ -6,6 +6,7 @@ use crate::{
     stream_text, unmet, DecodeCache, GenerateSummary, ModelArgs, Prompt, Result, SamplingArgs,
 };
 use clap::Args;
+use ferrotensor_backend::KernelTiming;
 use ferrotensor_loader::Tokenizer;
 use std::io::{BufRead as _, IsTerminal as _};
 use std::path::PathBuf;
@@ -35,7 +36,7 @@ pub struct ChatArgs {
 
 /// Runs the conversation until end of input, `/exit` or `/quit`.
 pub async fn run(args: ChatArgs) -> Result<()> {
-    let base = load_base(&args.model).await?;
+    let base = load_base(&args.model, KernelTiming::Off).await?;
     let tokenizer = &base.tokenizer;
     if !["<|im_start|>", "<|im_end|>"]
         .iter()
