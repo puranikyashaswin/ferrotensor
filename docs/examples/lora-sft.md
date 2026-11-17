@@ -197,7 +197,7 @@ with f16 base weights, sequence length 256, 8-step gradient accumulation and
 size from `/usr/bin/time -v`.
 
 **Confirmation run of merged `main`.** One session, the released v0.6.0
-(`fb6fc49`) against merged `main` (`af41068`):
+(`fb6fc49`) against `main` at `af41068`, merged before the 0.7.0 release:
 
 | Model | 0.6 GPU | 0.7 GPU | 0.7 `--checkpoint-blocks` GPU | 0.6 host | 0.7 host | Time per step 0.7 → `--checkpoint-blocks` |
 |---|---:|---:|---:|---:|---:|---:|
