@@ -488,3 +488,30 @@ Ferrotensor counts itself.
 - `pretrain` with the defaults reached loss 1.2271 in 71.2 s (peak 246 MiB),
   and the 19,079,808-parameter model 0.7507 in 916.7 s (peak 1,487 MiB),
   the same losses as on the A10G.
+
+# Real hardware run, 17 November 2026: generation
+
+One NVIDIA A10G (24 GB), Vulkan backend, release builds of `main` at
+`612b3f7` and of the branch that adds the decode kernels (a matrix-vector
+kernel for one-row products, one-query attention and the GPU argmax). Same
+machine, builds interleaved, three runs each; the runs of one build differ by
+less than 1.5%. The output text was byte-identical between the two builds on
+every run (same SHA-256): greedy `generate` on all three models and a
+three-turn greedy `chat` on 1.7B.
+
+`generate`, 120 new tokens, decode speed in tokens per second:
+
+| Model | Sampling | `main` | Decode kernels |
+|---|---|---:|---:|
+| SmolLM2-135M | greedy | 58.4 | 110.1 |
+| SmolLM2-360M | greedy | 39.8 | 96.7 |
+| SmolLM2-1.7B | greedy | 18.9 | 56.9 |
+| SmolLM2-135M | `--temperature 0.7 --seed 7` | 52.6 | 91.5 |
+| SmolLM2-1.7B | `--temperature 0.7 --seed 7` | 18.3 | 51.2 |
+
+Three-turn greedy `chat` on SmolLM2-1.7B with the kept KV cache, tokens per
+second per turn: `main` 18.9 / 17.1 / 15.7, decode kernels 56.7 / 55.0 /
+53.4.
+
+Sampled generation still reads the logits row back each step and samples on
+the host; greedy decoding reads back only the token id.

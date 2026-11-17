@@ -236,3 +236,103 @@ fn flash_attention_v2_metal(
         }
     }
 }
+
+// ----------------------------------------------------------------------------
+// One query (seq_q == 1, decoding against a KV cache): the kernel above
+// would give the whole cache to one of its 128 threads. Here a workgroup
+// per (batch, head) takes FA_DEC_KEYS keys at a time, one score per thread,
+// then each thread below head_dim adds one output dimension over those keys.
+// Same bindings, parameters and maths as flash_attention_v2_metal.
+
+const FA_DEC_KEYS: u32 = 128u;
+
+var<workgroup> fa_dec_q: array<vec4<f32>, 32>; // [FA_MAX_D / 4]
+var<workgroup> fa_dec_w: array<f32, 128>;      // [FA_DEC_KEYS]
+var<workgroup> fa_dec_red: array<f32, 128>;
+
+// Max (or sum) of `v` over the workgroup.
+fn fa_dec_reduce(lid: u32, v: f32, take_max: bool) -> f32 {
+    fa_dec_red[lid] = v;
+    workgroupBarrier();
+    for (var s = FA_DEC_KEYS / 2u; s > 0u; s = s >> 1u) {
+        if (lid < s) {
+            let a = fa_dec_red[lid];
+            let b = fa_dec_red[lid + s];
+            fa_dec_red[lid] = select(a + b, max(a, b), take_max);
+        }
+        workgroupBarrier();
+    }
+    let r = fa_dec_red[0];
+    workgroupBarrier();
+    return r;
+}
+
+@compute @workgroup_size(128, 1, 1)
+fn flash_attention_decode(
+    @builtin(local_invocation_index) lid: u32,
+    @builtin(workgroup_id) wg_id: vec3<u32>,
+) {
+    let p = flash_v2_params;
+    let d_len = p.head_dim;
+    let d4 = (d_len + 3u) / 4u;
+    let batch_idx = wg_id.z / p.num_heads;
+    let head_idx = wg_id.z % p.num_heads;
+    let kv_head_idx = head_idx / (p.num_heads / p.num_kv_heads);
+    let q_base = (batch_idx * p.num_heads + head_idx) * d_len;
+    if (lid < d4) { fa_dec_q[lid] = fa_ld4(0u, q_base, lid, d_len) * p.scale; }
+    workgroupBarrier();
+
+    let qa = p.causal_offset;
+    var k_end = p.seq_k;
+    if (p.causal == 1u) { k_end = min(p.seq_k, qa + 1u); }
+    var k_begin = 0u;
+    if (p.window > 0u) {
+        if (qa + 1u > p.window) { k_begin = qa + 1u - p.window; }
+        if (p.causal == 0u) { k_end = min(k_end, qa + p.window); }
+    }
+
+    let bh = batch_idx * p.num_heads + head_idx;
+    let mask_base = batch_idx * p.mask_stride_b + head_idx * p.mask_stride_h;
+    var m_run = FA_MASKED;
+    var l_run = 0.0;
+    var acc = 0.0;
+    for (var k_start = k_begin; k_start < k_end; k_start += FA_DEC_KEYS) {
+        let kp = k_start + lid;
+        var sc = FA_MASKED;
+        if (fa_visible(p, 0u, kp)) {
+            let base = ((batch_idx * p.seq_k + kp) * p.num_kv_heads + kv_head_idx) * d_len;
+            var dot4 = vec4<f32>(0.0);
+            for (var c = 0u; c < d4; c++) {
+                dot4 = fma(fa_dec_q[c], fa_ld4(1u, base, c, d_len), dot4);
+            }
+            sc = dot4.x + dot4.y + dot4.z + dot4.w;
+            if (p.has_mask == 1u) {
+                sc += flash_v2_mask[mask_base + kp * p.mask_stride_k];
+            }
+        }
+        // A tile with every key masked leaves m_new = m_run, corr = 1 and
+        // all weights 0, which is the other kernel's skip.
+        let m_new = max(m_run, fa_dec_reduce(lid, sc, true));
+        let corr = exp(m_run - m_new);
+        var pj = 0.0;
+        if (sc > FA_MASKED) { pj = exp(sc - m_new); }
+        fa_dec_w[lid] = pj * dropout_scale(p.dropout_prob, p.seed_val, p.seed_hi, bh, 0u, kp);
+        l_run = l_run * corr + fa_dec_reduce(lid, pj, false);
+        if (lid < d_len) {
+            acc *= corr;
+            let keys = min(FA_DEC_KEYS, k_end - k_start);
+            for (var j = 0u; j < keys; j++) {
+                let v_row = ((batch_idx * p.seq_k + k_start + j) * p.num_kv_heads + kv_head_idx) * d_len;
+                acc = fma(fa_dec_w[j], flash_v2_v[v_row + lid], acc);
+            }
+        }
+        m_run = m_new;
+        workgroupBarrier();
+    }
+
+    if (lid < d_len) {
+        var inv = 0.0;
+        if (l_run > 0.0) { inv = 1.0 / l_run; }
+        flash_v2_out[q_base + lid] = acc * inv;
+    }
+}

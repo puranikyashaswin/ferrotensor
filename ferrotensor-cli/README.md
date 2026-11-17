@@ -665,6 +665,13 @@ which counts the one-token forward passes after the prompt and leaves the
 prefill out; `--json` reports them as `prefill_seconds` and
 `tokens_per_second` (null when no such pass ran).
 
+Each decode step runs one token through the model. Its linear layers use a
+matrix-vector kernel (f32, f16 and 4-bit weights) and its attention a kernel
+whose threads split the cached keys, instead of the kernels training uses
+for many rows. Greedy decoding (`--temperature 0` or `--top-k 1`) picks the
+token on the GPU and reads back only its id, 4 bytes per step; other
+sampling reads the logits back and samples on the host as before.
+
 ## Talk to a model: `chat`
 
 `chat` holds a multi-turn conversation with a base model or, with `--lora`,
