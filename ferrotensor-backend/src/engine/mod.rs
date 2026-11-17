@@ -32,8 +32,10 @@ fn shader_source() -> String {
     let matvec_src = &include_str!("../shaders/matvec.wgsl").replace("\r\n", "\n");
     let matvec_h_src = half_w_matvec(matvec_src);
     let matvec_q4_src = include_str!("../shaders/matvec_q4.wgsl");
+    let thin_src = &include_str!("../shaders/matmul_thin.wgsl").replace("\r\n", "\n");
+    let thin_h_src = half_w_thin_matmul(thin_src);
     format!(
-        "{kernels_src}\n{matmul_src}\n{matmul_h_src}\n{matmul_q4_src}\n{matvec_src}\n{matvec_h_src}\n{matvec_q4_src}\n{flash_v2_src}\n{flash_v2_bw_src}"
+        "{kernels_src}\n{matmul_src}\n{matmul_h_src}\n{matmul_q4_src}\n{matvec_src}\n{matvec_h_src}\n{matvec_q4_src}\n{thin_src}\n{thin_h_src}\n{flash_v2_src}\n{flash_v2_bw_src}"
     )
 }
 
@@ -55,6 +57,27 @@ fn half_w_matvec(src: &str) -> String {
     .replace("fn matvec(", "fn matvec_h(")
     .replace("mv_", "mvh_")
     .replace("MV_", "MVH_")
+}
+
+/// `matmul_thin_h`: the thin matmul with its wide operand `w` stored as f16
+/// pairs packed into `u32` words, generated from matmul_thin.wgsl like
+/// [`half_b_matmul`]. A pair that starts on an even element is one word,
+/// read once.
+fn half_w_thin_matmul(src: &str) -> String {
+    const W_DECL: &str = "var<storage, read> mt_w: array<f32>;";
+    const W_LOAD: &str = "    if (both) { return vec2<f32>(mt_w[i], mt_w[i + 1u]); }\n    return vec2<f32>(mt_w[i], 0.0);";
+    assert!(
+        src.contains(W_DECL) && src.contains(W_LOAD),
+        "matmul_thin.wgsl changed"
+    );
+    src.replace(
+        W_LOAD,
+        "    let word = unpack2x16float(mt_w[i >> 1u]);\n    if ((i & 1u) == 0u) { return select(vec2<f32>(word.x, 0.0), word, both); }\n    if (!both) { return vec2<f32>(word.y, 0.0); }\n    return vec2<f32>(word.y, unpack2x16float(mt_w[(i >> 1u) + 1u]).x);",
+    )
+    .replace(W_DECL, "var<storage, read> mt_w: array<u32>;")
+    .replace("fn matmul_thin(", "fn matmul_thin_h(")
+    .replace("mt_", "mth_")
+    .replace("MT_", "MTH_")
 }
 
 /// `matmul_blocked_h`: the matmul kernel with `b` stored as f16 pairs packed
@@ -181,6 +204,8 @@ pub struct ComputeEngine {
     matmul: Kernel,
     matmul_h: Kernel,
     matmul_q4: Kernel,
+    matmul_thin: Kernel,
+    matmul_thin_h: Kernel,
     matvec: Kernel,
     matvec_h: Kernel,
     matvec_q4: Kernel,
@@ -243,6 +268,8 @@ impl ComputeEngine {
             matmul: k("matmul_blocked"),
             matmul_h: k("matmul_blocked_h"),
             matmul_q4: k("matmul_blocked_q4"),
+            matmul_thin: k("matmul_thin"),
+            matmul_thin_h: k("matmul_thin_h"),
             matvec: k("matvec"),
             matvec_h: k("matvec_h"),
             matvec_q4: k("matvec_q4"),

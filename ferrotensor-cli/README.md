@@ -501,11 +501,14 @@ profile: GPU time by kernel in that step
 `kernels` array of `name`, `dispatches_per_step` and
 `gpu_seconds_per_step`, longest first. A kernel is named by its WGSL entry
 point; matmul also by layout (`a@b`, `a@bT` for `b` transposed, `aT@b` for
-`a` transposed) and a size class: `m<=4` (few rows), `min dim<=64`
-(LoRA-rank shapes), and otherwise fewer (`out<1M`) or at least
-(`out>=1M`) 2^20 output elements. `matmul_blocked_h` reads f16 weights and
-`matmul_blocked_q4` 4-bit weights. A one-row product `a@b` runs as
-`matvec`, `matvec_h` or `matvec_q4` instead, one-query attention as
+`a` transposed) and a size class. `matmul_blocked` (the 64x64-tile kernel)
+uses `m<=4` (few rows), `min dim<=64` (LoRA-rank shapes), and otherwise
+fewer (`out<1M`) or at least (`out>=1M`) 2^20 output elements;
+`matmul_blocked_h` reads f16 weights and `matmul_blocked_q4` 4-bit weights.
+`matmul_thin` and `matmul_thin_h` (f16 weights) run products whose output
+has at most 64 rows (`m<=64`) or, with f32 `b`, at most 64 columns
+(`n<=64`, such as LoRA `x @ A`). A one-row product `a@b` runs as `matvec`,
+`matvec_h` or `matvec_q4` instead, one-query attention as
 `flash_attention_decode`, and greedy picks as `argmax_rows`; in
 `generate --profile` these make up most of the decode table.
 
