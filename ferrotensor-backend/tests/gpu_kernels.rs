@@ -551,6 +551,72 @@ fn matmul_at_matches_cpu() {
     }
 }
 
+/// `(m, k, n)` of products with a short output side, which run the thin
+/// kernel: M of 2, 3, 63 and 64 against wide N; K of 1 and off the 32 a
+/// workgroup steps by; N of 1 and wider than a vocabulary block; the LoRA
+/// shapes of rank 8 and rank 1 (`x @ A` with 8 or 1 columns, `(x A) @ B`
+/// with K of 8 or 1, `dB` with 8 rows).
+const THIN_SHAPES: &[(usize, usize, usize)] = &[
+    (2, 37, 1),
+    (3, 1000, 5000),
+    (2, 2049, 7),
+    (63, 33, 129),
+    (64, 576, 192),
+    (200, 576, 8),
+    (40, 8, 576),
+    (300, 64, 1),
+    (40, 1, 576),
+    (8, 63, 2048),
+];
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn thin_matmul_matches_cpu_in_every_layout() {
+    // f32 in all three layouts, and f16 `b` forward and transposed. With f32
+    // the short side may be N (the kernel then runs on the transposed
+    // product); f16 `b` with few columns takes the tile kernel.
+    let g = gpu();
+    for (seed, &(m, k, n)) in THIN_SHAPES.iter().enumerate() {
+        let a = rand_vec(m * k, 3000 + seed as u64);
+        let b: Vec<f32> = rand_vec(k * n, 3100 + seed as u64)
+            .iter()
+            .map(|v| v * 0.1)
+            .collect();
+        let check = |name: &str, out: &UnifiedTensor, b_seen: &[f32]| {
+            assert_close(
+                &format!("{name} {m}x{k}x{n}"),
+                &read(out),
+                &cpu_matmul(&a, b_seen, m, k, n),
+                1e-4,
+                1e-4,
+            );
+        };
+        let (bt, at) = (transpose(&b, k, n), transpose(&a, m, k));
+        let a_up = upload(&a, &[m, k]);
+
+        let out = zeros(&[m, n]);
+        g.engine.matmul(&g.ctx, &a_up, &upload(&b, &[k, n]), &out);
+        check("matmul", &out, &b);
+        let out = zeros(&[m, n]);
+        g.engine
+            .matmul_bt(&g.ctx, &a_up, &upload(&bt, &[n, k]), &out);
+        check("matmul_bt", &out, &b);
+        let out = zeros(&[m, n]);
+        g.engine
+            .matmul_at(&g.ctx, &upload(&at, &[k, m]), &upload(&b, &[k, n]), &out);
+        check("matmul_at", &out, &b);
+
+        let b_h = UnifiedTensor::from_f32_as_f16(&g.ctx, &b, &[k, n]);
+        let out = zeros(&[m, n]);
+        g.engine.matmul_f16b(&g.ctx, &a_up, &b_h, &out);
+        check("matmul_f16b", &out, &f16_round(&b));
+        let bt_h = UnifiedTensor::from_f32_as_f16(&g.ctx, &bt, &[n, k]);
+        let out = zeros(&[m, n]);
+        g.engine.matmul_bt_f16b(&g.ctx, &a_up, &bt_h, &out);
+        check("matmul_bt_f16b", &out, &f16_round(&b));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Element-wise ops and their backward passes
 // ---------------------------------------------------------------------------
