@@ -279,7 +279,11 @@ pub fn build_sft_example(
         )
     };
 
-    Ok(sft_example_from_tokens(prompt_tokens, response_tokens, max_len))
+    Ok(sft_example_from_tokens(
+        prompt_tokens,
+        response_tokens,
+        max_len,
+    ))
 }
 
 /// The tokenized half of [`build_sft_example`]: `prompt_tokens` followed by

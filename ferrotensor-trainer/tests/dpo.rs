@@ -202,7 +202,11 @@ fn max_abs_diff(actual: &[f32], expected: &[f32]) -> (f64, f64) {
     for (&a, &e) in actual.iter().zip(expected) {
         let d = (a as f64 - e as f64).abs();
         // NaN must fail.
-        err = if d.is_nan() { f64::INFINITY } else { err.max(d) };
+        err = if d.is_nan() {
+            f64::INFINITY
+        } else {
+            err.max(d)
+        };
         scale = scale.max((e as f64).abs());
     }
     (err, scale)
@@ -235,8 +239,14 @@ fn reference_pass_runs_the_base_model_without_a_graph() {
         })
     });
     assert!(adapters_enabled(), "the switch must restore the adapters");
-    assert!(reference.creator.is_none(), "reference logits recorded a graph");
-    assert!(!reference.requires_grad, "reference logits require a gradient");
+    assert!(
+        reference.creator.is_none(),
+        "reference logits recorded a graph"
+    );
+    assert!(
+        !reference.requires_grad,
+        "reference logits require a gradient"
+    );
     let (base_shape, base) = &expected["logits.base"];
     assert_eq!(&reference.data.shape, base_shape);
     let (err, _) = max_abs_diff(&host(&gpu, &reference.data), base);
@@ -297,7 +307,12 @@ fn host_log_prob(logits: &[f32], vocab: usize, targets: &[u32], mask: &[u8]) -> 
             continue;
         }
         let max = row.iter().fold(f64::NEG_INFINITY, |m, &x| m.max(x as f64));
-        let lse = max + row.iter().map(|&x| (x as f64 - max).exp()).sum::<f64>().ln();
+        let lse = max
+            + row
+                .iter()
+                .map(|&x| (x as f64 - max).exp())
+                .sum::<f64>()
+                .ln();
         sum += row[targets[r] as usize] as f64 - lse;
         n += 1;
     }
@@ -313,7 +328,9 @@ fn dpo_loss_and_gradient_match_the_host_formula() {
     let gpu = gpu();
     let (sequences, seq, vocab) = (4usize, 5usize, 7usize);
     let values = common::pseudo_random(sequences * seq * vocab, 77, 3.0);
-    let targets: Vec<u32> = (0..sequences * seq).map(|i| ((i * 5 + 2) % vocab) as u32).collect();
+    let targets: Vec<u32> = (0..sequences * seq)
+        .map(|i| ((i * 5 + 2) % vocab) as u32)
+        .collect();
     let mask: Vec<u8> = [
         [0, 1, 1, 1, 0],
         [0, 0, 1, 1, 1],
@@ -395,14 +412,27 @@ fn dpo_loss_and_gradient_match_the_host_formula() {
         let got_logp: Vec<(f64, usize)> = scored
             .iter()
             .flat_map(|s| {
-                sequence_log_probs(s.logits, s.target_ids, s.loss_mask, s.sequences, &gpu.engine)
-                    .expect("log-probs")
+                sequence_log_probs(
+                    s.logits,
+                    s.target_ids,
+                    s.loss_mask,
+                    s.sequences,
+                    &gpu.engine,
+                )
+                .expect("log-probs")
             })
             .collect();
         for (s, &(lp, tokens)) in got_logp.iter().enumerate() {
-            let expect_tokens = mask[s * seq..(s + 1) * seq].iter().filter(|&&m| m != 0).count();
+            let expect_tokens = mask[s * seq..(s + 1) * seq]
+                .iter()
+                .filter(|&&m| m != 0)
+                .count();
             assert_eq!(tokens, expect_tokens, "sequence {s} tokens");
-            assert!((lp - logp[s]).abs() < 1e-5, "sequence {s}: {lp} vs {}", logp[s]);
+            assert!(
+                (lp - logp[s]).abs() < 1e-5,
+                "sequence {s}: {lp} vs {}",
+                logp[s]
+            );
         }
 
         let out = dpo_loss(&scored, &reference, beta, &gpu.engine).expect("dpo loss");
@@ -510,7 +540,11 @@ fn check_pytorch_case(case_name: &str, per_sequence: bool) {
 
     let label = format!(
         "{case_name}{}",
-        if per_sequence { ", one pass per sequence" } else { "" }
+        if per_sequence {
+            ", one pass per sequence"
+        } else {
+            ""
+        }
     );
     let mut text = format!(
         "\nDPO parity [{label}] vs PyTorch, beta {}: loss and gradients pass if |a-e| <= {PARITY_ATOL:e}\n\
@@ -519,7 +553,12 @@ fn check_pytorch_case(case_name: &str, per_sequence: bool) {
     );
     let mut failing = Vec::new();
     let loss_err = (loss.value as f64 - case.loss).abs();
-    text += &format!("{:<40} {:>12.4e} {:>12.3e}\n", "loss", case.loss.abs(), loss_err);
+    text += &format!(
+        "{:<40} {:>12.4e} {:>12.3e}\n",
+        "loss",
+        case.loss.abs(),
+        loss_err
+    );
     if loss_err.is_nan() || loss_err > PARITY_ATOL {
         failing.push("loss".to_string());
     }
@@ -534,7 +573,12 @@ fn check_pytorch_case(case_name: &str, per_sequence: bool) {
     ] {
         for (i, (g, w)) in got.iter().zip(want).enumerate() {
             let err = (g - w).abs();
-            text += &format!("{:<40} {:>12.4e} {:>12.3e}\n", format!("{what} {i}"), w.abs(), err);
+            text += &format!(
+                "{:<40} {:>12.4e} {:>12.3e}\n",
+                format!("{what} {i}"),
+                w.abs(),
+                err
+            );
             if err.is_nan() || err > LOG_PROB_ATOL {
                 failing.push(format!("{what} {i}"));
             }
@@ -570,8 +614,14 @@ fn check_pytorch_case(case_name: &str, per_sequence: bool) {
         worst.0, worst.1
     );
     let _ = std::io::stderr().write_all(text.as_bytes());
-    assert_eq!(compared, expected_count, "not every expected gradient was compared");
-    assert!(failing.is_empty(), "[{label}] out of tolerance: {failing:?}{text}");
+    assert_eq!(
+        compared, expected_count,
+        "not every expected gradient was compared"
+    );
+    assert!(
+        failing.is_empty(),
+        "[{label}] out of tolerance: {failing:?}{text}"
+    );
 }
 
 /// One pair, beta 0.1: loss and the gradients of all 30 LoRA tensors.
@@ -607,8 +657,7 @@ fn tiny_pairs() -> Vec<PreferencePair> {
     let other_prompt = [6u32, 13, 20];
     vec![
         PreferencePair::from_tokens(&prompt, &chosen, &rejected, 64).expect("pair"),
-        PreferencePair::from_tokens(&other_prompt, &chosen[..3], &rejected[..4], 64)
-            .expect("pair"),
+        PreferencePair::from_tokens(&other_prompt, &chosen[..3], &rejected[..4], 64).expect("pair"),
     ]
 }
 
@@ -639,7 +688,9 @@ fn train_dpo_starts_at_log_2_and_learns_the_preference() {
     );
     assert!(s.margin.abs() < 1e-5, "first margin {}", s.margin);
     assert_eq!(s.tokens, pairs[0].supervised_tokens());
-    assert!(first.iter().all(|s| s.optimizer_step && s.grad_norm.is_some()));
+    assert!(first
+        .iter()
+        .all(|s| s.optimizer_step && s.grad_norm.is_some()));
 
     let mut last = first;
     for _ in 0..30 {
@@ -649,7 +700,11 @@ fn train_dpo_starts_at_log_2_and_learns_the_preference() {
     }
     for (i, s) in last.iter().enumerate() {
         assert!(s.loss.is_finite(), "pair {i}: loss {}", s.loss);
-        assert!(s.margin > 0.0, "pair {i}: margin {} after training", s.margin);
+        assert!(
+            s.margin > 0.0,
+            "pair {i}: margin {} after training",
+            s.margin
+        );
         assert!(s.loss < std::f32::consts::LN_2, "pair {i}: loss {}", s.loss);
         assert!(s.chosen_reward > s.rejected_reward);
     }

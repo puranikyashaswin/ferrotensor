@@ -17,8 +17,7 @@ use ferrotensor_autograd::{AdamW, WarmupCosineScheduler};
 use ferrotensor_backend::MemoryCategory;
 use ferrotensor_graph::lfm::legacy_llama_name;
 use ferrotensor_trainer::checkpoint::{
-    save_lora_checkpoint, upgrade_optimizer_names, LoraMetadata, TrainingCheckpoint,
-    TrainingState,
+    save_lora_checkpoint, upgrade_optimizer_names, LoraMetadata, TrainingCheckpoint, TrainingState,
 };
 use ferrotensor_trainer::data::shuffled_indices;
 use ferrotensor_trainer::dpo::{DpoStats, DEFAULT_BETA};
@@ -541,9 +540,20 @@ mod tests {
         assert_eq!(args.beta, DEFAULT_BETA);
         assert_eq!(args.data, PathBuf::from("pairs.jsonl"));
         assert_eq!(args.out, PathBuf::from("outputs/dpo"));
-        assert_eq!((args.batch_size, args.grad_accum, args.seq_len), (1, 4, 256));
+        assert_eq!(
+            (args.batch_size, args.grad_accum, args.seq_len),
+            (1, 4, 256)
+        );
         assert!(!args.json && !args.no_chat_template);
-        let args = parse(&["--beta", "0.25", "--batch-size", "2", "--json", "--seq-len", "64"]);
+        let args = parse(&[
+            "--beta",
+            "0.25",
+            "--batch-size",
+            "2",
+            "--json",
+            "--seq-len",
+            "64",
+        ]);
         assert_eq!(args.beta, 0.25);
         assert_eq!((args.batch_size, args.seq_len), (2, 64));
         assert!(args.json);
@@ -565,7 +575,12 @@ mod tests {
     #[test]
     fn window_means_and_accuracy() {
         let mut w = Window::default();
-        for s in [stats(0.5, 0.25), stats(0.75, -0.5), stats(0.25, 1.0), stats(0.5, 0.0)] {
+        for s in [
+            stats(0.5, 0.25),
+            stats(0.75, -0.5),
+            stats(0.25, 1.0),
+            stats(0.5, 0.0),
+        ] {
             w.add(&s);
         }
         let m = w.means();

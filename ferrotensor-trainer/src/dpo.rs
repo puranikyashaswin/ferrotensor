@@ -44,7 +44,12 @@ struct Rows {
     seq_len: usize,
 }
 
-fn scored_rows(shape: &[usize], target_ids: &[u32], loss_mask: &[u8], sequences: usize) -> Option<Rows> {
+fn scored_rows(
+    shape: &[usize],
+    target_ids: &[u32],
+    loss_mask: &[u8],
+    sequences: usize,
+) -> Option<Rows> {
     let vocab = *shape.last()?;
     let rows = shape.iter().product::<usize>() / vocab.max(1);
     if vocab == 0 || sequences == 0 || !rows.is_multiple_of(sequences) {
@@ -110,12 +115,22 @@ pub fn sequence_log_probs(
 ) -> Option<Vec<(f64, usize)>> {
     let rows = scored_rows(&logits.data.shape, target_ids, loss_mask, sequences)?;
     let ctx = &logits.ctx;
-    let target_buf =
-        UnifiedTensor::from_bytes(ctx, bytemuck::cast_slice(&rows.targets), &[rows.targets.len()]);
+    let target_buf = UnifiedTensor::from_bytes(
+        ctx,
+        bytemuck::cast_slice(&rows.targets),
+        &[rows.targets.len()],
+    );
     let grad = UnifiedTensor::empty(ctx, &logits.data.shape);
     let weights = vec![0.0f32; rows.targets.len()];
-    let log_probs =
-        log_probs_and_grad(ctx, &logits.data, &rows, &target_buf, &weights, &grad, engine);
+    let log_probs = log_probs_and_grad(
+        ctx,
+        &logits.data,
+        &rows,
+        &target_buf,
+        &weights,
+        &grad,
+        engine,
+    );
     Some(log_probs.into_iter().zip(rows.tokens).collect())
 }
 
@@ -500,8 +515,14 @@ impl Trainer {
             } else {
                 rows.iter()
                     .map(|row| {
-                        self.model
-                            .forward_with_dropout(&self.engine, row, 0, None, None, dropout_seed)
+                        self.model.forward_with_dropout(
+                            &self.engine,
+                            row,
+                            0,
+                            None,
+                            None,
+                            dropout_seed,
+                        )
                     })
                     .collect()
             }
@@ -608,7 +629,10 @@ mod tests {
         assert!((l.margin - 2.5).abs() < 1e-15, "{l:?}");
         let sigmoid = 1.0 / (1.0 + (-2.5f64).exp());
         assert!((l.loss + sigmoid.ln()).abs() < 1e-14, "{l:?}");
-        assert!((l.grad_chosen + 0.5 * (1.0 - sigmoid)).abs() < 1e-14, "{l:?}");
+        assert!(
+            (l.grad_chosen + 0.5 * (1.0 - sigmoid)).abs() < 1e-14,
+            "{l:?}"
+        );
     }
 
     #[test]
