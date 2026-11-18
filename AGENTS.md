@@ -139,7 +139,7 @@ also exit with 2, with the usage text on stderr and nothing on stdout.
 Run `ferrotensor plan --json` (no `--model`) to see which documented SmolLM2
 size fits; it decides from the GPU memory budget. `--memory-mib` sets the
 budget; else on a GPU that shares system RAM (Apple silicon, integrated GPUs)
-it is 60% of system RAM, on an NVIDIA GPU the `nvidia-smi` total, and
+it is system RAM less a 2,048 MiB reserve, on an NVIDIA GPU the `nvidia-smi` total, and
 otherwise an assumed 4,096 MiB, so pass `--vram-mib` for other discrete GPUs.
 
 Measured peak GPU memory (`nvidia-smi`, MiB) on one NVIDIA A10G (24 GB), f16
