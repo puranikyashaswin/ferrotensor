@@ -118,7 +118,15 @@ ferrotensor chat --model HuggingFaceTB/SmolLM2-135M
   `trained_weights.safetensors` and holds the f32 base weights that
   trained, which `eval --lora`, `generate --lora` and `--resume` load),
   `metrics.jsonl` (one line per logged step / eval) and
-  `training_state.json` (read by `ferrotensor monitor`).
+  `training_state.json` (read by `ferrotensor monitor`). A training line has
+  `step`, `loss`, `grad_norm`, `lr`, `tokens` (supervised tokens since the
+  previous line), `seconds`, `elapsed`, and two keys for the optimizer step
+  it logs: `input_tokens`, the rows that went through the forward passes
+  with padding counted (sequences are padded to a multiple of 32), and
+  `micro_batch_m`, the rows `M` of each forward pass of that step, in
+  order: sequences in the pass times their padded length. `train --json`
+  adds `mean_input_tokens_per_step`, the mean of `input_tokens` over the
+  steps of the run (null without a step).
 - `--train-modules` picks what trains: `lora` (the default), or base weights
   by group: `attn`, `mlp`, `norm`, `head`, `all` (every base weight but the
   token embedding), `embed` (only the token embedding) and `full` (`all`
@@ -499,7 +507,15 @@ profile: GPU time by kernel in that step
 
 `profile.json` gets `kernel_timing`, `kernel_gpu_seconds_per_step` and a
 `kernels` array of `name`, `dispatches_per_step` and
-`gpu_seconds_per_step`, longest first. A kernel is named by its WGSL entry
+`gpu_seconds_per_step`, longest first. It also gets `matmul_shapes`, one
+object per distinct matmul dispatched, longest GPU time first:
+`entry`, `layout`, `m`, `n`, `k`, `dispatches_per_step`,
+`gpu_seconds_per_step` and `tflops` (`2 m n k` times the dispatches over the
+GPU time, in units of 1e12; null when the time is 0). `m`, `n` and `k` are
+those of the product `out[m, n] = op(a) @ op(b)` with `k` summed, whichever
+side the kernel treats as thin. The kernels are 2-D, so a batch of
+sequences is part of `m`. One-row `matvec` products (decode) are not listed,
+and `generate --profile` does not report shapes. A kernel is named by its WGSL entry
 point; matmul also by layout (`a@b`, `a@bT` for `b` transposed, `aT@b` for
 `a` transposed) and a size class. `matmul_blocked` (the 64x64-tile kernel)
 uses `m<=4` (few rows), `min dim<=64` (LoRA-rank shapes), and otherwise

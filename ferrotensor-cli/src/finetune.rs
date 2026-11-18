@@ -357,6 +357,7 @@ mod tests {
                 eval_loss_after: None,
                 measured_peak_mib: 2900,
                 seconds: 1.5,
+                mean_input_tokens_per_step: None,
                 out_dir: "runs/a".into(),
                 adapter: Some("runs/a/lora_adapters.safetensors".into()),
                 q4_weights: None,
@@ -383,6 +384,7 @@ mod tests {
                 "eval_loss_after": null,
                 "measured_peak_mib": 2900,
                 "seconds": 1.5,
+                "mean_input_tokens_per_step": null,
                 "out_dir": "runs/a",
                 "adapter": "runs/a/lora_adapters.safetensors",
             })

@@ -1554,6 +1554,9 @@ struct TrainSummary {
     /// Peak of the GPU buffers Ferrotensor tracks, without the driver context.
     measured_peak_mib: u64,
     seconds: f32,
+    /// Mean over the optimizer steps of this run of the rows that went
+    /// through the forward passes (padding included); `None` without a step.
+    mean_input_tokens_per_step: Option<f64>,
     out_dir: PathBuf,
     /// `None` on ranks other than 0, which save nothing.
     adapter: Option<PathBuf>,
@@ -1859,6 +1862,9 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
     let mut last_loss = f32::NAN;
     let mut last_norm = 0.0f32;
     let mut last_lr = 0.0f32;
+    // Forward passes of the last optimizer step, and rows over all of them.
+    let mut last_micro = ferrotensor_trainer::MicroBatches::default();
+    let (mut total_input_tokens, mut steps_taken) = (0usize, 0usize);
     if let Some(m) = &memory {
         m.begin_steps();
     }
@@ -1895,6 +1901,9 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
                     continue;
                 }
                 step += 1;
+                last_micro = trainer.last_step_micro_batches().clone();
+                total_input_tokens += last_micro.input_tokens();
+                steps_taken += 1;
                 if let Some(p) = profile.as_mut() {
                     p.after_step();
                 }
@@ -1916,6 +1925,8 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
                         serde_json::json!({
                             "step": step, "loss": loss, "grad_norm": last_norm, "lr": last_lr,
                             "tokens": win_tok, "seconds": secs,
+                            "input_tokens": last_micro.input_tokens(),
+                            "micro_batch_m": last_micro.rows(),
                             "elapsed": run_start.elapsed().as_secs_f32(),
                         })
                     )?;
@@ -2034,6 +2045,8 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
         eval_loss_after,
         measured_peak_mib: peak_bytes.div_ceil(MIB),
         seconds: elapsed.as_secs_f32(),
+        mean_input_tokens_per_step: (steps_taken > 0)
+            .then(|| total_input_tokens as f64 / steps_taken as f64),
         out_dir: args.out,
         adapter: is_root.then_some(adapter_path),
         q4_weights,
@@ -2605,6 +2618,7 @@ mod tests {
             eval_loss_after: Some(3.25),
             measured_peak_mib: 1400,
             seconds: 1.5,
+            mean_input_tokens_per_step: Some(384.0),
             out_dir: PathBuf::from("runs/a"),
             adapter: Some(PathBuf::from("runs/a/lora_adapters.safetensors")),
             q4_weights: None,
@@ -2619,6 +2633,7 @@ mod tests {
                 "eval_loss_after": 3.25,
                 "measured_peak_mib": 1400,
                 "seconds": 1.5,
+                "mean_input_tokens_per_step": 384.0,
                 "out_dir": "runs/a",
                 "adapter": "runs/a/lora_adapters.safetensors",
             })

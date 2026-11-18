@@ -58,6 +58,35 @@ pub struct StepStats {
     pub lr: Option<f32>,
 }
 
+/// The forward passes of one accumulation window, as the matmuls see them.
+///
+/// Each entry is the `M` of one forward pass: the sequences it ran times
+/// their common padded length, so padding counts. Every projection of that
+/// pass is a matmul with this many rows.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MicroBatches(Vec<usize>);
+
+impl MicroBatches {
+    /// `M` of each forward pass, in the order they ran.
+    pub fn rows(&self) -> &[usize] {
+        &self.0
+    }
+
+    /// Rows that went through the forward passes, padding included.
+    pub fn input_tokens(&self) -> usize {
+        self.0.iter().sum()
+    }
+
+    fn record(&mut self, sequences: usize, padded_len: usize) {
+        self.0.push(sequences * padded_len);
+    }
+}
+
+/// `len` rounded up to a multiple of `bucket`: the length the GPU runs.
+fn bucketed_len(len: usize, bucket: usize) -> usize {
+    len.div_ceil(bucket) * bucket
+}
+
 /// Error from a training step.
 #[derive(Debug)]
 pub struct TrainError(pub String);
@@ -108,6 +137,10 @@ pub struct Trainer {
     /// attention dropout is 0.
     pub dropout_seed: u64,
     optimizer_step_count: usize,
+    /// Forward passes since the accumulation window began.
+    window_micro_batches: MicroBatches,
+    /// Forward passes of the last finished accumulation window.
+    last_micro_batches: MicroBatches,
 }
 
 impl Trainer {
@@ -132,6 +165,8 @@ impl Trainer {
             length_bucket: 32,
             dropout_seed: 0,
             optimizer_step_count: 0,
+            window_micro_batches: MicroBatches::default(),
+            last_micro_batches: MicroBatches::default(),
         }
     }
 
@@ -201,6 +236,19 @@ impl Trainer {
         self.optimizer_step_count
     }
 
+    /// The forward passes of the last accumulation window that ended, which
+    /// is the one the latest [`StepStats::optimizer_step`] closed.
+    pub fn last_step_micro_batches(&self) -> &MicroBatches {
+        &self.last_micro_batches
+    }
+
+    /// Closes the accumulation window: its forward passes become
+    /// [`last_step_micro_batches`](Self::last_step_micro_batches).
+    fn end_window(&mut self) {
+        self.step_in_accum = 0;
+        self.last_micro_batches = std::mem::take(&mut self.window_micro_batches);
+    }
+
     /// Restore the optimizer-step counter (and advance the LR schedule to
     /// match) when resuming from a checkpoint.
     pub fn set_optimizer_steps(&mut self, steps: usize) {
@@ -235,7 +283,8 @@ impl Trainer {
         train_params: &[Tensor],
     ) -> Result<StepStats, TrainError> {
         let len = input_ids.len().min(target_ids.len());
-        let padded_len = len.div_ceil(self.length_bucket) * self.length_bucket;
+        let padded_len = bucketed_len(len, self.length_bucket);
+        self.window_micro_batches.record(1, padded_len);
         let mut inputs = input_ids[..len].to_vec();
         let mut targets = target_ids[..len].to_vec();
         let mut mask = match loss_mask {
@@ -284,7 +333,7 @@ impl Trainer {
 
         self.step_in_accum += 1;
         if self.step_in_accum >= self.grad_accum_steps {
-            self.step_in_accum = 0;
+            self.end_window();
             let applied = self.apply_gradients(train_params, &mut stats);
             self.optimizer.zero_grad(train_params);
             applied?;
@@ -433,7 +482,8 @@ impl Trainer {
             .map(|s| s.0.len().min(s.1.len()))
             .max()
             .unwrap_or(0);
-        let padded_len = longest.div_ceil(self.length_bucket) * self.length_bucket;
+        let padded_len = bucketed_len(longest, self.length_bucket);
+        self.window_micro_batches.record(chunk.len(), padded_len);
         let mut inputs = Vec::with_capacity(chunk.len());
         let mut targets = Vec::with_capacity(chunk.len() * padded_len);
         let mut masks = Vec::with_capacity(chunk.len() * padded_len);
@@ -485,7 +535,7 @@ impl Trainer {
 
         self.step_in_accum += chunk.len();
         if self.step_in_accum >= self.grad_accum_steps {
-            self.step_in_accum = 0;
+            self.end_window();
             let mut stats = out.pop().unwrap_or(StepStats {
                 loss: 0.0,
                 tokens: 0,
@@ -795,8 +845,28 @@ pub fn masked_cross_entropy_from_logits(
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use super::masked_cross_entropy_from_logits;
+    use super::{bucketed_len, masked_cross_entropy_from_logits, MicroBatches};
     use crate::data::TrainingExample;
+
+    #[test]
+    fn lengths_round_up_to_the_bucket() {
+        assert_eq!(bucketed_len(33, 32), 64);
+        assert_eq!(bucketed_len(64, 32), 64);
+        assert_eq!(bucketed_len(1, 32), 32);
+        assert_eq!(bucketed_len(7, 1), 7);
+    }
+
+    #[test]
+    fn micro_batches_count_padded_rows_of_each_forward_pass() {
+        // A window of 4 sequences with a bucket of 32: a batched forward of
+        // 3 sequences whose longest has 33 tokens, then one of 1 with 20.
+        let mut window = MicroBatches::default();
+        window.record(3, bucketed_len(33, 32));
+        window.record(1, bucketed_len(20, 32));
+        assert_eq!(window.rows(), [192, 32]);
+        assert_eq!(window.input_tokens(), 224);
+        assert_eq!(MicroBatches::default().input_tokens(), 0);
+    }
 
     #[test]
     fn sft_mask_excludes_prompt_from_host_loss() {

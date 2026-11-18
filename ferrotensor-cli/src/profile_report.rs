@@ -4,7 +4,7 @@
 //! the GPU time of each kernel when the adapter has timestamp queries.
 
 use ferrotensor_backend::{
-    GpuCounterSnapshot, KernelTimes, KernelTiming, KernelTimingMode, WgpuContext,
+    GpuCounterSnapshot, KernelTimes, KernelTiming, KernelTimingMode, MatmulShapes, WgpuContext,
 };
 use serde_json::{json, Map, Value};
 use std::path::Path;
@@ -29,6 +29,7 @@ pub fn kernel_timing(profile: bool) -> KernelTiming {
 pub struct GpuMark {
     counters: GpuCounterSnapshot,
     kernels: KernelTimes,
+    matmul_shapes: MatmulShapes,
 }
 
 impl GpuMark {
@@ -37,6 +38,7 @@ impl GpuMark {
         Self {
             counters: ctx.gpu_counters(),
             kernels: ctx.kernel_times(),
+            matmul_shapes: ctx.matmul_shapes(),
         }
     }
 
@@ -44,6 +46,7 @@ impl GpuMark {
         Self {
             counters: self.counters.since(&earlier.counters),
             kernels: self.kernels.since(&earlier.kernels),
+            matmul_shapes: self.matmul_shapes.since(&earlier.matmul_shapes),
         }
     }
 }
@@ -136,6 +139,7 @@ impl ProfileRun {
                 mode.map(KernelTimingMode::name).into(),
             );
             insert_kernels(&mut report, &median.work.kernels, 1.0, "_per_step");
+            insert_matmul_shapes(&mut report, &median.work.matmul_shapes);
             let text = serde_json::to_string_pretty(&report)?;
             std::fs::write(path, text + "\n")?;
             eprintln!("profile report: {}", path.display());
@@ -256,10 +260,43 @@ fn insert_kernels(report: &mut Map<String, Value>, kernels: &KernelTimes, per: f
     report.insert("kernels".into(), rows.into());
 }
 
+/// Inserts `matmul_shapes`: one object per distinct matmul (`entry`,
+/// `layout`, `m`, `n`, `k`) with its `dispatches_per_step`,
+/// `gpu_seconds_per_step` and `tflops` (`2 m n k` per dispatch over the GPU
+/// time; null when that time is zero), longest GPU time first. `m`, `n` and
+/// `k` are those of `out[m, n] = op(a) @ op(b)`; a batch is folded into `m`.
+fn insert_matmul_shapes(report: &mut Map<String, Value>, shapes: &MatmulShapes) {
+    let rows: Vec<Value> = shapes
+        .by_gpu_time()
+        .into_iter()
+        .map(|(shape, time)| {
+            let seconds = time.gpu_time.as_secs_f64();
+            let flops = 2.0
+                * f64::from(shape.m)
+                * f64::from(shape.n)
+                * f64::from(shape.k)
+                * time.dispatches as f64;
+            let tflops = (seconds > 0.0).then(|| flops / seconds / 1e12);
+            json!({
+                "entry": shape.entry,
+                "layout": shape.layout,
+                "m": shape.m,
+                "n": shape.n,
+                "k": shape.k,
+                "dispatches_per_step": time.dispatches as f64,
+                "gpu_seconds_per_step": seconds,
+                "tflops": tflops,
+            })
+        })
+        .collect();
+    report.insert("matmul_shapes".into(), rows.into());
+}
+
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use ferrotensor_backend::KernelTime;
+    use ferrotensor_backend::{KernelTime, MatmulShape};
 
     #[test]
     fn kernels_are_written_per_unit_longest_first() {
@@ -304,6 +341,82 @@ mod tests {
     }
 
     #[test]
+    fn matmul_shapes_give_tflops_and_sort_longest_first() {
+        let shape = |entry, m, n, k| MatmulShape {
+            entry,
+            layout: "a@b",
+            m,
+            n,
+            k,
+        };
+        let shapes: MatmulShapes = [
+            // Two dispatches of 2 * 66 * 2048 * 2048 flops each, 2 ms in all.
+            (
+                shape("matmul_thin", 66, 2048, 2048),
+                KernelTime {
+                    dispatches: 2,
+                    gpu_time: Duration::from_millis(2),
+                },
+            ),
+            // Longer in total, so first.
+            (
+                shape("matmul_blocked", 512, 256, 128),
+                KernelTime {
+                    dispatches: 1,
+                    gpu_time: Duration::from_millis(4),
+                },
+            ),
+            // A zero GPU time has no rate.
+            (
+                shape("matmul_blocked", 8, 8, 8),
+                KernelTime {
+                    dispatches: 3,
+                    gpu_time: Duration::ZERO,
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let mut report = Map::new();
+        insert_matmul_shapes(&mut report, &shapes);
+        let rows = report["matmul_shapes"].as_array().expect("an array");
+        assert_eq!(rows.len(), 3);
+
+        assert_eq!(rows[0]["entry"], "matmul_blocked");
+        assert_eq!(rows[0]["m"], 512);
+        assert_eq!(rows[0]["gpu_seconds_per_step"], 0.004);
+        // 2 * 512 * 256 * 128 = 33_554_432 flops in 4 ms.
+        let tflops = rows[0]["tflops"].as_f64().expect("a rate");
+        assert!((tflops - 0.008_388_608).abs() < 1e-12, "{tflops}");
+
+        let expected = json!({
+            "entry": "matmul_thin",
+            "layout": "a@b",
+            "m": 66,
+            "n": 2048,
+            "k": 2048,
+            "dispatches_per_step": 2.0,
+            "gpu_seconds_per_step": 0.002,
+        });
+        for (key, value) in expected.as_object().expect("an object") {
+            assert_eq!(&rows[1][key], value, "{key}");
+        }
+        // 2 dispatches * 553_648_128 flops in 2 ms.
+        let tflops = rows[1]["tflops"].as_f64().expect("a rate");
+        assert!((tflops - 0.553_648_128).abs() < 1e-12, "{tflops}");
+
+        assert_eq!(rows[2]["dispatches_per_step"], 3.0);
+        assert_eq!(rows[2]["tflops"], Value::Null);
+    }
+
+    #[test]
+    fn no_matmul_shapes_writes_an_empty_array() {
+        let mut report = Map::new();
+        insert_matmul_shapes(&mut report, &MatmulShapes::default());
+        assert_eq!(Value::Object(report), json!({"matmul_shapes": []}));
+    }
+
+    #[test]
     fn no_kernels_writes_an_empty_array() {
         let mut report = Map::new();
         insert_kernels(&mut report, &KernelTimes::default(), 1.0, "_per_step");
@@ -330,6 +443,7 @@ mod tests {
             )]
             .into_iter()
             .collect(),
+            matmul_shapes: MatmulShapes::default(),
         };
         let work = later.since(&earlier);
         assert_eq!(work.counters.dispatches, 3);
