@@ -48,6 +48,15 @@ fn mmb_load_b(gk: u32, gn: u32, k: u32, n: u32, mode: u32) -> f32 {
 // Whether consecutive k of one n are adjacent in mmb_b's storage.
 fn mmb_b_k_inner(mode: u32) -> bool { return mode == 1u; }
 
+// Whether the k-inner staging takes k in pairs. Off here, where a pair costs
+// two loads anyway; the f16 kernel turns it on, since one word holds both.
+const MMB_K_PAIRS: bool = false;
+
+// b[gk][gn] and b[gk + 1][gn] (0 past k) for the paired k-inner staging.
+fn mmb_load_b_pair(gk: u32, gn: u32, k: u32, n: u32, mode: u32) -> vec2<f32> {
+    return vec2<f32>(mmb_load_b(gk, gn, k, n, mode), mmb_load_b(gk + 1u, gn, k, n, mode));
+}
+
 @compute @workgroup_size(16, 16, 1)
 fn matmul_blocked(
     @builtin(local_invocation_index) lidx: u32,
@@ -82,21 +91,44 @@ fn matmul_blocked(
                 mmb_load_a(gm + 3u, gk, m, k, mode),
             );
         }
-        for (var idx = lidx; idx < MMB_BK * MMB_BN / 4u; idx += 256u) {
-            var kk = idx / (MMB_BN / 4u);
-            var n4 = (idx % (MMB_BN / 4u)) * 4u;
-            if (b_k_inner) {
-                kk = idx % MMB_BK;
-                n4 = (idx / MMB_BK) * 4u;
+        if (b_k_inner && MMB_K_PAIRS) {
+            // Half the threads each fill the vec4s of four columns at k and
+            // k + 1, so the f16 kernel takes each pair from one word.
+            // Threads 4 to 7 of every 8 write the k + 1 row first, which
+            // puts each 8 threads' stores in 8 different bank groups.
+            for (var idx = lidx; idx < MMB_BK * MMB_BN / 8u; idx += 256u) {
+                let kk = (idx % (MMB_BK / 2u)) * 2u;
+                let n4 = (idx / (MMB_BK / 2u)) * 4u;
+                let gk = k0 + kk;
+                let gn = col0 + n4;
+                let p0 = mmb_load_b_pair(gk, gn, k, n, mode);
+                let p1 = mmb_load_b_pair(gk, gn + 1u, k, n, mode);
+                let p2 = mmb_load_b_pair(gk, gn + 2u, k, n, mode);
+                let p3 = mmb_load_b_pair(gk, gn + 3u, k, n, mode);
+                let lo = vec4<f32>(p0.x, p1.x, p2.x, p3.x);
+                let hi = vec4<f32>(p0.y, p1.y, p2.y, p3.y);
+                let flip = (idx & 4u) != 0u;
+                let c = n4 / 4u;
+                mmb_bs4[(kk + select(0u, 1u, flip)) * MMB_BS_ROW + c] = select(lo, hi, flip);
+                mmb_bs4[(kk + select(1u, 0u, flip)) * MMB_BS_ROW + c] = select(hi, lo, flip);
             }
-            let gk = k0 + kk;
-            let gn = col0 + n4;
-            mmb_bs4[kk * MMB_BS_ROW + n4 / 4u] = vec4<f32>(
-                mmb_load_b(gk, gn, k, n, mode),
-                mmb_load_b(gk, gn + 1u, k, n, mode),
-                mmb_load_b(gk, gn + 2u, k, n, mode),
-                mmb_load_b(gk, gn + 3u, k, n, mode),
-            );
+        } else {
+            for (var idx = lidx; idx < MMB_BK * MMB_BN / 4u; idx += 256u) {
+                var kk = idx / (MMB_BN / 4u);
+                var n4 = (idx % (MMB_BN / 4u)) * 4u;
+                if (b_k_inner) {
+                    kk = idx % MMB_BK;
+                    n4 = (idx / MMB_BK) * 4u;
+                }
+                let gk = k0 + kk;
+                let gn = col0 + n4;
+                mmb_bs4[kk * MMB_BS_ROW + n4 / 4u] = vec4<f32>(
+                    mmb_load_b(gk, gn, k, n, mode),
+                    mmb_load_b(gk, gn + 1u, k, n, mode),
+                    mmb_load_b(gk, gn + 2u, k, n, mode),
+                    mmb_load_b(gk, gn + 3u, k, n, mode),
+                );
+            }
         }
         workgroupBarrier();
 

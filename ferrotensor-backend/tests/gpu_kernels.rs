@@ -622,13 +622,18 @@ fn thin_matmul_matches_cpu_in_every_layout() {
 /// at a time and N off its 64 columns. M and N above 64 (for f16 and 4-bit
 /// `b`, M above 64 alone) take the 64x64-tile kernel; (37, 70, 45) and
 /// (1, 33, 17) take the thin and matrix-vector kernels, checked against the
-/// same reference.
+/// same reference. The f16 tile kernel reads k in pairs: an odd K starts
+/// every other row's pairs on the high half of a word and leaves a last
+/// pair with one element; K of 70 ends a slice partway through.
 const ALONG_K_SHAPES: &[(usize, usize, usize)] = &[
     (66, 2048, 96),
     (67, 70, 65),
     (129, 33, 17),
     (65, 1, 130),
     (100, 31, 191),
+    (80, 2047, 72),
+    (65, 17, 66),
+    (70, 3, 129),
     (37, 70, 45),
     (1, 33, 17),
 ];
