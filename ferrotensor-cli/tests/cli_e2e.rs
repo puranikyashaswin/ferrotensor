@@ -131,6 +131,7 @@ fn json_errors_are_one_object_on_stdout() {
         ("train", &[][..]),
         ("eval", &[][..]),
         ("finetune", &["--memory-mib", "4096"][..]),
+        ("dpo", &[][..]),
     ] {
         let mut args = vec![command];
         args.extend_from_slice(&model_and_data);
@@ -1349,6 +1350,117 @@ fn chatml_model_dir(tag: &str) -> common::TempDir {
     common::write_tiny_llama(dir.path());
     common::write_tiny_chatml_tokenizer(dir.path());
     dir
+}
+
+/// `dpo` on a few preference pairs: the first loss is ln 2 because the
+/// adapters start at zero, the run writes the usual LoRA files and the
+/// adapter exports to PEFT.
+#[test]
+#[ignore = "needs a GPU"]
+fn dpo_writes_adapter_state_and_metrics() {
+    let model = chatml_model_dir("dpo-model");
+    let out = common::TempDir::new("dpo-out");
+    let data = out.path().join("pairs.jsonl");
+    let pairs: String = (0..4)
+        .map(|i| {
+            let w = |k: usize| format!("w{}", 4 + (i * 7 + k) % 58);
+            serde_json::json!({
+                "prompt": format!("{} {}", w(0), w(1)),
+                "chosen": format!("{} {} {}", w(2), w(3), w(4)),
+                "rejected": format!("{} {}", w(5), w(6)),
+            })
+            .to_string()
+                + "\n"
+        })
+        .collect();
+    std::fs::write(&data, pairs).expect("write pairs");
+
+    let run = ferrotensor(&[
+        "dpo",
+        "--model",
+        s(model.path()),
+        "--data",
+        s(&data),
+        "--out",
+        s(out.path()),
+        "--seq-len",
+        "32",
+        "--max-steps",
+        "3",
+        "--grad-accum",
+        "1",
+        "--log-every",
+        "1",
+        "--lora-rank",
+        "4",
+        "--json",
+    ]);
+    assert_success(&run);
+    let stdout = text(&run.stdout);
+    let summary: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("summary is not JSON: {e}\nstdout: {stdout}"));
+    assert_eq!(summary["steps"], 3, "{summary}");
+    let first = summary["first_loss"].as_f64().expect("first_loss");
+    assert!(
+        (first - std::f64::consts::LN_2).abs() < 1e-3,
+        "first loss {first} is not ln 2: {summary}"
+    );
+    for key in ["final_loss", "reward_margin", "accuracy"] {
+        let v = summary[key].as_f64().unwrap_or(f64::NAN);
+        assert!(v.is_finite(), "{key}: {summary}");
+    }
+
+    for name in RUN_FILES {
+        let path = out.path().join(name);
+        let meta = std::fs::metadata(&path)
+            .unwrap_or_else(|e| panic!("{} is missing: {e}", path.display()));
+        assert!(meta.len() > 0, "{} is empty", path.display());
+    }
+    let state = read_json(&out.path().join("training_state.json"));
+    assert_eq!(state["task"], "dpo", "{state}");
+    assert_eq!(state["step"], 3, "{state}");
+    let metrics = std::fs::read_to_string(out.path().join("metrics.jsonl")).expect("metrics");
+    let lines: Vec<serde_json::Value> = metrics
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("one JSON object per line"))
+        .collect();
+    assert_eq!(lines.len(), 3, "metrics: {metrics}");
+    for line in &lines {
+        for key in ["loss", "reward_margin", "accuracy"] {
+            assert!(line[key].as_f64().is_some(), "{key}: {line}");
+        }
+    }
+
+    let peft = out.path().join("peft");
+    let export = ferrotensor(&[
+        "export-adapter",
+        "--lora",
+        s(&out.path().join("lora_adapters.safetensors")),
+        "--model",
+        s(model.path()),
+        "--output",
+        s(&peft),
+    ]);
+    assert_success(&export);
+    for name in ["adapter_model.safetensors", "adapter_config.json"] {
+        assert!(peft.join(name).is_file(), "{name} is missing");
+    }
+
+    // A file with no usable pair is refused with exit code 2.
+    let empty = out.path().join("empty.jsonl");
+    std::fs::write(&empty, "{\"prompt\": \"w5\"}\n").expect("write empty");
+    let run = ferrotensor(&[
+        "dpo",
+        "--model",
+        s(model.path()),
+        "--data",
+        s(&empty),
+        "--out",
+        s(&out.path().join("empty-out")),
+        "--json",
+    ]);
+    assert_eq!(run.status.code(), Some(2), "stdout: {}", text(&run.stdout));
 }
 
 /// Run `chat` with up to 4 new tokens per reply on the lines of `input`.
