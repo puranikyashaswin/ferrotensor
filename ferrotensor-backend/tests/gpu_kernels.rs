@@ -1421,6 +1421,233 @@ fn flash_attention_single_head_backward_matches_cpu() {
     assert_close("v1 dv", &read(&gv), &want_dv, 1e-4, 1e-3);
 }
 
+/// Log-sum-exp of the scaled (and masked) scores of every (batch, head,
+/// query) row, in the order of the attention stats.
+fn cpu_attention_lse(
+    q: &[f32],
+    k: &[f32],
+    mask: Option<&[f32]>,
+    (b, sq, sk, h, hkv, d): (usize, usize, usize, usize, usize, usize),
+    visible: impl Fn(usize, usize) -> bool,
+) -> Vec<f32> {
+    let scale = 1.0 / (d as f32).sqrt();
+    let mut lse = Vec::with_capacity(b * h * sq);
+    for bi in 0..b {
+        for hi in 0..h {
+            let kh = hi / (h / hkv);
+            for i in 0..sq {
+                let qo = ((bi * sq + i) * h + hi) * d;
+                let s: Vec<f64> = (0..sk)
+                    .filter(|&j| visible(i, j))
+                    .map(|j| {
+                        let ko = ((bi * sk + j) * hkv + kh) * d;
+                        let dot: f64 = (0..d).map(|x| (q[qo + x] * k[ko + x]) as f64).sum();
+                        let m = mask.map_or(0.0, |m| m[((bi * h + hi) * sq + i) * sk + j] as f64);
+                        dot * scale as f64 + m
+                    })
+                    .collect();
+                let max = s.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let sum: f64 = s.iter().map(|x| (x - max).exp()).sum();
+                lse.push((max + sum.ln()) as f32);
+            }
+        }
+    }
+    lse
+}
+
+/// (batch, seq, heads, kv_heads, head_dim) for the saved-stats tests: every
+/// length is causal, lengths 17, 66 and 130 end inside a 16-row block and
+/// 256 fills its blocks exactly.
+const SAVED_STATS_CASES: &[(usize, usize, usize, usize, usize)] = &[
+    (1, 1, 2, 2, 64),
+    (1, 17, 2, 1, 64),
+    (1, 66, 4, 4, 64),
+    (2, 130, 4, 2, 64),
+    (1, 66, 2, 2, 128),
+    (1, 130, 2, 2, 96),
+    (1, 256, 2, 2, 64),
+    (1, 256, 2, 1, 128),
+];
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn flash_attention_v2_saved_stats_match_cpu_and_the_recomputing_backward() {
+    let g = gpu();
+    for (seed, &(b, s, h, hkv, d)) in SAVED_STATS_CASES.iter().enumerate() {
+        let dims = (b, s, s, h, hkv, d);
+        let seed = 60 + 4 * seed as u64;
+        let q = rand_vec(b * s * h * d, seed);
+        let k = rand_vec(b * s * hkv * d, seed + 1);
+        let v = rand_vec(b * s * hkv * d, seed + 2);
+        let dout = rand_vec(b * s * h * d, seed + 3);
+        let (want, probs) = cpu_attention(&q, &k, &v, None, dims, causal_rule(true));
+        let (want_dq, want_dk, want_dv) = cpu_attention_backward(&q, &k, &v, &dout, &probs, dims);
+        let want_lse = cpu_attention_lse(&q, &k, None, dims, causal_rule(true));
+
+        let (tq, tk, tv, tdo) = (
+            upload(&q, &[b, s, h, d]),
+            upload(&k, &[b, s, hkv, d]),
+            upload(&v, &[b, s, hkv, d]),
+            upload(&dout, &[b, s, h, d]),
+        );
+        let opts = AttentionOptions {
+            causal: true,
+            ..AttentionOptions::default()
+        };
+        let out = zeros(&[b, s, h, d]);
+        let stats = zeros(&[b, h, s, 2]);
+        g.engine
+            .flash_attention_v2_with_stats(&g.ctx, &tq, &tk, &tv, &out, &stats, &opts, None);
+        let name = format!("b{b} s{s} h{h}/{hkv} d{d}");
+        assert_close(&format!("fwd {name}"), &read(&out), &want, 1e-5, 1e-3);
+        let lse: Vec<f32> = read(&stats).iter().skip(1).step_by(2).copied().collect();
+        assert_close(&format!("lse {name}"), &lse, &want_lse, 1e-5, 1e-5);
+
+        let grads = || {
+            (
+                zeros(&[b, s, h, d]),
+                zeros(&[b, s, hkv, d]),
+                zeros(&[b, s, hkv, d]),
+            )
+        };
+        let (gq, gk, gv) = grads();
+        g.engine.flash_attention_v2_backward_with_stats(
+            &g.ctx, &tq, &tk, &tv, &out, &tdo, &gq, &gk, &gv, &stats, &opts, None,
+        );
+        let (rq, rk, rv) = grads();
+        g.engine.flash_attention_v2_backward_with(
+            &g.ctx, &tq, &tk, &tv, &out, &tdo, &rq, &rk, &rv, &opts, None,
+        );
+        let (gq, gk, gv) = (read(&gq), read(&gk), read(&gv));
+        assert_close(&format!("dq {name}"), &gq, &want_dq, 1e-4, 1e-3);
+        assert_close(&format!("dk {name}"), &gk, &want_dk, 1e-4, 1e-3);
+        assert_close(&format!("dv {name}"), &gv, &want_dv, 1e-4, 1e-3);
+        // The two backward paths differ only in how the log-sum-exp was
+        // summed, so they agree far more closely than either with the CPU.
+        assert_close(
+            &format!("dq vs recompute {name}"),
+            &gq,
+            &read(&rq),
+            1e-5,
+            1e-4,
+        );
+        assert_close(
+            &format!("dk vs recompute {name}"),
+            &gk,
+            &read(&rk),
+            1e-5,
+            1e-4,
+        );
+        assert_close(
+            &format!("dv vs recompute {name}"),
+            &gv,
+            &read(&rv),
+            1e-5,
+            1e-4,
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn flash_attention_v2_saved_stats_keep_mask_dropout_and_window() {
+    let g = gpu();
+    let (b, s, h, hkv, d) = (2, 45, 4, 2, 64);
+    let q = rand_vec(b * s * h * d, 80);
+    let k = rand_vec(b * s * hkv * d, 81);
+    let v = rand_vec(b * s * hkv * d, 82);
+    let dout = rand_vec(b * s * h * d, 83);
+    // [batch, 1, 1, seq] padding mask: batch 1 hides its last 6 keys, so
+    // its first rows still see keys and its later rows lose some.
+    let mask: Vec<f32> = (0..b * s)
+        .map(|i| {
+            if i / s == 1 && i % s >= s - 6 {
+                -1e9
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let (tq, tk, tv, tdo, tmask) = (
+        upload(&q, &[b, s, h, d]),
+        upload(&k, &[b, s, hkv, d]),
+        upload(&v, &[b, s, hkv, d]),
+        upload(&dout, &[b, s, h, d]),
+        upload(&mask, &[b, 1, 1, s]),
+    );
+    let opts = AttentionOptions {
+        causal: true,
+        window: 20,
+        dropout_prob: 0.2,
+        seed: 0x1234_5678_9ABC_DEF0,
+        ..AttentionOptions::default()
+    };
+    let out = zeros(&[b, s, h, d]);
+    let stats = zeros(&[b, h, s, 2]);
+    g.engine.flash_attention_v2_with_stats(
+        &g.ctx,
+        &tq,
+        &tk,
+        &tv,
+        &out,
+        &stats,
+        &opts,
+        Some(&tmask),
+    );
+    let plain = zeros(&[b, s, h, d]);
+    g.engine
+        .flash_attention_v2_with(&g.ctx, &tq, &tk, &tv, &plain, &opts, Some(&tmask));
+    assert_eq!(read(&out), read(&plain), "saving stats changed the output");
+
+    let mask_full: Vec<f32> = (0..b * h * s * s)
+        .map(|i| mask[(i / (h * s * s)) * s + i % s])
+        .collect();
+    let visible = |i: usize, j: usize| j <= i && i - j < 20;
+    let want_lse = cpu_attention_lse(&q, &k, Some(&mask_full), (b, s, s, h, hkv, d), visible);
+    let lse: Vec<f32> = read(&stats).iter().skip(1).step_by(2).copied().collect();
+    assert_close("lse mask window", &lse, &want_lse, 1e-5, 1e-5);
+
+    let grads = || {
+        (
+            zeros(&[b, s, h, d]),
+            zeros(&[b, s, hkv, d]),
+            zeros(&[b, s, hkv, d]),
+        )
+    };
+    let (gq, gk, gv) = grads();
+    g.engine.flash_attention_v2_backward_with_stats(
+        &g.ctx,
+        &tq,
+        &tk,
+        &tv,
+        &out,
+        &tdo,
+        &gq,
+        &gk,
+        &gv,
+        &stats,
+        &opts,
+        Some(&tmask),
+    );
+    let (rq, rk, rv) = grads();
+    g.engine.flash_attention_v2_backward_with(
+        &g.ctx,
+        &tq,
+        &tk,
+        &tv,
+        &out,
+        &tdo,
+        &rq,
+        &rk,
+        &rv,
+        &opts,
+        Some(&tmask),
+    );
+    assert_close("dq mask dropout window", &read(&gq), &read(&rq), 1e-5, 1e-4);
+    assert_close("dk mask dropout window", &read(&gk), &read(&rk), 1e-5, 1e-4);
+    assert_close("dv mask dropout window", &read(&gv), &read(&rv), 1e-5, 1e-4);
+}
+
 // ---------------------------------------------------------------------------
 // Quantisation
 // ---------------------------------------------------------------------------
