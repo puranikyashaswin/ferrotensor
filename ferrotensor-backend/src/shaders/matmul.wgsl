@@ -11,10 +11,19 @@
 // 4x4 outputs held in vec4 registers. K is consumed in slices of MMB_BK,
 // staged through workgroup memory as As[k][m] and Bs[k][n] and read back as
 // vec4s.
+//
+// When b is stored along k (mode 1, b[N, K]), the staging gives neighbouring
+// threads neighbouring k of the same rows, so each warp-wide load reads
+// contiguous memory; it then writes the slice transposed into Bs[k][n], so
+// the inner loop is the same in every mode.
 
 const MMB_BM: u32 = 64u;
 const MMB_BN: u32 = 64u;
 const MMB_BK: u32 = 16u;
+// Row length of mmb_bs4 in vec4s, one more than MMB_BN / 4: the k-inner
+// staging writes 16 rows at once, and the pad spreads those stores over the
+// shared-memory banks instead of stacking them on one.
+const MMB_BS_ROW: u32 = 17u;
 
 @group(0) @binding(0) var<storage, read> mmb_a: array<f32>;
 @group(0) @binding(1) var<storage, read> mmb_b: array<f32>;
@@ -22,7 +31,7 @@ const MMB_BK: u32 = 16u;
 @group(0) @binding(3) var<uniform> mmb_params: vec4<u32>; // M, K, N, mode
 
 var<workgroup> mmb_as4: array<vec4<f32>, 256>; // [MMB_BK][MMB_BM / 4]
-var<workgroup> mmb_bs4: array<vec4<f32>, 256>; // [MMB_BK][MMB_BN / 4]
+var<workgroup> mmb_bs4: array<vec4<f32>, 272>; // [MMB_BK][MMB_BS_ROW], last vec4 unused
 
 fn mmb_load_a(gm: u32, gk: u32, m: u32, k: u32, mode: u32) -> f32 {
     if (gm >= m || gk >= k) { return 0.0; }
@@ -36,6 +45,9 @@ fn mmb_load_b(gk: u32, gn: u32, k: u32, n: u32, mode: u32) -> f32 {
     return mmb_b[gk * n + gn];
 }
 
+// Whether consecutive k of one n are adjacent in mmb_b's storage.
+fn mmb_b_k_inner(mode: u32) -> bool { return mode == 1u; }
+
 @compute @workgroup_size(16, 16, 1)
 fn matmul_blocked(
     @builtin(local_invocation_index) lidx: u32,
@@ -46,6 +58,7 @@ fn matmul_blocked(
     let k = mmb_params.y;
     let n = mmb_params.z;
     let mode = mmb_params.w;
+    let b_k_inner = mmb_b_k_inner(mode);
     let row0 = wg.y * MMB_BM;
     let col0 = wg.x * MMB_BN;
 
@@ -70,11 +83,15 @@ fn matmul_blocked(
             );
         }
         for (var idx = lidx; idx < MMB_BK * MMB_BN / 4u; idx += 256u) {
-            let kk = idx / (MMB_BN / 4u);
-            let n4 = (idx % (MMB_BN / 4u)) * 4u;
+            var kk = idx / (MMB_BN / 4u);
+            var n4 = (idx % (MMB_BN / 4u)) * 4u;
+            if (b_k_inner) {
+                kk = idx % MMB_BK;
+                n4 = (idx / MMB_BK) * 4u;
+            }
             let gk = k0 + kk;
             let gn = col0 + n4;
-            mmb_bs4[idx] = vec4<f32>(
+            mmb_bs4[kk * MMB_BS_ROW + n4 / 4u] = vec4<f32>(
                 mmb_load_b(gk, gn, k, n, mode),
                 mmb_load_b(gk, gn + 1u, k, n, mode),
                 mmb_load_b(gk, gn + 2u, k, n, mode),
@@ -85,7 +102,7 @@ fn matmul_blocked(
 
         for (var kk = 0u; kk < MMB_BK; kk++) {
             let a0 = mmb_as4[kk * (MMB_BM / 4u) + lid.y + 16u * 0u];
-            let b0 = mmb_bs4[kk * (MMB_BN / 4u) + lid.x + 16u * 0u];
+            let b0 = mmb_bs4[kk * MMB_BS_ROW + lid.x + 16u * 0u];
             acc0_0 = fma(vec4<f32>(a0.x), b0, acc0_0);
             acc1_0 = fma(vec4<f32>(a0.y), b0, acc1_0);
             acc2_0 = fma(vec4<f32>(a0.z), b0, acc2_0);
