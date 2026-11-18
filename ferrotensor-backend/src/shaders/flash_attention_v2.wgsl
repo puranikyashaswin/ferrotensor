@@ -13,6 +13,11 @@
 // (batch, head) and streams K/V through workgroup memory FA_TILE_K keys at a
 // time as vec4s, keeping a running max / sum (online softmax) so the full
 // score matrix is never materialised.
+//
+// With write_stats set, each query row's log-sum-exp of its scores goes to
+// flash_v2_stats[2 * row + 1] (row = (batch * num_heads + head) * seq_q + q),
+// the layout of the backward kernels' stats, so backward need not recompute
+// it. Slot 2 * row is left for the backward pass.
 
 const FA_TILE_Q: u32 = 128u;
 const FA_TILE_K: u32 = 16u;
@@ -45,11 +50,13 @@ struct FlashV2Params {
     mask_stride_k: u32,
     window: u32,
     seed_hi: u32,
-    _pad1: u32,
+    write_stats: u32,
     _pad2: u32,
 };
 @group(0) @binding(4) var<uniform> flash_v2_params: FlashV2Params;
 @group(0) @binding(5) var<storage, read> flash_v2_mask: array<f32>;
+// Per (batch, head, query) row: [unused here, LSE]; only flash_attention_v2_metal binds it.
+@group(0) @binding(6) var<storage, read_write> flash_v2_stats: array<f32>;
 
 // Simple 3D hash for dropout RNG. Shared with the backward kernels, which
 // must regenerate exactly the same keep/drop decisions.
@@ -226,6 +233,13 @@ fn flash_attention_v2_metal(
     if (valid) {
         var inv = 0.0;
         if (l_run > 0.0) { inv = 1.0 / l_run; }
+        if (p.write_stats == 1u) {
+            // A fully masked row has no probability mass; this LSE makes
+            // every backward P_ij zero, as the backward's own sweep does.
+            var lse = 3.0e38;
+            if (l_run > 0.0) { lse = m_run + log(l_run); }
+            flash_v2_stats[2u * (bh * p.seq_q + q_idx) + 1u] = lse;
+        }
         for (var c = 0u; c < d4; c++) {
             let o = acc[c] * inv;
             let d = c * 4u;
