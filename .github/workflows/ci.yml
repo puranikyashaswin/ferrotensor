@@ -25,9 +25,10 @@ jobs:
     name: Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4.2.2
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # stable
         with:
+          toolchain: stable
           components: rustfmt
       - run: cargo fmt --all -- --check
 
@@ -35,11 +36,12 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4.2.2
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # stable
         with:
+          toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
@@ -50,9 +52,11 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4.2.2
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # Hosted runners have no GPU: GPU tests are #[ignore]d and skipped here.
       - run: cargo test --workspace
       # Run the examples that need no GPU. They check their own results.
@@ -71,7 +75,7 @@ jobs:
       WGPU_BACKEND: vulkan
       FERROTENSOR_RUN_GPU_TESTS: "1"
     steps:
-      - uses: actions/checkout@v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       # Lavapipe comes from apt, and the runner has no route to the Ubuntu
       # package hosts during an outage (every one of them failed to resolve for
       # about three hours once). So the .deb files, dependencies included, are
@@ -85,7 +89,7 @@ jobs:
         id: image
         run: echo "id=${ImageOS}-${ImageVersion}" >> "$GITHUB_OUTPUT"
       - name: Cache lavapipe packages
-        uses: actions/cache@v4.3.0
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.cache/lavapipe-debs
           # Bump the v1 suffix to discard a bad cache entry.
@@ -100,8 +104,10 @@ jobs:
           else
             echo "vulkaninfo is not installed; skipping the summary"
           fi
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Adapter and kernel self-check
         run: cargo run --release -p ferrotensor-cli -- info --check
       - name: Trainer examples (tiny model, no download)
@@ -163,7 +169,7 @@ jobs:
         run: scripts/run-examples.sh --gpu
       - name: Hardware report (quick)
         run: scripts/hardware-report.sh --quick
-      - uses: actions/upload-artifact@v4.4.3
+      - uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         with:
           name: hardware-report-lavapipe
           path: reports/
@@ -202,7 +208,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       # wgpu's default DX12 shader compiler, FXC, took about 9 minutes to
       # build the engine's pipelines on WARP, so each test that opens a GPU
       # took that long. WGPU_DX12_COMPILER=dxc selects DXC, whose two DLLs
@@ -216,8 +222,10 @@ jobs:
           ls -l "$dir/dxcompiler.dll" "$dir/dxil.dll"
           cygpath -w "$dir" >> "$GITHUB_PATH"
           echo "WGPU_DX12_COMPILER=dxc" >> "$GITHUB_ENV"
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # The JSON names the adapter, backend and device type that ran the tests.
       - name: Adapter and kernel self-check
         run: cargo run --release -p ferrotensor-cli -- info --check --json
@@ -268,9 +276,11 @@ jobs:
     env:
       RUSTDOCFLAGS: -D rustdoc::broken_intra_doc_links
     steps:
-      - uses: actions/checkout@v4.2.2
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # The CLI's binary is also named `ferrotensor`; documented in the same
       # cargo call as the library, both write target/doc/ferrotensor and the
       # job fails now and then with a missing file. Document it afterwards.
@@ -281,14 +291,14 @@ jobs:
     name: MSRV
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Read rust-version
         id: msrv
         run: echo "version=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo check --workspace --locked
 
   # A missing file in a package, a path dependency without a version and a wrong
@@ -301,9 +311,11 @@ jobs:
     name: Package
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4.2.2
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo --version
       - run: cargo publish --workspace --dry-run --locked
 
@@ -311,7 +323,7 @@ jobs:
     name: cargo-deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4.2.2
-      - uses: EmbarkStudios/cargo-deny-action@v2.1.1
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check advisories licenses bans sources
