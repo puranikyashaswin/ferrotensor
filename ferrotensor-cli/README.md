@@ -323,9 +323,9 @@ ferrotensor dpo --model ./data/models/SmolLM2-360M --data pairs.jsonl --beta 0.2
 - Not in `dpo`: `--eval-data`, `--world-size`, `--q4-weights` and the memory
   and profile reports.
 - Measured on an NVIDIA A10G: after 250 steps on 2,000 UltraFeedback pairs,
-  SmolLM2-360M ranked 60.0% of 115 held-out pairs correctly, from a tie
+  SmolLM2-360M ranked 62.0% of 500 held-out pairs correctly, from a tie
   before training, and PyTorch + PEFT gives the exported adapter the same
-  accuracy. The set is small and the run, with 135M, is in
+  accuracy. The runs, with 135M, are in
   [RESULTS.md](../benchmarks/RESULTS.md#real-hardware-run-18-november-2026-preference-tuning-dpo).
 
 ## What fits this machine: `plan`
