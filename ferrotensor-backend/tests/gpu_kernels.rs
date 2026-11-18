@@ -718,15 +718,15 @@ fn small_m_matmul_matches_cpu_for_every_split() {
 #[test]
 #[ignore = "needs a GPU; run with --ignored --test-threads=1"]
 fn small_m_matmul_matches_cpu_with_odd_tiles() {
-    // Two threads along M; 5 threads along M by 8 along N with 8 columns
-    // each, whose 40 threads leave the last round of staged values short;
-    // and one thread.
+    // Two threads along M with K steps of 32; 5 threads along M by 8 along
+    // N with 8 columns each, whose 40 threads leave the last round of staged
+    // values short; and one thread. All fit in 16 KiB of workgroup memory.
     let g = gpu();
     let tiles = [
         SmallMTile {
-            tm: 8,
+            tm: 4,
             tn: 4,
-            tx: 16,
+            tx: 8,
             ty: 2,
             bk: 32,
         },
@@ -820,23 +820,32 @@ fn matmul_routes_few_rows_against_wide_weights_to_small_m() {
             .map(|launch| launch.tile)
     };
     // 64 rows: 8 threads along M with 8 rows each, 16 along N with 4
-    // columns each; K steps of 32 need 36 KiB of workgroup memory (NVIDIA's
-    // Vulkan driver has 48), else 16 (20 KiB).
+    // columns each. K steps of 32 need 36 KiB of workgroup memory (NVIDIA's
+    // Vulkan driver has 48), steps of 16 need 20 KiB (Metal and software
+    // Vulkan have 32); the router takes no smaller step, so with 16 KiB
+    // (DX12 on WARP) the previous kernels run.
     let bytes = g.ctx.device.limits().max_compute_workgroup_storage_size;
-    let bk = if bytes >= 36 * 1024 { 32 } else { 16 };
-    let tile = SmallMTile {
+    let tile = |bk| SmallMTile {
         tm: 8,
         tn: 4,
         tx: 16,
         ty: 8,
         bk,
     };
-    assert_eq!(route((64, 512, 256), true, DType::FP32), Some(tile));
-    assert_eq!(route((64, 512, 256), false, DType::FP16), Some(tile));
-    // 160 rows: two row blocks of 80.
+    let want = if bytes >= 36 * 1024 {
+        Some(tile(32))
+    } else if bytes >= 20 * 1024 {
+        Some(tile(16))
+    } else {
+        None
+    };
+    assert_eq!(route((64, 512, 256), true, DType::FP32), want, "{bytes} B");
+    assert_eq!(route((64, 512, 256), false, DType::FP16), want, "{bytes} B");
+    // 160 rows: two row blocks of 80, with K steps of 16 in 22.5 KiB.
     assert_eq!(
         route((160, 256, 300), true, DType::FP16).map(SmallMTile::bm),
-        Some(80)
+        (bytes >= 23_040).then_some(80),
+        "{bytes} B"
     );
     // Too narrow, too shallow, too few or too many rows: the previous kernels.
     assert_eq!(route((64, 512, 192), true, DType::FP32), None);

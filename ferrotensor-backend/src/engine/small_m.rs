@@ -23,6 +23,11 @@ pub(super) const SMALL_M_MIN_WIDTH: u32 = 256;
 /// Most rows of the default tile; a pass of more rows runs as two row blocks.
 const BLOCK_MAX_ROWS: u32 = 128;
 
+/// Smallest K step the router takes. Smaller steps fit a device with 16 KiB
+/// of workgroup memory, but read `a` and `b` in short runs; there the
+/// previous kernels stay until a measurement says otherwise.
+pub(super) const ROUTE_MIN_BK: u32 = 16;
+
 /// Fewest K slices per split, so a workgroup's loop is long enough to hide
 /// its first load and the partial sums stay few.
 const MIN_TILES_PER_SPLIT: u32 = 4;
@@ -102,7 +107,8 @@ impl SmallMTile {
     /// One row block covers up to 128 rows, more run as two
     /// blocks. 16 threads along N each keep 4 columns (64 per workgroup);
     /// 8 to 16 threads along M keep up to 8 rows each. K advances 32 at a
-    /// time when both layouts fit in workgroup memory, else 16.
+    /// time when both layouts fit in workgroup memory, else 16, 8 or 4 (a
+    /// device with 16 KiB, such as DX12 on WARP, runs only those).
     pub fn for_rows(m: u32, max_bytes: u32) -> Option<Self> {
         if m == 0 {
             return None;
@@ -114,7 +120,7 @@ impl SmallMTile {
         };
         let ty = rows.div_ceil(8).clamp(8, 16);
         let tm = rows.div_ceil(ty);
-        [32, 16]
+        [32, 16, 8, 4]
             .into_iter()
             .map(|bk| Self {
                 tm,
@@ -551,8 +557,16 @@ mod tests {
             SmallMTile::for_rows(128, small),
             Some(tile(8, 4, 16, 16, 16))
         );
-        // Nothing fits in the WebGPU default of 16 KiB at 128 rows.
-        assert_eq!(SmallMTile::for_rows(128, 16 * 1024), None);
+        // 16 KiB (the WebGPU default, DX12 on WARP): K steps of 8 or 4.
+        let least = 16 * 1024;
+        assert_eq!(SmallMTile::for_rows(32, least), Some(tile(4, 4, 16, 8, 16)));
+        assert_eq!(SmallMTile::for_rows(37, least), Some(tile(5, 4, 16, 8, 8)));
+        assert_eq!(SmallMTile::for_rows(64, least), Some(tile(8, 4, 16, 8, 8)));
+        assert_eq!(
+            SmallMTile::for_rows(128, least),
+            Some(tile(8, 4, 16, 16, 4))
+        );
+        assert_eq!(SmallMTile::for_rows(128, 8 * 1024), None);
         assert_eq!(SmallMTile::for_rows(0, nv), None);
     }
 
@@ -641,11 +655,12 @@ mod tests {
         // along M or N, a thread count that leaves the last round of staged
         // units short.
         let mut tiles: HashSet<SmallMTile> = (1..=256)
-            .flat_map(|m| [32 * 1024, 48 * 1024].map(|b| SmallMTile::for_rows(m, b)))
+            .flat_map(|m| [16 * 1024, 32 * 1024, 48 * 1024].map(|b| SmallMTile::for_rows(m, b)))
             .flatten()
             .collect();
         tiles.extend([
             tile(8, 8, 16, 8, 32),
+            tile(4, 4, 8, 2, 32),
             tile(4, 4, 16, 16, 16),
             tile(8, 4, 32, 8, 16),
             tile(3, 8, 8, 5, 16),

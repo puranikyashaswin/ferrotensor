@@ -308,7 +308,9 @@ impl ComputeEngine {
         if !small_m::routes(dtype, (m, k, n)) {
             return None;
         }
-        let tile = self.small_m_tile(m, transposed_b)?;
+        let tile = self
+            .small_m_tile(m, transposed_b)
+            .filter(|tile| tile.bk >= small_m::ROUTE_MIN_BK)?;
         Self::small_m_grid_fits(tile, m, n, None).then_some((transposed_b, tile))
     }
 
