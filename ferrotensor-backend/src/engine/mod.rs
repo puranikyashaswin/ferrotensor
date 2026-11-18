@@ -4,8 +4,9 @@ use crate::context::Dispatch;
 use crate::kernel_timing::KernelLabel;
 use crate::{UnifiedTensor, WgpuContext};
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use wgpu::{util::DeviceExt, Buffer, Device};
 
 mod attention;
@@ -14,9 +15,12 @@ mod matmul;
 mod misc;
 mod norm;
 mod quant;
+mod small_m;
 mod training;
 
 pub use attention::AttentionOptions;
+pub use matmul::MatmulPath;
+pub use small_m::{SmallMLaunch, SmallMTile};
 pub use training::{AdamParams, MASKED_CE_SKIP, SUM_SQUARES_CHUNK};
 
 /// The full WGSL source compiled into the engine's shader module.
@@ -34,8 +38,9 @@ fn shader_source() -> String {
     let matvec_q4_src = include_str!("../shaders/matvec_q4.wgsl");
     let thin_src = &include_str!("../shaders/matmul_thin.wgsl").replace("\r\n", "\n");
     let thin_h_src = half_w_thin_matmul(thin_src);
+    let split_reduce_src = include_str!("../shaders/matmul_split_reduce.wgsl");
     format!(
-        "{kernels_src}\n{matmul_src}\n{matmul_h_src}\n{matmul_q4_src}\n{matvec_src}\n{matvec_h_src}\n{matvec_q4_src}\n{thin_src}\n{thin_h_src}\n{flash_v2_src}\n{flash_v2_bw_src}"
+        "{kernels_src}\n{matmul_src}\n{matmul_h_src}\n{matmul_q4_src}\n{matvec_src}\n{matvec_h_src}\n{matvec_q4_src}\n{thin_src}\n{thin_h_src}\n{split_reduce_src}\n{flash_v2_src}\n{flash_v2_bw_src}"
     )
 }
 
@@ -250,6 +255,15 @@ pub struct ComputeEngine {
     flash_attn_decode: Kernel,
     flash_attn_v2_bw_dq: Kernel,
     flash_attn_v2_bw_dkdv: Kernel,
+    split_reduce: Kernel,
+    /// Small-M matmul kernels, compiled the first time a tile and layout run.
+    small_m: Mutex<HashMap<small_m::SmallMKey, Arc<Kernel>>>,
+    /// The device's workgroup memory in bytes, which bounds the small-M tiles.
+    small_m_max_bytes: u32,
+    /// The most threads a workgroup of this device can have.
+    small_m_max_threads: u32,
+    /// Workgroups a small-M matmul's K split aims for on this device.
+    split_target: u32,
 }
 
 impl ComputeEngine {
@@ -263,6 +277,7 @@ impl ComputeEngine {
                 source: wgpu::ShaderSource::Wgsl(Cow::Owned(combined_src)),
             });
         let k = |entry: &'static str| Kernel::new(&ctx.device, &module, entry);
+        let limits = ctx.device.limits();
 
         Self {
             matmul: k("matmul_blocked"),
@@ -314,6 +329,13 @@ impl ComputeEngine {
             flash_attn_decode: k("flash_attention_decode"),
             flash_attn_v2_bw_dq: k("flash_bwd_dq"),
             flash_attn_v2_bw_dkdv: k("flash_bwd_dk_dv"),
+            split_reduce: k("matmul_split_reduce"),
+            small_m: Mutex::new(HashMap::new()),
+            small_m_max_bytes: limits.max_compute_workgroup_storage_size,
+            small_m_max_threads: limits
+                .max_compute_invocations_per_workgroup
+                .min(limits.max_compute_workgroup_size_x),
+            split_target: small_m::split_target(ctx.adapter.get_info().device_type),
         }
     }
 
