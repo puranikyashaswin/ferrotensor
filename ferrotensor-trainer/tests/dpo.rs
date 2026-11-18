@@ -43,10 +43,67 @@ use std::path::{Path, PathBuf};
 /// `beta` times their differences.
 const PARITY_ATOL: f64 = 1e-6;
 
+/// Gradients pass when `|a - e| <= PARITY_ATOL + GRAD_RTOL * |e|`; the loss
+/// keeps the plain `PARITY_ATOL`.
+///
+/// A gradient is `beta * sigmoid(-z) / pairs` times SFT-style row gradients,
+/// where `z` is the implicit reward margin. `z` is built from four sequence
+/// log-probabilities, each a sum of response-token terms of size 3 to 4, so
+/// each carries an f32 error of a few 1e-7 (the loss shows 6e-7). The error
+/// in `z` moves `sigmoid(-z)` by a relative amount of the same size, and
+/// the same factor multiplies every element of the gradients of that pair,
+/// so the error scales with the gradient: it is relative, not absolute.
+/// With gradients of 0.25 to 0.55 a relative error of 2.5e-6 is 1.4e-6
+/// absolute. 1e-5 is about four times that and still 100 times tighter than
+/// the 1e-3 used for the SFT gradient tests, so a wrong sign, a missing
+/// pair, a wrong scale or a wrong mask still fails by orders of magnitude.
+const GRAD_RTOL: f64 = 1e-5;
+
 /// The sequence log-probabilities are sums of eight f32 cross-entropies of
 /// about 3.5 each, so f32 rounding alone is of order 1e-6 there. They are
 /// printed and checked loosely; the loss and gradients carry the gate.
 const LOG_PROB_ATOL: f64 = 1e-4;
+
+/// How far a gradient is from its reference.
+struct GradDiff {
+    /// Largest `|a - e|`.
+    abs: f64,
+    /// Largest `|e|`.
+    scale: f64,
+    /// Largest `|a - e| / |e|` over elements with `|e| >= scale / 10`.
+    rel: f64,
+    /// Largest `|a - e| / (PARITY_ATOL + GRAD_RTOL * |e|)`; passes at <= 1.
+    ratio: f64,
+}
+
+fn gradient_diff(actual: &[f32], expected: &[f32]) -> GradDiff {
+    assert_eq!(actual.len(), expected.len(), "length mismatch");
+    let scale = expected
+        .iter()
+        .fold(0.0f64, |m, &e| m.max((e as f64).abs()));
+    let mut diff = GradDiff {
+        abs: 0.0,
+        scale,
+        rel: 0.0,
+        ratio: 0.0,
+    };
+    for (&a, &e) in actual.iter().zip(expected) {
+        let (a, e) = (a as f64, e as f64);
+        let d = (a - e).abs();
+        if d.is_nan() {
+            // NaN must fail.
+            diff.abs = f64::INFINITY;
+            diff.ratio = f64::INFINITY;
+            continue;
+        }
+        diff.abs = diff.abs.max(d);
+        diff.ratio = diff.ratio.max(d / (PARITY_ATOL + GRAD_RTOL * e.abs()));
+        if e.abs() >= scale / 10.0 {
+            diff.rel = diff.rel.max(d / e.abs());
+        }
+    }
+    diff
+}
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -547,9 +604,10 @@ fn check_pytorch_case(case_name: &str, per_sequence: bool) {
         }
     );
     let mut text = format!(
-        "\nDPO parity [{label}] vs PyTorch, beta {}: loss and gradients pass if |a-e| <= {PARITY_ATOL:e}\n\
-         {:<40} {:>12} {:>12}\n",
-        case.beta, "tensor", "max|e|", "max abs"
+        "\nDPO parity [{label}] vs PyTorch, beta {}: the loss passes if |a-e| <= {PARITY_ATOL:e}; \
+         a gradient passes if |a-e| <= {PARITY_ATOL:e} + {GRAD_RTOL:e}*|e|\n\
+         {:<40} {:>12} {:>12} {:>12} {:>8}\n",
+        case.beta, "tensor", "max|e|", "max abs", "max rel", "ratio"
     );
     let mut failing = Vec::new();
     let loss_err = (loss.value as f64 - case.loss).abs();
@@ -599,13 +657,16 @@ fn check_pytorch_case(case_name: &str, per_sequence: bool) {
             .clone()
             .unwrap_or_else(|| panic!("no gradient for {name}"));
         assert_eq!(&grad.shape, shape, "gradient shape of {name}");
-        let (err, scale) = max_abs_diff(&host(&gpu, &grad), want);
-        text += &format!("{name:<40} {scale:>12.4e} {err:>12.3e}\n");
-        if err > PARITY_ATOL {
+        let d = gradient_diff(&host(&gpu, &grad), want);
+        text += &format!(
+            "{name:<40} {:>12.4e} {:>12.3e} {:>12.3e} {:>8.3}\n",
+            d.scale, d.abs, d.rel, d.ratio
+        );
+        if d.ratio.is_nan() || d.ratio > 1.0 {
             failing.push(name.clone());
         }
-        if err >= worst.1 {
-            worst = (name, err);
+        if d.abs >= worst.1 {
+            worst = (name, d.abs);
         }
         compared += 1;
     }
