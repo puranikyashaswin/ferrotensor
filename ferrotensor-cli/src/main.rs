@@ -1862,8 +1862,7 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
     let mut last_loss = f32::NAN;
     let mut last_norm = 0.0f32;
     let mut last_lr = 0.0f32;
-    // Forward passes of the last optimizer step, and rows over all of them.
-    let mut last_micro = ferrotensor_trainer::MicroBatches::default();
+    // Rows through the forward passes over all optimizer steps, and how many.
     let (mut total_input_tokens, mut steps_taken) = (0usize, 0usize);
     if let Some(m) = &memory {
         m.begin_steps();
@@ -1901,8 +1900,8 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
                     continue;
                 }
                 step += 1;
-                last_micro = trainer.last_step_micro_batches().clone();
-                total_input_tokens += last_micro.input_tokens();
+                let micro = trainer.last_step_micro_batches().clone();
+                total_input_tokens += micro.input_tokens();
                 steps_taken += 1;
                 if let Some(p) = profile.as_mut() {
                     p.after_step();
@@ -1925,8 +1924,8 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
                         serde_json::json!({
                             "step": step, "loss": loss, "grad_norm": last_norm, "lr": last_lr,
                             "tokens": win_tok, "seconds": secs,
-                            "input_tokens": last_micro.input_tokens(),
-                            "micro_batch_m": last_micro.rows(),
+                            "input_tokens": micro.input_tokens(),
+                            "micro_batch_m": micro.rows(),
                             "elapsed": run_start.elapsed().as_secs_f32(),
                         })
                     )?;
