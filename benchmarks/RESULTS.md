@@ -546,3 +546,53 @@ because the thin kernel adds in a different order. The tracked peak was
 Greedy generation is unchanged, since one-row products already run the
 matrix-vector kernel: 108.9 and 110.9 tokens per second on SmolLM2-135M,
 57.0 and 57.2 on 1.7B.
+
+# Real hardware run, 18 November 2026: preference tuning (`dpo`)
+
+One NVIDIA A10G (24 GB), driver 595.112.07, Vulkan backend, rustc 1.100.0,
+release build of the 0.8.0 integration branch at commit `4482741`. The
+cross-check used PyTorch 2.15.0 (CUDA 13.2), PEFT 0.21.3 and transformers
+5.23.0. Each case ran once. The 500-pair row comes from a second run of the
+same binary.
+
+Data: `trl-lib/ultrafeedback_binarized` at revision `47124cb`, single-turn
+pairs only, where the chosen answer scored higher, the prompt has at most
+400 characters, each answer at most 600, and the chat prompt at most 160
+tokens. Training used 2,000 pairs from the train split. The held-out set is
+the 115 pairs of the test split that pass the same filter; none of their
+prompts is in the training pairs. The 500-pair set adds 385 pairs from the
+train split that come after the 2,000 training pairs in the same seeded
+order. They were never trained on, and no prompt repeats.
+
+Recipe: `dpo` with LoRA rank 8 on q, k, v and o, `--beta 0.1`,
+`--seq-len 320`, batch 1 × accumulation 8 (8 pairs per step), 250 steps
+(one pass over the 2,000 pairs), 10 warmup steps, then cosine decay, seed 0.
+
+A held-out pair counts as ranked correctly when its reward margin is above
+0.001. Before training the adapters are zero, so every margin is exactly 0
+and no pair counts. Ferrotensor scored the held-out pairs with `dpo --lr 0`
+resumed from the trained adapter. `export-adapter` then wrote the adapter in
+PEFT format, and PyTorch + PEFT (fp32) scored the same pairs.
+
+| Model | Learning rate | Train accuracy, last 25 steps | Held-out accuracy, Ferrotensor | Held-out accuracy, PyTorch + PEFT | Mean held-out margin | Median s/step | Peak GPU memory |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| SmolLM2-135M | 2e-4 | 58.5% | 53.9% (62 of 115) | 53.9% | 0.0686 | 1.80 | 2,995 MiB |
+| SmolLM2-135M | 5e-5 | 57.0% | 58.3% (67 of 115) | 58.3% | 0.0177 | 1.80 | 3,019 MiB |
+| SmolLM2-360M | 2e-4 | 63.5% | 60.0% (69 of 115) | 60.0% | 0.0738 | 2.50 | 5,399 MiB |
+| SmolLM2-360M, 500 held-out pairs | 2e-4 | 63.5% | 62.0% (310 of 500) | 62.0% | 0.1422 | 2.48 | 5,399 MiB |
+
+Peak GPU memory is the largest `nvidia-smi` sample at 200 ms.
+
+- In every case the two scorers give the same held-out accuracy and the
+  same mean margin to four digits.
+- On the 500 pairs, the two scorers' margins, each sorted, differ by at
+  most 0.00007.
+- 115 pairs is a small set: one standard error at 50% is 4.7 points. 60.0%
+  at 360M is 2.1 standard errors above a coin flip, and 58.3% at 135M is
+  1.8. On 500 pairs one standard error is 2.2 points, and 62.0% at 360M is
+  5.4 above. The second run ranked the same 69 of the 115 test-split pairs
+  correctly, and 62.6% (241 of 385) of the added pairs.
+- The base model alone gives the chosen answer the higher log-probability
+  on 47.0% of the 115 pairs at 135M, 48.7% at 360M, and 44.8% of the 500
+  pairs at 360M, so likelihood without the adapter does not pick the chosen
+  answer here.
