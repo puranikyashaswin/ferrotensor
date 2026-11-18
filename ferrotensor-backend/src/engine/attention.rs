@@ -4,6 +4,9 @@ use super::{dummy_storage, groups64, uniform, ComputeEngine};
 use crate::{DType, UnifiedTensor, WgpuContext};
 use wgpu::Buffer;
 
+/// Query or key rows per workgroup of the attention kernels (`FA_TILE_Q` and `FAB_ROWS` in WGSL).
+const ATTENTION_ROWS: u32 = 16;
+
 impl ComputeEngine {
     /// Rotate-half RoPE (theta 10000) applied in place.
     ///
@@ -204,7 +207,7 @@ impl ComputeEngine {
             }
         };
         // One query (decoding) gets a kernel whose threads split the keys;
-        // the other gives each thread a query, which would leave 127 idle.
+        // the other gives each query 8 of its 128 threads and leaves 120 idle.
         // Only the many-query kernel writes stats, so a one-query training
         // call takes it and decoding is unchanged.
         if dims.seq_q == 1 && stats.is_none() {
@@ -243,7 +246,11 @@ impl ComputeEngine {
                 (5, mask_buf),
                 (6, stats_buf),
             ],
-            (1, dims.seq_q.div_ceil(128), dims.batch * dims.heads),
+            (
+                1,
+                dims.seq_q.div_ceil(ATTENTION_ROWS),
+                dims.batch * dims.heads,
+            ),
         );
     }
 
@@ -413,7 +420,7 @@ impl ComputeEngine {
                 (9, mask_buf),
                 (10, stats),
             ],
-            (1, dims.seq_q.div_ceil(128), b * h),
+            (1, dims.seq_q.div_ceil(ATTENTION_ROWS), b * h),
         );
         self.run(
             ctx,
@@ -429,7 +436,7 @@ impl ComputeEngine {
                 (9, mask_buf),
                 (10, stats),
             ],
-            (1, dims.seq_k.div_ceil(128), b * hkv),
+            (1, dims.seq_k.div_ceil(ATTENTION_ROWS), b * hkv),
         );
     }
 }
