@@ -1,8 +1,11 @@
 //! Rotary embeddings and fused (flash) attention.
 
 use super::{dummy_storage, groups64, uniform, ComputeEngine};
-use crate::{UnifiedTensor, WgpuContext};
+use crate::{DType, UnifiedTensor, WgpuContext};
 use wgpu::Buffer;
+
+/// Query or key rows per workgroup of the attention kernels (`FA_TILE_Q` and `FAB_ROWS` in WGSL).
+const ATTENTION_ROWS: u32 = 16;
 
 impl ComputeEngine {
     /// Rotate-half RoPE (theta 10000) applied in place.
@@ -143,8 +146,58 @@ impl ComputeEngine {
         opts: &AttentionOptions,
         mask: Option<&UnifiedTensor>,
     ) {
+        self.attention_forward(ctx, q, k, v, out, None, opts, mask);
+    }
+
+    /// [`flash_attention_v2_with`](Self::flash_attention_v2_with) that also
+    /// saves each query row's log-sum-exp for
+    /// [`flash_attention_v2_backward_with_stats`](Self::flash_attention_v2_backward_with_stats).
+    ///
+    /// `stats` is an `f32` tensor of `batch * num_heads * seq_q * 2`
+    /// elements (e.g. shaped `[batch, num_heads, seq_q, 2]`). Element
+    /// `2 * row + 1`, with `row = (b * num_heads + h) * seq_q + i`, receives
+    /// the log-sum-exp of that row's scores; the backward pass uses element
+    /// `2 * row` as scratch.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors flash_attention_v2_with plus the stats output"
+    )]
+    pub fn flash_attention_v2_with_stats(
+        &self,
+        ctx: &WgpuContext,
+        q: &UnifiedTensor,
+        k: &UnifiedTensor,
+        v: &UnifiedTensor,
+        out: &UnifiedTensor,
+        stats: &UnifiedTensor,
+        opts: &AttentionOptions,
+        mask: Option<&UnifiedTensor>,
+    ) {
+        self.attention_forward(ctx, q, k, v, out, Some(stats), opts, mask);
+    }
+
+    /// Shared body of the forward entry points; `stats`, when given,
+    /// receives the per-row log-sum-exp.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one argument per kernel binding and option"
+    )]
+    fn attention_forward(
+        &self,
+        ctx: &WgpuContext,
+        q: &UnifiedTensor,
+        k: &UnifiedTensor,
+        v: &UnifiedTensor,
+        out: &UnifiedTensor,
+        stats: Option<&UnifiedTensor>,
+        opts: &AttentionOptions,
+        mask: Option<&UnifiedTensor>,
+    ) {
         let dims = AttentionDims::new(q, k);
-        let params = dims.params(ctx, opts, mask);
+        if let Some(s) = stats {
+            dims.check_stats(s);
+        }
+        let params = dims.params(ctx, opts, mask, stats.is_some());
         let dummy;
         let mask_buf = match mask {
             Some(m) => m.buffer(),
@@ -154,15 +207,36 @@ impl ComputeEngine {
             }
         };
         // One query (decoding) gets a kernel whose threads split the keys;
-        // the other gives each thread a query, which would leave 127 idle.
-        let kernel = if dims.seq_q == 1 {
-            &self.flash_attn_decode
-        } else {
-            &self.flash_attn_v2
+        // the other gives each query 8 of its 128 threads and leaves 120 idle.
+        // Only the many-query kernel writes stats, so a one-query training
+        // call takes it and decoding is unchanged.
+        if dims.seq_q == 1 && stats.is_none() {
+            self.run(
+                ctx,
+                &self.flash_attn_decode,
+                &[
+                    (0, q.buffer()),
+                    (1, k.buffer()),
+                    (2, v.buffer()),
+                    (3, out.buffer()),
+                    (4, &params),
+                    (5, mask_buf),
+                ],
+                (1, 1, dims.batch * dims.heads),
+            );
+            return;
+        }
+        let stats_dummy;
+        let stats_buf = match stats {
+            Some(s) => s.buffer(),
+            None => {
+                stats_dummy = dummy_storage(ctx);
+                &stats_dummy
+            }
         };
         self.run(
             ctx,
-            kernel,
+            &self.flash_attn_v2,
             &[
                 (0, q.buffer()),
                 (1, k.buffer()),
@@ -170,8 +244,13 @@ impl ComputeEngine {
                 (3, out.buffer()),
                 (4, &params),
                 (5, mask_buf),
+                (6, stats_buf),
             ],
-            (1, dims.seq_q.div_ceil(128), dims.batch * dims.heads),
+            (
+                1,
+                dims.seq_q.div_ceil(ATTENTION_ROWS),
+                dims.batch * dims.heads,
+            ),
         );
     }
 
@@ -244,8 +323,64 @@ impl ComputeEngine {
         opts: &AttentionOptions,
         mask: Option<&UnifiedTensor>,
     ) {
+        let grads = [grad_q, grad_k, grad_v];
+        self.attention_backward(ctx, q, k, v, out, grad_out, grads, None, opts, mask);
+    }
+
+    /// [`flash_attention_v2_backward_with`](Self::flash_attention_v2_backward_with)
+    /// that reads the log-sum-exp saved by
+    /// [`flash_attention_v2_with_stats`](Self::flash_attention_v2_with_stats)
+    /// instead of recomputing it from the scores.
+    ///
+    /// `stats` is the tensor that forward call filled; its scratch half is
+    /// overwritten.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors flash_attention_v2_backward_with plus the saved stats"
+    )]
+    pub fn flash_attention_v2_backward_with_stats(
+        &self,
+        ctx: &WgpuContext,
+        q: &UnifiedTensor,
+        k: &UnifiedTensor,
+        v: &UnifiedTensor,
+        out: &UnifiedTensor,
+        grad_out: &UnifiedTensor,
+        grad_q: &UnifiedTensor,
+        grad_k: &UnifiedTensor,
+        grad_v: &UnifiedTensor,
+        stats: &UnifiedTensor,
+        opts: &AttentionOptions,
+        mask: Option<&UnifiedTensor>,
+    ) {
+        let grads = [grad_q, grad_k, grad_v];
+        self.attention_backward(ctx, q, k, v, out, grad_out, grads, Some(stats), opts, mask);
+    }
+
+    /// Shared body of the backward entry points; without `saved` stats the
+    /// kernel recomputes each row's log-sum-exp.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one argument per kernel binding and option"
+    )]
+    fn attention_backward(
+        &self,
+        ctx: &WgpuContext,
+        q: &UnifiedTensor,
+        k: &UnifiedTensor,
+        v: &UnifiedTensor,
+        out: &UnifiedTensor,
+        grad_out: &UnifiedTensor,
+        [grad_q, grad_k, grad_v]: [&UnifiedTensor; 3],
+        saved: Option<&UnifiedTensor>,
+        opts: &AttentionOptions,
+        mask: Option<&UnifiedTensor>,
+    ) {
         let dims = AttentionDims::new(q, k);
-        let params = dims.params_bwd(ctx, opts, mask);
+        if let Some(s) = saved {
+            dims.check_stats(s);
+        }
+        let params = dims.params_bwd(ctx, opts, mask, saved.is_some());
         let dummy;
         let mask_buf = match mask {
             Some(m) => m.buffer(),
@@ -255,14 +390,21 @@ impl ComputeEngine {
             }
         };
         // Per (batch, head, query) row: [Delta, LSE].
-        let stats = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Flash Bwd Stats"),
-            size: (dims.batch * dims.heads * dims.seq_q).max(1) as u64 * 8,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-        // Dropped at the end of this function, before the dispatches run.
-        ctx.memory().count_dispatch_buffer(stats.size());
+        let scratch;
+        let stats = match saved {
+            Some(s) => s.buffer(),
+            None => {
+                scratch = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Flash Bwd Stats"),
+                    size: (dims.batch * dims.heads * dims.seq_q).max(1) as u64 * 8,
+                    usage: wgpu::BufferUsages::STORAGE,
+                    mapped_at_creation: false,
+                });
+                // Dropped at the end of this function, before the dispatches run.
+                ctx.memory().count_dispatch_buffer(scratch.size());
+                &scratch
+            }
+        };
         let (b, h, hkv) = (dims.batch, dims.heads, dims.kv_heads);
         self.run(
             ctx,
@@ -276,9 +418,9 @@ impl ComputeEngine {
                 (5, grad_q.buffer()),
                 (8, &params),
                 (9, mask_buf),
-                (10, &stats),
+                (10, stats),
             ],
-            (1, dims.seq_q.div_ceil(128), b * h),
+            (1, dims.seq_q.div_ceil(ATTENTION_ROWS), b * h),
         );
         self.run(
             ctx,
@@ -292,9 +434,9 @@ impl ComputeEngine {
                 (7, grad_v.buffer()),
                 (8, &params),
                 (9, mask_buf),
-                (10, &stats),
+                (10, stats),
             ],
-            (1, dims.seq_k.div_ceil(128), b * hkv),
+            (1, dims.seq_k.div_ceil(ATTENTION_ROWS), b * hkv),
         );
     }
 }
@@ -345,6 +487,18 @@ impl AttentionDims {
         dims
     }
 
+    /// Panics unless `stats` holds two `f32` values per (batch, head, query) row.
+    fn check_stats(&self, stats: &UnifiedTensor) {
+        let rows = (self.batch * self.heads * self.seq_q) as usize;
+        assert!(
+            stats.dtype == DType::FP32 && stats.shape.iter().product::<usize>() == rows * 2,
+            "attention stats must be {} f32 values (2 per batch, head and query), got {:?} {:?}",
+            rows * 2,
+            stats.dtype,
+            stats.shape
+        );
+    }
+
     fn scale(&self) -> f32 {
         1.0 / (self.head_dim as f32).sqrt()
     }
@@ -355,6 +509,7 @@ impl AttentionDims {
         ctx: &WgpuContext,
         opts: &AttentionOptions,
         mask: Option<&UnifiedTensor>,
+        write_stats: bool,
     ) -> Buffer {
         let (has_mask, s) = mask_strides(mask);
         let params: [u32; 20] = [
@@ -376,7 +531,7 @@ impl AttentionDims {
             s[3],
             opts.window,
             (opts.seed >> 32) as u32,
-            0,
+            write_stats as u32,
             0,
         ];
         uniform(ctx, bytemuck::cast_slice(&params))
@@ -388,6 +543,7 @@ impl AttentionDims {
         ctx: &WgpuContext,
         opts: &AttentionOptions,
         mask: Option<&UnifiedTensor>,
+        lse_saved: bool,
     ) -> Buffer {
         let (has_mask, s) = mask_strides(mask);
         let params: [u32; 20] = [
@@ -409,7 +565,7 @@ impl AttentionDims {
             s[3],
             opts.window,
             (opts.seed >> 32) as u32,
-            0,
+            lse_saved as u32,
             0,
         ];
         uniform(ctx, bytemuck::cast_slice(&params))
