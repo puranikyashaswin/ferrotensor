@@ -28,7 +28,7 @@ const OVERHEAD_MIB: u64 = 1600;
 /// MiB. Fitted to that single run and not yet checked against others.
 const METAL_OVERHEAD_MIB: u64 = 494;
 /// Measured activation bytes over 4 bytes per value that
-/// [`estimate_peak_mib`] counts. Fitted to the measured peaks.
+/// [`estimate_peak_mib_for`] counts. Fitted to the measured peaks.
 const ACTIVATION_SCALE: f64 = 0.92;
 /// Values per token and block, per unit of key/value width, kept beyond
 /// the counted ones. Ferrotensor's own count of its buffers shows
@@ -312,6 +312,7 @@ fn ceil_mib(bytes: f64) -> u64 {
 
 /// Estimated peak GPU memory of LoRA training `shape` with `config`, with
 /// the NVIDIA-fitted overhead.
+#[cfg(test)]
 pub fn estimate_peak_mib(shape: &ModelShape, config: &TrainConfig) -> Estimate {
     estimate_peak_mib_for(shape, config, Calibration::NvidiaFitted)
 }
@@ -418,6 +419,7 @@ pub struct Plan {
 /// size only changes speed), then no checkpointing before checkpointing,
 /// then larger batch, trying only the `pinned` value where there is one.
 /// When none fits, the smallest one, with `fits` false.
+#[cfg(test)]
 pub fn choose(
     shape: &ModelShape,
     budget_mib: u64,
@@ -436,7 +438,7 @@ pub fn choose(
     )
 }
 
-/// [`choose`] with the estimate calibrated for `calibration`. On `unified`
+/// The plan choice, with the estimate calibrated for `calibration`. On `unified`
 /// memory a plan must also stay within `UNIFIED_HEADROOM_FRACTION` of the
 /// usable budget; when none does, the smallest one is chosen if it fits the
 /// usable budget (`tight`), else it is reported as not fitting.
