@@ -9,19 +9,26 @@
 // with broadcast strides and attention dropout are also supported.
 // head_dim <= 128.
 //
-// One thread owns one query row; a workgroup covers FA_TILE_Q queries of one
-// (batch, head) and streams K/V through workgroup memory FA_TILE_K keys at a
-// time as vec4s, keeping a running max / sum (online softmax) so the full
-// score matrix is never materialised.
+// A workgroup covers FA_TILE_Q queries of one (batch, head) and streams K/V
+// through workgroup memory FA_TILE_K keys at a time as vec4s, keeping a
+// running max / sum (online softmax) so the full score matrix is never
+// materialised. FA_TPR threads share a query row: each owns every FA_TPR-th
+// vec4 of head_dim, a score is the sum of their partial dot products, and
+// each keeps its own part of the output. Small query blocks give short
+// sequences enough workgroups to fill the GPU. The tiles take 12 KB of
+// workgroup memory, under the 16 KB every WebGPU adapter offers.
 //
 // With write_stats set, each query row's log-sum-exp of its scores goes to
 // flash_v2_stats[2 * row + 1] (row = (batch * num_heads + head) * seq_q + q),
 // the layout of the backward kernels' stats, so backward need not recompute
 // it. Slot 2 * row is left for the backward pass.
 
-const FA_TILE_Q: u32 = 128u;
-const FA_TILE_K: u32 = 16u;
+const FA_TILE_Q: u32 = 16u;
+const FA_TILE_K: u32 = 8u;
 const FA_MAX_D: u32 = 128u;
+const FA_THREADS: u32 = 128u; // FA_TILE_Q * FA_TPR
+const FA_TPR: u32 = 8u;       // threads per query row
+const FA_SLICES: u32 = 4u;    // vec4s of head_dim per thread: FA_MAX_D / 4 / FA_TPR
 // Scores at or below this are treated as masked out (-inf).
 const FA_MASKED: f32 = -1.0e30;
 
@@ -109,8 +116,10 @@ fn fa_visible(p: FlashV2Params, q_idx: u32, kp: u32) -> bool {
 }
 
 // K/V tiles as vec4s: [FA_TILE_K][FA_MAX_D / 4].
-var<workgroup> fa_k_tile: array<vec4<f32>, 512>;
-var<workgroup> fa_v_tile: array<vec4<f32>, 512>;
+var<workgroup> fa_k_tile: array<vec4<f32>, 256>;
+var<workgroup> fa_v_tile: array<vec4<f32>, 256>;
+// Each thread's partial query . key products: [FA_TILE_K][FA_THREADS].
+var<workgroup> fa_part: array<f32, 1024>;
 
 // Element `c` of a head_dim-long row starting at `base`, or 0 past the end.
 fn fa_ld(buf_sel: u32, base: u32, c: u32, d_len: u32) -> f32 {
@@ -142,16 +151,25 @@ fn flash_attention_v2_metal(
     let head_idx = wg_id.z % p.num_heads;
     let kv_head_idx = head_idx / (p.num_heads / p.num_kv_heads);
 
+    let lid = local_id.x;
+    let row = lid / FA_TPR;
+    let lane = lid % FA_TPR;
+    let row_first = row * FA_TPR;
+    // This thread's vec4s of head_dim are lane, lane + FA_TPR, ...
+    var n_sl = 0u;
+    if (lane < d4) { n_sl = (d4 - lane + FA_TPR - 1u) / FA_TPR; }
+
     let q_start = wg_id.y * FA_TILE_Q;
-    let q_idx = q_start + local_id.x;
+    let q_idx = q_start + row;
     let valid = q_idx < p.seq_q;
 
-    var q_reg: array<vec4<f32>, 32>;
-    var acc: array<vec4<f32>, 32>;
+    var q_reg: array<vec4<f32>, 4>;
+    var acc: array<vec4<f32>, 4>;
     let q_base = ((batch_idx * p.seq_q + q_idx) * p.num_heads + head_idx) * d_len;
-    for (var c = 0u; c < d4; c++) {
-        acc[c] = vec4<f32>(0.0);
-        if (valid) { q_reg[c] = fa_ld4(0u, q_base, c, d_len) * p.scale; } else { q_reg[c] = vec4<f32>(0.0); }
+    for (var i = 0u; i < FA_SLICES; i++) {
+        acc[i] = vec4<f32>(0.0);
+        q_reg[i] = vec4<f32>(0.0);
+        if (valid && i < n_sl) { q_reg[i] = fa_ld4(0u, q_base, lane + i * FA_TPR, d_len) * p.scale; }
     }
 
     var m_run = FA_MASKED; // running max
@@ -173,7 +191,7 @@ fn flash_attention_v2_metal(
 
     for (var k_start = k_begin; k_start < k_end; k_start += FA_TILE_K) {
         // Cooperative load of FA_TILE_K rows of K and V.
-        for (var i = local_id.x; i < FA_TILE_K * d4; i += 128u) {
+        for (var i = lid; i < FA_TILE_K * d4; i += FA_THREADS) {
             let r = i / d4;
             let c = i % d4;
             let kp = k_start + r;
@@ -189,18 +207,30 @@ fn flash_attention_v2_metal(
         }
         workgroupBarrier();
 
+        // Only the threads of the same row read a thread's partials, so a
+        // row past seq_q skips them.
         if (valid) {
-            var s: array<f32, 16>;
+            for (var j = 0u; j < FA_TILE_K; j++) {
+                var dot4 = vec4<f32>(0.0);
+                for (var i = 0u; i < n_sl; i++) {
+                    dot4 = fma(q_reg[i], fa_k_tile[j * (FA_MAX_D / 4u) + lane + i * FA_TPR], dot4);
+                }
+                fa_part[j * FA_THREADS + lid] = dot4.x + dot4.y + dot4.z + dot4.w;
+            }
+        }
+        workgroupBarrier();
+
+        if (valid) {
+            // Every thread of a row adds the same partials in the same
+            // order, so they agree on the scores, the max and the sum.
+            var s: array<f32, 8>; // FA_TILE_K
             var tile_max = FA_MASKED;
             for (var j = 0u; j < FA_TILE_K; j++) {
                 let kp = k_start + j;
                 var sc = FA_MASKED;
                 if (fa_visible(p, q_idx, kp)) {
-                    var dot4 = vec4<f32>(0.0);
-                    for (var c = 0u; c < d4; c++) {
-                        dot4 = fma(q_reg[c], fa_k_tile[j * (FA_MAX_D / 4u) + c], dot4);
-                    }
-                    sc = dot4.x + dot4.y + dot4.z + dot4.w;
+                    sc = 0.0;
+                    for (var t = 0u; t < FA_TPR; t++) { sc += fa_part[j * FA_THREADS + row_first + t]; }
                     if (p.has_mask == 1u) {
                         sc += flash_v2_mask[mask_base + kp * p.mask_stride_k];
                     }
@@ -213,14 +243,14 @@ fn flash_attention_v2_metal(
                 let m_new = max(m_run, tile_max);
                 let corr = exp(m_run - m_new);
                 l_run *= corr;
-                for (var c = 0u; c < d4; c++) { acc[c] *= corr; }
+                for (var i = 0u; i < n_sl; i++) { acc[i] *= corr; }
                 for (var j = 0u; j < FA_TILE_K; j++) {
                     if (s[j] > FA_MASKED) {
                         let pj = exp(s[j] - m_new);
                         l_run += pj;
                         let w = pj * dropout_scale(p.dropout_prob, p.seed_val, p.seed_hi, bh, q_idx, k_start + j);
-                        for (var c = 0u; c < d4; c++) {
-                            acc[c] = fma(vec4<f32>(w), fa_v_tile[j * (FA_MAX_D / 4u) + c], acc[c]);
+                        for (var i = 0u; i < n_sl; i++) {
+                            acc[i] = fma(vec4<f32>(w), fa_v_tile[j * (FA_MAX_D / 4u) + lane + i * FA_TPR], acc[i]);
                         }
                     }
                 }
@@ -233,16 +263,16 @@ fn flash_attention_v2_metal(
     if (valid) {
         var inv = 0.0;
         if (l_run > 0.0) { inv = 1.0 / l_run; }
-        if (p.write_stats == 1u) {
+        if (p.write_stats == 1u && lane == 0u) {
             // A fully masked row has no probability mass; this LSE makes
             // every backward P_ij zero, as the backward's own sweep does.
             var lse = 3.0e38;
             if (l_run > 0.0) { lse = m_run + log(l_run); }
             flash_v2_stats[2u * (bh * p.seq_q + q_idx) + 1u] = lse;
         }
-        for (var c = 0u; c < d4; c++) {
-            let o = acc[c] * inv;
-            let d = c * 4u;
+        for (var i = 0u; i < n_sl; i++) {
+            let o = acc[i] * inv;
+            let d = (lane + i * FA_TPR) * 4u;
             flash_v2_out[q_base + d] = o.x;
             if (d + 1u < d_len) { flash_v2_out[q_base + d + 1u] = o.y; }
             if (d + 2u < d_len) { flash_v2_out[q_base + d + 2u] = o.z; }
@@ -253,7 +283,7 @@ fn flash_attention_v2_metal(
 
 // ----------------------------------------------------------------------------
 // One query (seq_q == 1, decoding against a KV cache): the kernel above
-// would give the whole cache to one of its 128 threads. Here a workgroup
+// would give the whole cache to 8 of its 128 threads. Here a workgroup
 // per (batch, head) takes FA_DEC_KEYS keys at a time, one score per thread,
 // then each thread below head_dim adds one output dimension over those keys.
 // Same bindings, parameters and maths as flash_attention_v2_metal.
