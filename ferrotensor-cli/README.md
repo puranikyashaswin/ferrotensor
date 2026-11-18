@@ -302,8 +302,8 @@ ferrotensor plan                 # the documented SmolLM2 sizes and which fit
 ```
 
 - Budget: `--memory-mib` wins; else `--vram-mib`; else, on a GPU that
-  shares system RAM (integrated GPUs, Apple silicon), 60% of the system
-  RAM; else, on an NVIDIA GPU, the smallest `memory.total` that
+  shares system RAM (integrated GPUs, Apple silicon), the system RAM less a
+  2,048 MiB reserve for the OS and the process; else, on an NVIDIA GPU, the smallest `memory.total` that
   `nvidia-smi` lists; else an assumed 4,096 MiB, because wgpu does not
   report the memory of a discrete GPU. The output says which (`measured`,
   `assumed`, `user`).

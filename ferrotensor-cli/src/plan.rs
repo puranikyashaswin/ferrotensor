@@ -14,10 +14,21 @@ const MIB: f64 = 1024.0 * 1024.0;
 
 /// Fixed GPU memory every run holds: the driver context, the buffer pool's
 /// idle buffers (cap 512 MiB) and allocator slack. Fitted to the measured
-/// peaks.
+/// peaks, which are `nvidia-smi` samples on an A10G and a T4 and so include
+/// the CUDA context.
 const OVERHEAD_MIB: u64 = 1600;
+/// The same fixed memory on Metal, where the estimate counts only the GPU
+/// buffers Ferrotensor tracks (there is no driver context to include; the
+/// process's host side is left to [`UNIFIED_HOST_RESERVE_MIB`]). From one
+/// run: `finetune --force` of SmolLM2-1.7B (batch 1 x 8, seq 128, block
+/// checkpointing, f16) on the GitHub macOS arm64 runner (Apple M1, 7.0 GiB,
+/// Metal paravirtual GPU), Actions run 44241853474. Tracked buffers peaked at
+/// 4,319 MiB; the estimate's other parts for that run are weights 3,648,
+/// adapters 48, activations 81 and logits 48, which leaves 4,319 - 3,825 = 494
+/// MiB. Fitted to that single run and not yet checked against others.
+const METAL_OVERHEAD_MIB: u64 = 494;
 /// Measured activation bytes over 4 bytes per value that
-/// [`estimate_peak_mib`] counts. Fitted to the measured peaks.
+/// [`estimate_peak_mib_for`] counts. Fitted to the measured peaks.
 const ACTIVATION_SCALE: f64 = 0.92;
 /// Values per token and block, per unit of key/value width, kept beyond
 /// the counted ones. Ferrotensor's own count of its buffers shows
@@ -36,9 +47,29 @@ const LOGIT_FLOATS_PER_VOCAB: f64 = 2.0;
 /// Fraction of the budget a plan leaves free; above the estimator's largest
 /// underestimate of the measured peaks (4.6%).
 const SAFETY_MARGIN: f64 = 0.15;
-/// Share of system RAM budgeted for a GPU that shares it (the training
-/// process itself needs the rest).
-const UNIFIED_RAM_PERCENT: u64 = 60;
+/// Memory of the training process outside the GPU buffers the estimate
+/// counts (model loading, tokenizer, data, the Metal runtime). The same run
+/// as [`METAL_OVERHEAD_MIB`] measured a peak footprint of 5,077 MiB against
+/// 4,319 MiB of tracked buffers, so 758 MiB; rounded up to 1,024 MiB.
+const UNIFIED_HOST_RESERVE_MIB: u64 = 1024;
+/// Memory left to the operating system and other processes on a machine whose
+/// GPU shares system RAM. Not measured: an assumption of 1,024 MiB. In that
+/// run, 7,168 MiB of RAM less the 5,077 MiB footprint left 2,091 MiB, and
+/// the swap file held 554 MiB after the run and none before it; whether the
+/// training caused that is not yet known (the apple-proof workflow records swap
+/// before and after the `finetune` step alone).
+const UNIFIED_OS_RESERVE_MIB: u64 = 1024;
+/// Total reserve taken from system RAM to get the budget of a GPU that shares
+/// it. It replaces the earlier flat 60% of RAM, which refused the 7,168 MiB
+/// runner (budget 4,300 MiB) although the run's footprint was 5,077 MiB.
+const UNIFIED_RESERVE_MIB: u64 = UNIFIED_HOST_RESERVE_MIB + UNIFIED_OS_RESERVE_MIB;
+/// Share of the usable budget (the budget less [`SAFETY_MARGIN`]) a plan may
+/// estimate on a GPU that shares system RAM. Below 100% because the Metal
+/// overhead is fitted to a single run (the plan for that run has no headroom
+/// by construction) and the 554 MiB of swap seen after it is not yet
+/// attributed. When no configuration clears it, the smallest one is still
+/// chosen if it fits the whole usable budget, and is reported as a tight fit.
+const UNIFIED_HEADROOM_FRACTION: f64 = 0.95;
 /// Budget when nothing better is known.
 const ASSUMED_BUDGET_MIB: u64 = 4096;
 /// Sequences per optimizer step, as in the measured runs.
@@ -236,6 +267,27 @@ pub struct TrainConfig {
     pub checkpointing: Checkpointing,
 }
 
+/// The backend an estimate is calibrated for. Only the fixed overhead
+/// differs; the other parts come from the model's shape.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Calibration {
+    /// Fitted to `nvidia-smi` peaks on an A10G and a T4 (`OVERHEAD_MIB`).
+    /// Used for every dedicated GPU and wherever the backend is not known.
+    NvidiaFitted,
+    /// Fitted to the tracked-buffer peak on Apple silicon
+    /// (`METAL_OVERHEAD_MIB`).
+    Metal,
+}
+
+impl Calibration {
+    fn overhead_mib(self) -> u64 {
+        match self {
+            Self::NvidiaFitted => OVERHEAD_MIB,
+            Self::Metal => METAL_OVERHEAD_MIB,
+        }
+    }
+}
+
 /// Estimated GPU memory of a training run, by part, in MiB.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Estimate {
@@ -258,8 +310,20 @@ fn ceil_mib(bytes: f64) -> u64 {
     (bytes / MIB).ceil() as u64
 }
 
-/// Estimated peak GPU memory of LoRA training `shape` with `config`.
+/// Estimated peak GPU memory of LoRA training `shape` with `config`, with
+/// the NVIDIA-fitted overhead.
+#[cfg(test)]
 pub fn estimate_peak_mib(shape: &ModelShape, config: &TrainConfig) -> Estimate {
+    estimate_peak_mib_for(shape, config, Calibration::NvidiaFitted)
+}
+
+/// Estimated peak GPU memory of LoRA training `shape` with `config`, with
+/// the fixed overhead of `calibration`.
+pub fn estimate_peak_mib_for(
+    shape: &ModelShape,
+    config: &TrainConfig,
+    calibration: Calibration,
+) -> Estimate {
     let h = shape.hidden as f64;
     let vocab = shape.vocab as f64;
     let layers = shape.n_layers as f64;
@@ -308,7 +372,7 @@ pub fn estimate_peak_mib(shape: &ModelShape, config: &TrainConfig) -> Estimate {
         ceil_mib(adapters),
         ceil_mib(activations),
         ceil_mib(logits),
-        OVERHEAD_MIB,
+        calibration.overhead_mib(),
     ];
     Estimate {
         weights_mib: parts[0],
@@ -340,19 +404,52 @@ pub struct Plan {
     pub estimate: Estimate,
     /// Whether the estimate plus the safety margin fits the budget.
     pub fits: bool,
+    /// Fits, but above `UNIFIED_HEADROOM_FRACTION` of the usable budget.
+    /// Only a budget that shares system RAM sets this.
+    pub tight: bool,
+    /// The usable budget (budget less the safety margin, rounded down) minus
+    /// the estimate, in MiB; negative when the plan does not fit.
+    pub headroom_mib: i64,
 }
 
-/// The first configuration that fits `budget_mib` with the safety margin:
+/// The first configuration that fits `budget_mib` with the safety margin
+/// (and, on `unified` memory, within `UNIFIED_HEADROOM_FRACTION` of what
+/// that leaves):
 /// longer sequence first (cutting examples changes what is trained, batch
 /// size only changes speed), then no checkpointing before checkpointing,
 /// then larger batch, trying only the `pinned` value where there is one.
 /// When none fits, the smallest one, with `fits` false.
+#[cfg(test)]
 pub fn choose(
     shape: &ModelShape,
     budget_mib: u64,
     precision: Precision,
     lora_rank: usize,
     pinned: Pinned,
+) -> Plan {
+    choose_for(
+        shape,
+        budget_mib,
+        precision,
+        lora_rank,
+        pinned,
+        Calibration::NvidiaFitted,
+        false,
+    )
+}
+
+/// The plan choice, with the estimate calibrated for `calibration`. On `unified`
+/// memory a plan must also stay within `UNIFIED_HEADROOM_FRACTION` of the
+/// usable budget; when none does, the smallest one is chosen if it fits the
+/// usable budget (`tight`), else it is reported as not fitting.
+pub fn choose_for(
+    shape: &ModelShape,
+    budget_mib: u64,
+    precision: Precision,
+    lora_rank: usize,
+    pinned: Pinned,
+    calibration: Calibration,
+    unified: bool,
 ) -> Plan {
     let seq_pin = pinned.seq_len.map(NonZeroUsize::get);
     let seq_lens: &[usize] = match &seq_pin {
@@ -369,6 +466,11 @@ pub fn choose(
         None => &CHECKPOINTINGS,
     };
     let usable_mib = budget_mib as f64 * (1.0 - SAFETY_MARGIN);
+    let target_mib = if unified {
+        usable_mib * UNIFIED_HEADROOM_FRACTION
+    } else {
+        usable_mib
+    };
     let plan_for = |checkpointing, batch_size, seq_len| {
         let config = TrainConfig {
             batch_size,
@@ -378,18 +480,21 @@ pub fn choose(
             precision,
             checkpointing,
         };
-        let estimate = estimate_peak_mib(shape, &config);
+        let estimate = estimate_peak_mib_for(shape, &config, calibration);
+        let peak = estimate.peak_mib as f64;
         Plan {
             config,
             estimate,
-            fits: estimate.peak_mib as f64 <= usable_mib,
+            fits: peak <= usable_mib,
+            tight: peak > target_mib && peak <= usable_mib,
+            headroom_mib: usable_mib.floor() as i64 - estimate.peak_mib as i64,
         }
     };
     for &seq_len in seq_lens {
         for &checkpointing in checkpointings {
             for &batch_size in batch_sizes {
                 let plan = plan_for(checkpointing, batch_size, seq_len);
-                if plan.fits {
+                if plan.fits && !plan.tight {
                     return plan;
                 }
             }
@@ -435,10 +540,17 @@ pub struct Budget {
     pub source: BudgetSource,
     /// How it was worked out, for the output.
     pub reason: String,
+    /// The calibration of the estimate that goes with this budget. Metal only
+    /// when the budget was measured on a Metal adapter that shares system
+    /// RAM; a budget given on the command line may be for another machine.
+    pub calibration: Calibration,
+    /// Whether the GPU shares system RAM, which brings the headroom rule
+    /// (`UNIFIED_HEADROOM_FRACTION`).
+    pub unified: bool,
 }
 
 /// The budget from `--memory-mib`, `--vram-mib`, the system RAM of a GPU
-/// that shares it, `nvidia_smi_mib` for an NVIDIA GPU, or else an assumed
+/// that shares it less a reserve, `nvidia_smi_mib` for an NVIDIA GPU, or else an assumed
 /// default, in that order.
 pub fn budget(
     args: &BudgetArgs,
@@ -450,6 +562,8 @@ pub fn budget(
         mib,
         source: BudgetSource::User,
         reason: format!("set with {flag}"),
+        calibration: Calibration::NvidiaFitted,
+        unified: false,
     };
     if let Some(mib) = args.memory_mib {
         return user(mib, "--memory-mib");
@@ -461,16 +575,25 @@ pub fn budget(
         mib: ASSUMED_BUDGET_MIB,
         source: BudgetSource::Assumed,
         reason: format!("assumed, not measured: {why}; pass --vram-mib or --memory-mib"),
+        calibration: Calibration::NvidiaFitted,
+        unified: false,
     };
     match adapter {
         // Apple silicon GPUs share system RAM whatever device type Metal reports.
         Some(a) if a.device_type == "IntegratedGpu" || a.vendor == "Apple" => match total_ram_mib {
             Ok(ram) => Budget {
-                mib: ram * UNIFIED_RAM_PERCENT / 100,
+                mib: ram.saturating_sub(UNIFIED_RESERVE_MIB),
                 source: BudgetSource::Measured,
                 reason: format!(
-                    "{UNIFIED_RAM_PERCENT}% of {ram} MiB system RAM, which this GPU shares"
+                    "{ram} MiB system RAM, which this GPU shares, minus a {UNIFIED_RESERVE_MIB} MiB \
+                     reserve for the OS and this process's host side"
                 ),
+                calibration: if a.backend == "Metal" {
+                    Calibration::Metal
+                } else {
+                    Calibration::NvidiaFitted
+                },
+                unified: true,
             },
             Err(e) => assumed(format!("cannot read system RAM ({e})")),
         },
@@ -479,6 +602,8 @@ pub fn budget(
                 mib,
                 source: BudgetSource::Measured,
                 reason: "memory.total from nvidia-smi (the smallest GPU listed)".into(),
+                calibration: Calibration::NvidiaFitted,
+                unified: false,
             },
             Err(e) => assumed(format!(
                 "wgpu does not report the memory of a discrete GPU and nvidia-smi failed ({e})"
@@ -598,6 +723,13 @@ fn plan_json(shape: &ModelShape, model_arg: &str, plan: &Plan) -> Map<String, Va
     fields.insert("estimated_peak_mib".into(), json!(plan.estimate.peak_mib));
     fields.insert("margin".into(), json!(SAFETY_MARGIN));
     fields.insert("fits".into(), json!(plan.fits));
+    // "tight": fits the usable budget but not its headroom share (unified
+    // memory only); "ok" otherwise, also when the plan does not fit.
+    fields.insert(
+        "headroom".into(),
+        json!(if plan.tight { "tight" } else { "ok" }),
+    );
+    fields.insert("headroom_mib".into(), json!(plan.headroom_mib));
     fields.insert(
         "train_command".into(),
         json!(train_command(model_arg, &plan.config)),
@@ -655,8 +787,8 @@ pub fn run(args: PlanArgs) -> Result<Exit, Box<dyn std::error::Error>> {
         ..Pinned::default()
     };
     let mut report = match &args.model {
-        Some(dir) => plan_model(dir, budget.mib, args.weights, args.lora_rank, pinned)?.1,
-        None => plan_documented(&args, budget.mib, pinned),
+        Some(dir) => plan_model(dir, &budget, args.weights, args.lora_rank, pinned)?.1,
+        None => plan_documented(&args, &budget, pinned),
     };
     push_common_notes(&mut report.notes, &budget);
 
@@ -706,7 +838,7 @@ pub fn plan_training(
     pinned: Pinned,
 ) -> Result<TrainingPlan, Box<dyn std::error::Error>> {
     let (adapter, budget) = machine_budget(flags)?;
-    let (plan, mut report) = plan_model(dir, budget.mib, precision, lora_rank, pinned)?;
+    let (plan, mut report) = plan_model(dir, &budget, precision, lora_rank, pinned)?;
     push_common_notes(&mut report.notes, &budget);
     Ok(TrainingPlan {
         plan,
@@ -744,6 +876,14 @@ fn push_common_notes(notes: &mut Vec<String>, budget: &Budget) {
          reached their peak"
             .into(),
     );
+    if budget.calibration == Calibration::Metal {
+        notes.push(
+            "on Metal the fixed overhead (494 MiB) is fitted to one run, SmolLM2-1.7B on an \
+             Apple M1 with 7 GiB; the estimate counts the GPU buffers Ferrotensor tracks, and \
+             the budget leaves 2,048 MiB of RAM for the OS and the process's host side"
+                .into(),
+        );
+    }
     notes.push("replace train.jsonl in the train command with your dataset".into());
     if budget.source == BudgetSource::Assumed {
         notes.push(format!("budget {} MiB is {}", budget.mib, budget.reason));
@@ -776,7 +916,7 @@ fn human_lines(adapter: Option<&AdapterReport>, budget: &Budget, report: &Report
 
 fn plan_model(
     dir: &Path,
-    budget_mib: u64,
+    budget: &Budget,
     precision: Precision,
     lora_rank: usize,
     pinned: Pinned,
@@ -786,7 +926,15 @@ fn plan_model(
         .map_err(|e| crate::unmet(format!("cannot read {}: {e}", config_path.display())))?;
     let model_arg = dir.display().to_string();
     let shape = ModelShape::from_config(model_arg.clone(), &config);
-    let plan = choose(&shape, budget_mib, precision, lora_rank, pinned);
+    let plan = choose_for(
+        &shape,
+        budget.mib,
+        precision,
+        lora_rank,
+        pinned,
+        budget.calibration,
+        budget.unified,
+    );
     let mut notes: Vec<String> = short_seq_note(&shape.name, plan.config.seq_len)
         .into_iter()
         .collect();
@@ -799,7 +947,15 @@ fn plan_model(
         );
     }
     if !plan.fits && precision == Precision::F16 {
-        let q4 = choose(&shape, budget_mib, Precision::Q4, lora_rank, pinned);
+        let q4 = choose_for(
+            &shape,
+            budget.mib,
+            Precision::Q4,
+            lora_rank,
+            pinned,
+            budget.calibration,
+            budget.unified,
+        );
         if q4.fits {
             notes.push(format!(
                 "with --weights q4 (experimental, worse held-out loss) this fits: {}, {} MiB",
@@ -809,7 +965,20 @@ fn plan_model(
         }
     }
     let e = &plan.estimate;
-    let verdict = if plan.fits { "fits" } else { "does not fit" };
+    let verdict = match (plan.fits, plan.tight) {
+        (true, true) => "fits, tight",
+        (true, false) => "fits",
+        (false, _) => "does not fit",
+    };
+    if plan.tight {
+        notes.push(format!(
+            "tight fit: only {} MiB of the {} MiB usable budget is left, under the {:.0}% \
+             headroom this machine's plan aims for",
+            plan.headroom_mib,
+            plan.estimate.peak_mib as i64 + plan.headroom_mib,
+            (1.0 - UNIFIED_HEADROOM_FRACTION) * 100.0
+        ));
+    }
     let lines = vec![
         format!(
             "model     {} ({} parameters)",
@@ -843,7 +1012,7 @@ fn plan_model(
     Ok((plan, report))
 }
 
-fn plan_documented(args: &PlanArgs, budget_mib: u64, pinned: Pinned) -> Report {
+fn plan_documented(args: &PlanArgs, budget: &Budget, pinned: Pinned) -> Report {
     let mut models = Vec::new();
     let mut lines = vec![format!(
         "\n{:<14} {:>10}  {:<58} {:>10}  fits",
@@ -852,7 +1021,15 @@ fn plan_documented(args: &PlanArgs, budget_mib: u64, pinned: Pinned) -> Report {
     let mut any_fits = false;
     let mut notes = Vec::new();
     for shape in ModelShape::documented() {
-        let plan = choose(&shape, budget_mib, args.weights, args.lora_rank, pinned);
+        let plan = choose_for(
+            &shape,
+            budget.mib,
+            args.weights,
+            args.lora_rank,
+            pinned,
+            budget.calibration,
+            budget.unified,
+        );
         any_fits |= plan.fits;
         notes.extend(short_seq_note(&shape.name, plan.config.seq_len));
         let model_arg = format!("path/to/{}", shape.name);
@@ -863,7 +1040,11 @@ fn plan_documented(args: &PlanArgs, budget_mib: u64, pinned: Pinned) -> Report {
             millions(shape.parameters()),
             describe(&plan.config),
             plan.estimate.peak_mib,
-            if plan.fits { "yes" } else { "no" }
+            match (plan.fits, plan.tight) {
+                (true, true) => "tight",
+                (true, false) => "yes",
+                (false, _) => "no",
+            }
         ));
     }
     let mut fields = Map::new();
@@ -1305,29 +1486,246 @@ mod tests {
         assert_eq!((b.mib, b.source), (9000, BudgetSource::User));
     }
 
+    fn metal_adapter() -> AdapterReport {
+        AdapterReport {
+            backend: "Metal".into(),
+            ..adapter("Apple", "IntegratedGpu")
+        }
+    }
+
     #[test]
-    fn unified_memory_budgets_a_share_of_system_ram() {
+    fn unified_memory_budgets_system_ram_less_a_reserve() {
+        // The GitHub macOS arm64 runner: 7,168 MiB (run 44241853474), which
+        // the flat 60% rule budgeted at 4,300 MiB.
         let b = budget(
             &args(None, None),
-            Some(&adapter("Apple", "DiscreteGpu")),
+            Some(&metal_adapter()),
+            Ok(7168),
+            no_nvidia_smi,
+        );
+        assert_eq!(
+            (b.mib, b.source, b.calibration),
+            (5120, BudgetSource::Measured, Calibration::Metal)
+        );
+        assert!(b.unified);
+        assert!(
+            b.reason.contains("minus a 2048 MiB reserve"),
+            "{}",
+            b.reason
+        );
+        // An 8 GiB Mac.
+        let b = budget(
+            &args(None, None),
+            Some(&metal_adapter()),
             Ok(8192),
             no_nvidia_smi,
         );
-        assert_eq!((b.mib, b.source), (4915, BudgetSource::Measured));
+        assert_eq!((b.mib, b.calibration), (6144, Calibration::Metal));
+        // Less RAM than the reserve leaves nothing, without underflow.
+        let b = budget(
+            &args(None, None),
+            Some(&metal_adapter()),
+            Ok(1024),
+            no_nvidia_smi,
+        );
+        assert_eq!(b.mib, 0);
+        // The vendor alone marks Apple silicon, whatever device type Metal
+        // reports.
+        let b = budget(
+            &args(None, None),
+            Some(&AdapterReport {
+                device_type: "DiscreteGpu".into(),
+                ..metal_adapter()
+            }),
+            Ok(8192),
+            no_nvidia_smi,
+        );
+        assert_eq!((b.mib, b.calibration), (6144, Calibration::Metal));
+        // An integrated GPU on another backend shares RAM the same way but
+        // keeps the NVIDIA-fitted estimate.
         let b = budget(
             &args(None, None),
             Some(&adapter("Intel", "IntegratedGpu")),
             Ok(16384),
             no_nvidia_smi,
         );
-        assert_eq!((b.mib, b.source), (9830, BudgetSource::Measured));
+        assert_eq!(
+            (b.mib, b.source, b.calibration),
+            (14336, BudgetSource::Measured, Calibration::NvidiaFitted)
+        );
         let b = budget(
             &args(None, None),
             Some(&adapter("Intel", "IntegratedGpu")),
             Err("no /proc".into()),
             no_nvidia_smi,
         );
-        assert_eq!((b.mib, b.source), (4096, BudgetSource::Assumed));
+        assert_eq!(
+            (b.mib, b.source, b.calibration),
+            (4096, BudgetSource::Assumed, Calibration::NvidiaFitted)
+        );
+    }
+
+    #[test]
+    fn dedicated_gpu_and_flag_budgets_keep_the_fitted_estimate() {
+        // A dedicated GPU is untouched by the unified reserve.
+        let nvidia = adapter("NVIDIA", "DiscreteGpu");
+        let b = budget(&args(None, None), Some(&nvidia), Ok(8192), || Ok(23028));
+        assert_eq!((b.mib, b.calibration), (23028, Calibration::NvidiaFitted));
+        assert!(!b.unified);
+        // A flag may describe another machine, so even on a Metal adapter it
+        // keeps the NVIDIA-fitted estimate.
+        let b = budget(
+            &args(Some(5120), None),
+            Some(&metal_adapter()),
+            Ok(7168),
+            no_nvidia_smi,
+        );
+        assert_eq!((b.mib, b.calibration), (5120, Calibration::NvidiaFitted));
+        assert!(!b.unified);
+    }
+
+    /// SmolLM2-1.7B as the runner trained it: batch 1 x 8, seq 128, block
+    /// checkpointing, f16 weights, rank 8.
+    fn runner_config() -> TrainConfig {
+        TrainConfig {
+            batch_size: 1,
+            grad_accum: 8,
+            seq_len: 128,
+            lora_rank: 8,
+            precision: Precision::F16,
+            checkpointing: Checkpointing::Blocks,
+        }
+    }
+
+    #[test]
+    fn metal_estimate_matches_the_runner_peak() {
+        // Tracked buffers peaked at 4,319 MiB (weights 3,648) in run
+        // 44241853474; the NVIDIA-fitted estimate was 5,425 MiB, 25.6% high.
+        let shape = smollm2("SmolLM2-1.7B");
+        let parts = |e: Estimate| {
+            (
+                e.weights_mib,
+                e.adapters_mib,
+                e.activations_mib,
+                e.logits_mib,
+                e.overhead_mib,
+                e.peak_mib,
+            )
+        };
+        let metal = estimate_peak_mib_for(&shape, &runner_config(), Calibration::Metal);
+        assert_eq!(parts(metal), (3648, 48, 81, 48, 494, 4319));
+        let fitted = estimate_peak_mib_for(&shape, &runner_config(), Calibration::NvidiaFitted);
+        assert_eq!(parts(fitted), (3648, 48, 81, 48, 1600, 5425));
+        assert_eq!(estimate_peak_mib(&shape, &runner_config()), fitted);
+        // Only the overhead differs.
+        assert_eq!(fitted.peak_mib - metal.peak_mib, 1600 - 494);
+    }
+
+    /// The plan for SmolLM2-1.7B at a budget: configuration (checkpointing,
+    /// batch, seq), estimate, fits, tight, headroom.
+    fn plan_1_7b(
+        mib: u64,
+        calibration: Calibration,
+        unified: bool,
+    ) -> (Checkpointing, usize, usize, u64, bool, bool, i64) {
+        let p = choose_for(
+            &smollm2("SmolLM2-1.7B"),
+            mib,
+            Precision::F16,
+            8,
+            Pinned::default(),
+            calibration,
+            unified,
+        );
+        (
+            p.config.checkpointing,
+            p.config.batch_size,
+            p.config.seq_len,
+            p.estimate.peak_mib,
+            p.fits,
+            p.tight,
+            p.headroom_mib,
+        )
+    }
+
+    #[test]
+    fn the_runner_gets_a_tight_fit_for_smollm2_1_7b() {
+        // 7,168 MiB less 2,048 is 5,120; 85% of it is 4,352 MiB and 95% of
+        // that 4,134 MiB. Seq 256 with checkpointing needs 4,448 MiB and
+        // seq 128 at batch 2 the same; batch 1 at seq 128 needs 4,319 MiB,
+        // above 4,134 but within 4,352, so it is chosen as a tight fit with
+        // 33 MiB left.
+        assert_eq!(
+            plan_1_7b(5120, Calibration::Metal, true),
+            (Checkpointing::Blocks, 1, 128, 4319, true, true, 33)
+        );
+        // Without the headroom rule (dedicated memory) the same plan is not
+        // tight.
+        assert_eq!(
+            plan_1_7b(5120, Calibration::Metal, false),
+            (Checkpointing::Blocks, 1, 128, 4319, true, false, 33)
+        );
+        // Before: a 4,300 MiB budget with the NVIDIA-fitted estimate, which
+        // does not fit however the headroom is read (3,655 MiB usable).
+        let (.., estimate, fits, tight, headroom) =
+            plan_1_7b(4300, Calibration::NvidiaFitted, false);
+        assert_eq!(
+            (estimate, fits, tight, headroom),
+            (5425, false, false, -1770)
+        );
+        // The new budget alone does not admit the fitted estimate.
+        assert!(!plan_1_7b(5120, Calibration::NvidiaFitted, true).4);
+        // Nothing fits 4,000 MiB (3,400 usable): not a tight fit but a miss.
+        assert_eq!(
+            plan_1_7b(4000, Calibration::Metal, true),
+            (Checkpointing::Blocks, 1, 128, 4319, false, false, -919)
+        );
+    }
+
+    #[test]
+    fn an_8_gib_mac_skips_the_tight_batch_4_plan() {
+        // 8,192 - 2,048 = 6,144 MiB, 5,222 usable, 4,961 at 95%. Batch 4 at
+        // seq 256 needs 5,219 MiB (3 MiB left) and is skipped; batch 2 needs
+        // 4,705 MiB and leaves 517 MiB.
+        assert_eq!(
+            plan_1_7b(6144, Calibration::Metal, true),
+            (Checkpointing::Blocks, 2, 256, 4705, true, false, 517)
+        );
+        // On dedicated memory the old rule still takes batch 4.
+        assert_eq!(
+            plan_1_7b(6144, Calibration::Metal, false),
+            (Checkpointing::Blocks, 4, 256, 5219, true, false, 3)
+        );
+    }
+
+    #[test]
+    fn a_tight_plan_is_reported_in_the_json_fields() {
+        let shape = smollm2("SmolLM2-1.7B");
+        let plan = choose_for(
+            &shape,
+            5120,
+            Precision::F16,
+            8,
+            Pinned::default(),
+            Calibration::Metal,
+            true,
+        );
+        let fields = plan_json(&shape, "m", &plan);
+        assert_eq!(fields["headroom"], "tight");
+        assert_eq!(fields["headroom_mib"], 33);
+        assert_eq!(fields["fits"], true);
+        // The safety margin keeps its own field.
+        assert_eq!(fields["margin"], 0.15);
+        let roomy = choose_for(
+            &shape,
+            6144,
+            Precision::F16,
+            8,
+            Pinned::default(),
+            Calibration::Metal,
+            true,
+        );
+        assert_eq!(plan_json(&shape, "m", &roomy)["headroom"], "ok");
     }
 
     #[test]
