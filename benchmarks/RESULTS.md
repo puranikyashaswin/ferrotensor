@@ -398,6 +398,37 @@ Batch 1 × 8-step accumulation, sequence length 256, per optimizer step
 The loss and gradient norm at step 30 equal those of the 15 November 2026 run
 of the same command: 135M 2.5320 and 1.476, 1.7B 1.4793 and 1.665.
 
+## Compute passes shared by consecutive dispatches
+
+`main` at `85b3419` opened one compute pass per kernel dispatch. Builds that
+encode consecutive dispatches into one pass, with at most 4, 8, 16 or 32
+dispatches per pass, were run against it on one NVIDIA A10G. All runs used the
+same machine, with the builds interleaved, two runs each. Loss and gradient
+norm were the same in every build. Step wall time per optimizer step, batch
+1 × 8-step accumulation, sequence length 256, `train --profile`:
+
+| Model | `main` | at most 4 | at most 8 | at most 16 | at most 32 |
+|---|---:|---:|---:|---:|---:|
+| SmolLM2-135M | 1.166 s | 1.001 s | 0.989 s | 0.982 s | 1.018 s |
+| SmolLM2-360M | 1.547 s | 1.353 s | 1.334 s | 1.325 s | 1.393 s |
+| SmolLM2-1.7B | 2.216 s | 2.146 s | 2.169 s | 2.165 s | 2.300 s |
+
+Compute passes per step at 4 / 8 / 16 / 32: 135M 7,305 / 4,435 / 3,295 /
+3,049; 360M 7,733 / 4,695 / 3,491 / 3,243; 1.7B 5,825 / 3,553 / 2,650 / 2,450.
+`main` has one pass per dispatch. The host time per step falls as passes
+are shared. Long passes add GPU time, enough to make 1.7B slower than `main`
+at 32. An earlier box measured 2.227 s at 16 against 2.217 s for `main` on
+1.7B, so 16 is at the edge there. `main` now uses at most 8: 15.2% faster
+on 135M, 13.8% on 360M and 2.1% on 1.7B in this table.
+
+Other measurements with shared passes, on the same machine:
+
+- Greedy `generate`, 120 tokens: 135M 40.6 → 59.5 tokens per second, 1.7B
+  16.1 → 17.5. The cap made no difference here.
+- The 250-step `finetune` of 1.7B at batch 4 × 2 (at most 16 per pass):
+  334.6 s → 327.9 s of training, the same held-out loss 1.0612. The tracked
+  peak rose by 168 MiB on that run (13,893 → 14,061 MiB).
+
 ## `pretrain`, byte-level tokenizer
 
 The corpus is a 1 MB English text file built from the Alpaca training
@@ -457,3 +488,61 @@ Ferrotensor counts itself.
 - `pretrain` with the defaults reached loss 1.2271 in 71.2 s (peak 246 MiB),
   and the 19,079,808-parameter model 0.7507 in 916.7 s (peak 1,487 MiB),
   the same losses as on the A10G.
+
+# Real hardware run, 17 November 2026: generation
+
+One NVIDIA A10G (24 GB), Vulkan backend, release builds of `main` at
+`612b3f7` and of the branch that adds the decode kernels (a matrix-vector
+kernel for one-row products, one-query attention and the GPU argmax). Same
+machine, builds interleaved, three runs each; the runs of one build differ by
+less than 1.5%. The output text was byte-identical between the two builds on
+every run (same SHA-256): greedy `generate` on all three models and a
+three-turn greedy `chat` on 1.7B.
+
+`generate`, 120 new tokens, decode speed in tokens per second:
+
+| Model | Sampling | `main` | Decode kernels |
+|---|---|---:|---:|
+| SmolLM2-135M | greedy | 58.4 | 110.1 |
+| SmolLM2-360M | greedy | 39.8 | 96.7 |
+| SmolLM2-1.7B | greedy | 18.9 | 56.9 |
+| SmolLM2-135M | `--temperature 0.7 --seed 7` | 52.6 | 91.5 |
+| SmolLM2-1.7B | `--temperature 0.7 --seed 7` | 18.3 | 51.2 |
+
+Three-turn greedy `chat` on SmolLM2-1.7B with the kept KV cache, tokens per
+second per turn: `main` 18.9 / 17.1 / 15.7, decode kernels 56.7 / 55.0 /
+53.4.
+
+Sampled generation still reads the logits row back each step and samples on
+the host; greedy decoding reads back only the token id.
+
+# Real hardware run, 17 November 2026: thin matrix products in training
+
+One NVIDIA A10G (24 GB), Vulkan backend, release builds of `main` at
+`dab3301` and of the branch that adds the thin matmul kernel (`matmul_thin`,
+`matmul_thin_h`: products whose output has at most 64 rows, or with f32 `b`
+at most 64 columns). Same machine, builds interleaved, three runs each; the
+runs of one build differ by less than 0.3%.
+
+`train --profile`, sequence length 256, seconds per optimizer step:
+
+| Model | Batch x accumulation | `main` | Thin kernel |
+|---|---|---:|---:|
+| SmolLM2-135M | 1 x 8 | 1.193 | 0.961 |
+| SmolLM2-360M | 1 x 8 | 1.571 | 1.203 |
+| SmolLM2-1.7B | 1 x 8 | 2.233 | 1.697 |
+| SmolLM2-1.7B | 4 x 2 | 1.348 | 1.261 |
+
+The training loss at step 30 is the same on both builds: 2.5320 on
+SmolLM2-135M, 1.8838 on 360M and 1.4793 on 1.7B, also 1.4793 at batch 4 x 2.
+The gradient norm at step 30 printed the same on both builds too.
+
+A 250-step `finetune` of SmolLM2-1.7B with the planner's setting (batch 4 x
+accumulation 2) took 328.0 s on `main` and 320.0 s on the branch. The
+held-out loss was 1.0612 on `main` and 1.0607 on the branch; the two differ
+because the thin kernel adds in a different order. The tracked peak was
+14,061 MiB on both.
+
+Greedy generation is unchanged, since one-row products already run the
+matrix-vector kernel: 108.9 and 110.9 tokens per second on SmolLM2-135M,
+57.0 and 57.2 on 1.7B.

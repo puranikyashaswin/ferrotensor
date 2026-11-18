@@ -1,17 +1,25 @@
 //! GPU device setup.
 
 use crate::dispatch_cache::DispatchCache;
+use crate::kernel_timing::{
+    KernelLabel, KernelTimer, KernelTimes, KernelTiming, KernelTimingMode, PendingTimes,
+};
 use crate::pool::BufferPool;
 use crate::profile::{GpuCounterSnapshot, GpuCounters};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use wgpu::{Adapter, CommandEncoder, Device, Instance, Queue};
+use wgpu::{Adapter, BindGroup, CommandEncoder, ComputePipeline, Device, Instance, Queue};
 
 /// Recorded GPU work is submitted once this many ops are pending, so the GPU
 /// starts on long sequences without waiting for a sync point.
 const MAX_PENDING_OPS: u32 = 128;
+
+/// Queued dispatches are encoded into a pass once this many are waiting. A
+/// long pass delays GPU work: on an A10G (16 Nov 2026) passes of up to 32
+/// dispatches made SmolLM2-1.7B steps slower than one pass per dispatch.
+const MAX_PASS_DISPATCHES: usize = 8;
 
 /// Uploaded bytes after which [`WgpuContext::note_upload`] waits for the
 /// staging copies to finish so wgpu can free them.
@@ -21,7 +29,8 @@ pub const UPLOAD_RELEASE_BYTES: u64 = 256 << 20;
 ///
 /// Kernel dispatches and copies from [`ComputeEngine`](crate::ComputeEngine)
 /// are recorded into one pending command encoder and submitted together:
-/// every 128 ops, and whenever a result is read
+/// up to 8 consecutive dispatches share one compute pass, which a copy or a
+/// submission also ends. They are submitted every 128 ops, and whenever a result is read
 /// ([`UnifiedTensor::to_vec`](crate::UnifiedTensor::to_vec)) or a buffer is
 /// written ([`UnifiedTensor::write_data`](crate::UnifiedTensor::write_data)).
 /// Call [`flush`](Self::flush) before submitting work of your own on
@@ -57,19 +66,37 @@ pub struct WgpuContext {
     staged: AtomicU64,
     pub(crate) counters: GpuCounters,
     pub(crate) dispatch_cache: DispatchCache,
+    /// Timestamp queries, with [`KernelTiming::On`] on an adapter that has them.
+    timer: Option<KernelTimer>,
 }
 
-/// Recorded work not yet submitted.
+/// Recorded work not yet submitted: the encoder, and the dispatches not yet
+/// encoded into it.
 #[derive(Default)]
 struct Pending {
     encoder: Option<CommandEncoder>,
+    dispatches: Vec<Dispatch>,
     ops: u32,
+    times: PendingTimes,
 }
 
 impl std::fmt::Debug for Pending {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Pending").field("ops", &self.ops).finish()
+        f.debug_struct("Pending")
+            .field("ops", &self.ops)
+            .field("dispatches", &self.dispatches.len())
+            .finish()
     }
+}
+
+/// One kernel dispatch waiting to be encoded.
+pub(crate) struct Dispatch {
+    pub(crate) pipeline: Arc<ComputePipeline>,
+    /// Shared with the bind group cache; holding it here keeps the bind
+    /// group and the buffers it binds alive until the dispatch is encoded.
+    pub(crate) bind_group: Arc<BindGroup>,
+    pub(crate) groups: (u32, u32, u32),
+    pub(crate) label: KernelLabel,
 }
 
 /// Why [`WgpuContext::try_new_with_options`] could not open a GPU.
@@ -172,7 +199,8 @@ impl WgpuContext {
 
     /// Opens an adapter with the given power preference, optionally forcing
     /// the software fallback adapter. The `WGPU_BACKEND` environment variable
-    /// (e.g. `vulkan`) restricts which backends are tried.
+    /// (e.g. `vulkan`) restricts which backends are tried, and
+    /// `WGPU_DX12_COMPILER` (`dxc` or `fxc`) picks the DX12 shader compiler.
     ///
     /// # Errors
     /// [`ContextError::NoAdapter`] if wgpu finds no adapter, and
@@ -181,9 +209,25 @@ impl WgpuContext {
         power_preference: wgpu::PowerPreference,
         force_fallback_adapter: bool,
     ) -> Result<Self, ContextError> {
+        Self::try_new_with_timing(power_preference, force_fallback_adapter, KernelTiming::Off).await
+    }
+
+    /// Opens an adapter like [`try_new_with_options`](Self::try_new_with_options);
+    /// with [`KernelTiming::On`] it also asks for timestamp queries, when the
+    /// adapter has them, and times every kernel (see
+    /// [`kernel_times`](Self::kernel_times)).
+    ///
+    /// # Errors
+    /// As [`try_new_with_options`](Self::try_new_with_options).
+    pub async fn try_new_with_timing(
+        power_preference: wgpu::PowerPreference,
+        force_fallback_adapter: bool,
+        timing: KernelTiming,
+    ) -> Result<Self, ContextError> {
         let backends = crate::adapters::backends();
         let instance = Instance::new(wgpu::InstanceDescriptor {
             backends,
+            dx12_shader_compiler: wgpu::util::dx12_shader_compiler_from_env().unwrap_or_default(),
             ..Default::default()
         });
         let adapter = instance
@@ -198,11 +242,16 @@ impl WgpuContext {
                 force_fallback_adapter,
             })?;
 
+        let timing_mode = match timing {
+            KernelTiming::Off => None,
+            KernelTiming::On => KernelTimingMode::for_features(adapter.features()),
+        };
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("Ferrotensor Device"),
-                    required_features: wgpu::Features::empty(),
+                    required_features: timing_mode
+                        .map_or(wgpu::Features::empty(), KernelTimingMode::features),
                     // Use what the hardware supports rather than the WebGPU
                     // defaults (e.g. 8 storage buffers per stage, 128 MiB
                     // bindings), which are too small for model weights.
@@ -225,6 +274,7 @@ impl WgpuContext {
                 .ok()
                 .as_deref(),
         ));
+        let timer = timing_mode.map(|mode| KernelTimer::new(mode, &queue, MAX_PENDING_OPS));
         Ok(Self {
             instance,
             adapter,
@@ -235,6 +285,7 @@ impl WgpuContext {
             staged: AtomicU64::new(0),
             counters: GpuCounters::default(),
             dispatch_cache: DispatchCache::default(),
+            timer,
         })
     }
 
@@ -246,15 +297,78 @@ impl WgpuContext {
     )]
     pub(crate) fn record(&self, f: impl FnOnce(&mut CommandEncoder)) {
         let mut pending = self.pending.lock().unwrap();
-        let encoder = pending.encoder.get_or_insert_with(|| {
+        f(self.encoder(&mut pending));
+        self.count_op(&mut pending);
+    }
+
+    /// Records a kernel dispatch into the open compute pass; it runs after
+    /// everything recorded before it. Submits once enough ops are pending.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "lock poisoning means another thread panicked while holding the lock"
+    )]
+    pub(crate) fn record_dispatch(&self, dispatch: Dispatch) {
+        let mut pending = self.pending.lock().unwrap();
+        pending.dispatches.push(dispatch);
+        if pending.dispatches.len() >= MAX_PASS_DISPATCHES {
+            self.encoder(&mut pending);
+        }
+        self.count_op(&mut pending);
+    }
+
+    fn count_op(&self, pending: &mut Pending) {
+        pending.ops += 1;
+        if pending.ops >= MAX_PENDING_OPS {
+            self.submit(pending);
+        }
+    }
+
+    /// The pending encoder, with the pending dispatches encoded into it as
+    /// one compute pass (or one pass each, timed at its start and end, with
+    /// [`KernelTimingMode::PassBoundaries`]).
+    ///
+    /// wgpu-core 0.19 builds usage trackers sized by the highest live buffer
+    /// id for every pass and drops them at its end, so one pass per dispatch
+    /// cost more host time than the dispatch. Within a pass wgpu still checks
+    /// usage per dispatch and puts a barrier between a write and a later
+    /// access, so each dispatch sees the results of those before it.
+    fn encoder<'p>(&self, pending: &'p mut Pending) -> &'p mut CommandEncoder {
+        let Pending {
+            encoder,
+            dispatches,
+            times,
+            ..
+        } = pending;
+        let encoder = encoder.get_or_insert_with(|| {
             self.device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor::default())
         });
-        f(encoder);
-        pending.ops += 1;
-        if pending.ops >= MAX_PENDING_OPS {
-            self.submit(&mut pending);
+        if dispatches.is_empty() {
+            return encoder;
         }
+        if let Some(timer) = &self.timer {
+            let passes = timer.encode(&self.device, encoder, dispatches, times);
+            self.counters
+                .compute_passes
+                .fetch_add(passes, Ordering::Relaxed);
+            dispatches.clear();
+        } else {
+            self.counters.compute_passes.fetch_add(1, Ordering::Relaxed);
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            let mut bound: Option<&Arc<ComputePipeline>> = None;
+            for dispatch in dispatches.iter() {
+                if !bound.is_some_and(|pipeline| Arc::ptr_eq(pipeline, &dispatch.pipeline)) {
+                    pass.set_pipeline(&dispatch.pipeline);
+                    bound = Some(&dispatch.pipeline);
+                }
+                pass.set_bind_group(0, &dispatch.bind_group, &[]);
+                let (x, y, z) = dispatch.groups;
+                pass.dispatch_workgroups(x, y, z);
+            }
+            drop(pass);
+            dispatches.clear();
+        }
+        encoder
     }
 
     /// Submits all recorded work to the queue. Reads and writes through
@@ -312,13 +426,16 @@ impl WgpuContext {
         let start = Instant::now();
         let mut polls = 0u32;
         loop {
-            self.device.poll(wgpu::Maintain::Poll);
+            self.poll();
             if done() {
                 GpuCounters::add_elapsed(&self.counters.gpu_wait_nanos, start);
                 // Callers wait for the last submitted work, so that poll let
                 // wgpu destroy every buffer dropped before it.
                 self.memory().gpu_reclaimed();
                 self.release_idle_buffers();
+                if let Some(timer) = &self.timer {
+                    timer.collect();
+                }
                 return;
             }
             if polls < 100 {
@@ -332,13 +449,22 @@ impl WgpuContext {
 
     fn submit(&self, pending: &mut Pending) {
         pending.ops = 0;
-        if let Some(encoder) = pending.encoder.take() {
+        if !pending.dispatches.is_empty() {
+            self.encoder(pending);
+        }
+        if let Some(mut encoder) = pending.encoder.take() {
+            if let Some(timer) = &self.timer {
+                timer.resolve(&mut encoder, &pending.times);
+            }
             let memory = self.memory();
             let serial = memory.begin_submission();
             self.counters.submits.fetch_add(1, Ordering::Relaxed);
             // wgpu maintains the device here: it destroys buffers whose work
             // has finished and runs the callbacks of finished submissions.
             self.queue.submit(Some(encoder.finish()));
+            if let Some(timer) = &self.timer {
+                timer.submitted(&mut pending.times);
+            }
             let tracker = memory.clone();
             self.queue
                 .on_submitted_work_done(move || tracker.gpu_completed(serial));
@@ -353,8 +479,15 @@ impl WgpuContext {
     fn release_idle_buffers(&self) {
         let trimmed = self.pool.trim();
         if trimmed + self.evict_dead_bind_groups() > 0 {
-            self.device.poll(wgpu::Maintain::Poll);
+            self.poll();
         }
+    }
+
+    /// Polls the device without blocking. Each poll runs wgpu's device
+    /// maintenance, whose cost grows with the number of live buffers.
+    fn poll(&self) {
+        self.counters.device_polls.fetch_add(1, Ordering::Relaxed);
+        self.device.poll(wgpu::Maintain::Poll);
     }
 
     /// Byte counters of this context's tensors: live, peak, idle in the
@@ -366,6 +499,24 @@ impl WgpuContext {
     /// Totals of the GPU work recorded and waited for on this context.
     pub fn gpu_counters(&self) -> GpuCounterSnapshot {
         self.counters.snapshot()
+    }
+
+    /// Where this context writes kernel timestamps; `None` when it was
+    /// opened without [`KernelTiming::On`] or the adapter has no timestamp
+    /// queries.
+    pub fn kernel_timing_mode(&self) -> Option<KernelTimingMode> {
+        self.timer.as_ref().map(|timer| timer.mode)
+    }
+
+    /// GPU time by kernel, of the work the GPU finished before the last
+    /// wait for it; empty without kernel timing. Never waits.
+    pub fn kernel_times(&self) -> KernelTimes {
+        self.timer
+            .as_ref()
+            .map_or_else(KernelTimes::default, |timer| {
+                timer.collect();
+                timer.totals()
+            })
     }
 
     /// Adapter name and backend, e.g. `"Apple M2 (Metal)"`.

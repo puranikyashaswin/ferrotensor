@@ -64,18 +64,34 @@ is `null`. On an error stdout carries `{"error": "<message>"}` instead.
 | `finetune` | `chosen` (`batch_size`, `seq_len`, `rank`, `precision`, `checkpoint_blocks`), `grad_accum`, `budget_mib`, `estimated_peak_mib`, `fits`, then every `train` key |
 | `train` | `steps`, `first_loss`, `final_loss`, `eval_loss_before`, `eval_loss_after` (null without `--eval-data`), `measured_peak_mib`, `seconds`, `out_dir`, `adapter` (null on ranks above 0, which save nothing), and with `--q4-weights` only, `q4_weights` (`modules`, `skip`, `group`, `tensors`: the 4-bit selection and how many tensors it stored at 4 bits) |
 | `eval` | `examples`, `tokens`, `loss`, `perplexity`, `seconds` |
-| `generate` | `text`, `prompt_tokens`, `new_tokens`, `tokens_per_second` (decode speed: one-token forward passes after the prompt per second, prompt time left out; null when none ran), `prefill_seconds` (time to run the prompt), `kv_cache` |
+| `generate` | `text`, `prompt_tokens`, `new_tokens`, `tokens_per_second` (decode speed: one-token forward passes after the prompt per second, prompt time left out; null when none ran), `prefill_seconds` (time to run the prompt), `kv_cache`, and with `--profile` only, `profile` (`kernel_timing`, `prefill` and `decode`: see [GPU time by kernel](#gpu-time-by-kernel---profile)) |
 | `chat` | one object per reply, each on its own line: `reply`, `prompt_tokens` (the whole conversation), `cached_tokens` (prompt tokens taken from the KV cache of earlier turns, not run again), `new_tokens`, `tokens_per_second` and `prefill_seconds` (as for `generate`; with the kept cache the prefill runs only the uncached tokens) |
 | `merge` | `out_dir`, `merged` (tensors with the adapter added), `copied` (tensors copied byte for byte) |
 | `export-gguf` | `out_file`, `tensors` (tensors in the GGUF file), `merged` (tensors with the `--lora` adapter added; 0 without it) |
 | `pretrain` | every `train` key, then `parameters`, `vocab_size` (259 for the byte-level tokenizer, `--vocab-size` for BPE) and `tokenizer` (`"byte"` or `"bpe"`) |
-| `info` | `ferrotensor`, `os`, `arch`, `adapters` (one object per GPU, `selected` marks the one used), `checks` (null without `--check`), and `error` only on failure |
+| `info` | `ferrotensor`, `os`, `arch`, `adapters` (one object per GPU, `selected` marks the one used, `kernel_timing` the mode `--profile` would time kernels in, or null), `checks` (null without `--check`), and `error` only on failure |
 | `q4-report` | `model`, `group`, `tensors` (one object per 2-D weight, by name: `name`, `shape` as stored, `relative_error`, `max_abs_error`, `groups`, `outlier_groups`, `outlier_fraction`) |
 
 `chat` is the one command that prints more than one object: it reads one
 user message per line of stdin and writes one JSON line per reply, so read
 stdout line by line. An error ends the session with a one-line
 `{"error": ...}` object.
+
+### GPU time by kernel (`--profile`)
+
+`train --profile` writes `OUT/profile.json` with the median step's totals
+(`step_seconds`, `gpu_wait_seconds`, `<count>_per_step`) and, from
+timestamp queries, `kernel_timing` (`"inside_passes"`, `"pass_boundaries"`
+or null when the adapter has none), `kernel_gpu_seconds_per_step` and
+`kernels`: one object per kernel, longest GPU time first, with `name`,
+`dispatches_per_step` and `gpu_seconds_per_step`. `generate --profile
+--json` adds `profile` with `kernel_timing`, `prefill` (`gpu_wait_seconds`,
+`kernel_gpu_seconds`, `kernels` of `name`, `dispatches`, `gpu_seconds`) and
+`decode` (`tokens`, `gpu_wait_seconds_per_token`,
+`kernel_gpu_seconds_per_token`, `kernels` of `name`, `dispatches_per_token`,
+`gpu_seconds_per_token`). The kernel sum attributes GPU time; it leaves out
+idle gaps and is not an exact budget (see
+[ferrotensor-cli/README.md](ferrotensor-cli/README.md#gpu-time-by-kernel)).
 
 `measured_peak_mib` counts the GPU buffers Ferrotensor tracks, not the driver
 context, so it is below what `nvidia-smi` shows. `classify-train`,
@@ -173,7 +189,11 @@ weight matrix on the host, without a GPU. See
   `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`,
   docs and MSRV. Format with `cargo fmt --all` before every commit.
 - GPU tests are skipped unless `FERROTENSOR_RUN_GPU_TESTS=1`; CLI tests that
-  need a GPU are `#[ignore]` and run in CI with `--ignored` on software Vulkan.
+  need a GPU are `#[ignore]` and run in CI with `--ignored` on software Vulkan,
+  on Metal (GitHub's Apple silicon runners) and on DX12 (WARP; there without
+  the `ferrotensor-cli` tests, which take too long, and on pull requests only
+  the backend kernel and parity tests; the rest runs on `main`, weekly and by
+  `workflow_dispatch`).
   The four Qwen2 parity tests also read `FERROTENSOR_QWEN2_FIXTURE` (CI sets
   it) and skip with a message when it is unset.
 - No `unwrap`, `expect` or `panic!` outside tests; propagate errors with `?`.

@@ -154,7 +154,7 @@ fn gpu_training_matches_cpu() {
         eprintln!("skipping GPU training parity; set FERROTENSOR_RUN_GPU_TESTS=1 to enable");
         return;
     }
-    let gpu = Device::gpu().expect("FERROTENSOR_RUN_GPU_TESTS=1 but no GPU is available");
+    let gpu = crate::tensor::tests::shared_gpu();
     let train = |d: &Device| {
         let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(3);
         let w1 = Tensor::randn_with(&[8, 32], &mut rng, d).requires_grad_();

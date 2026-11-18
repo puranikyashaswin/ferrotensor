@@ -20,7 +20,7 @@ fn gpu() -> Option<Device> {
         eprintln!("skipping GPU layer parity; set FERROTENSOR_RUN_GPU_TESTS=1 to enable");
         return None;
     }
-    Some(Device::gpu().expect("FERROTENSOR_RUN_GPU_TESTS=1 but no GPU is available"))
+    Some(crate::tensor::tests::shared_gpu())
 }
 
 fn close(gpu: &[f32], cpu: &[f32], what: &str) {

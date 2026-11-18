@@ -1,7 +1,9 @@
 //! Dequantisation kernels.
 
 use super::{groups64, record_dispatch, ComputeEngine};
+use crate::kernel_timing::KernelLabel;
 use crate::{UnifiedTensor, WgpuContext};
+use std::sync::Arc;
 
 impl ComputeEngine {
     /// Unpacks bytes to floats: element `i` of `out` is byte `i` of `input`
@@ -32,10 +34,16 @@ impl ComputeEngine {
             &self.affine_dequant.layout,
             &[(0, weight), (1, scales), (2, biases), (3, out.buffer())],
         );
+        let label = KernelLabel {
+            entry: self.affine_dequant.entry_point,
+            layout: "",
+            size_class: "",
+        };
         record_dispatch(
             ctx,
             &self.affine_dequant,
-            &bind_group,
+            Arc::new(bind_group),
+            label,
             groups64(out.shape.iter().product()),
         );
     }

@@ -551,6 +551,72 @@ fn matmul_at_matches_cpu() {
     }
 }
 
+/// `(m, k, n)` of products with a short output side, which run the thin
+/// kernel: M of 2, 3, 63 and 64 against wide N; K of 1 and off the 32 a
+/// workgroup steps by; N of 1 and wider than a vocabulary block; the LoRA
+/// shapes of rank 8 and rank 1 (`x @ A` with 8 or 1 columns, `(x A) @ B`
+/// with K of 8 or 1, `dB` with 8 rows).
+const THIN_SHAPES: &[(usize, usize, usize)] = &[
+    (2, 37, 1),
+    (3, 1000, 5000),
+    (2, 2049, 7),
+    (63, 33, 129),
+    (64, 576, 192),
+    (200, 576, 8),
+    (40, 8, 576),
+    (300, 64, 1),
+    (40, 1, 576),
+    (8, 63, 2048),
+];
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn thin_matmul_matches_cpu_in_every_layout() {
+    // f32 in all three layouts, and f16 `b` forward and transposed. With f32
+    // the short side may be N (the kernel then runs on the transposed
+    // product); f16 `b` with few columns takes the tile kernel.
+    let g = gpu();
+    for (seed, &(m, k, n)) in THIN_SHAPES.iter().enumerate() {
+        let a = rand_vec(m * k, 3000 + seed as u64);
+        let b: Vec<f32> = rand_vec(k * n, 3100 + seed as u64)
+            .iter()
+            .map(|v| v * 0.1)
+            .collect();
+        let check = |name: &str, out: &UnifiedTensor, b_seen: &[f32]| {
+            assert_close(
+                &format!("{name} {m}x{k}x{n}"),
+                &read(out),
+                &cpu_matmul(&a, b_seen, m, k, n),
+                1e-4,
+                1e-4,
+            );
+        };
+        let (bt, at) = (transpose(&b, k, n), transpose(&a, m, k));
+        let a_up = upload(&a, &[m, k]);
+
+        let out = zeros(&[m, n]);
+        g.engine.matmul(&g.ctx, &a_up, &upload(&b, &[k, n]), &out);
+        check("matmul", &out, &b);
+        let out = zeros(&[m, n]);
+        g.engine
+            .matmul_bt(&g.ctx, &a_up, &upload(&bt, &[n, k]), &out);
+        check("matmul_bt", &out, &b);
+        let out = zeros(&[m, n]);
+        g.engine
+            .matmul_at(&g.ctx, &upload(&at, &[k, m]), &upload(&b, &[k, n]), &out);
+        check("matmul_at", &out, &b);
+
+        let b_h = UnifiedTensor::from_f32_as_f16(&g.ctx, &b, &[k, n]);
+        let out = zeros(&[m, n]);
+        g.engine.matmul_f16b(&g.ctx, &a_up, &b_h, &out);
+        check("matmul_f16b", &out, &f16_round(&b));
+        let bt_h = UnifiedTensor::from_f32_as_f16(&g.ctx, &bt, &[n, k]);
+        let out = zeros(&[m, n]);
+        g.engine.matmul_bt_f16b(&g.ctx, &a_up, &bt_h, &out);
+        check("matmul_bt_f16b", &out, &f16_round(&b));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Element-wise ops and their backward passes
 // ---------------------------------------------------------------------------
@@ -1889,4 +1955,220 @@ fn q4_upload_rejects_non_matrix_shapes() {
     let err =
         UnifiedTensor::from_f32_as_q4(&g.ctx, &[0.0; 8], &[2, 2, 2], Q4Group::DEFAULT).unwrap_err();
     assert_eq!(err, q4::Q4Error::NotMatrix { rank: 3 });
+}
+
+// ---------------------------------------------------------------------------
+// Decoding one token
+// ---------------------------------------------------------------------------
+
+/// `(k, n)` of one-row products: K off the 16 threads that split it, N of
+/// 1, odd N, and N as wide as a vocabulary.
+const MATVEC_SHAPES: &[(usize, usize)] = &[
+    (1, 1),
+    (7, 1),
+    (5, 7),
+    (33, 129),
+    (576, 576),
+    (1000, 3),
+    (64, 49_152),
+];
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn matvec_matches_cpu_for_every_storage_kind() {
+    // One-row products run the matrix-vector kernels. Each storage kind is
+    // compared with the host product on the weights as the kernel sees
+    // them: rounded to f16, or through the 4-bit round trip.
+    let g = gpu();
+    for (seed, &(k, n)) in MATVEC_SHAPES.iter().enumerate() {
+        let x = rand_vec(k, 2000 + seed as u64);
+        let w: Vec<f32> = rand_vec(k * n, 2100 + seed as u64)
+            .iter()
+            .map(|v| v * 0.1)
+            .collect();
+        let xt = upload(&x, &[1, k]);
+        let check = |kind: &str, w_stored: &UnifiedTensor, w_seen: &[f32]| {
+            let y = zeros(&[1, n]);
+            match w_stored.dtype {
+                DType::FP32 => g.engine.matmul(&g.ctx, &xt, w_stored, &y),
+                DType::FP16 => g.engine.matmul_f16b(&g.ctx, &xt, w_stored, &y),
+                DType::Q4 => g.engine.matmul_q4b(&g.ctx, &xt, w_stored, &y),
+            }
+            assert_close(
+                &format!("matvec {kind} 1x{k}x{n}"),
+                &read(&y),
+                &cpu_matmul(&x, w_seen, 1, k, n),
+                1e-4,
+                1e-4,
+            );
+        };
+        check("f32", &upload(&w, &[k, n]), &w);
+        let w_h = UnifiedTensor::from_f32_as_f16(&g.ctx, &w, &[k, n]);
+        check("f16", &w_h, &f16_round(&w));
+        for size in Q4Group::SIZES {
+            let group = Q4Group::new(size).unwrap();
+            let w_q = UnifiedTensor::from_f32_as_q4(&g.ctx, &w, &[k, n], group).unwrap();
+            check(&format!("q4 G={size}"), &w_q, &q4_round(&w, k, n, group));
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn one_query_attention_matches_the_many_query_kernel() {
+    // One query runs the decode kernel. The same query as the second row of
+    // a two-query call, one position earlier, runs the kernel that gives
+    // each thread a query; both are also compared with the host. Cases:
+    // (batch, cache slots, position, heads, kv heads, head_dim), with
+    // caches longer than one 128-key tile, GQA and a head size off 4.
+    let g = gpu();
+    let cases = [
+        (1, 8, 3, 1, 1, 16),
+        (2, 37, 36, 4, 2, 64),
+        (1, 300, 299, 2, 1, 64),
+        (1, 300, 140, 9, 3, 64),
+        (1, 130, 129, 2, 2, 128),
+        (1, 20, 19, 2, 2, 6),
+    ];
+    for (i, &(b, sk, pos, h, hkv, d)) in cases.iter().enumerate() {
+        let seed = 3000 + 10 * i as u64;
+        let q = rand_vec(b * h * d, seed);
+        let k = rand_vec(b * sk * hkv * d, seed + 1);
+        let v = rand_vec(b * sk * hkv * d, seed + 2);
+        let (tk, tv) = (upload(&k, &[b, sk, hkv, d]), upload(&v, &[b, sk, hkv, d]));
+        let opts = |offset: usize| AttentionOptions {
+            causal: true,
+            causal_offset: offset as u32,
+            ..AttentionOptions::default()
+        };
+        let one = zeros(&[b, 1, h, d]);
+        let tq = upload(&q, &[b, 1, h, d]);
+        g.engine
+            .flash_attention_v2_with(&g.ctx, &tq, &tk, &tv, &one, &opts(pos), None);
+        let got = read(&one);
+
+        let filler = rand_vec(b * h * d, seed + 3);
+        let mut two_q = Vec::new();
+        for row in 0..b {
+            two_q.extend_from_slice(&filler[row * h * d..(row + 1) * h * d]);
+            two_q.extend_from_slice(&q[row * h * d..(row + 1) * h * d]);
+        }
+        let two = zeros(&[b, 2, h, d]);
+        let tq2 = upload(&two_q, &[b, 2, h, d]);
+        g.engine
+            .flash_attention_v2_with(&g.ctx, &tq2, &tk, &tv, &two, &opts(pos - 1), None);
+        let second: Vec<f32> = read(&two)
+            .chunks(h * d)
+            .skip(1)
+            .step_by(2)
+            .flatten()
+            .copied()
+            .collect();
+
+        let name = format!("b{b} cache {sk} pos {pos} h{h}/{hkv} d{d}");
+        assert_close(
+            &format!("decode vs two-query kernel, {name}"),
+            &got,
+            &second,
+            1e-5,
+            1e-3,
+        );
+        let dims = (b, 1, sk, h, hkv, d);
+        let (want, _) = cpu_attention(&q, &k, &v, None, dims, |_, j| j <= pos);
+        assert_close(&format!("decode vs host, {name}"), &got, &want, 1e-5, 1e-3);
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn one_query_attention_keeps_the_window_and_the_mask() {
+    let g = gpu();
+    let (b, sk, h, hkv, d, pos, window) = (2, 200, 2, 1, 32, 150, 60);
+    let q = rand_vec(b * h * d, 3100);
+    let k = rand_vec(b * sk * hkv * d, 3101);
+    let v = rand_vec(b * sk * hkv * d, 3102);
+    // [batch, heads, 1, keys]: batch 1 hides every 7th key, the rest a bias.
+    let mut mask = vec![0.0f32; b * h * sk];
+    for (i, m) in mask.iter_mut().enumerate() {
+        let (batch, j) = (i / (h * sk), i % sk);
+        *m = if batch == 1 && j % 7 == 0 {
+            -1e9
+        } else {
+            0.1 * (j % 3) as f32
+        };
+    }
+    for causal in [true, false] {
+        let opts = AttentionOptions {
+            causal,
+            causal_offset: pos as u32,
+            window: window as u32,
+            ..AttentionOptions::default()
+        };
+        let out = zeros(&[b, 1, h, d]);
+        g.engine.flash_attention_v2_with(
+            &g.ctx,
+            &upload(&q, &[b, 1, h, d]),
+            &upload(&k, &[b, sk, hkv, d]),
+            &upload(&v, &[b, sk, hkv, d]),
+            &out,
+            &opts,
+            Some(&upload(&mask, &[b, h, 1, sk])),
+        );
+        let visible = |_: usize, j: usize| (!causal || j <= pos) && pos.abs_diff(j) < window;
+        let dims = (b, 1, sk, h, hkv, d);
+        let (want, _) = cpu_attention(&q, &k, &v, Some(&mask), dims, visible);
+        assert_close(
+            &format!("decode causal={causal}"),
+            &read(&out),
+            &want,
+            1e-5,
+            1e-3,
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn argmax_rows_matches_the_host_argmax_including_ties() {
+    // The host rule (`ferrotensor_loader::argmax`): the largest value in
+    // `f32::total_cmp` order, the last index of equal maxima.
+    let g = gpu();
+    let host_argmax = |row: &[f32]| {
+        row.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map_or(0, |(i, _)| i as u32)
+    };
+    let mut tied = rand_vec(259, 41);
+    tied[17] = 2.0;
+    tied[200] = 2.0;
+    let mut with_nan = rand_vec(300, 42);
+    with_nan[123] = f32::NAN;
+    let rows = [
+        (vec![-3.0], Some(0)),
+        (tied, Some(200)),
+        (vec![-0.0, 0.0, -0.0, -1.0], Some(1)),
+        (with_nan, Some(123)),
+        (vec![0.5; 513], Some(512)),
+        (rand_vec(49_152, 43), None),
+    ];
+    for (row, expected) in &rows {
+        let out = zeros(&[1]);
+        g.engine
+            .argmax_rows(&g.ctx, &upload(row, &[1, row.len()]), &out);
+        let got = read(&out)[0].to_bits();
+        assert_eq!(got, host_argmax(&row[..]), "row of {}", row.len());
+        if let Some(expected) = expected {
+            assert_eq!(got, *expected, "row of {}", row.len());
+        }
+    }
+
+    let (n_rows, len) = (5, 1000);
+    let x = rand_vec(n_rows * len, 44);
+    let out = zeros(&[n_rows]);
+    g.engine
+        .argmax_rows(&g.ctx, &upload(&x, &[n_rows, len]), &out);
+    let got: Vec<u32> = read(&out).iter().map(|v| v.to_bits()).collect();
+    let want: Vec<u32> = x.chunks(len).map(host_argmax).collect();
+    assert_eq!(got, want);
 }

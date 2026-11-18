@@ -191,6 +191,22 @@ fn train_writes_adapter_state_and_metrics() {
         .as_u64()
         .expect("dispatches_per_step is a count");
     assert!(dispatches > 0, "profile: {profile}");
+    let passes = profile["compute_passes_per_step"]
+        .as_u64()
+        .expect("compute_passes_per_step is a count");
+    if profile["kernel_timing"] == "pass_boundaries" {
+        assert_eq!(passes, dispatches, "one dispatch per timed pass: {profile}");
+    } else {
+        assert!(
+            passes > 0 && passes * 4 <= dispatches,
+            "up to 8 dispatches share a compute pass: {profile}"
+        );
+    }
+    assert!(
+        profile["device_polls_per_step"].as_u64() > Some(0),
+        "each step waits for the GPU at least once: {profile}"
+    );
+    assert_kernels(&profile, "_per_step");
 
     for name in RUN_FILES {
         let path = out.path().join(name);
@@ -411,6 +427,108 @@ fn generate_emits_tokens() {
     let generated = json["text"].as_str().expect("text");
     let stderr = text(&run.stderr);
     assert!(stderr.contains(generated), "{json}\nstderr: {stderr}");
+}
+
+/// Checks the kernel table under `report`: none when the adapter has no
+/// timestamp queries (`kernel_timing` null), else named rows, longest first,
+/// that sum to `kernel_gpu_seconds{suffix}`.
+fn assert_kernels(report: &serde_json::Value, suffix: &str) {
+    let kernels = report["kernels"].as_array().expect("kernels is an array");
+    let Some(mode) = report["kernel_timing"].as_str() else {
+        assert!(kernels.is_empty(), "{report}");
+        return;
+    };
+    assert!(
+        ["inside_passes", "pass_boundaries"].contains(&mode),
+        "{report}"
+    );
+    assert!(!kernels.is_empty(), "{report}");
+    let seconds: Vec<f64> = kernels
+        .iter()
+        .map(|k| {
+            assert!(k["name"].as_str().is_some_and(|n| !n.is_empty()), "{k}");
+            assert!(k[format!("dispatches{suffix}")].as_f64() > Some(0.0), "{k}");
+            k[format!("gpu_seconds{suffix}")]
+                .as_f64()
+                .expect("gpu_seconds is a number")
+        })
+        .collect();
+    assert!(seconds.windows(2).all(|w| w[0] >= w[1]), "{report}");
+    let total = report[format!("kernel_gpu_seconds{suffix}")]
+        .as_f64()
+        .expect("kernel_gpu_seconds is a number");
+    assert!(
+        (seconds.iter().sum::<f64>() - total).abs() < 1e-9,
+        "{report}"
+    );
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn generate_profile_times_the_prefill_and_each_decode_token() {
+    let model = model_dir("generate-profile");
+    let json = greedy_generate(model.path(), "w5 w6 w7", "4", &["--raw", "--profile"]);
+    let profile = &json["profile"];
+    let with_mode = |section: &serde_json::Value| {
+        let mut section = section.clone();
+        section["kernel_timing"] = profile["kernel_timing"].clone();
+        section
+    };
+    let prefill = with_mode(&profile["prefill"]);
+    let decode = with_mode(&profile["decode"]);
+    assert_kernels(&prefill, "");
+    // A forward pass follows each new token but the last one before
+    // --max-new-tokens.
+    let new_tokens = json["new_tokens"].as_u64().expect("new_tokens");
+    let decode_tokens = decode["tokens"].as_u64().expect("decode tokens");
+    assert!(
+        decode_tokens + 1 == new_tokens || decode_tokens == new_tokens,
+        "{json}"
+    );
+    if decode_tokens > 0 {
+        assert_kernels(&decode, "_per_token");
+    }
+    if profile["kernel_timing"].is_string() {
+        let names = |section: &serde_json::Value| -> Vec<String> {
+            section["kernels"]
+                .as_array()
+                .expect("kernels")
+                .iter()
+                .map(|k| k["name"].as_str().expect("name").to_owned())
+                .collect()
+        };
+        let has = |names: &[String], name: &str| names.iter().any(|n| n == name);
+        // The prompt runs as one multi-row pass; greedy picks run on the GPU.
+        let prefill_names = names(&prefill);
+        assert!(has(&prefill_names, "flash_attention_v2_metal"), "{prefill}");
+        assert!(has(&prefill_names, "argmax_rows"), "{prefill}");
+        assert!(!has(&prefill_names, "flash_attention_decode"), "{prefill}");
+        // Each decode token is one row: matrix-vector products and the
+        // one-query attention kernel, each under its own name.
+        if decode_tokens > 0 {
+            let decode_names = names(&decode);
+            // f16 base weights by default: matvec_h.
+            assert!(
+                decode_names.iter().any(|n| n.starts_with("matvec")),
+                "{decode}"
+            );
+            for name in ["flash_attention_decode", "argmax_rows"] {
+                assert!(has(&decode_names, name), "{name}: {decode}");
+            }
+            assert!(!has(&decode_names, "flash_attention_v2_metal"), "{decode}");
+        }
+    }
+    assert!(prefill["gpu_wait_seconds"].as_f64() >= Some(0.0), "{json}");
+    assert!(
+        decode["gpu_wait_seconds_per_token"].as_f64() >= Some(0.0),
+        "{json}"
+    );
+    let plain = greedy_generate(model.path(), "w5 w6 w7", "4", &["--raw"]);
+    assert_eq!(plain.get("profile"), None, "{plain}");
+    assert_eq!(
+        plain["text"], json["text"],
+        "timestamps do not change tokens"
+    );
 }
 
 /// Greedy `generate --json` of up to `max_new` tokens after `prompt`.

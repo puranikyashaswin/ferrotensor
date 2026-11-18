@@ -153,7 +153,7 @@ mod tests {
             eprintln!("skipping GPU embedding test; set FERROTENSOR_RUN_GPU_TESTS=1 to enable");
             return;
         }
-        let gpu = Device::gpu().expect("FERROTENSOR_RUN_GPU_TESTS=1 but no GPU is available");
+        let gpu = crate::tensor::tests::shared_gpu();
         let on_gpu = both_paths(&gpu);
         assert_eq!(on_gpu[0], on_gpu[1]);
         assert_eq!(on_gpu, both_paths(&Device::cpu()));

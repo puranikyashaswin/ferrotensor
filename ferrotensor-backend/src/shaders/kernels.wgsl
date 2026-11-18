@@ -225,19 +225,76 @@ fn dequantize(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
 
 @compute @workgroup_size(1)
 fn top_k(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    // The previous pick is kept in registers, not read back from tk_out_idx:
+    // reading back the indices this invocation had just written gave the top
+    // index twice on Metal (Apple's paravirtual GPU in CI). Order: larger
+    // value first, then lower index.
     let k = tk_params;
     let len = arrayLength(&tk_input);
+    var prev_v = 0.0;
+    var prev_idx = 0u;
     for (var i = 0u; i < k; i = i + 1u) {
-        var max_v = -1e9;
+        var found = false;
+        var max_v = 0.0;
         var max_idx = 0u;
         for (var j = 0u; j < len; j = j + 1u) {
             let v = tk_input[j];
-            var used = false;
-            for (var p = 0u; p < i; p = p + 1u) { if (tk_out_idx[p] == j) { used = true; break; } }
-            if (!used && v > max_v) { max_v = v; max_idx = j; }
+            let after_prev = i == 0u || v < prev_v || (v == prev_v && j > prev_idx);
+            if (after_prev && (!found || v > max_v)) { found = true; max_v = v; max_idx = j; }
         }
         tk_out_idx[i] = max_idx;
+        prev_v = max_v;
+        prev_idx = max_idx;
     }
+}
+
+// --- Argmax per row ---
+// One workgroup per row of [rows, am_len]. Values are compared as
+// f32::total_cmp orders them and the last of equal maxima wins, as in the
+// host `argmax` greedy decoding used before; reading raw bits keeps a NaN's
+// sign and payload.
+@group(0) @binding(0) var<storage, read> am_bits: array<u32>;
+@group(0) @binding(1) var<storage, read_write> am_out: array<u32>;
+@group(0) @binding(2) var<uniform> am_len: u32;
+
+var<workgroup> am_key: array<u32, 256>;
+var<workgroup> am_idx: array<u32, 256>;
+
+// A key whose unsigned order is f32::total_cmp's order of the bits.
+fn am_order_key(bits: u32) -> u32 {
+    if ((bits & 0x80000000u) != 0u) { return ~bits; }
+    return bits | 0x80000000u;
+}
+
+@compute @workgroup_size(256)
+fn argmax_rows(@builtin(local_invocation_index) lid: u32,
+               @builtin(workgroup_id) wg: vec3<u32>,
+               @builtin(num_workgroups) nwg: vec3<u32>) {
+    let len = am_len;
+    let base = row_index(wg, nwg) * len;
+    // A thread with no elements keeps (0, 0), which never beats a real
+    // element: 0 is the lowest key, and on equal keys the larger index wins.
+    var key = 0u;
+    var idx = 0u;
+    for (var i = lid; i < len; i += ROW_WG) {
+        let ki = am_order_key(am_bits[base + i]);
+        if (ki >= key) { key = ki; idx = i; }
+    }
+    am_key[lid] = key;
+    am_idx[lid] = idx;
+    workgroupBarrier();
+    for (var s = ROW_WG / 2u; s > 0u; s = s >> 1u) {
+        if (lid < s) {
+            let other_key = am_key[lid + s];
+            let other_idx = am_idx[lid + s];
+            if (other_key > am_key[lid] || (other_key == am_key[lid] && other_idx > am_idx[lid])) {
+                am_key[lid] = other_key;
+                am_idx[lid] = other_idx;
+            }
+        }
+        workgroupBarrier();
+    }
+    if (lid == 0u) { am_out[row_index(wg, nwg)] = am_idx[0]; }
 }
 
 // --- 9. Backward Kernels (Clean: No Accumulation) ---

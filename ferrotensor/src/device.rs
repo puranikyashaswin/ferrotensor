@@ -551,8 +551,10 @@ impl Device {
     /// Async version of [`Device::gpu`].
     pub async fn gpu_async() -> Option<Self> {
         // WGPU_BACKEND (e.g. "vulkan", "metal", "dx12", "gl") restricts the backends tried.
+        // WGPU_DX12_COMPILER ("dxc" or "fxc") picks the DX12 shader compiler.
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::util::backend_bits_from_env().unwrap_or(wgpu::Backends::all()),
+            dx12_shader_compiler: wgpu::util::dx12_shader_compiler_from_env().unwrap_or_default(),
             ..Default::default()
         });
         let adapter = instance
