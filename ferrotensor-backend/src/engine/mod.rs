@@ -83,19 +83,33 @@ fn half_w_thin_matmul(src: &str) -> String {
 /// `matmul_blocked_h`: the matmul kernel with `b` stored as f16 pairs packed
 /// into `u32` words (element `i` in the low half of word `i / 2` when `i` is
 /// even, the high half when odd). Generated from matmul.wgsl so the two
-/// kernels cannot drift apart; only the `b` binding and its loader differ.
+/// kernels cannot drift apart; only the `b` binding and its loaders differ,
+/// and in mode 1 the staging takes k in pairs, read from one word when the
+/// pair starts on an even element.
 fn half_b_matmul(src: &str) -> String {
     const B_DECL: &str = "var<storage, read> mmb_b: array<f32>;";
     const B_LOAD: &str =
         "    if (mode == 1u) { return mmb_b[gn * k + gk]; }\n    return mmb_b[gk * n + gn];";
+    const PAIRS: &str = "const MMB_K_PAIRS: bool = false;";
+    const PAIR_LOAD: &str = "    return vec2<f32>(mmb_load_b(gk, gn, k, n, mode), mmb_load_b(gk + 1u, gn, k, n, mode));";
     assert!(
-        src.contains(B_DECL) && src.contains(B_LOAD),
+        src.contains(B_DECL)
+            && src.contains(B_LOAD)
+            && src.contains(PAIRS)
+            && src.contains(PAIR_LOAD),
         "matmul.wgsl changed"
     );
+    // The paired staging runs only in mode 1, where b is [N, K], so the pair
+    // loader indexes that layout alone.
     src.replace(
         B_LOAD,
         "    var i = gk * n + gn;\n    if (mode == 1u) { i = gn * k + gk; }\n    return unpack2x16float(mmb_b[i >> 1u])[i & 1u];",
     )
+    .replace(
+        PAIR_LOAD,
+        "    if (gn >= n || gk >= k) { return vec2<f32>(0.0); }\n    let i = gn * k + gk;\n    let word = unpack2x16float(mmb_b[i >> 1u]);\n    let has_next = gk + 1u < k;\n    if ((i & 1u) == 0u) { return select(vec2<f32>(word.x, 0.0), word, has_next); }\n    if (!has_next) { return vec2<f32>(word.y, 0.0); }\n    return vec2<f32>(word.y, unpack2x16float(mmb_b[(i >> 1u) + 1u]).x);",
+    )
+    .replace(PAIRS, "const MMB_K_PAIRS: bool = true;")
     .replace(B_DECL, "var<storage, read> mmb_b: array<u32>;")
     .replace("matmul_blocked", "matmul_blocked_h")
     .replace("mmb_", "mmh_")
@@ -105,9 +119,11 @@ fn half_b_matmul(src: &str) -> String {
 /// `matmul_blocked_q4`: the matmul kernel with `b` in the 4-bit format of
 /// [`crate::q4`] (codes then per-group scale/min words in one `u32`
 /// buffer; logical `b[K, N]` stored in `[N, K]` order). Generated from
-/// matmul.wgsl like [`half_b_matmul`]; only the `b` binding and its loader
-/// differ. The storage index is `gn * k + gk` in mode 0 and `gk * n + gn`
-/// in mode 1 (the reverse of the f16 kernel, because of the `[N, K]` order).
+/// matmul.wgsl like [`half_b_matmul`]; only the `b` binding, its loader and
+/// the mode whose `b` runs along k differ. The storage index is
+/// `gn * k + gk` in mode 0 and `gk * n + gn` in mode 1 (the reverse of the
+/// f16 kernel, because of the `[N, K]` order), so mode 0 is the one staged
+/// along k.
 /// The params' last word carries the layout in its low 8 bits and log2 of
 /// the group size `G` above them; the scale words start after the codes, at
 /// `ceil(k * n / G) * G / 8`.
@@ -116,8 +132,9 @@ fn q4_b_matmul(src: &str) -> String {
     const B_LOAD: &str =
         "    if (mode == 1u) { return mmb_b[gn * k + gk]; }\n    return mmb_b[gk * n + gn];";
     const MODE: &str = "    let mode = mmb_params.w;";
+    const K_INNER: &str = "fn mmb_b_k_inner(mode: u32) -> bool { return mode == 1u; }";
     assert!(
-        src.contains(B_DECL) && src.contains(B_LOAD) && src.contains(MODE),
+        src.contains(B_DECL) && src.contains(B_LOAD) && src.contains(MODE) && src.contains(K_INNER),
         "matmul.wgsl changed"
     );
     src.replace(
@@ -125,6 +142,10 @@ fn q4_b_matmul(src: &str) -> String {
         "    var j = gn * k + gk;\n    if (mode == 1u) { j = gk * n + gn; }\n    let lg = mmb_params.w >> 8u;\n    let q = (mmb_b[j >> 3u] >> ((j & 7u) * 4u)) & 15u;\n    let groups = (k * n + (1u << lg) - 1u) >> lg;\n    let sm = unpack2x16float(mmb_b[(groups << (lg - 3u)) + (j >> lg)]);\n    return f32(q) * sm.x + sm.y;",
     )
     .replace(MODE, "    let mode = mmb_params.w & 255u;")
+    .replace(
+        K_INNER,
+        "fn mmb_b_k_inner(mode: u32) -> bool { return mode == 0u; }",
+    )
     .replace(B_DECL, "var<storage, read> mmb_b: array<u32>;")
     .replace("matmul_blocked", "matmul_blocked_q4")
     .replace("mmb_", "mmq_")

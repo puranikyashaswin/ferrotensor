@@ -617,6 +617,70 @@ fn thin_matmul_matches_cpu_in_every_layout() {
     }
 }
 
+/// `(m, k, n)` of products whose `b` is stored along k: `a @ b^T` in f32 and
+/// f16, and `x @ W` with 4-bit `W`. K is off the 16 the tile kernel stages
+/// at a time and N off its 64 columns. M and N above 64 (for f16 and 4-bit
+/// `b`, M above 64 alone) take the 64x64-tile kernel; (37, 70, 45) and
+/// (1, 33, 17) take the thin and matrix-vector kernels, checked against the
+/// same reference. The f16 tile kernel reads k in pairs: an odd K starts
+/// every other row's pairs on the high half of a word and leaves a last
+/// pair with one element; K of 70 ends a slice partway through.
+const ALONG_K_SHAPES: &[(usize, usize, usize)] = &[
+    (66, 2048, 96),
+    (67, 70, 65),
+    (129, 33, 17),
+    (65, 1, 130),
+    (100, 31, 191),
+    (80, 2047, 72),
+    (65, 17, 66),
+    (70, 3, 129),
+    (37, 70, 45),
+    (1, 33, 17),
+];
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn matmul_with_b_along_k_matches_cpu_at_odd_shapes() {
+    let g = gpu();
+    for (seed, &(m, k, n)) in ALONG_K_SHAPES.iter().enumerate() {
+        let a = rand_vec(m * k, 3200 + seed as u64);
+        // Weight-sized values keep the k = 2048 sums near 1, so the
+        // tolerance below measures the kernel, not f32 rounding.
+        let b: Vec<f32> = rand_vec(k * n, 3300 + seed as u64)
+            .iter()
+            .map(|v| v * 0.1)
+            .collect();
+        let check = |name: &str, out: &UnifiedTensor, b_seen: &[f32]| {
+            assert_close(
+                &format!("{name} {m}x{k}x{n}"),
+                &read(out),
+                &cpu_matmul(&a, b_seen, m, k, n),
+                1e-4,
+                1e-4,
+            );
+        };
+        let bt = transpose(&b, k, n); // [n, k]
+        let a_up = upload(&a, &[m, k]);
+
+        let out = zeros(&[m, n]);
+        g.engine
+            .matmul_bt(&g.ctx, &a_up, &upload(&bt, &[n, k]), &out);
+        check("matmul_bt", &out, &b);
+
+        let bt_h = UnifiedTensor::from_f32_as_f16(&g.ctx, &bt, &[n, k]);
+        let out = zeros(&[m, n]);
+        g.engine.matmul_bt_f16b(&g.ctx, &a_up, &bt_h, &out);
+        check("matmul_bt_f16b", &out, &f16_round(&b));
+
+        // The 4-bit format stores W[k, n] in [n, k] order, so the forward
+        // product is the one that reads it along k.
+        let w_q = UnifiedTensor::from_f32_as_q4(&g.ctx, &b, &[k, n], Q4Group::DEFAULT).unwrap();
+        let out = zeros(&[m, n]);
+        g.engine.matmul_q4b(&g.ctx, &a_up, &w_q, &out);
+        check("matmul_q4b", &out, &q4_round(&b, k, n, Q4Group::DEFAULT));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Element-wise ops and their backward passes
 // ---------------------------------------------------------------------------
