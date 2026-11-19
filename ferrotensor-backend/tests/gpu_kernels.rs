@@ -12,8 +12,8 @@
 #![allow(clippy::unwrap_used)]
 
 use ferrotensor_backend::{
-    q4, AdamParams, AttentionOptions, ComputeEngine, DType, MemoryCategory, UnifiedTensor,
-    WgpuContext, MASKED_CE_SKIP, SUM_SQUARES_CHUNK,
+    q4, AdamParams, AttentionOptions, ComputeEngine, DType, MatmulPath, MemoryCategory, SmallMTile,
+    UnifiedTensor, WgpuContext, MASKED_CE_SKIP, SUM_SQUARES_CHUNK,
 };
 use q4::Q4Group;
 use std::io::Write as _;
@@ -674,6 +674,290 @@ fn matmul_with_b_along_k_matches_cpu_at_odd_shapes() {
         g.engine.matmul_q4b(&g.ctx, &a_up, &w_q, &out);
         check("matmul_q4b", &out, &q4_round(&b, k, n, Q4Group::DEFAULT));
     }
+}
+
+/// `(m, k, n)` of products the small-M kernel takes: M of one and of two row
+/// blocks, K and N off the 64 columns and 16 or 32 of K a workgroup steps by.
+const SMALL_M_SHAPES: &[(usize, usize, usize)] = &[
+    (17, 259, 300),
+    (37, 1000, 257),
+    (64, 512, 256),
+    (100, 333, 321),
+    (130, 289, 263),
+    (256, 260, 512),
+];
+
+/// `b` of a small-M test as `[K, N]` and as `[N, K]`, in f32 and in f16, with
+/// the reference product for f32 and for f16 `b`.
+struct SmallMWeights {
+    weights: Vec<(&'static str, bool, UnifiedTensor)>,
+    want: Vec<f32>,
+    want_h: Vec<f32>,
+}
+
+impl SmallMWeights {
+    fn new(a: &[f32], (m, k, n): (usize, usize, usize), seed: u64) -> Self {
+        let g = gpu();
+        let b: Vec<f32> = rand_vec(k * n, seed).iter().map(|v| v * 0.1).collect();
+        let bt = transpose(&b, k, n);
+        Self {
+            weights: vec![
+                ("f32 a@b", false, upload(&b, &[k, n])),
+                ("f32 a@bT", true, upload(&bt, &[n, k])),
+                (
+                    "f16 a@b",
+                    false,
+                    UnifiedTensor::from_f32_as_f16(&g.ctx, &b, &[k, n]),
+                ),
+                (
+                    "f16 a@bT",
+                    true,
+                    UnifiedTensor::from_f32_as_f16(&g.ctx, &bt, &[n, k]),
+                ),
+            ],
+            want: cpu_matmul(a, &b, m, k, n),
+            want_h: cpu_matmul(a, &f16_round(&b), m, k, n),
+        }
+    }
+
+    fn want(&self, b: &UnifiedTensor) -> &[f32] {
+        if b.dtype == DType::FP16 {
+            &self.want_h
+        } else {
+            &self.want
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn small_m_matmul_matches_cpu_for_every_split() {
+    // Both layouts, f32 and f16 b, the split the heuristic picks and 1, 2, 3
+    // and 7 slices of K.
+    let g = gpu();
+    for (seed, &(m, k, n)) in SMALL_M_SHAPES.iter().enumerate() {
+        let a = rand_vec(m * k, 5000 + seed as u64);
+        let a_up = upload(&a, &[m, k]);
+        let w = SmallMWeights::new(&a, (m, k, n), 5100 + seed as u64);
+        for (name, transposed_b, b) in &w.weights {
+            for split in [None, Some(1), Some(2), Some(3), Some(7)] {
+                let out = zeros(&[m, n]);
+                let launch = g
+                    .engine
+                    .matmul_with_path(
+                        &g.ctx,
+                        *transposed_b,
+                        &a_up,
+                        b,
+                        &out,
+                        MatmulPath::SmallM { tile: None, split },
+                    )
+                    .unwrap()
+                    .unwrap();
+                // K of 256 or more is at least 8 steps, so 2 slices of whole
+                // steps always cover it; 3 and 7 may round down.
+                match split {
+                    Some(1) => assert_eq!(launch.split, 1),
+                    Some(2) => assert_eq!(launch.split, 2),
+                    Some(s) => assert!((1..=s).contains(&launch.split), "{launch:?}"),
+                    None => assert!(launch.split >= 1),
+                }
+                assert_close(
+                    &format!("small_m {name} {m}x{k}x{n} {launch:?}"),
+                    &read(&out),
+                    w.want(b),
+                    1e-4,
+                    1e-4,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn small_m_matmul_matches_cpu_with_odd_tiles() {
+    // Two threads along M with K steps of 32; 5 threads along M by 8 along
+    // N with 8 columns each, whose 40 threads leave the last round of staged
+    // values short; and one thread. All fit in 16 KiB of workgroup memory.
+    let g = gpu();
+    let tiles = [
+        SmallMTile {
+            tm: 4,
+            tn: 4,
+            tx: 8,
+            ty: 2,
+            bk: 32,
+        },
+        SmallMTile {
+            tm: 3,
+            tn: 8,
+            tx: 8,
+            ty: 5,
+            bk: 16,
+        },
+        SmallMTile {
+            tm: 1,
+            tn: 4,
+            tx: 1,
+            ty: 1,
+            bk: 4,
+        },
+    ];
+    for (seed, &(m, k, n)) in [(17, 259, 300), (130, 289, 263)].iter().enumerate() {
+        let a = rand_vec(m * k, 5200 + seed as u64);
+        let a_up = upload(&a, &[m, k]);
+        let w = SmallMWeights::new(&a, (m, k, n), 5300 + seed as u64);
+        for (name, transposed_b, b) in &w.weights {
+            for tile in tiles {
+                for split in [Some(1), Some(3)] {
+                    let out = zeros(&[m, n]);
+                    let path = MatmulPath::SmallM {
+                        tile: Some(tile),
+                        split,
+                    };
+                    let launch = g
+                        .engine
+                        .matmul_with_path(&g.ctx, *transposed_b, &a_up, b, &out, path)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(launch.tile, tile);
+                    assert_close(
+                        &format!("small_m {name} {m}x{k}x{n} {launch:?}"),
+                        &read(&out),
+                        w.want(b),
+                        1e-4,
+                        1e-4,
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn small_m_matmul_is_deterministic() {
+    // The split's partial sums are added in a fixed order, so two runs give
+    // the same bits.
+    let g = gpu();
+    let (m, k, n) = (130, 1000, 263);
+    let a = rand_vec(m * k, 5400);
+    let a_up = upload(&a, &[m, k]);
+    let w = SmallMWeights::new(&a, (m, k, n), 5401);
+    for (name, transposed_b, b) in &w.weights {
+        for split in [Some(1), Some(5)] {
+            let path = MatmulPath::SmallM { tile: None, split };
+            let run = || {
+                let out = zeros(&[m, n]);
+                g.engine
+                    .matmul_with_path(&g.ctx, *transposed_b, &a_up, b, &out, path)
+                    .unwrap();
+                read(&out).iter().map(|v| v.to_bits()).collect::<Vec<u32>>()
+            };
+            assert_eq!(run(), run(), "small_m {name} split {split:?}");
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn matmul_routes_few_rows_against_wide_weights_to_small_m() {
+    let g = gpu();
+    let route = |(m, k, n): (usize, usize, usize), transposed_b: bool, dtype: DType| {
+        let a = upload(&rand_vec(m * k, 5500), &[m, k]);
+        let shape = if transposed_b { [n, k] } else { [k, n] };
+        let data = rand_vec(k * n, 5501);
+        let b = match dtype {
+            DType::FP16 => UnifiedTensor::from_f32_as_f16(&g.ctx, &data, &shape),
+            _ => upload(&data, &shape),
+        };
+        let out = zeros(&[m, n]);
+        g.engine
+            .matmul_with_path(&g.ctx, transposed_b, &a, &b, &out, MatmulPath::Auto)
+            .unwrap()
+            .map(|launch| launch.tile)
+    };
+    // 64 rows: 8 threads along M with 8 rows each, 16 along N with 4
+    // columns each. K steps of 32 need 36 KiB of workgroup memory (NVIDIA's
+    // Vulkan driver has 48), steps of 16 need 20 KiB (Metal and software
+    // Vulkan have 32); the router takes no smaller step, so with 16 KiB
+    // (DX12 on WARP) the previous kernels run.
+    let bytes = g.ctx.device.limits().max_compute_workgroup_storage_size;
+    let tile = |bk| SmallMTile {
+        tm: 8,
+        tn: 4,
+        tx: 16,
+        ty: 8,
+        bk,
+    };
+    let want = if bytes >= 36 * 1024 {
+        Some(tile(32))
+    } else if bytes >= 20 * 1024 {
+        Some(tile(16))
+    } else {
+        None
+    };
+    assert_eq!(route((64, 512, 256), true, DType::FP32), want, "{bytes} B");
+    assert_eq!(route((64, 512, 256), false, DType::FP16), want, "{bytes} B");
+    // 160 rows: two row blocks of 80, with K steps of 16 in 22.5 KiB.
+    assert_eq!(
+        route((160, 256, 300), true, DType::FP16).map(SmallMTile::bm),
+        (bytes >= 23_040).then_some(80),
+        "{bytes} B"
+    );
+    // Too narrow, too shallow, too few or too many rows: the previous kernels.
+    assert_eq!(route((64, 512, 192), true, DType::FP32), None);
+    assert_eq!(route((64, 192, 512), false, DType::FP32), None);
+    assert_eq!(route((15, 512, 512), true, DType::FP32), None);
+    assert_eq!(route((257, 512, 512), true, DType::FP32), None);
+    assert_eq!(route((64, 2048, 8), true, DType::FP32), None);
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn small_m_matmul_refuses_what_it_cannot_run() {
+    let g = gpu();
+    let (m, k, n) = (64, 256, 256);
+    let a = upload(&rand_vec(m * k, 5600), &[m, k]);
+    let data = rand_vec(k * n, 5601);
+    let out = zeros(&[m, n]);
+    let small_m = |tile| MatmulPath::SmallM { tile, split: None };
+    // A 4-bit weight.
+    let b_q4 = UnifiedTensor::from_f32_as_q4(&g.ctx, &data, &[k, n], Q4Group::DEFAULT).unwrap();
+    assert!(g
+        .engine
+        .matmul_with_path(&g.ctx, false, &a, &b_q4, &out, small_m(None))
+        .is_err());
+    let b = upload(&data, &[k, n]);
+    // Columns per thread not a multiple of 4, and more threads than a
+    // workgroup can have.
+    for tile in [
+        SmallMTile {
+            tm: 8,
+            tn: 6,
+            tx: 16,
+            ty: 8,
+            bk: 32,
+        },
+        SmallMTile {
+            tm: 1,
+            tn: 4,
+            tx: 64,
+            ty: 64,
+            bk: 4,
+        },
+    ] {
+        assert!(g
+            .engine
+            .matmul_with_path(&g.ctx, false, &a, &b, &out, small_m(Some(tile)))
+            .is_err());
+    }
+    // Shapes that do not match.
+    assert!(g
+        .engine
+        .matmul_with_path(&g.ctx, true, &a, &b, &zeros(&[m, n + 1]), small_m(None))
+        .is_err());
 }
 
 // ---------------------------------------------------------------------------
