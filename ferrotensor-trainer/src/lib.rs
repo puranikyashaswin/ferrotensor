@@ -403,7 +403,7 @@ impl Trainer {
     /// [`masked_cross_entropy`] does.
     #[expect(
         clippy::expect_used,
-        reason = "this API returns no Result, and a readback fails only when the GPU device was lost"
+        reason = "a readback fails only on device loss, and the caller has no error path"
     )]
     fn read_pending_losses(&mut self) {
         if self.pending_rows.is_empty() {
@@ -610,7 +610,7 @@ impl Trainer {
 /// read back once and added up on the host in f64.
 #[expect(
     clippy::expect_used,
-    reason = "this API returns no Result, and a readback fails only when the GPU device was lost"
+    reason = "a readback fails only on device loss, and the caller has no error path"
 )]
 pub(crate) fn global_grad_norm(
     grads: &[UnifiedTensor],
@@ -670,7 +670,7 @@ impl AutogradNode for MaskedCrossEntropyNode {
 
     #[expect(
         clippy::expect_used,
-        reason = "this API returns no Result, and a readback fails only when the GPU device was lost"
+        reason = "a readback fails only on device loss, and the caller has no error path"
     )]
     fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
         if self.applied_seed.is_some() {
@@ -817,7 +817,7 @@ fn ce_loss_tensor(
 /// losses are read back. Returns `None` when no position is supervised.
 #[expect(
     clippy::expect_used,
-    reason = "this API returns no Result, and a readback fails only when the GPU device was lost"
+    reason = "a readback fails only on device loss, and the caller has no error path"
 )]
 pub fn masked_cross_entropy(
     logits: &Tensor,
@@ -878,7 +878,7 @@ pub struct BatchLoss {
 /// no position is supervised.
 #[expect(
     clippy::expect_used,
-    reason = "this API returns no Result, and a readback fails only when the GPU device was lost"
+    reason = "a readback fails only on device loss, and the caller has no error path"
 )]
 pub fn masked_cross_entropy_batch(
     logits: &Tensor,
