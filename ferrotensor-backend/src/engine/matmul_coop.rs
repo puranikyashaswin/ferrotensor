@@ -263,11 +263,25 @@ const TUNED: &[Tuned] = &[
     Tuned::new(2048, false, 49152, 2048, 11, 1),
 ];
 
+/// Rows the [`TUNED`] rows stand for: the 256-row ones for up to 256 rows, the
+/// 2048-row ones for more, up to 2048. Training batches are padded to their
+/// longest sequence, so a step's row count is rarely exactly 256 or 2048, and
+/// an exact match would leave most products to the fallback rule. `m` is
+/// rounded up to a multiple of 16 first, the size of a fragment row.
+fn tuned_rows(m: u32) -> Option<u32> {
+    match m.div_ceil(16) * 16 {
+        0..=256 => Some(256),
+        257..=2048 => Some(2048),
+        _ => None,
+    }
+}
+
 /// The measured configuration for this product, when the router has one.
 fn tuned(m: u32, transposed_b: bool, k: u32, n: u32) -> Option<CoopConfig> {
+    let rows = tuned_rows(m)?;
     let row = TUNED
         .iter()
-        .find(|t| (t.m, t.transposed_b, t.k, t.n) == (m, transposed_b, k, n))?;
+        .find(|t| (t.m, t.transposed_b, t.k, t.n) == (rows, transposed_b, k, n))?;
     Some(CoopConfig {
         tile: *CoopTile::ALL.get(row.tile)?,
         split: row.split,
@@ -1259,9 +1273,52 @@ mod tests {
         let none_but_small = |t: CoopTile| t.bm * t.bn <= 32 * 64;
         let got = plan((2048, 2048, 8192), true, (160, true), none_but_small);
         assert!(got.is_some_and(|c| c.tile.bm * c.tile.bn <= 32 * 64));
+        // A padded batch has fewer rows than 256 or 2048: it runs the row
+        // count's bucket, which is the 256-row winner of 576 x 576 for up to
+        // 256 rows and the 2048-row winner above that, up to 2048.
+        for (m, want) in [
+            (64, 12),
+            (106, 12),
+            (130, 12),
+            (256, 12),
+            (257, 6),
+            (1500, 6),
+            (2048, 6),
+        ] {
+            let got = plan((m, 576, 576), true, (160, true), all).expect("a tile fits");
+            assert_eq!((got.tile, got.split), (CoopTile::ALL[want], 1), "m {m}");
+        }
+        // More rows than the table has run the router's own rule.
+        let got = plan((4096, 576, 576), true, (160, true), all);
+        assert_eq!(got.map(|c| c.tile), Some(CoopTile::ALL[1]));
         // Without the table (a device it was not measured on) the router's
         // own rule applies.
         let got = plan((2048, 2048, 8192), true, (160, false), all);
         assert_eq!(got.map(|c| c.tile), Some(CoopTile::ALL[1]));
+    }
+
+    #[test]
+    fn padded_row_counts_run_the_256_row_winner() {
+        let all = |_: CoopTile| true;
+        // 106 and 200 rows are what a padded SmolLM2 micro-batch can have;
+        // each runs what the 256-row product runs, split included.
+        for &(m, transposed_b, k, n, _) in BENCH.iter().filter(|r| r.0 == 256) {
+            let want = plan((256, k, n), transposed_b, (160, true), all).expect("a tile fits");
+            for rows in [106, 200, 256] {
+                let got = plan((rows, k, n), transposed_b, (160, true), all).expect("a tile fits");
+                assert_eq!(
+                    (got.tile, got.split),
+                    (want.tile, want.split),
+                    "m {m} rows {rows} k {k} n {n}"
+                );
+            }
+        }
+        // 135M down projection at 200 rows: tile 11 with K split into 6.
+        let got = plan((200, 1536, 576), false, (160, true), all).expect("a tile fits");
+        assert_eq!((got.tile, got.split), (CoopTile::ALL[11], 6));
+        // The row count is rounded up to a multiple of 16 for the lookup, so
+        // 2049 rows (2064) are past the table and 2048 are not.
+        let past = plan((2049, 576, 576), true, (160, true), all).expect("a tile fits");
+        assert_eq!(past.tile, CoopTile::ALL[1]);
     }
 }
