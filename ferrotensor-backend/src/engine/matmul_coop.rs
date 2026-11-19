@@ -630,7 +630,8 @@ mod tests {
             let mut validator = naga::valid::Validator::new(
                 naga::valid::ValidationFlags::all(),
                 naga::valid::Capabilities::COOPERATIVE_MATRIX
-                    | naga::valid::Capabilities::SHADER_FLOAT16,
+                    | naga::valid::Capabilities::SHADER_FLOAT16
+                    | naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32,
             );
             if let Err(e) = validator.validate(&module) {
                 panic!(
