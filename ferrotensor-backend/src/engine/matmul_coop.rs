@@ -2,10 +2,13 @@
 //! with f32 `a`, f16 `b`, 16x16x16 f16 fragments and f32 accumulation.
 //!
 //! The kernel stages `a` (converted to f16) and `b` in workgroup memory, one
-//! K step of `BK` at a time, and each subgroup of 32 threads multiplies its
+//! K step of 32 or 64 at a time (with two staging buffers the next step loads
+//! while this one multiplies), and each subgroup of 32 threads multiplies its
 //! own block of 16x16 fragments. The accumulators go back through workgroup
 //! memory, so the epilogue and the edges of M and N that are not multiples
-//! of 16 are handled per element.
+//! of 16 are handled per element. A product with too few output tiles to
+//! fill the GPU splits K over the grid's third dimension, and the split-K
+//! reduction adds the slices in order.
 //!
 //! A value of `a` that f16 cannot hold (beyond +-65504, or NaN) is clamped
 //! for the product, counted in [`ComputeEngine::coop_f16_overflows`], and the
@@ -17,15 +20,13 @@
 //! that is not 16-byte aligned reads or writes the aligned address below it
 //! (on the A10G a 4-byte atomic among them shifted the results by elements).
 
-use super::{uniform, ComputeEngine, Epilogue, Kernel};
+use super::{grid, uniform, ComputeEngine, Epilogue, Kernel};
 use crate::kernel_timing::KernelLabel;
 use crate::{DType, ReadbackError, UnifiedTensor, WgpuContext};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
-/// K step staged in workgroup memory per iteration.
-const BK: u32 = 32;
 /// f16 elements of padding after each staged row, against bank conflicts.
 const PAD: u32 = 8;
 /// Threads per subgroup the kernel is written for.
@@ -35,20 +36,73 @@ const SUBGROUP: u32 = 32;
 const MIN_ROWS: u32 = 64;
 /// Largest workgroup count per grid dimension.
 const MAX_GROUPS: u32 = 65_535;
+/// Fewest K steps of `bk` per slice when the router splits K, so each
+/// slice's loop still overlaps a load with a multiply.
+const MIN_STEPS_PER_SPLIT: u32 = 2;
 
 /// A workgroup's output tile `bm x bn`, split into one `wm x wn` block per
-/// subgroup.
+/// subgroup, stepping through K `bk` at a time with one staging buffer or
+/// two (`double`: the next step's loads overlap this step's multiplies, and
+/// each step needs one barrier instead of two).
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(super) struct CoopTile {
-    bm: u32,
-    bn: u32,
-    wm: u32,
-    wn: u32,
+pub struct CoopTile {
+    /// Output rows per workgroup.
+    pub bm: u32,
+    /// Output columns per workgroup.
+    pub bn: u32,
+    /// Output rows per subgroup.
+    pub wm: u32,
+    /// Output columns per subgroup.
+    pub wn: u32,
+    /// K per staged step, 32 or 64.
+    pub bk: u32,
+    /// Two staging buffers.
+    pub double: bool,
 }
 
 impl CoopTile {
-    const fn new(bm: u32, bn: u32, wm: u32, wn: u32) -> Self {
-        Self { bm, bn, wm, wn }
+    const fn new(bm: u32, bn: u32, (wm, wn): (u32, u32), bk: u32, double: bool) -> Self {
+        Self {
+            bm,
+            bn,
+            wm,
+            wn,
+            bk,
+            double,
+        }
+    }
+
+    /// Every tile the generator is tested with, for tests and the tuning
+    /// bench. The first three are the tiles of the first coop kernel.
+    pub const ALL: [Self; 14] = [
+        Self::new(128, 64, (64, 32), 32, false),
+        Self::new(64, 64, (32, 32), 32, false),
+        Self::new(32, 32, (16, 16), 32, false),
+        Self::new(128, 64, (64, 32), 32, true),
+        Self::new(64, 64, (32, 32), 32, true),
+        Self::new(128, 128, (64, 64), 32, true),
+        Self::new(128, 64, (32, 32), 32, true),
+        Self::new(64, 128, (32, 64), 32, true),
+        Self::new(64, 64, (32, 32), 64, true),
+        Self::new(64, 32, (32, 16), 32, true),
+        Self::new(32, 64, (16, 32), 32, true),
+        Self::new(64, 64, (16, 32), 32, true),
+        Self::new(32, 64, (16, 16), 64, true),
+        Self::new(32, 32, (16, 16), 64, true),
+    ];
+
+    /// A short name such as `128x64/w64x32/k32/db`.
+    pub fn name(self) -> String {
+        format!(
+            "{}x{}/w{}x{}/k{}{}",
+            self.bm,
+            self.bn,
+            self.wm,
+            self.wn,
+            self.bk,
+            if self.double { "/db" } else { "" }
+        )
     }
 
     fn warps(self) -> u32 {
@@ -59,16 +113,34 @@ impl CoopTile {
         SUBGROUP * self.warps()
     }
 
-    /// Workgroup memory in bytes: the staged `a` and `b` tiles in f16 and
-    /// one 16x16 f32 staging fragment per subgroup.
-    fn workgroup_bytes(self, transposed_b: bool) -> u32 {
-        let a = self.bm * (BK + PAD) * 2;
-        let b = if transposed_b {
-            self.bn * (BK + PAD) * 2
+    fn stages(self) -> u32 {
+        if self.double {
+            2
         } else {
-            BK * (self.bn + PAD) * 2
-        };
-        a + b + self.warps() * 256 * 4
+            1
+        }
+    }
+
+    /// f16 elements of one staged `a` tile.
+    fn a_len(self) -> u32 {
+        self.bm * (self.bk + PAD)
+    }
+
+    /// f16 elements of one staged `b` tile: `[n][k]` rows for `b[N, K]`,
+    /// `[k][n]` rows for `b[K, N]`.
+    fn b_len(self, transposed_b: bool) -> u32 {
+        if transposed_b {
+            self.bn * (self.bk + PAD)
+        } else {
+            self.bk * (self.bn + PAD)
+        }
+    }
+
+    /// Workgroup memory in bytes: the staged `a` and `b` tiles in f16 (two
+    /// of each when double-buffered) and one 16x16 f32 staging fragment per
+    /// subgroup.
+    pub fn workgroup_bytes(self, transposed_b: bool) -> u32 {
+        self.stages() * (self.a_len() + self.b_len(transposed_b)) * 2 + self.warps() * 256 * 4
     }
 
     fn groups(self, m: u32, n: u32) -> (u32, u32) {
@@ -76,14 +148,30 @@ impl CoopTile {
     }
 }
 
-/// The tiles, largest first: 128x64 with four 64x32 subgroup blocks was the
-/// fastest shared-memory tile on the 135M shapes in the spike; the smaller
-/// ones fill the GPU when M or N is short.
-const TILES: [CoopTile; 3] = [
-    CoopTile::new(128, 64, 64, 32),
-    CoopTile::new(64, 64, 32, 32),
-    CoopTile::new(32, 32, 16, 16),
-];
+/// A tile and how many slices K is split into; with more than one slice the
+/// kernel writes partial sums and a second pass adds them.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CoopConfig {
+    /// The tile.
+    pub tile: CoopTile,
+    /// Slices of K (1: no reduction pass).
+    pub split: u32,
+}
+
+/// Tiles the router tries for products of more than 256 rows, in order:
+/// the first whose grid reaches the target runs. Not tuned yet.
+const LARGE_M_TILES: [usize; 3] = [5, 3, 4];
+/// Tiles the router tries for products of up to 256 rows; when none reaches
+/// the target, the last one runs with K split. Not tuned yet.
+const SMALL_M_TILES: [usize; 2] = [3, 4];
+
+/// `(splits, K per split)` for `requested` slices of K = `k` in steps of
+/// `bk`: every slice a whole number of steps, none empty.
+fn split_k(k: u32, bk: u32, requested: u32) -> (u32, u32) {
+    let per = k.div_ceil(bk).div_ceil(requested.max(1)).max(1) * bk;
+    (k.div_ceil(per).max(1), per)
+}
 
 /// What one compiled kernel is specialised for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -125,6 +213,53 @@ fn device_supports(ctx: &WgpuContext) -> bool {
             .any(|c| (c.m, c.n, c.k) == (16, 16, 16) && c.ab_type == "f16" && c.cr_type == "f32")
 }
 
+/// Whether a grid of `tile` over `m x n` with `split` slices is within the
+/// per-dimension limit.
+fn grid_fits(tile: CoopTile, m: u32, n: u32, split: u32) -> bool {
+    let (gx, gy) = tile.groups(m, n);
+    gx <= MAX_GROUPS && gy <= MAX_GROUPS && split <= MAX_GROUPS
+}
+
+/// The configuration the router runs an `m x k x n` product with: the first
+/// tile of the list for `m` that `fits` and whose grid reaches `target`
+/// workgroups, else the last one that fits with K split until the grid
+/// reaches the target (at most one slice per [`MIN_STEPS_PER_SPLIT`] steps).
+/// The first kernel's tiles stand in on a device that fits none of the list.
+fn plan(
+    (m, k, n): (u32, u32, u32),
+    target: u32,
+    fits: impl Fn(CoopTile) -> bool,
+) -> Option<CoopConfig> {
+    let list: &[usize] = if m > 256 {
+        &LARGE_M_TILES
+    } else {
+        &SMALL_M_TILES
+    };
+    let usable = |tile: &CoopTile| fits(*tile) && grid_fits(*tile, m, n, 1);
+    let mut tiles: Vec<CoopTile> = list
+        .iter()
+        .map(|&i| CoopTile::ALL[i])
+        .filter(usable)
+        .collect();
+    if tiles.is_empty() {
+        tiles = CoopTile::ALL[..3].iter().copied().filter(usable).collect();
+    }
+    for &tile in &tiles {
+        let (gx, gy) = tile.groups(m, n);
+        if gx * gy >= target {
+            return Some(CoopConfig { tile, split: 1 });
+        }
+    }
+    let tile = *tiles.last()?;
+    let (gx, gy) = tile.groups(m, n);
+    let most = (k.div_ceil(tile.bk) / MIN_STEPS_PER_SPLIT).max(1);
+    let wanted = target.div_ceil(gx * gy).clamp(1, most);
+    Some(CoopConfig {
+        tile,
+        split: split_k(k, tile.bk, wanted).0,
+    })
+}
+
 impl Coop {
     /// The kernels for `ctx`, or `None` when its device cannot run them.
     pub(super) fn new(ctx: &WgpuContext, target: u32) -> Option<Self> {
@@ -146,24 +281,6 @@ impl Coop {
 
     fn fits(&self, tile: CoopTile, transposed_b: bool) -> bool {
         tile.threads() <= self.max_threads && tile.workgroup_bytes(transposed_b) <= self.max_bytes
-    }
-
-    /// The largest tile whose grid over `m x n` reaches the target, else the
-    /// smallest that fits.
-    fn tile(&self, m: u32, n: u32, transposed_b: bool) -> Option<CoopTile> {
-        let fitting = TILES.iter().copied().filter(|&t| {
-            let (gx, gy) = t.groups(m, n);
-            self.fits(t, transposed_b) && gx <= MAX_GROUPS && gy <= MAX_GROUPS
-        });
-        let mut last = None;
-        for tile in fitting {
-            let (gx, gy) = tile.groups(m, n);
-            if gx * gy >= self.target {
-                return Some(tile);
-            }
-            last = Some(tile);
-        }
-        last
     }
 
     fn kernel(&self, ctx: &WgpuContext, key: CoopKey) -> Arc<Kernel> {
@@ -253,12 +370,34 @@ impl ComputeEngine {
         &self,
         ctx: &WgpuContext,
         transposed_b: bool,
-        [a, b, out]: [&UnifiedTensor; 3],
+        tensors: [&UnifiedTensor; 3],
         ep: Epilogue,
     ) -> Result<(), String> {
-        if self.coop.is_none() {
+        self.matmul_coop_config_into(ctx, transposed_b, tensors, None, ep)
+            .map(|_| ())
+    }
+
+    /// Runs [`matmul_coop_into`](Self::matmul_coop_into) with `config`, or
+    /// with the configuration the router would pick when it is `None`, and
+    /// returns the configuration that ran (a split can come out smaller, so
+    /// that no slice of K is empty).
+    ///
+    /// # Errors
+    ///
+    /// As [`matmul_coop_into`](Self::matmul_coop_into), and when `config`'s
+    /// tile does not fit this device or its grid is past the dispatch limit.
+    #[doc(hidden)]
+    pub fn matmul_coop_config_into(
+        &self,
+        ctx: &WgpuContext,
+        transposed_b: bool,
+        [a, b, out]: [&UnifiedTensor; 3],
+        config: Option<CoopConfig>,
+        ep: Epilogue,
+    ) -> Result<CoopConfig, String> {
+        let Some(coop) = self.coop.as_ref() else {
             return Err("matmul_coop_into: this device has no f16 cooperative matrices".into());
-        }
+        };
         if b.dtype != DType::FP16 {
             return Err("matmul_coop_into: b must be f16".into());
         }
@@ -279,13 +418,23 @@ impl ComputeEngine {
             return Err("matmul_coop_into: empty product".into());
         }
         let dims = (*m as u32, *k as u32, *n as u32);
-        if self.matmul_coop(ctx, transposed_b, dims, [a, b, out], ep) {
-            Ok(())
-        } else {
-            Err(format!(
-                "matmul_coop_into: no tile fits {m} x {n} on this device"
-            ))
-        }
+        let fits = |t: CoopTile| coop.fits(t, transposed_b);
+        let config = match config {
+            Some(c) if fits(c.tile) && grid_fits(c.tile, dims.0, dims.2, c.split) => Some(c),
+            Some(c) => {
+                return Err(format!(
+                    "matmul_coop_into: {} with split {} does not fit {m} x {n} on this device",
+                    c.tile.name(),
+                    c.split
+                ));
+            }
+            None => plan(dims, coop.target, fits),
+        };
+        let Some(config) = config else {
+            return Err(format!("matmul_coop_into: no tile fits {m} x {n} on this device"));
+        };
+        self.matmul_coop_run(ctx, transposed_b, dims, [a, b, out], config, ep)
+            .ok_or_else(|| "matmul_coop_into: no cooperative-matrix kernel".into())
     }
 
     /// Records the cooperative-matrix matmul; false (recording nothing) when
@@ -294,61 +443,110 @@ impl ComputeEngine {
         &self,
         ctx: &WgpuContext,
         transposed_b: bool,
-        (m, k, n): (u32, u32, u32),
-        [a, b, out]: [&UnifiedTensor; 3],
+        dims: (u32, u32, u32),
+        tensors: [&UnifiedTensor; 3],
         ep: Epilogue,
     ) -> bool {
         let Some(coop) = self.coop.as_ref() else {
             return false;
         };
-        let Some(tile) = coop.tile(m, n, transposed_b) else {
+        let Some(config) = plan(dims, coop.target, |t| coop.fits(t, transposed_b)) else {
             return false;
         };
+        self.matmul_coop_run(ctx, transposed_b, dims, tensors, config, ep)
+            .is_some()
+    }
+
+    /// Records `config` for the product: one pass that applies `ep`, or with
+    /// K split, one pass of partial sums and the reduction that adds them in
+    /// slice order and applies `ep`. Returns the configuration that ran, or
+    /// `None` (recording nothing) without the kernel.
+    fn matmul_coop_run(
+        &self,
+        ctx: &WgpuContext,
+        transposed_b: bool,
+        (m, k, n): (u32, u32, u32),
+        [a, b, out]: [&UnifiedTensor; 3],
+        config: CoopConfig,
+        ep: Epilogue,
+    ) -> Option<CoopConfig> {
+        let coop = self.coop.as_ref()?;
+        let tile = config.tile;
+        let (split, kps) = split_k(k, tile.bk, config.split);
         let b_row = if transposed_b { k } else { n };
         let key = CoopKey {
             tile,
             transposed_b,
-            a_vec4: k % 4 == 0,
-            b_vec8: b_row % 8 == 0,
+            a_vec4: k.is_multiple_of(4),
+            b_vec8: b_row.is_multiple_of(8),
         };
         let kernel = coop.kernel(ctx, key);
-        let params = uniform(
-            ctx,
-            bytemuck::cast_slice(&[m, k, n, 0, ep.alpha.to_bits(), ep.beta.to_bits(), 0, 0]),
-        );
+        // With K split the kernel stores plain partial sums; the reduction
+        // applies the epilogue once.
+        let kernel_ep = if split == 1 { ep } else { Epilogue::STORE };
+        let (alpha, beta) = (kernel_ep.alpha.to_bits(), kernel_ep.beta.to_bits());
+        let words = [m, k, n, kps, alpha, beta, 0, 0];
+        let params = uniform(ctx, bytemuck::cast_slice(&words));
         let label = KernelLabel {
             entry: "matmul_coop",
             layout: if transposed_b { "a@bT" } else { "a@b" },
             size_class: if m <= 256 { "m<=256" } else { "m>256" },
         };
-        self.run_labeled(
-            ctx,
-            &kernel,
-            label,
-            &[
-                (0, a.buffer()),
-                (1, b.buffer()),
-                (2, out.buffer()),
-                (3, &params),
-                (4, coop.overflows.buffer()),
-            ],
-            {
-                let (gx, gy) = tile.groups(m, n);
-                (gx, gy, 1)
-            },
-        );
-        true
+        let (gx, gy) = tile.groups(m, n);
+        if split == 1 {
+            self.run_labeled(
+                ctx,
+                &kernel,
+                label,
+                &[
+                    (0, a.buffer()),
+                    (1, b.buffer()),
+                    (2, out.buffer()),
+                    (3, &params),
+                    (4, coop.overflows.buffer()),
+                ],
+                (gx, gy, 1),
+            );
+        } else {
+            let parts = UnifiedTensor::empty(ctx, &[split as usize, m as usize, n as usize]);
+            self.run_labeled(
+                ctx,
+                &kernel,
+                label,
+                &[
+                    (0, a.buffer()),
+                    (1, b.buffer()),
+                    (2, parts.buffer()),
+                    (3, &params),
+                    (4, coop.overflows.buffer()),
+                ],
+                (gx, gy, split),
+            );
+            let len = m * n;
+            let params = uniform(
+                ctx,
+                bytemuck::cast_slice(&[len, split, ep.alpha.to_bits(), ep.beta.to_bits()]),
+            );
+            self.run(
+                ctx,
+                &self.split_reduce,
+                &[(0, parts.buffer()), (1, out.buffer()), (2, &params)],
+                grid(len.div_ceil(256)),
+            );
+        }
+        Some(CoopConfig { tile, split })
     }
 }
 
-/// The 16x16 fragments of one K substep `kk`: loads of `a` and `b` from
-/// workgroup memory, then every multiply-add of the subgroup's block.
-fn fragment_step(key: CoopKey, kk: u32) -> String {
+/// The 16x16 fragments of one K substep `kk` from the staged tiles `sa` and
+/// `sb`: loads of `a` and `b`, then every multiply-add of the subgroup's
+/// block.
+fn fragment_step(key: CoopKey, kk: u32, (sa, sb): (&str, &str)) -> String {
     let (ti, tj) = (key.tile.wm / 16, key.tile.wn / 16);
     let mut s = String::from("    {\n");
     for i in 0..ti {
         s.push_str(&format!(
-            "      let fa{i} = coopLoadT<coop_mat16x16<f16, A>>(&sa[(wr + {}u) * AP + {}u], AP);\n",
+            "      let fa{i} = coopLoadT<coop_mat16x16<f16, A>>(&{sa}[(wr + {}u) * AP + {}u], AP);\n",
             i * 16,
             kk * 16
         ));
@@ -358,13 +556,13 @@ fn fragment_step(key: CoopKey, kk: u32) -> String {
         // row-major with stride BP.
         let line = if key.transposed_b {
             format!(
-                "      let fb{j} = coopLoad<coop_mat16x16<f16, B>>(&sb[(wc + {}u) * AP + {}u], AP);",
+                "      let fb{j} = coopLoad<coop_mat16x16<f16, B>>(&{sb}[(wc + {}u) * AP + {}u], AP);",
                 j * 16,
                 kk * 16
             )
         } else {
             format!(
-                "      let fb{j} = coopLoadT<coop_mat16x16<f16, B>>(&sb[{}u * BP + wc + {}u], BP);",
+                "      let fb{j} = coopLoadT<coop_mat16x16<f16, B>>(&{sb}[{}u * BP + wc + {}u], BP);",
                 kk * 16,
                 j * 16
             )
@@ -384,10 +582,11 @@ fn fragment_step(key: CoopKey, kk: u32) -> String {
 }
 
 /// Staging `a[m0.., k0..]` into `sa` as f16, flagging values f16 cannot hold.
-fn load_a(key: CoopKey) -> String {
+fn load_a(key: CoopKey, sa: &str) -> String {
     let nt = key.tile.threads();
+    let bk = key.tile.bk;
     if key.a_vec4 {
-        let count = key.tile.bm * (BK / 4) / nt;
+        let count = key.tile.bm * (bk / 4) / nt;
         format!(
             "    for (var i = 0u; i < {count}u; i++) {{
       let idx = li + i * {nt}u;
@@ -400,16 +599,16 @@ fn load_a(key: CoopKey) -> String {
       if (any(!(abs(v) <= vec4<f32>(F16_MAX)))) {{ overflow = true; }}
       let h = vec4<f16>(clamp(v, vec4<f32>(-F16_MAX), vec4<f32>(F16_MAX)));
       let o = r * AP + q * 4u;
-      sa[o] = h.x;
-      sa[o + 1u] = h.y;
-      sa[o + 2u] = h.z;
-      sa[o + 3u] = h.w;
+      {sa}[o] = h.x;
+      {sa}[o + 1u] = h.y;
+      {sa}[o + 2u] = h.z;
+      {sa}[o + 3u] = h.w;
     }}
 ",
-            q = BK / 4
+            q = bk / 4
         )
     } else {
-        let count = key.tile.bm * BK / nt;
+        let count = key.tile.bm * bk / nt;
         format!(
             "    for (var i = 0u; i < {count}u; i++) {{
       let idx = li + i * {nt}u;
@@ -420,7 +619,7 @@ fn load_a(key: CoopKey) -> String {
       var v = 0.0;
       if (gr < m && gk < k) {{ v = a[gr * k + gk]; }}
       if (!(abs(v) <= F16_MAX)) {{ overflow = true; }}
-      sa[r * AP + q] = f16(clamp(v, -F16_MAX, F16_MAX));
+      {sa}[r * AP + q] = f16(clamp(v, -F16_MAX, F16_MAX));
     }}
 "
         )
@@ -429,20 +628,20 @@ fn load_a(key: CoopKey) -> String {
 
 /// Staging the f16 `b` tile into `sb`: `[k][n]` rows of BP for `b[K, N]`,
 /// `[n][k]` rows of AP for `b[N, K]`.
-fn load_b(key: CoopKey) -> String {
+fn load_b(key: CoopKey, sb: &str) -> String {
     let nt = key.tile.threads();
-    let bn = key.tile.bn;
+    let (bn, bk) = (key.tile.bn, key.tile.bk);
     if key.b_vec8 {
-        // (rows of the tile, 8-half chunks per row, global row, global
-        // column of the chunk, word index, workgroup offset)
+        // (rows of the tile, 8-half chunks per row), then the global row,
+        // column of the chunk, word index and workgroup offset.
         let (rows_chunks, body) = if key.transposed_b {
             (
-                (bn, BK / 8),
+                (bn, bk / 8),
                 "      let gn = n0 + r;\n      let gk = k0 + q * 8u;\n      if (gn < n && gk < k) { w = b[(gn * k + gk) / 8u]; }\n      let o = r * AP + q * 8u;\n",
             )
         } else {
             (
-                (BK, bn / 8),
+                (bk, bn / 8),
                 "      let gk = k0 + r;\n      let gn = n0 + q * 8u;\n      if (gk < k && gn < n) { w = b[(gk * n + gn) / 8u]; }\n      let o = r * BP + q * 8u;\n",
             )
         };
@@ -458,19 +657,19 @@ fn load_b(key: CoopKey) -> String {
       let h1 = vec2<f16>(unpack2x16float(w.y));
       let h2 = vec2<f16>(unpack2x16float(w.z));
       let h3 = vec2<f16>(unpack2x16float(w.w));
-      sb[o] = h0.x;
-      sb[o + 1u] = h0.y;
-      sb[o + 2u] = h1.x;
-      sb[o + 3u] = h1.y;
-      sb[o + 4u] = h2.x;
-      sb[o + 5u] = h2.y;
-      sb[o + 6u] = h3.x;
-      sb[o + 7u] = h3.y;
+      {sb}[o] = h0.x;
+      {sb}[o + 1u] = h0.y;
+      {sb}[o + 2u] = h1.x;
+      {sb}[o + 3u] = h1.y;
+      {sb}[o + 4u] = h2.x;
+      {sb}[o + 5u] = h2.y;
+      {sb}[o + 6u] = h3.x;
+      {sb}[o + 7u] = h3.y;
     }}
 "
         )
     } else {
-        let count = BK * bn / nt;
+        let count = bk * bn / nt;
         let body = if key.transposed_b {
             "      let r = idx / BK;\n      let q = idx % BK;\n      let gn = n0 + r;\n      let gk = k0 + q;\n      let e = gn * k + gk;\n      let o = r * AP + q;\n"
         } else {
@@ -481,15 +680,67 @@ fn load_b(key: CoopKey) -> String {
       let idx = li + i * {nt}u;
 {body}      var v = 0.0;
       if (gk < k && gn < n) {{ v = unpack2x16float(b[e >> 1u])[e & 1u]; }}
-      sb[o] = f16(v);
+      {sb}[o] = f16(v);
     }}
 "
         )
     }
 }
 
+/// The loads of the K step that starts at `k0` into the staging pair
+/// `(sa, sb)`.
+fn load_step(key: CoopKey, k0: &str, (sa, sb): (&str, &str)) -> String {
+    format!(
+        "    {{\n    let k0 = {k0};\n{}{}    }}\n",
+        load_a(key, sa),
+        load_b(key, sb)
+    )
+}
+
+/// The multiplies of one K step from the staging pair `bufs`.
+fn compute_step(key: CoopKey, bufs: (&str, &str)) -> String {
+    (0..key.tile.bk / 16)
+        .map(|kk| fragment_step(key, kk, bufs))
+        .collect()
+}
+
+/// The K loop over this slice's `steps` steps. With one staging pair each
+/// step loads, waits, multiplies and waits. With two, the loads of step
+/// `t + 1` go to the other pair before step `t`'s multiplies, and one
+/// barrier per step separates a pair's reads from its next writes.
+fn main_loop(key: CoopKey) -> String {
+    let p0 = ("sa0", "sb0");
+    if !key.tile.double {
+        return format!(
+            "  for (var t = 0u; t < steps; t++) {{\n{}    workgroupBarrier();\n{}    workgroupBarrier();\n  }}\n",
+            load_step(key, "kb + t * BK", p0),
+            compute_step(key, p0)
+        );
+    }
+    let p1 = ("sa1", "sb1");
+    format!(
+        "  if (steps > 0u) {{\n{first}  }}
+  workgroupBarrier();
+  for (var t = 0u; t < steps; t += 2u) {{
+    if (t + 1u < steps) {{\n{load1}    }}
+{mul0}    workgroupBarrier();
+    if (t + 1u < steps) {{
+      if (t + 2u < steps) {{\n{load0}      }}
+{mul1}      workgroupBarrier();
+    }}
+  }}
+",
+        first = load_step(key, "kb", p0),
+        load1 = load_step(key, "kb + (t + 1u) * BK", p1),
+        mul0 = compute_step(key, p0),
+        load0 = load_step(key, "kb + (t + 2u) * BK", p0),
+        mul1 = compute_step(key, p1),
+    )
+}
+
 /// The epilogue of fragment `(i, j)`: through the subgroup's staging
-/// fragment to `c`, guarded at the edges, with alpha and beta.
+/// fragment to `c` (this slice's partial sums when K is split), guarded at
+/// the edges, with alpha and beta.
 fn store_fragment(i: u32, j: u32) -> String {
     format!(
         "  coopStoreT(acc{i}_{j}, &cs[warp * 256u], 16u);
@@ -499,9 +750,10 @@ fn store_fragment(i: u32, j: u32) -> String {
     let r = m0 + wr + {ri}u + idx / 16u;
     let col = n0 + wc + {cj}u + idx % 16u;
     if (r < m && col < n) {{
+      let o = base + r * n + col;
       var v = alpha * cs[warp * 256u + idx];
-      if (beta != 0.0) {{ v += beta * c[r * n + col]; }}
-      c[r * n + col] = v;
+      if (beta != 0.0) {{ v += beta * c[o]; }}
+      c[o] = v;
     }}
   }}
   workgroupBarrier();
@@ -512,16 +764,12 @@ fn store_fragment(i: u32, j: u32) -> String {
 }
 
 /// The WGSL of the kernel for `key`, entry point `matmul_coop`. Params are
-/// `[M, K, N, 0]` and `[alpha bits, beta bits, 0, 0]`.
+/// `[M, K, N, K per slice]` and `[alpha bits, beta bits, 0, 0]`; workgroup z
+/// is the slice of K, whose sums go to `c[z * M * N ..]`.
 pub(super) fn source(key: CoopKey) -> String {
     let t = key.tile;
     let (ti, tj) = (t.wm / 16, t.wn / 16);
     let warps = t.warps();
-    let sb_len = if key.transposed_b {
-        t.bn * (BK + PAD)
-    } else {
-        BK * (t.bn + PAD)
-    };
     let mut init = String::new();
     let mut store = String::new();
     for i in 0..ti {
@@ -532,7 +780,15 @@ pub(super) fn source(key: CoopKey) -> String {
             store.push_str(&store_fragment(i, j));
         }
     }
-    let steps: String = (0..BK / 16).map(|kk| fragment_step(key, kk)).collect();
+    let (a_len, b_len) = (t.a_len(), t.b_len(key.transposed_b));
+    let mut arrays = format!(
+        "var<workgroup> sa0: array<f16, {a_len}>;\nvar<workgroup> sb0: array<f16, {b_len}>;\n"
+    );
+    if t.double {
+        arrays.push_str(&format!(
+            "var<workgroup> sa1: array<f16, {a_len}>;\nvar<workgroup> sb1: array<f16, {b_len}>;\n"
+        ));
+    }
     format!(
         "enable f16;
 enable wgpu_cooperative_matrix;
@@ -545,14 +801,12 @@ enable wgpu_cooperative_matrix;
 
 const BM: u32 = {bm}u;
 const BN: u32 = {bn}u;
-const BK: u32 = {BK}u;
+const BK: u32 = {bk}u;
 const AP: u32 = {ap}u;
 const BP: u32 = {bp}u;
 const F16_MAX: f32 = 65504.0;
 
-var<workgroup> sa: array<f16, {sa_len}>;
-var<workgroup> sb: array<f16, {sb_len}>;
-var<workgroup> cs: array<f32, {cs_len}>;
+{arrays}var<workgroup> cs: array<f32, {cs_len}>;
 
 @compute @workgroup_size({nt})
 fn matmul_coop(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {{
@@ -567,18 +821,20 @@ fn matmul_coop(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_i
   let wc = (warp % {warps_n}u) * {wn}u;
   let m0 = wg.y * BM;
   let n0 = wg.x * BN;
+  // This workgroup's slice of K, [kb, ke), and where its sums go. Slices
+  // are whole steps of BK, so a step never reads into the next slice.
+  let kb = wg.z * params[0].w;
+  let ke = min(k, kb + params[0].w);
+  let steps = select(0u, (ke - kb + BK - 1u) / BK, kb < ke);
+  let base = wg.z * m * n;
   for (var i = li; i < {cs_len}u; i += {nt}u) {{ cs[i] = 0.0; }}
   workgroupBarrier();
 {init}  var overflow = false;
-  for (var k0 = 0u; k0 < k; k0 += BK) {{
-{load_a}{load_b}    workgroupBarrier();
-{steps}    workgroupBarrier();
-  }}
-{store}  // After the epilogue's writes, so the poison is the last write to that element.
+{main}{store}  // After the epilogue's writes, so the poison is the last write to that element.
   storageBarrier();
   if (overflow) {{
     atomicAdd(&overflows[0], 1u);
-    c[m0 * n + n0] = bitcast<f32>(0x7fc00000u);
+    c[base + m0 * n + n0] = bitcast<f32>(0x7fc00000u);
   }}
 }}
 ",
@@ -586,27 +842,26 @@ fn matmul_coop(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_i
         b_ty = if key.b_vec8 { "vec4<u32>" } else { "u32" },
         bm = t.bm,
         bn = t.bn,
-        ap = BK + PAD,
+        bk = t.bk,
+        ap = t.bk + PAD,
         bp = t.bn + PAD,
-        sa_len = t.bm * (BK + PAD),
         cs_len = warps * 256,
         nt = t.threads(),
         warps_n = t.bn / t.wn,
         wm = t.wm,
         wn = t.wn,
-        load_a = load_a(key),
-        load_b = load_b(key),
+        main = main_loop(key),
     )
 }
 
 #[cfg(test)]
 #[allow(clippy::panic)]
 mod tests {
-    use super::{source, CoopKey, CoopTile, BK, PAD, TILES};
+    use super::{plan, source, split_k, CoopKey, CoopTile, PAD};
 
     fn keys() -> Vec<CoopKey> {
         let mut keys = Vec::new();
-        for tile in TILES {
+        for tile in CoopTile::ALL {
             for transposed_b in [false, true] {
                 for a_vec4 in [false, true] {
                     for b_vec8 in [false, true] {
@@ -648,29 +903,74 @@ mod tests {
 
     #[test]
     fn tiles_split_evenly_over_their_threads() {
-        for t in TILES {
+        for t in CoopTile::ALL {
             let nt = t.threads();
+            let bk = t.bk;
+            assert!(bk == 32 || bk == 64, "{t:?}");
             assert_eq!(t.bm % t.wm, 0, "{t:?}");
             assert_eq!(t.bn % t.wn, 0, "{t:?}");
             assert_eq!(t.wm % 16, 0, "{t:?}");
             assert_eq!(t.wn % 16, 0, "{t:?}");
-            // Every staging loop gives each thread the same count.
-            assert_eq!(t.bm * (BK / 4) % nt, 0, "{t:?} a vec4");
-            assert_eq!(t.bm * BK % nt, 0, "{t:?} a");
-            assert_eq!(BK * t.bn / 8 % nt, 0, "{t:?} b vec8");
-            assert_eq!(BK * t.bn % nt, 0, "{t:?} b");
-            assert!(t.workgroup_bytes(true) <= 32 * 1024, "{t:?}");
-            assert!(t.workgroup_bytes(false) <= 32 * 1024, "{t:?}");
+            // Every staging loop gives each thread the same nonzero count.
+            assert_eq!(t.bm * (bk / 4) % nt, 0, "{t:?} a vec4");
+            assert_eq!(t.bm * bk % nt, 0, "{t:?} a");
+            assert_eq!(bk * t.bn / 8 % nt, 0, "{t:?} b vec8");
+            assert_eq!(bk * t.bn % nt, 0, "{t:?} b");
+            assert!(t.bm * (bk / 4) >= nt, "{t:?} a vec4 count");
+            assert!(bk * t.bn / 8 >= nt, "{t:?} b vec8 count");
+            // NVIDIA's 48 KiB of workgroup memory holds every tile.
+            assert!(t.workgroup_bytes(true) <= 48 * 1024, "{t:?}");
+            assert!(t.workgroup_bytes(false) <= 48 * 1024, "{t:?}");
             // Each workgroup array (sa, sb either way, cs) is a multiple of
             // 16 bytes, so the packed arrays all start 16-byte aligned.
-            assert_eq!(t.bm * (BK + PAD) * 2 % 16, 0, "{t:?} sa");
-            assert_eq!(t.bn * (BK + PAD) * 2 % 16, 0, "{t:?} sb transposed");
-            assert_eq!(BK * (t.bn + PAD) * 2 % 16, 0, "{t:?} sb");
+            assert_eq!(t.bm * (bk + PAD) * 2 % 16, 0, "{t:?} sa");
+            assert_eq!(t.bn * (bk + PAD) * 2 % 16, 0, "{t:?} sb transposed");
+            assert_eq!(bk * (t.bn + PAD) * 2 % 16, 0, "{t:?} sb");
             assert_eq!(t.warps() * 256 * 4 % 16, 0, "{t:?} cs");
             // Row strides in bytes keep every fragment 16-byte aligned.
-            assert_eq!((BK + PAD) * 2 % 16, 0);
+            assert_eq!((bk + PAD) * 2 % 16, 0);
             assert_eq!((t.bn + PAD) * 2 % 16, 0, "{t:?}");
         }
-        assert_eq!(CoopTile::new(128, 64, 64, 32).threads(), 128);
+        assert_eq!(CoopTile::ALL[0].threads(), 128);
+        assert_eq!(CoopTile::ALL[6].threads(), 256);
+        assert_eq!(CoopTile::ALL[0].name(), "128x64/w64x32/k32");
+        assert_eq!(CoopTile::ALL[3].name(), "128x64/w64x32/k32/db");
+    }
+
+    #[test]
+    fn split_k_keeps_whole_steps_and_no_empty_slice() {
+        assert_eq!(split_k(576, 32, 1), (1, 576));
+        assert_eq!(split_k(576, 32, 4), (4, 160));
+        assert_eq!(split_k(576, 32, 9), (9, 64));
+        // 18 steps in 7 slices: 3 steps each fills 6 slices.
+        assert_eq!(split_k(576, 32, 7), (6, 96));
+        assert_eq!(split_k(50, 32, 4), (2, 32));
+        for k in [16, 33, 576, 1536, 8192] {
+            for s in 1..20 {
+                let (split, per) = split_k(k, 32, s);
+                assert!(split <= s && per.is_multiple_of(32), "{k} {s}");
+                assert!((split - 1) * per < k && split * per >= k, "{k} {s}");
+            }
+        }
+    }
+
+    #[test]
+    fn plan_reaches_the_target_or_splits_k() {
+        let all = |_: CoopTile| true;
+        // More than 256 rows: the first listed tile whose grid reaches the target.
+        let got = plan((2048, 2048, 8192), 160, all).map(|c| (c.tile, c.split));
+        assert_eq!(got, Some((CoopTile::ALL[5], 1)));
+        // 256 rows: the last listed tile with K split until the grid reaches
+        // the target, at least two steps per slice. Its 9 x 4 tiles want 5
+        // slices of K = 576.
+        let got = plan((256, 576, 576), 160, all).map(|c| (c.tile, c.split));
+        assert_eq!(got, Some((CoopTile::ALL[4], 5)));
+        let got = plan((256, 64, 16), 160, all).map(|c| (c.tile, c.split));
+        assert_eq!(got, Some((CoopTile::ALL[4], 1)));
+        // A device that fits none of the listed tiles runs the first kernel's.
+        let single = |t: CoopTile| !t.double;
+        let got = plan((256, 576, 576), 160, single).map(|c| (c.tile, c.split));
+        assert_eq!(got, Some((CoopTile::ALL[2], 2)));
+        assert!(plan((256, 576, 576), 160, |_: CoopTile| false).is_none());
     }
 }

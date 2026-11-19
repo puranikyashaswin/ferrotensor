@@ -16,11 +16,14 @@ mod matmul_coop;
 mod misc;
 mod norm;
 mod quant;
+mod skinny;
 mod small_m;
 mod training;
 
 pub use attention::AttentionOptions;
 pub use matmul::{Epilogue, MatmulPath};
+pub use matmul_coop::{CoopConfig, CoopTile};
+pub use skinny::SkinnyTile;
 pub use small_m::{SmallMLaunch, SmallMTile};
 pub use training::{AdamParams, MASKED_CE_SKIP, SUM_SQUARES_CHUNK};
 
@@ -277,6 +280,8 @@ pub struct ComputeEngine {
     split_target: u32,
     /// Cooperative-matrix matmul kernels, when the device has them.
     coop: Option<matmul_coop::Coop>,
+    /// Skinny matmul kernels, compiled the first time a tile and layout run.
+    skinny: Mutex<HashMap<skinny::SkinnyKey, Arc<Kernel>>>,
 }
 
 impl ComputeEngine {
@@ -354,6 +359,7 @@ impl ComputeEngine {
                 ctx,
                 small_m::split_target(ctx.adapter.get_info().device_type),
             ),
+            skinny: Mutex::new(HashMap::new()),
         }
     }
 

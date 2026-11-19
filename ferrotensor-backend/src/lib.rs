@@ -46,7 +46,7 @@ pub use engine::{
     AdamParams, AttentionOptions, ComputeEngine, Epilogue, MASKED_CE_SKIP, SUM_SQUARES_CHUNK,
 };
 #[doc(hidden)]
-pub use engine::{MatmulPath, SmallMLaunch, SmallMTile};
+pub use engine::{CoopConfig, CoopTile, MatmulPath, SkinnyTile, SmallMLaunch, SmallMTile};
 pub use kernel_timing::{KernelTime, KernelTimes, KernelTiming, KernelTimingMode};
 pub use memory::{MemoryCategory, MemorySnapshot, MemoryTracker};
 pub use profile::GpuCounterSnapshot;

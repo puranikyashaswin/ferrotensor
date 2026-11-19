@@ -13,7 +13,7 @@
 
 use ferrotensor_backend::{
     q4, AdamParams, AttentionOptions, ComputeEngine, DType, Epilogue, MatmulPath, MemoryCategory,
-    SmallMTile, UnifiedTensor, WgpuContext, MASKED_CE_SKIP, SUM_SQUARES_CHUNK,
+    SkinnyTile, SmallMTile, UnifiedTensor, WgpuContext, MASKED_CE_SKIP, SUM_SQUARES_CHUNK,
 };
 use q4::Q4Group;
 use std::io::Write as _;
@@ -614,6 +614,60 @@ fn thin_matmul_matches_cpu_in_every_layout() {
         let out = zeros(&[m, n]);
         g.engine.matmul_bt_f16b(&g.ctx, &a_up, &bt_h, &out);
         check("matmul_bt_f16b", &out, &f16_round(&b));
+    }
+}
+
+/// `(m, k, n)` for the skinny kernel: the LoRA `x @ A` of rank 8 at 256 and
+/// 2048 rows and at the 1.7B MLP's K of 8192, then M, K and N off every
+/// tile's multiple, one column, and the widest N it takes.
+const SKINNY_SHAPES: &[(usize, usize, usize)] = &[
+    (256, 576, 8),
+    (2048, 576, 8),
+    (256, 8192, 8),
+    (200, 40, 8),
+    (77, 37, 5),
+    (300, 64, 1),
+    (130, 1000, 64),
+];
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn every_skinny_tile_matches_cpu_in_both_layouts() {
+    let g = gpu();
+    for (seed, &(m, k, n)) in SKINNY_SHAPES.iter().enumerate() {
+        let a = rand_vec(m * k, 3400 + seed as u64);
+        let b: Vec<f32> = rand_vec(k * n, 3500 + seed as u64)
+            .iter()
+            .map(|v| v * 0.1)
+            .collect();
+        let old = rand_vec(m * n, 3600 + seed as u64);
+        let product = cpu_matmul(&a, &b, m, k, n);
+        let a_up = upload(&a, &[m, k]);
+        let layouts = [
+            (false, upload(&b, &[k, n])),
+            (true, upload(&transpose(&b, k, n), &[n, k])),
+        ];
+        for (transposed_b, b_up) in &layouts {
+            for tile in SkinnyTile::ALL {
+                for (alpha, beta) in [(1.0f32, 0.0f32), (-0.5, 1.0)] {
+                    let out = upload(&old, &[m, n]);
+                    let ep = Epilogue { alpha, beta };
+                    let tensors = [&a_up, b_up, &out];
+                    let ran = g
+                        .engine
+                        .matmul_skinny_into(&g.ctx, *transposed_b, tensors, Some(tile), ep);
+                    assert_eq!(ran, Ok(tile));
+                    let want: Vec<f32> = product
+                        .iter()
+                        .zip(&old)
+                        .map(|(&p, &o)| alpha * p + beta * o)
+                        .collect();
+                    // Names the tile, shape, layout, alpha and beta.
+                    let name = format!("{tile:?} {m}x{k}x{n} {transposed_b} {alpha} {beta}");
+                    assert_close(&name, &read(&out), &want, 1e-4, 1e-4);
+                }
+            }
+        }
     }
 }
 
@@ -2820,7 +2874,8 @@ fn matmul_epilogue_matches_cpu_on_every_path() {
     let g = gpu();
     // One shape per kernel: one row (the matrix-vector kernel for a@b, the
     // thin kernel for a@bT), a thin a, a thin b (64x64 tiles with an f16 b),
-    // 64x64 tiles, and the small-M kernel with one slice of K and with three.
+    // the router's skinny kernel for a thin f32 b, 64x64 tiles, and the
+    // small-M kernel with one slice of K and with three.
     let small_m = |split| MatmulPath::SmallM {
         tile: None,
         split: Some(split),
@@ -2829,6 +2884,7 @@ fn matmul_epilogue_matches_cpu_on_every_path() {
         ("one row", (1, 96, 80), MatmulPath::Previous),
         ("thin a", (8, 96, 200), MatmulPath::Previous),
         ("thin b", (200, 40, 8), MatmulPath::Previous),
+        ("skinny", (200, 576, 8), MatmulPath::Auto),
         ("tiles", (100, 72, 130), MatmulPath::Previous),
         ("small-M, 1 slice", (64, 512, 256), small_m(1)),
         ("small-M, 3 slices", (64, 512, 256), small_m(3)),

@@ -11,7 +11,9 @@
 
 #![allow(clippy::unwrap_used, clippy::panic)]
 
-use ferrotensor_backend::{ComputeEngine, Epilogue, UnifiedTensor, WgpuContext};
+use ferrotensor_backend::{
+    ComputeEngine, CoopConfig, CoopTile, Epilogue, UnifiedTensor, WgpuContext,
+};
 use std::sync::OnceLock;
 
 struct Gpu {
@@ -103,12 +105,28 @@ fn max_rel_error(got: &[f32], want: &[f64]) -> f64 {
 /// when `transposed_b`) with `ep` over `out0`, and returns the output.
 fn run_coop(
     g: &Gpu,
+    dims: (usize, usize, usize),
+    a: &[f32],
+    b: &[f32],
+    transposed_b: bool,
+    epilogue: (Epilogue, &[f32]),
+) -> Vec<f32> {
+    run_coop_config(g, dims, a, b, transposed_b, epilogue, None)
+        .unwrap()
+        .0
+}
+
+/// [`run_coop`] with `config` (`None`: the router's choice); also returns
+/// the configuration that ran, or the error when it does not fit.
+fn run_coop_config(
+    g: &Gpu,
     (m, k, n): (usize, usize, usize),
     a: &[f32],
     b: &[f32],
     transposed_b: bool,
     (ep, out0): (Epilogue, &[f32]),
-) -> Vec<f32> {
+    config: Option<CoopConfig>,
+) -> Result<(Vec<f32>, CoopConfig), String> {
     let a_t = UnifiedTensor::new(&g.ctx, a, &[m, k]);
     let b_t = if transposed_b {
         UnifiedTensor::from_f32_as_f16(&g.ctx, &transpose(b, k, n), &[n, k])
@@ -116,10 +134,41 @@ fn run_coop(
         UnifiedTensor::from_f32_as_f16(&g.ctx, b, &[k, n])
     };
     let out = UnifiedTensor::new(&g.ctx, out0, &[m, n]);
-    g.engine
-        .matmul_coop_into(&g.ctx, transposed_b, [&a_t, &b_t, &out], ep)
-        .unwrap();
-    pollster::block_on(out.to_vec(&g.ctx)).unwrap()
+    let (engine, tensors) = (&g.engine, [&a_t, &b_t, &out]);
+    let ran = engine.matmul_coop_config_into(&g.ctx, transposed_b, tensors, config, ep)?;
+    Ok((pollster::block_on(out.to_vec(&g.ctx)).unwrap(), ran))
+}
+
+/// Every tile with K whole and split in 3 (fewer when K has fewer steps).
+fn configs() -> Vec<CoopConfig> {
+    CoopTile::ALL
+        .iter()
+        .flat_map(|&tile| [1, 3].map(|split| CoopConfig { tile, split }))
+        .collect()
+}
+
+/// Runs `config`; `None` (after saying so) when its tile does not fit this
+/// device, which is no failure: the router never picks such a tile.
+fn run_or_skip(
+    g: &Gpu,
+    dims: (usize, usize, usize),
+    (a, b): (&[f32], &[f32]),
+    transposed_b: bool,
+    epilogue: (Epilogue, &[f32]),
+    config: CoopConfig,
+) -> Option<Vec<f32>> {
+    match run_coop_config(g, dims, a, b, transposed_b, epilogue, Some(config)) {
+        Ok((got, ran)) => {
+            assert_eq!(ran.tile, config.tile);
+            assert!(ran.split >= 1 && ran.split <= config.split, "{ran:?}");
+            Some(got)
+        }
+        Err(e) if e.contains("does not fit") => {
+            eprintln!("{} split {}: skipped, {e}", config.tile.name(), config.split);
+            None
+        }
+        Err(e) => panic!("{} split {}: {e}", config.tile.name(), config.split),
+    }
 }
 
 /// The 135M training shapes at batch 1 x 256 tokens, then shapes whose M,
@@ -293,4 +342,121 @@ fn coop_matmul_times_identity_returns_a_unshifted() {
         assert_eq!(&got[..n], &a[..n], "transposed_b {transposed_b} row 0");
         assert_eq!(got, a, "transposed_b {transposed_b}");
     }
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn every_coop_tile_and_split_matches_cpu() {
+    let Some(g) = coop_gpu("every_coop_tile_and_split_matches_cpu") else {
+        return;
+    };
+    for (seed, &(m, k, n)) in SHAPES.iter().enumerate() {
+        let a = f16_round(&rand_vec(m * k, 200 + seed as u64));
+        let b = f16_round(&rand_vec(k * n, 300 + seed as u64));
+        let want = cpu_matmul(&a, &b, (m, k, n));
+        let zeros = vec![0.0; m * n];
+        for config in configs() {
+            for transposed_b in [false, true] {
+                let ep = (Epilogue::STORE, zeros.as_slice());
+                let got = run_or_skip(g, (m, k, n), (&a, &b), transposed_b, ep, config);
+                let Some(got) = got else {
+                    continue;
+                };
+                // Slices of K are summed in another order than one pass: the
+                // bound is the f32 summation error, not equality.
+                let e = max_rel_error(&got, &want);
+                assert!(
+                    e < 2e-5,
+                    "{} split {} {m}x{k}x{n} transposed_b {transposed_b}: {e:e}",
+                    config.tile.name(),
+                    config.split
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn every_coop_tile_and_split_times_identity_returns_a() {
+    let Some(g) = coop_gpu("every_coop_tile_and_split_times_identity_returns_a") else {
+        return;
+    };
+    // M not a multiple of 16; K = 160 is 5 steps of 32 or 3 of 64, so with a
+    // split of 3 every slice but one adds exact zeros.
+    let (m, k, n) = (77, 160, 160);
+    let a: Vec<f32> = (0..m * k).map(|i| (i % 1000) as f32).collect();
+    let mut eye = vec![0.0f32; k * n];
+    for i in 0..k {
+        eye[i * n + i] = 1.0;
+    }
+    let zeros = vec![0.0; m * n];
+    for config in configs() {
+        for transposed_b in [false, true] {
+            let ep = (Epilogue::STORE, zeros.as_slice());
+            let got = run_or_skip(g, (m, k, n), (&a, &eye), transposed_b, ep, config);
+            let Some(got) = got else {
+                continue;
+            };
+            assert_eq!(
+                got,
+                a,
+                "{} split {} transposed_b {transposed_b}",
+                config.tile.name(),
+                config.split
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn split_k_applies_alpha_beta_and_keeps_the_overflow_poison() {
+    let Some(g) = coop_gpu("split_k_applies_alpha_beta_and_keeps_the_overflow_poison") else {
+        return;
+    };
+    let (m, k, n) = (96, 200, 72);
+    let a = f16_round(&rand_vec(m * k, 17));
+    let b = f16_round(&rand_vec(k * n, 18));
+    let old = rand_vec(m * n, 19);
+    let product = cpu_matmul(&a, &b, (m, k, n));
+    let split = CoopConfig {
+        tile: CoopTile::ALL[4],
+        split: 3,
+    };
+    for (alpha, beta) in [(1.0f32, 1.0f32), (-2.0, 0.25), (0.5, 0.0)] {
+        let want: Vec<f64> = product
+            .iter()
+            .zip(&old)
+            .map(|(&p, &o)| f64::from(alpha) * p + f64::from(beta) * f64::from(o))
+            .collect();
+        for transposed_b in [false, true] {
+            let ep = (Epilogue { alpha, beta }, old.as_slice());
+            let got = run_or_skip(g, (m, k, n), (&a, &b), transposed_b, ep, split);
+            let Some(got) = got else {
+                return;
+            };
+            let e = max_rel_error(&got, &want);
+            assert!(
+                e < 2e-5,
+                "alpha {alpha} beta {beta} transposed_b {transposed_b}: {e:e}"
+            );
+        }
+    }
+    // An overflow in the first slice of K poisons that slice's partial sums,
+    // and the reduction carries the NaN to the output.
+    let before = pollster::block_on(g.engine.coop_f16_overflows(&g.ctx)).unwrap();
+    let mut big = a.clone();
+    big[5] = 70_000.0;
+    let zeros = vec![0.0; m * n];
+    let ep = (Epilogue::STORE, zeros.as_slice());
+    let got = run_or_skip(g, (m, k, n), (&big, &b), false, ep, split);
+    let Some(got) = got else {
+        return;
+    };
+    assert_eq!(
+        pollster::block_on(g.engine.coop_f16_overflows(&g.ctx)).unwrap(),
+        before + 1
+    );
+    assert!(got[0].is_nan(), "the tile's first element is poisoned");
 }
