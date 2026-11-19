@@ -184,9 +184,7 @@ impl Coop {
             if self.immediates {
                 src = immediate_source(&src);
             }
-            let module = ctx
-                .shader_checks()
-                .module(&ctx.device, "matmul_coop", src);
+            let module = ctx.shader_checks().module(&ctx.device, "matmul_coop", src);
             let pipeline = Arc::new(ctx.device.create_compute_pipeline(
                 &wgpu::ComputePipelineDescriptor {
                     label: Some("matmul_coop"),
