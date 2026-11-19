@@ -1471,6 +1471,38 @@ fn rope_inverse_matches_cpu_and_undoes_rope() {
     }
 }
 
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn rope_into_a_new_buffer_matches_in_place_and_keeps_the_input() {
+    // Against the in-place kernel bit for bit, and the CPU rotation.
+    let g = gpu();
+    let e = &g.engine;
+    let bits = |t: &UnifiedTensor| read(t).iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    for &(batch, seq, heads, hd, pos) in &[(1, 1, 1, 8, 0), (1, 5, 1, 64, 3), (2, 7, 4, 32, 11)] {
+        let x = rand_vec(batch * seq * heads * hd, 14);
+        let shape = [batch, seq, heads * hd];
+        let input = upload(&x, &shape);
+        let x_bits = bits(&input);
+        for inverse in [false, true] {
+            let name = format!("rope_to {shape:?} inverse {inverse}");
+            let in_place = upload(&x, &shape);
+            let out = zeros(&shape);
+            if inverse {
+                e.rope_theta_inverse(&g.ctx, &in_place, hd, pos, 10000.0);
+                e.rope_theta_inverse_to(&g.ctx, (&input, &out), hd, pos, 10000.0);
+            } else {
+                e.rope_theta(&g.ctx, &in_place, hd, pos, 10000.0);
+                e.rope_theta_to(&g.ctx, (&input, &out), hd, pos, 10000.0);
+            }
+            assert_eq!(bits(&out), bits(&in_place), "{name}");
+            assert_eq!(bits(&input), x_bits, "{name}: input written");
+            let dir = if inverse { -1.0 } else { 1.0 };
+            let want = cpu_rope_dir(&x, batch, seq, heads, hd, pos, dir);
+            assert_close(&name, &read(&out), &want, 1e-4, 1e-4);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Attention
 // ---------------------------------------------------------------------------

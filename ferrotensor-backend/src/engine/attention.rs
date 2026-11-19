@@ -26,7 +26,7 @@ impl ComputeEngine {
         pos: usize,
         theta: f32,
     ) {
-        self.rotate(ctx, tensor, head_dim, pos, theta, false);
+        self.rotate(ctx, (tensor, None), head_dim, pos, theta, false);
     }
 
     /// The inverse of [`rope_theta`](Self::rope_theta), in place: rotates by
@@ -40,14 +40,41 @@ impl ComputeEngine {
         pos: usize,
         theta: f32,
     ) {
-        self.rotate(ctx, tensor, head_dim, pos, theta, true);
+        self.rotate(ctx, (tensor, None), head_dim, pos, theta, true);
     }
 
-    /// Shared body of [`rope_theta`](Self::rope_theta) and its inverse.
+    /// [`rope_theta`](Self::rope_theta) of `input` written to `out` (same
+    /// shape), leaving `input` as it is.
+    pub fn rope_theta_to(
+        &self,
+        ctx: &WgpuContext,
+        (input, out): (&UnifiedTensor, &UnifiedTensor),
+        head_dim: usize,
+        pos: usize,
+        theta: f32,
+    ) {
+        self.rotate(ctx, (input, Some(out)), head_dim, pos, theta, false);
+    }
+
+    /// [`rope_theta_inverse`](Self::rope_theta_inverse) of `input` written
+    /// to `out` (same shape), leaving `input` as it is.
+    pub fn rope_theta_inverse_to(
+        &self,
+        ctx: &WgpuContext,
+        (input, out): (&UnifiedTensor, &UnifiedTensor),
+        head_dim: usize,
+        pos: usize,
+        theta: f32,
+    ) {
+        self.rotate(ctx, (input, Some(out)), head_dim, pos, theta, true);
+    }
+
+    /// Shared body of [`rope_theta`](Self::rope_theta) and its inverse: in
+    /// place, or into `out` when it is given.
     fn rotate(
         &self,
         ctx: &WgpuContext,
-        tensor: &UnifiedTensor,
+        (tensor, out): (&UnifiedTensor, Option<&UnifiedTensor>),
         head_dim: usize,
         pos: usize,
         theta: f32,
@@ -74,12 +101,20 @@ impl ComputeEngine {
             ]),
         );
         let pairs = tensor.shape.iter().product::<usize>() / 2;
-        self.run(
-            ctx,
-            &self.rope,
-            &[(0, tensor.buffer()), (1, &params)],
-            groups64(pairs),
-        );
+        match out {
+            None => self.run(
+                ctx,
+                &self.rope,
+                &[(0, tensor.buffer()), (1, &params)],
+                groups64(pairs),
+            ),
+            Some(out) => self.run(
+                ctx,
+                &self.rope_out,
+                &[(0, tensor.buffer()), (1, &params), (2, out.buffer())],
+                groups64(pairs),
+            ),
+        }
     }
 
     /// Single-head attention: `q`, `k`, `v`, `out` are `[seq_len, head_dim]`.

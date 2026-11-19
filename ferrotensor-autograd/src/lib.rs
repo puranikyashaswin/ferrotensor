@@ -699,12 +699,12 @@ impl AutogradNode for RoPENode {
     }
     /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
     fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
-        // The gradient of a rotation is the inverse rotation; rotate a copy
-        // so the upstream gradient is left untouched.
+        // The gradient of a rotation is the inverse rotation; it is written
+        // to a new buffer so the upstream gradient is left untouched.
         let ctx = &self.input.ctx;
         let grad_in = UnifiedTensor::empty(ctx, &self.input.data.shape);
-        engine.copy_tensor(ctx, grad, &grad_in, 0);
-        engine.rope_theta_inverse(ctx, &grad_in, self.head_dim, self.pos, self.theta);
+        let (head_dim, pos, theta) = (self.head_dim, self.pos, self.theta);
+        engine.rope_theta_inverse_to(ctx, (grad, &grad_in), head_dim, pos, theta);
         vec![grad_in]
     }
 }
@@ -1339,8 +1339,8 @@ impl Tensor {
         engine: &ComputeEngine,
     ) -> Tensor {
         let out_data = UnifiedTensor::empty(&input.ctx, &input.data.shape);
-        engine.copy_tensor(&input.ctx, &input.data, &out_data, 0);
-        engine.rope_theta(&input.ctx, &out_data, head_dim, pos, theta);
+        let io = (input.data.as_ref(), &out_data);
+        engine.rope_theta_to(&input.ctx, io, head_dim, pos, theta);
         let node = Arc::new(RoPENode {
             input: input.clone(),
             head_dim,
