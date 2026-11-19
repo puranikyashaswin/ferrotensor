@@ -1832,7 +1832,6 @@ struct FlatState {
     ptrs: Vec<usize>,
     shapes: Vec<Vec<usize>>,
     layout: FlatLayout,
-    weights: UnifiedTensor,
     m: UnifiedTensor,
     v: UnifiedTensor,
 }
@@ -1941,15 +1940,14 @@ impl AdamW {
             ptrs,
             shapes: ts.iter().map(|p| p.data.shape.clone()).collect(),
             layout: layout.clone(),
-            weights: UnifiedTensor::zeros(ctx, &total),
             m,
             v,
         });
     }
 
     /// One AdamW step over every parameter at once: the weights are copied
-    /// into one buffer, updated by one dispatch against `grads` and the flat
-    /// moments, and copied back.
+    /// into a temporary buffer, updated by one dispatch against `grads` and the
+    /// flat moments, and copied back.
     fn apply_flat_step(&mut self, params: &[Tensor], grads: &FlatGrads) -> Result<(), String> {
         let ts: Vec<&Tensor> = params
             .iter()
@@ -1980,15 +1978,18 @@ impl AdamW {
         let Some(flat) = self.flat.as_ref() else {
             return Err("the flat optimizer state is missing".to_string());
         };
+        // The weights only need the buffer for this step, so it is made
+        // here and freed after, and does not stay live between steps.
+        let weights = UnifiedTensor::zeros(&ctx, &[grads.layout.total()]);
         for (i, param) in ts.iter().enumerate() {
             self.engine
-                .copy_into_flat(&ctx, &param.data, &flat.weights, grads.layout.offset(i));
+                .copy_into_flat(&ctx, &param.data, &weights, grads.layout.offset(i));
         }
         self.engine
-            .adamw_update(&ctx, &flat.weights, &grads.data, &flat.m, &flat.v, &p);
+            .adamw_update(&ctx, &weights, &grads.data, &flat.m, &flat.v, &p);
         for (i, param) in ts.iter().enumerate() {
             self.engine
-                .copy_from_flat(&ctx, &flat.weights, grads.layout.offset(i), &param.data);
+                .copy_from_flat(&ctx, &weights, grads.layout.offset(i), &param.data);
         }
         Ok(())
     }

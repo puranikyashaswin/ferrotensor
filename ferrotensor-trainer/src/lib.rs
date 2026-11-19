@@ -120,9 +120,6 @@ pub struct Trainer {
     /// With deferred readback, the submission that ended the previous
     /// micro-batch's backward pass; the next backward waits for it.
     backward_mark: Option<u64>,
-    /// The gradients packed into one buffer for the norm, the clip and the
-    /// optimizer step, kept between steps while their sizes stay the same.
-    flat_grads: Option<FlatGrads>,
 }
 
 /// A sequence's [`StepStats`], with its loss still on the GPU until `rows`
@@ -169,7 +166,6 @@ impl Trainer {
             pending_rows: Vec::new(),
             deferred: Vec::new(),
             backward_mark: None,
-            flat_grads: None,
         }
     }
 
@@ -442,27 +438,20 @@ impl Trainer {
         self.deferred.drain(..read).map(|d| d.stats).collect()
     }
 
-    /// Packs `grads` into the cached flat buffer when the optimizer can step
-    /// from one and they fit in one. Returns whether it did.
-    fn pack_flat_grads(&mut self, grads: &[UnifiedTensor]) -> bool {
+    /// Packs `grads` into one buffer when the optimizer can step from one and
+    /// they fit in one; the buffer lives for one step.
+    fn pack_flat_grads(&self, grads: &[UnifiedTensor]) -> Option<FlatGrads> {
         if grads.len() < 2
             || !self.optimizer.supports_flat_step()
             || grads.iter().any(|g| g.dtype != DType::FP32)
         {
-            return false;
+            return None;
         }
         let sizes: Vec<usize> = grads.iter().map(|g| g.shape.iter().product()).collect();
-        let same = self
-            .flat_grads
-            .as_ref()
-            .is_some_and(|f| f.layout.sizes() == sizes.as_slice());
-        if !same {
-            self.flat_grads = FlatGrads::new(&self.ctx, &sizes);
-        }
-        match &self.flat_grads {
-            Some(packed) => packed.pack(&self.ctx, &self.engine, grads).is_ok(),
-            None => false,
-        }
+        let _tag = self.ctx.memory().scope(MemoryCategory::OptimizerState);
+        let packed = FlatGrads::new(&self.ctx, &sizes)?;
+        packed.pack(&self.ctx, &self.engine, grads).ok()?;
+        Some(packed)
     }
 
     /// Sync, unscale, clip and apply the accumulated gradients.
@@ -500,10 +489,10 @@ impl Trainer {
             }
         }
 
-        let flat = self.pack_flat_grads(&grads);
-        let norm = match &self.flat_grads {
-            Some(packed) if flat => flat_grad_norm(packed, &self.ctx, &self.engine),
-            _ => global_grad_norm(&grads, &self.ctx, &self.engine),
+        let packed = self.pack_flat_grads(&grads);
+        let norm = match &packed {
+            Some(packed) => flat_grad_norm(packed, &self.ctx, &self.engine),
+            None => global_grad_norm(&grads, &self.ctx, &self.engine),
         };
         stats.grad_norm = Some(norm);
         if !norm.is_finite() {
@@ -513,12 +502,12 @@ impl Trainer {
         if let Some(max_norm) = self.clip_grad_norm {
             if norm > max_norm {
                 let scale = max_norm / (norm + 1e-6);
-                match &self.flat_grads {
-                    Some(packed) if flat => {
+                match &packed {
+                    Some(packed) => {
                         self.engine
                             .clip_grad_by_norm(&self.ctx, &packed.data, scale);
                     }
-                    _ => {
+                    None => {
                         for grad in &grads {
                             self.engine.clip_grad_by_norm(&self.ctx, grad, scale);
                         }
@@ -537,9 +526,9 @@ impl Trainer {
         }
         {
             let _tag = self.ctx.memory().scope(MemoryCategory::OptimizerState);
-            let stepped = match &self.flat_grads {
-                Some(packed) if flat => self.optimizer.step_flat(train_params, packed),
-                _ => {
+            let stepped = match &packed {
+                Some(packed) => self.optimizer.step_flat(train_params, packed),
+                None => {
                     self.optimizer.step(train_params);
                     Ok(())
                 }
