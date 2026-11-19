@@ -116,6 +116,9 @@ pub struct Trainer {
     pending_rows: Vec<UnifiedTensor>,
     /// Stats of the sequences trained so far and not yet returned, in order.
     deferred: Vec<DeferredStats>,
+    /// With deferred readback, the submission that ended the previous
+    /// micro-batch's backward pass; the next backward waits for it.
+    backward_mark: Option<u64>,
 }
 
 /// A sequence's [`StepStats`], with its loss still on the GPU until `rows`
@@ -161,6 +164,7 @@ impl Trainer {
             optimizer_step_count: 0,
             pending_rows: Vec::new(),
             deferred: Vec::new(),
+            backward_mark: None,
         }
     }
 
@@ -357,8 +361,19 @@ impl Trainer {
             let value = UnifiedTensor::new(&self.ctx, &[0.0], &[1]);
             let loss = ce_loss_tensor(logits, ce.grad, value, Some(seed));
             *loss.grad.borrow_mut() = Some(UnifiedTensor::new(&self.ctx, &[seed], &[1]));
+            // Without a readback the host can run several micro-batches
+            // ahead of a busy GPU, and the pool can trim none of their idle
+            // buffers until the GPU catches up. Waiting here for the
+            // previous backward pass keeps the host one micro-batch ahead
+            // (this forward is already submitted and keeps the GPU busy).
+            if let Some(mark) = self.backward_mark.take() {
+                self.ctx.wait_for_submission(mark);
+            }
             let _tag = self.ctx.memory().scope(MemoryCategory::BackwardScratch);
             loss.backward(&self.engine);
+            if self.defer_loss_readback {
+                self.backward_mark = Some(self.ctx.submission_mark());
+            }
             memory::tag_gradients(train_params);
             memory::tag_loss(logits);
         } else if empty_stats {
