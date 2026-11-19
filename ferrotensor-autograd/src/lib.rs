@@ -790,7 +790,7 @@ impl AutogradNode for SelectTokenNode {
     /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
     #[expect(
         clippy::expect_used,
-        reason = "this API returns no Result, and a readback fails only when the GPU device was lost"
+        reason = "a readback fails only on device loss, and the caller has no error path"
     )]
     fn backward(&self, grad: &UnifiedTensor, _engine: &ComputeEngine) -> Vec<UnifiedTensor> {
         let mut full_grad = vec![0.0f32; self.input.data.shape.iter().product()];
@@ -821,7 +821,7 @@ impl AutogradNode for EmbeddingNode {
     /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
     #[expect(
         clippy::expect_used,
-        reason = "this API returns no Result, and a readback fails only when the GPU device was lost"
+        reason = "a readback fails only on device loss, and the caller has no error path"
     )]
     fn backward(&self, grad: &UnifiedTensor, _engine: &ComputeEngine) -> Vec<UnifiedTensor> {
         let hidden = self.table.data.shape[1];
@@ -860,7 +860,7 @@ impl AutogradNode for MSELossNode {
     /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
     #[expect(
         clippy::expect_used,
-        reason = "this API returns no Result, and a readback fails only when the GPU device was lost"
+        reason = "a readback fails only on device loss, and the caller has no error path"
     )]
     fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
         let grad_in = UnifiedTensor::empty(&self.pred.ctx, &self.pred.data.shape);
@@ -897,7 +897,7 @@ impl AutogradNode for CrossEntropyLossNode {
     /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
     #[expect(
         clippy::expect_used,
-        reason = "this API returns no Result, and a readback fails only when the GPU device was lost"
+        reason = "a readback fails only on device loss, and the caller has no error path"
     )]
     fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
         let grad_logits = UnifiedTensor::empty(&self.logits.ctx, &self.logits.data.shape);
@@ -1309,7 +1309,7 @@ impl Tensor {
     /// Its gradient is `pred - target` (the backward kernel's output).
     #[expect(
         clippy::expect_used,
-        reason = "this API returns no Result, and a readback fails only when the GPU device was lost"
+        reason = "a readback fails only on device loss, and the caller has no error path"
     )]
     pub fn mse_loss(pred: &Tensor, target: &Tensor, engine: &ComputeEngine) -> Tensor {
         // The kernel writes 0.5 * (p - t)^2 per element; sum on the host.
@@ -1418,7 +1418,7 @@ impl Tensor {
     /// Row `token_index` of `[seq, vocab]` logits.
     #[expect(
         clippy::expect_used,
-        reason = "shape precondition: input has at least one dimension"
+        reason = "shape precondition: input has at least one dimension; the readback fails only on device loss, and this API has no error path"
     )]
     pub fn select_token(input: &Tensor, token_index: usize) -> Tensor {
         let vocab_size = *input
@@ -1814,7 +1814,7 @@ impl Optimizer for AdamW {
     /// Serialize optimizer state keyed by parameter name (`None` if unsupported).
     #[expect(
         clippy::expect_used,
-        reason = "this API returns no Result, and a readback fails only when the GPU device was lost"
+        reason = "a readback fails only on device loss, and the caller has no error path"
     )]
     fn save_state(
         &self,
