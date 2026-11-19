@@ -23,7 +23,7 @@ pub struct AdapterReport {
     /// Largest single buffer, in bytes.
     pub max_buffer_size: u64,
     /// Largest storage buffer a kernel can bind, in bytes.
-    pub max_storage_buffer_binding_size: u32,
+    pub max_storage_buffer_binding_size: u64,
     /// Most threads in one workgroup.
     pub max_compute_invocations_per_workgroup: u32,
     /// Workgroup shared memory, in bytes.
@@ -188,6 +188,7 @@ pub fn list_adapters() -> Vec<AdapterReport> {
     let chosen = match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         compatible_surface: None,
+        apply_limit_buckets: false,
         force_fallback_adapter: false,
     })) {
         Ok(adapter) => Some(adapter.get_info()),

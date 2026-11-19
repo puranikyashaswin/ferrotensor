@@ -119,10 +119,7 @@ pub fn run(args: InfoArgs) -> Result<Exit, Box<dyn std::error::Error>> {
                 println!("    driver            {}", a.driver);
             }
             println!("    max buffer        {}", mib(a.max_buffer_size));
-            println!(
-                "    max storage bind  {}",
-                mib(u64::from(a.max_storage_buffer_binding_size))
-            );
+            println!("    max storage bind  {}", mib(a.max_storage_buffer_binding_size));
             println!(
                 "    workgroup         {} threads, {} KiB shared",
                 a.max_compute_invocations_per_workgroup,

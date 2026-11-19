@@ -249,6 +249,7 @@ impl WgpuContext {
                 power_preference,
                 force_fallback_adapter,
                 compatible_surface: None,
+                apply_limit_buckets: false,
             })
             .await
             .map_err(|_| ContextError::NoAdapter {

@@ -565,6 +565,7 @@ impl Device {
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: None,
+                apply_limit_buckets: false,
                 force_fallback_adapter: false,
             })
             .await
