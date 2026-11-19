@@ -12,7 +12,8 @@
 #![allow(clippy::unwrap_used)]
 
 use ferrotensor_backend::{
-    wgpu, ComputeEngine, KernelTiming, KernelTimingMode, UnifiedTensor, WgpuContext,
+    wgpu, ComputeEngine, GpuCounterSnapshot, KernelTiming, KernelTimingMode, UnifiedTensor,
+    WgpuContext,
 };
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -55,14 +56,16 @@ fn counters_match_a_known_sequence_of_ops() {
         "add and the first scale share a pass; the copy ends it"
     );
     assert!(ops.device_polls >= 1, "the readback polls: {ops:?}");
-    assert_eq!(ops.bind_groups, 3);
+    assert_eq!(ops.bind_groups, 3, "each dispatch binds new buffers");
+    assert_eq!(ops.bind_group_hits, 0);
     // One f32 scale per gradient_scale, set with the dispatch as immediates
-    // or else in a uniform buffer.
-    let (uniform_buffers, uniform_bytes) = if ctx.uses_immediates() {
-        (0, 0)
+    // or else in a uniform buffer, whose bind group is not cached.
+    let (uniform_buffers, uniform_bytes, misses) = if ctx.uses_immediates() {
+        (0, 0, 3)
     } else {
-        (2, 8)
+        (2, 8, 1)
     };
+    assert_eq!(ops.bind_group_misses, misses);
     assert_eq!(ops.uniform_buffers, uniform_buffers);
     assert_eq!(ops.uniform_bytes, uniform_bytes);
     assert_eq!(ops.submits, 1, "the readback submits all recorded work");
@@ -341,4 +344,66 @@ fn immediates_and_uniform_params_give_the_same_results() {
     for ((name, got), (_, want)) in immediate.iter().zip(&uniform) {
         assert_eq!(got, want, "{name}: immediates and uniform buffers differ");
     }
+}
+
+fn read(ctx: &WgpuContext, x: &UnifiedTensor) -> Vec<f32> {
+    pollster::block_on(x.to_vec(ctx)).unwrap()
+}
+
+/// (bind groups created, cache hits, cache misses) since `before`.
+fn bind_counts(ctx: &WgpuContext, before: &GpuCounterSnapshot) -> (u64, u64, u64) {
+    let ops = ctx.gpu_counters().since(before);
+    (ops.bind_groups, ops.bind_group_hits, ops.bind_group_misses)
+}
+
+/// A dispatch that binds the same buffers to the same kernel reuses the
+/// cached bind group. When the pool hands a dropped tensor's buffer to a new
+/// tensor, the group reads the new tensor's data; when the buffer is freed,
+/// a new buffer gets a new group.
+#[test]
+#[ignore = "needs a GPU"]
+fn bind_group_cache_follows_reused_and_freed_buffers() {
+    let ctx = pollster::block_on(WgpuContext::new());
+    let engine = ComputeEngine::new(&ctx);
+    let a = UnifiedTensor::new(&ctx, &[1.0, 2.0, 3.0, 4.0], &[4]);
+    let b = UnifiedTensor::new(&ctx, &[10.0, 20.0, 30.0, 40.0], &[4]);
+    let x = UnifiedTensor::empty(&ctx, &[4]);
+    let sum = UnifiedTensor::empty(&ctx, &[4]);
+
+    let before = ctx.gpu_counters();
+    engine.add(&ctx, &a, &b, &x);
+    engine.add(&ctx, &x, &b, &sum);
+    assert_eq!(read(&ctx, &sum), vec![21.0, 42.0, 63.0, 84.0]);
+    assert_eq!(bind_counts(&ctx, &before), (2, 0, 2));
+
+    // The same kernel on the same buffers: the cached group.
+    let before = ctx.gpu_counters();
+    engine.add(&ctx, &a, &b, &x);
+    assert_eq!(read(&ctx, &x), vec![11.0, 22.0, 33.0, 44.0]);
+    assert_eq!(bind_counts(&ctx, &before), (0, 1, 0));
+
+    // The pool hands x's buffer to y, which holds other data.
+    let x_buffer = x.buffer().clone();
+    drop(x);
+    let y = UnifiedTensor::empty(&ctx, &[4]);
+    assert!(*y.buffer() == x_buffer, "the pool reused x's buffer");
+    drop(x_buffer);
+    engine.add(&ctx, &a, &a, &y);
+    let before = ctx.gpu_counters();
+    engine.add(&ctx, &y, &b, &sum);
+    assert_eq!(bind_counts(&ctx, &before), (0, 1, 0), "x's group, cached");
+    assert_eq!(read(&ctx, &sum), vec![12.0, 24.0, 36.0, 48.0], "y's data");
+
+    // Freed, y's buffer cannot come back: z gets a new buffer and group.
+    drop(y);
+    ctx.synchronize();
+    ctx.pool.clear();
+    let created = ctx.pool.buffers_created();
+    let z = UnifiedTensor::empty(&ctx, &[4]);
+    assert_eq!(ctx.pool.buffers_created(), created + 1, "a new buffer");
+    engine.add(&ctx, &b, &b, &z);
+    let before = ctx.gpu_counters();
+    engine.add(&ctx, &z, &b, &sum);
+    assert_eq!(bind_counts(&ctx, &before), (1, 0, 1));
+    assert_eq!(read(&ctx, &sum), vec![30.0, 60.0, 90.0, 120.0], "z's data");
 }

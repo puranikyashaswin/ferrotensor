@@ -29,6 +29,7 @@
 pub use wgpu; // Re-export wgpu for downstream crates
 
 pub mod adapters;
+mod bind_cache;
 mod context;
 mod engine;
 mod kernel_timing;

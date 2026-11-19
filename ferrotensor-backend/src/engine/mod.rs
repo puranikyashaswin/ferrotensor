@@ -1,5 +1,6 @@
 //! The compute engine: compiles the WGSL kernels and dispatches them.
 
+use crate::bind_cache::BindKey;
 use crate::context::Dispatch;
 use crate::kernel_timing::KernelLabel;
 use crate::{UnifiedTensor, WgpuContext};
@@ -249,10 +250,22 @@ fn uniform(ctx: &WgpuContext, bytes: &[u8]) -> Params {
     params
 }
 
-/// What a dispatch binds: a buffer, or the kernel's parameters.
+/// What a dispatch binds: a tensor's buffer, a buffer made for this call
+/// alone, or the kernel's parameters.
 enum ArgRef<'a> {
     Buffer(&'a Buffer),
+    Scratch(&'a Buffer),
     Params(&'a Params),
+}
+
+/// A buffer made for one call and dropped after it. A dispatch that binds
+/// one does not cache its bind group, which could never be used again.
+struct Scratch(Buffer);
+
+impl Arg for Scratch {
+    fn arg(&self) -> ArgRef<'_> {
+        ArgRef::Scratch(&self.0)
+    }
 }
 
 /// A value [`ComputeEngine::run`] can bind, so a buffer and the kernel's
@@ -475,6 +488,9 @@ impl ComputeEngine {
         groups: (u32, u32, u32),
     ) {
         let mut immediates = None;
+        // A group that binds a buffer made for this dispatch alone is not
+        // worth caching.
+        let mut cacheable = true;
         let mut bound = Vec::with_capacity(entries.len());
         for &(binding, arg) in entries {
             let buffer = match arg.arg() {
@@ -483,19 +499,46 @@ impl ComputeEngine {
                     immediates = Some(params.bytes.clone());
                     continue;
                 }
-                ArgRef::Params(params) => params.buffer(ctx),
+                ArgRef::Params(params) => {
+                    cacheable = false;
+                    params.buffer(ctx)
+                }
+                ArgRef::Scratch(buffer) => {
+                    cacheable = false;
+                    buffer
+                }
             };
-            bound.push(wgpu::BindGroupEntry {
-                binding,
-                resource: buffer.as_entire_binding(),
-            });
+            bound.push((binding, buffer));
         }
-        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &kernel.layout,
-            entries: &bound,
-        });
-        ctx.counters.bind_groups.fetch_add(1, Relaxed);
+        let create = || {
+            let entries: Vec<wgpu::BindGroupEntry<'_>> = bound
+                .iter()
+                .map(|&(binding, buffer)| wgpu::BindGroupEntry {
+                    binding,
+                    resource: buffer.as_entire_binding(),
+                })
+                .collect();
+            ctx.counters.bind_groups.fetch_add(1, Relaxed);
+            ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &kernel.layout,
+                entries: &entries,
+            })
+        };
+        let bind_group = if cacheable {
+            let buffers = bound.iter().map(|&(b, buffer)| (b, buffer.clone()));
+            let key = BindKey::new(&kernel.pipeline, buffers.collect());
+            let (group, hit) = ctx.pool.bind_groups().get_or_create(key, create);
+            let counter = if hit {
+                &ctx.counters.bind_group_hits
+            } else {
+                &ctx.counters.bind_group_misses
+            };
+            counter.fetch_add(1, Relaxed);
+            group
+        } else {
+            create()
+        };
         ctx.counters.dispatches.fetch_add(1, Relaxed);
         ctx.record_dispatch(Dispatch {
             pipeline: Arc::clone(&kernel.pipeline),
@@ -528,14 +571,16 @@ impl ComputeEngine {
 
 /// A 4-byte storage buffer bound where a kernel needs a buffer that is unused.
 /// Counted like [`uniform_buffer`].
-fn dummy_storage(ctx: &WgpuContext) -> Buffer {
+fn dummy_storage(ctx: &WgpuContext) -> Scratch {
     ctx.memory().count_dispatch_buffer(4);
-    ctx.device
+    let buffer = ctx
+        .device
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Dummy Storage"),
             contents: &[0u8; 4],
             usage: wgpu::BufferUsages::STORAGE,
-        })
+        });
+    Scratch(buffer)
 }
 
 #[cfg(test)]
