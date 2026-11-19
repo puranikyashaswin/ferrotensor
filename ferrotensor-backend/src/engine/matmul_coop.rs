@@ -159,12 +159,121 @@ pub struct CoopConfig {
     pub split: u32,
 }
 
-/// Tiles the router tries for products of more than 256 rows, in order:
-/// the first whose grid reaches the target runs. Not tuned yet.
-const LARGE_M_TILES: [usize; 3] = [5, 3, 4];
+/// Tiles the router tries for products of more than 256 rows, in order: the
+/// first whose grid reaches the target runs. The 64x64 tile with one staging
+/// buffer was within 6% of the fastest configuration on 21 of the 28 base
+/// weight products at 2048 rows that `matmul-tune` timed on an A10G, and the
+/// router's earlier picks (the 128x128 tile first) took 1.3 to 2.8 times the
+/// fastest time on 18 of them.
+const LARGE_M_TILES: [usize; 2] = [1, 2];
 /// Tiles the router tries for products of up to 256 rows; when none reaches
-/// the target, the last one runs with K split. Not tuned yet.
-const SMALL_M_TILES: [usize; 2] = [3, 4];
+/// the target, the last one runs with K split. These two were the fastest
+/// tiles of most of the 256-row products `matmul-tune` timed on an A10G.
+const SMALL_M_TILES: [usize; 2] = [12, 11];
+
+/// A product `matmul-tune` timed on an A10G and the fastest configuration it
+/// found.
+struct Tuned {
+    m: u32,
+    transposed_b: bool,
+    k: u32,
+    n: u32,
+    /// Index into [`CoopTile::ALL`].
+    tile: usize,
+    split: u32,
+}
+
+impl Tuned {
+    const fn new(m: u32, transposed_b: bool, k: u32, n: u32, tile: usize, split: u32) -> Self {
+        Self {
+            m,
+            transposed_b,
+            k,
+            n,
+            tile,
+            split,
+        }
+    }
+}
+
+/// The fastest configuration of every base-weight product of LoRA
+/// fine-tuning SmolLM2-135M, 360M and 1.7B at 256 and 2048 rows, from one
+/// `matmul-tune` run on an NVIDIA A10G. A K split stands only where it was
+/// at least 10% faster than the best unsplit configuration, since it costs
+/// a second pass and a partial-sum buffer that the bench's isolated calls
+/// charge only in part.
+const TUNED: &[Tuned] = &[
+    // SmolLM2-135M
+    Tuned::new(256, true, 576, 576, 12, 1),
+    Tuned::new(256, false, 576, 576, 12, 1),
+    Tuned::new(256, true, 576, 192, 12, 1),
+    Tuned::new(256, false, 192, 576, 12, 1),
+    Tuned::new(256, true, 576, 1536, 2, 1),
+    Tuned::new(256, false, 1536, 576, 11, 6),
+    Tuned::new(256, true, 1536, 576, 11, 6),
+    Tuned::new(256, false, 576, 1536, 2, 1),
+    Tuned::new(256, true, 576, 49152, 6, 1),
+    Tuned::new(256, false, 49152, 576, 11, 6),
+    Tuned::new(2048, true, 576, 576, 6, 1),
+    Tuned::new(2048, false, 576, 576, 6, 1),
+    Tuned::new(2048, true, 576, 192, 2, 1),
+    Tuned::new(2048, false, 192, 576, 6, 1),
+    Tuned::new(2048, true, 576, 1536, 1, 1),
+    Tuned::new(2048, false, 1536, 576, 6, 1),
+    Tuned::new(2048, true, 1536, 576, 6, 1),
+    Tuned::new(2048, false, 576, 1536, 1, 1),
+    Tuned::new(2048, true, 576, 49152, 0, 1),
+    Tuned::new(2048, false, 49152, 576, 6, 1),
+    // SmolLM2-360M
+    Tuned::new(256, true, 960, 960, 12, 1),
+    Tuned::new(256, false, 960, 960, 12, 1),
+    Tuned::new(256, true, 960, 320, 12, 4),
+    Tuned::new(256, false, 320, 960, 12, 1),
+    Tuned::new(256, true, 960, 2560, 11, 1),
+    Tuned::new(256, false, 2560, 960, 11, 4),
+    Tuned::new(256, true, 2560, 960, 11, 4),
+    Tuned::new(256, false, 960, 2560, 11, 1),
+    Tuned::new(256, true, 960, 49152, 0, 1),
+    Tuned::new(256, false, 49152, 960, 1, 8),
+    Tuned::new(2048, true, 960, 960, 1, 1),
+    Tuned::new(2048, false, 960, 960, 1, 1),
+    Tuned::new(2048, true, 960, 320, 11, 1),
+    Tuned::new(2048, false, 320, 960, 1, 1),
+    Tuned::new(2048, true, 960, 2560, 1, 1),
+    Tuned::new(2048, false, 2560, 960, 1, 1),
+    Tuned::new(2048, true, 2560, 960, 1, 1),
+    Tuned::new(2048, false, 960, 2560, 1, 1),
+    Tuned::new(2048, true, 960, 49152, 6, 1),
+    Tuned::new(2048, false, 49152, 960, 1, 1),
+    // SmolLM2-1.7B
+    Tuned::new(256, true, 2048, 2048, 1, 3),
+    Tuned::new(256, false, 2048, 2048, 1, 3),
+    Tuned::new(256, true, 2048, 8192, 0, 1),
+    Tuned::new(256, false, 8192, 2048, 1, 3),
+    Tuned::new(256, true, 8192, 2048, 1, 3),
+    Tuned::new(256, false, 2048, 8192, 0, 1),
+    Tuned::new(256, true, 2048, 49152, 0, 1),
+    Tuned::new(256, false, 49152, 2048, 1, 3),
+    Tuned::new(2048, true, 2048, 2048, 11, 1),
+    Tuned::new(2048, false, 2048, 2048, 11, 1),
+    Tuned::new(2048, true, 2048, 8192, 1, 1),
+    Tuned::new(2048, false, 8192, 2048, 11, 1),
+    Tuned::new(2048, true, 8192, 2048, 11, 1),
+    Tuned::new(2048, false, 2048, 8192, 1, 1),
+    Tuned::new(2048, true, 2048, 49152, 0, 1),
+    Tuned::new(2048, false, 49152, 2048, 11, 1),
+];
+
+/// The measured configuration for this product, when the router has one.
+fn tuned(m: u32, transposed_b: bool, k: u32, n: u32) -> Option<CoopConfig> {
+    let row = TUNED
+        .iter()
+        .find(|t| (t.m, t.transposed_b, t.k, t.n) == (m, transposed_b, k, n))?;
+    Some(CoopConfig {
+        tile: *CoopTile::ALL.get(row.tile)?,
+        split: row.split,
+    })
+}
 
 /// `(splits, K per split)` for `requested` slices of K = `k` in steps of
 /// `bk`: every slice a whole number of steps, none empty.
@@ -198,6 +307,8 @@ pub(super) struct Coop {
     routed: bool,
     /// Workgroups a grid aims for, as for the small-M kernel.
     target: u32,
+    /// Whether [`TUNED`] applies: it was measured on a discrete GPU.
+    tuned: bool,
     max_bytes: u32,
     max_threads: u32,
     /// Whether the kernel reads its parameters from immediates.
@@ -234,16 +345,25 @@ fn grid_fits(tile: CoopTile, m: u32, n: u32, split: u32) -> bool {
     gx <= MAX_GROUPS && gy <= MAX_GROUPS && split <= MAX_GROUPS
 }
 
-/// The configuration the router runs an `m x k x n` product with: the first
-/// tile of the list for `m` that `fits` and whose grid reaches `target`
-/// workgroups, else the last one that fits with K split until the grid
-/// reaches the target (at most one slice per [`MIN_STEPS_PER_SPLIT`] steps).
-/// The first kernel's tiles stand in on a device that fits none of the list.
+/// The configuration the router runs an `m x k x n` product with. On a
+/// device the [`TUNED`] rows were measured on (`use_tuned`), a product with a
+/// row there runs that row's configuration when its tile `fits`. Any other
+/// product gets the first tile of the list for `m` that `fits` and whose grid
+/// reaches `target` workgroups, else the last one that fits with K split
+/// until the grid reaches the target (at most one slice per
+/// [`MIN_STEPS_PER_SPLIT`] steps). The first kernel's tiles stand in on a
+/// device that fits none of the list.
 fn plan(
     (m, k, n): (u32, u32, u32),
-    target: u32,
+    transposed_b: bool,
+    (target, use_tuned): (u32, bool),
     fits: impl Fn(CoopTile) -> bool,
 ) -> Option<CoopConfig> {
+    let measured = tuned(m, transposed_b, k, n)
+        .filter(|c| use_tuned && fits(c.tile) && grid_fits(c.tile, m, n, c.split));
+    if measured.is_some() {
+        return measured;
+    }
     let list: &[usize] = if m > 256 {
         &LARGE_M_TILES
     } else {
@@ -287,6 +407,7 @@ impl Coop {
             flash: Some(super::flash_coop::FlashCoop::new()),
             routed: crate::adapters::experimental_opt_in(),
             target,
+            tuned: ctx.adapter.get_info().device_type == wgpu::DeviceType::DiscreteGpu,
             max_bytes: limits.max_compute_workgroup_storage_size,
             max_threads: limits
                 .max_compute_invocations_per_workgroup
@@ -448,7 +569,7 @@ impl ComputeEngine {
                     c.split
                 ));
             }
-            None => plan(dims, coop.target, fits),
+            None => plan(dims, transposed_b, (coop.target, coop.tuned), fits),
         };
         let Some(config) = config else {
             return Err(format!(
@@ -472,7 +593,8 @@ impl ComputeEngine {
         let Some(coop) = self.coop.as_ref() else {
             return false;
         };
-        let Some(config) = plan(dims, coop.target, |t| coop.fits(t, transposed_b)) else {
+        let target = (coop.target, coop.tuned);
+        let Some(config) = plan(dims, transposed_b, target, |t| coop.fits(t, transposed_b)) else {
             return false;
         };
         self.matmul_coop_run(ctx, transposed_b, dims, tensors, config, ep)
@@ -884,9 +1006,9 @@ fn matmul_coop(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_i
 }
 
 #[cfg(test)]
-#[allow(clippy::panic)]
+#[allow(clippy::expect_used, clippy::panic)]
 mod tests {
-    use super::{immediate_source, plan, source, split_k, CoopKey, CoopTile, PAD};
+    use super::{immediate_source, plan, source, split_k, CoopKey, CoopTile, PAD, TUNED};
 
     fn keys() -> Vec<CoopKey> {
         let mut keys = Vec::new();
@@ -1016,20 +1138,136 @@ mod tests {
     #[test]
     fn plan_reaches_the_target_or_splits_k() {
         let all = |_: CoopTile| true;
+        let untuned = (160, false);
         // More than 256 rows: the first listed tile whose grid reaches the target.
-        let got = plan((2048, 2048, 8192), 160, all).map(|c| (c.tile, c.split));
-        assert_eq!(got, Some((CoopTile::ALL[5], 1)));
+        let got = plan((2048, 2048, 8192), false, untuned, all).map(|c| (c.tile, c.split));
+        assert_eq!(got, Some((CoopTile::ALL[1], 1)));
+        // 512 x 576 x 576 has 8 x 9 = 72 tiles of 64x64: the next tile has 288.
+        let got = plan((512, 576, 576), false, untuned, all).map(|c| (c.tile, c.split));
+        assert_eq!(got, Some((CoopTile::ALL[2], 1)));
         // 256 rows: the last listed tile with K split until the grid reaches
         // the target, at least two steps per slice. Its 9 x 4 tiles want 5
         // slices of K = 576.
-        let got = plan((256, 576, 576), 160, all).map(|c| (c.tile, c.split));
-        assert_eq!(got, Some((CoopTile::ALL[4], 5)));
-        let got = plan((256, 64, 16), 160, all).map(|c| (c.tile, c.split));
-        assert_eq!(got, Some((CoopTile::ALL[4], 1)));
+        let got = plan((256, 576, 576), false, untuned, all).map(|c| (c.tile, c.split));
+        assert_eq!(got, Some((CoopTile::ALL[11], 5)));
+        let got = plan((256, 64, 16), false, untuned, all).map(|c| (c.tile, c.split));
+        assert_eq!(got, Some((CoopTile::ALL[11], 1)));
         // A device that fits none of the listed tiles runs the first kernel's.
         let single = |t: CoopTile| !t.double;
-        let got = plan((256, 576, 576), 160, single).map(|c| (c.tile, c.split));
+        let got = plan((256, 576, 576), false, untuned, single).map(|c| (c.tile, c.split));
         assert_eq!(got, Some((CoopTile::ALL[2], 2)));
-        assert!(plan((256, 576, 576), 160, |_: CoopTile| false).is_none());
+        assert!(plan((256, 576, 576), false, untuned, |_: CoopTile| false).is_none());
+    }
+
+    /// The fastest configuration `matmul-tune` found on an NVIDIA A10G for
+    /// each base-weight product of SmolLM2 training: `(m, a@bT, k, n,
+    /// configuration)`, copied from that run's `matmul_tune.md`.
+    const BENCH: &[(u32, bool, u32, u32, &str)] = &[
+        // SmolLM2-135M
+        (256, true, 576, 576, "32x64/w16x16/k64/db s1"),
+        (256, false, 576, 576, "32x64/w16x16/k64/db s1"),
+        (256, true, 576, 192, "32x64/w16x16/k64/db s5"),
+        (256, false, 192, 576, "32x64/w16x16/k64/db s1"),
+        (256, true, 576, 1536, "32x32/w16x16/k32 s1"),
+        (256, false, 1536, 576, "64x64/w16x32/k32/db s6"),
+        (256, true, 1536, 576, "64x64/w16x32/k32/db s6"),
+        (256, false, 576, 1536, "32x32/w16x16/k32 s1"),
+        (256, true, 576, 49152, "128x64/w32x32/k32/db s1"),
+        (256, false, 49152, 576, "64x64/w16x32/k32/db s6"),
+        (2048, true, 576, 576, "128x64/w32x32/k32/db s1"),
+        (2048, false, 576, 576, "128x64/w32x32/k32/db s1"),
+        (2048, true, 576, 192, "32x32/w16x16/k32 s1"),
+        (2048, false, 192, 576, "128x64/w32x32/k32/db s1"),
+        (2048, true, 576, 1536, "64x64/w32x32/k32 s1"),
+        (2048, false, 1536, 576, "128x64/w32x32/k32/db s1"),
+        (2048, true, 1536, 576, "128x64/w32x32/k32/db s1"),
+        (2048, false, 576, 1536, "64x64/w32x32/k32 s1"),
+        (2048, true, 576, 49152, "128x64/w64x32/k32 s1"),
+        (2048, false, 49152, 576, "128x64/w64x32/k32 s2"),
+        // SmolLM2-360M
+        (256, true, 960, 960, "32x64/w16x16/k64/db s1"),
+        (256, false, 960, 960, "32x64/w16x16/k64/db s1"),
+        (256, true, 960, 320, "32x64/w16x16/k64/db s4"),
+        (256, false, 320, 960, "32x64/w16x16/k64/db s1"),
+        (256, true, 960, 2560, "64x64/w16x32/k32/db s1"),
+        (256, false, 2560, 960, "64x64/w16x32/k32/db s4"),
+        (256, true, 2560, 960, "64x64/w16x32/k32/db s4"),
+        (256, false, 960, 2560, "64x64/w16x32/k32/db s1"),
+        (256, true, 960, 49152, "128x64/w64x32/k32 s1"),
+        (256, false, 49152, 960, "64x64/w32x32/k32 s8"),
+        (2048, true, 960, 960, "64x64/w32x32/k32 s1"),
+        (2048, false, 960, 960, "64x64/w32x32/k32 s1"),
+        (2048, true, 960, 320, "64x64/w16x32/k32/db s1"),
+        (2048, false, 320, 960, "64x64/w32x32/k32 s1"),
+        (2048, true, 960, 2560, "64x64/w32x32/k32 s1"),
+        (2048, false, 2560, 960, "64x64/w32x32/k32 s1"),
+        (2048, true, 2560, 960, "64x64/w32x32/k32 s1"),
+        (2048, false, 960, 2560, "64x64/w32x32/k32 s1"),
+        (2048, true, 960, 49152, "128x64/w32x32/k32/db s1"),
+        (2048, false, 49152, 960, "64x64/w32x32/k32 s1"),
+        // SmolLM2-1.7B
+        (256, true, 2048, 2048, "64x64/w32x32/k32 s3"),
+        (256, false, 2048, 2048, "64x64/w32x32/k32 s3"),
+        (256, true, 2048, 8192, "128x64/w64x32/k32 s1"),
+        (256, false, 8192, 2048, "64x64/w32x32/k32 s3"),
+        (256, true, 8192, 2048, "64x64/w32x32/k32 s3"),
+        (256, false, 2048, 8192, "128x64/w64x32/k32 s1"),
+        (256, true, 2048, 49152, "128x64/w64x32/k32 s1"),
+        (256, false, 49152, 2048, "64x64/w32x32/k32 s3"),
+        (2048, true, 2048, 2048, "64x64/w16x32/k32/db s1"),
+        (2048, false, 2048, 2048, "64x64/w16x32/k32/db s1"),
+        (2048, true, 2048, 8192, "64x64/w32x32/k32 s1"),
+        (2048, false, 8192, 2048, "64x64/w16x32/k32/db s1"),
+        (2048, true, 8192, 2048, "64x64/w16x32/k32/db s1"),
+        (2048, false, 2048, 8192, "64x64/w32x32/k32 s1"),
+        (2048, true, 2048, 49152, "128x64/w64x32/k32 s1"),
+        (2048, false, 49152, 2048, "64x64/w16x32/k32/db s1"),
+    ];
+
+    /// The products whose selected configuration differs from the bench's:
+    /// the bench winner split K and the best unsplit one was within 10% of it.
+    const UNSPLIT: &[(u32, bool, u32, u32, &str)] = &[
+        (256, true, 576, 192, "32x64/w16x16/k64/db s1"),
+        (2048, false, 49152, 576, "128x64/w32x32/k32/db s1"),
+    ];
+
+    #[test]
+    fn plan_selects_the_bench_winner_for_the_training_shapes() {
+        let all = |_: CoopTile| true;
+        assert_eq!(BENCH.len(), TUNED.len());
+        for &(m, transposed_b, k, n, winner) in BENCH {
+            let unsplit = UNSPLIT
+                .iter()
+                .find(|u| (u.0, u.1, u.2, u.3) == (m, transposed_b, k, n));
+            let want = unsplit.map_or(winner, |u| u.4);
+            let got = plan((m, k, n), transposed_b, (160, true), all).expect("a tile fits");
+            let name = format!("{} s{}", got.tile.name(), got.split);
+            assert_eq!(name, want, "m {m} k {k} n {n} transposed {transposed_b}");
+        }
+        assert_eq!(UNSPLIT.len(), 2);
+        for u in UNSPLIT {
+            assert!(u.4.ends_with(" s1"));
+        }
+    }
+
+    #[test]
+    fn splits_stay_where_the_bench_needed_them() {
+        let all = |_: CoopTile| true;
+        // At 2048 rows the grid fills the GPU on its own: no K split, so no
+        // reduction pass, for any model.
+        for &(m, transposed_b, k, n, _) in BENCH {
+            if m == 2048 {
+                let got = plan((m, k, n), transposed_b, (160, true), all).expect("a tile fits");
+                assert_eq!(got.split, 1);
+            }
+        }
+        // A tile that does not fit the device is not selected from the table.
+        let none_but_small = |t: CoopTile| t.bm * t.bn <= 32 * 64;
+        let got = plan((2048, 2048, 8192), true, (160, true), none_but_small);
+        assert!(got.is_some_and(|c| c.tile.bm * c.tile.bn <= 32 * 64));
+        // Without the table (a device it was not measured on) the router's
+        // own rule applies.
+        let got = plan((2048, 2048, 8192), true, (160, false), all);
+        assert_eq!(got.map(|c| c.tile), Some(CoopTile::ALL[1]));
     }
 }
