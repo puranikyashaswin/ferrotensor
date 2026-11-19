@@ -197,11 +197,17 @@ impl Tuned {
 }
 
 /// The fastest configuration of every base-weight product of LoRA
-/// fine-tuning SmolLM2-135M, 360M and 1.7B at 256 and 2048 rows, from one
-/// `matmul-tune` run on an NVIDIA A10G. A K split stands only where it was
-/// at least 10% faster than the best unsplit configuration, since it costs
-/// a second pass and a partial-sum buffer that the bench's isolated calls
-/// charge only in part.
+/// fine-tuning SmolLM2-135M and 360M at 256 and 2048 rows, and of 1.7B at
+/// 2048 rows, from one `matmul-tune` run on an NVIDIA A10G. A K split stands
+/// only where it was at least 10% faster than the best unsplit configuration,
+/// since it costs a second pass and a partial-sum buffer that the bench's
+/// isolated calls charge only in part. The 1.7B products at 256 rows are not
+/// here: their bench winners (the 128x64 and 64x64 tiles with one staging
+/// buffer) took 1.3 to 2.4 times as long in a `--profile` of a 30-step 1.7B
+/// run, with micro-batches of 64 to 256 rows next to the other kernels of the
+/// step, as the double-buffered 64x64 tile with K split to fill the GPU. The
+/// bench times one product alone, repeated with a warm cache, and the step
+/// does not. Those products run the router's rule.
 const TUNED: &[Tuned] = &[
     // SmolLM2-135M
     Tuned::new(256, true, 576, 576, 12, 1),
@@ -246,14 +252,6 @@ const TUNED: &[Tuned] = &[
     Tuned::new(2048, true, 960, 49152, 6, 1),
     Tuned::new(2048, false, 49152, 960, 1, 1),
     // SmolLM2-1.7B
-    Tuned::new(256, true, 2048, 2048, 1, 3),
-    Tuned::new(256, false, 2048, 2048, 1, 3),
-    Tuned::new(256, true, 2048, 8192, 0, 1),
-    Tuned::new(256, false, 8192, 2048, 1, 3),
-    Tuned::new(256, true, 8192, 2048, 1, 3),
-    Tuned::new(256, false, 2048, 8192, 0, 1),
-    Tuned::new(256, true, 2048, 49152, 0, 1),
-    Tuned::new(256, false, 49152, 2048, 1, 3),
     Tuned::new(2048, true, 2048, 2048, 11, 1),
     Tuned::new(2048, false, 2048, 2048, 11, 1),
     Tuned::new(2048, true, 2048, 8192, 1, 1),
@@ -1216,14 +1214,6 @@ mod tests {
         (2048, true, 960, 49152, "128x64/w32x32/k32/db s1"),
         (2048, false, 49152, 960, "64x64/w32x32/k32 s1"),
         // SmolLM2-1.7B
-        (256, true, 2048, 2048, "64x64/w32x32/k32 s3"),
-        (256, false, 2048, 2048, "64x64/w32x32/k32 s3"),
-        (256, true, 2048, 8192, "128x64/w64x32/k32 s1"),
-        (256, false, 8192, 2048, "64x64/w32x32/k32 s3"),
-        (256, true, 8192, 2048, "64x64/w32x32/k32 s3"),
-        (256, false, 2048, 8192, "128x64/w64x32/k32 s1"),
-        (256, true, 2048, 49152, "128x64/w64x32/k32 s1"),
-        (256, false, 49152, 2048, "64x64/w32x32/k32 s3"),
         (2048, true, 2048, 2048, "64x64/w16x32/k32/db s1"),
         (2048, false, 2048, 2048, "64x64/w16x32/k32/db s1"),
         (2048, true, 2048, 8192, "64x64/w32x32/k32 s1"),
@@ -1289,6 +1279,22 @@ mod tests {
         ] {
             let got = plan((m, 576, 576), true, (160, true), all).expect("a tile fits");
             assert_eq!((got.tile, got.split), (CoopTile::ALL[want], 1), "m {m}");
+        }
+        // 1.7B at up to 256 rows has no row, since the bench winners lost in
+        // a training step: the rule's tile runs, split until the grid fills
+        // the GPU.
+        for (m, a_bt, k, n, want) in [
+            (128, false, 2048, 8192, (12, 1)),
+            (128, true, 2048, 2048, (11, 3)),
+            (64, true, 8192, 2048, (11, 5)),
+            (256, false, 2048, 8192, (12, 1)),
+        ] {
+            let got = plan((m, k, n), a_bt, (160, true), all).expect("a tile fits");
+            assert_eq!(
+                (got.tile, got.split),
+                (CoopTile::ALL[want.0], want.1),
+                "m {m} k {k} n {n}"
+            );
         }
         // More rows than the table has run the router's own rule.
         let got = plan((4096, 576, 576), true, (160, true), all);
