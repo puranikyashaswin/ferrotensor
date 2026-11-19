@@ -1,7 +1,7 @@
 //! The small-M matmul: a weight-stationary, split-K kernel for products with
 //! few rows against a wide and deep weight (see matmul_small_m.wgsl).
 
-use super::{grid, uniform, ComputeEngine, Kernel};
+use super::{grid, uniform, ComputeEngine, Epilogue, Kernel};
 use crate::kernel_timing::KernelLabel;
 use crate::{DType, UnifiedTensor, WgpuContext};
 use std::borrow::Cow;
@@ -363,14 +363,14 @@ pub(super) fn source(tile: SmallMTile, transposed_b: bool, half_b: bool) -> Stri
             let c = j * tx;
             if transposed_b {
                 write += &format!(
-                    "            if (col0 + tx + {c}u < n) {{ skm_out[o + col0 + tx + {c}u] = acc{i}_{j}; }}\n"
+                    "            if (col0 + tx + {c}u < n) {{ skm_store(o + col0 + tx + {c}u, acc{i}_{j}); }}\n"
                 );
             } else {
                 write +=
                     &format!("            {{\n                let c = col0 + (tx + {c}u) * 4u;\n");
                 for (e, comp) in COMPONENTS.into_iter().enumerate() {
                     write += &format!(
-                        "                if (c + {e}u < n) {{ skm_out[o + c + {e}u] = acc{i}_{j}.{comp}; }}\n"
+                        "                if (c + {e}u < n) {{ skm_store(o + c + {e}u, acc{i}_{j}.{comp}); }}\n"
                     );
                 }
                 write += "            }\n";
@@ -438,20 +438,21 @@ impl ComputeEngine {
         }))
     }
 
-    /// Records `out[M, N] = a[M, K] @ op(b)` with the small-M kernel and
-    /// `tile`, with `b` stored `[N, K]` (`transposed_b`) or `[K, N]`, as f32
-    /// or f16. K is split into `split` slices, or as [`split_count`] picks
-    /// for this device; the slices' partial sums are added in a second
-    /// pass. The caller checks the tile with [`small_m_fits`](Self::small_m_fits)
-    /// and that the grid is within [`MAX_GROUPS`] per dimension.
+    /// Records `out[M, N] = alpha * a[M, K] @ op(b) + beta * out` (`ep`) with
+    /// the small-M kernel and `tile`, with `b` stored `[N, K]`
+    /// (`transposed_b`) or `[K, N]`, as f32 or f16. K is split into `split`
+    /// slices, or as [`split_count`] picks for this device; the slices'
+    /// partial sums are added in a second pass. The caller checks the tile
+    /// with [`small_m_fits`](Self::small_m_fits) and that the grid is within
+    /// [`MAX_GROUPS`] per dimension.
     pub(super) fn matmul_small_m(
         &self,
         ctx: &WgpuContext,
         transposed_b: bool,
         (m, k, n): (u32, u32, u32),
         [a, b, out]: [&UnifiedTensor; 3],
-        tile: SmallMTile,
-        split: Option<u32>,
+        (tile, split): (SmallMTile, Option<u32>),
+        ep: Epilogue,
     ) -> SmallMLaunch {
         let half_b = matches!(b.dtype, DType::FP16);
         let kernel = self.small_m_kernel(
@@ -476,7 +477,22 @@ impl ComputeEngine {
             layout: if transposed_b { "a@bT" } else { "a@b" },
             size_class: "m<=256",
         };
-        let params = uniform(ctx, bytemuck::cast_slice(&[m, k, n, k_per_split]));
+        // With one slice the kernel applies the epilogue; with more it writes
+        // plain partial sums and the reduction applies it.
+        let kernel_ep = if split == 1 { ep } else { Epilogue::STORE };
+        let params = uniform(
+            ctx,
+            bytemuck::cast_slice(&[
+                m,
+                k,
+                n,
+                k_per_split,
+                kernel_ep.alpha.to_bits(),
+                kernel_ep.beta.to_bits(),
+                0,
+                0,
+            ]),
+        );
         if split == 1 {
             self.run_labeled(
                 ctx,
@@ -505,7 +521,10 @@ impl ComputeEngine {
                 (rows, cols, split),
             );
             let len = m * n;
-            let params = uniform(ctx, bytemuck::cast_slice(&[len, split, 0, 0]));
+            let params = uniform(
+                ctx,
+                bytemuck::cast_slice(&[len, split, ep.alpha.to_bits(), ep.beta.to_bits()]),
+            );
             self.run(
                 ctx,
                 &self.split_reduce,

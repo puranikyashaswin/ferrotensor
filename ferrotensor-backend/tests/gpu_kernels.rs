@@ -12,8 +12,8 @@
 #![allow(clippy::unwrap_used)]
 
 use ferrotensor_backend::{
-    q4, AdamParams, AttentionOptions, ComputeEngine, DType, MatmulPath, MemoryCategory, SmallMTile,
-    UnifiedTensor, WgpuContext, MASKED_CE_SKIP, SUM_SQUARES_CHUNK,
+    q4, AdamParams, AttentionOptions, ComputeEngine, DType, Epilogue, MatmulPath, MemoryCategory,
+    SmallMTile, UnifiedTensor, WgpuContext, MASKED_CE_SKIP, SUM_SQUARES_CHUNK,
 };
 use q4::Q4Group;
 use std::io::Write as _;
@@ -2741,4 +2741,171 @@ fn argmax_rows_matches_the_host_argmax_including_ties() {
     let got: Vec<u32> = read(&out).iter().map(|v| v.to_bits()).collect();
     let want: Vec<u32> = x.chunks(len).map(host_argmax).collect();
     assert_eq!(got, want);
+}
+
+fn bits(x: &[f32]) -> Vec<u32> {
+    x.iter().map(|v| v.to_bits()).collect()
+}
+
+/// `alpha * op(a) @ op(b) + beta * init` on the CPU in f64, with `b` stored
+/// `[N, K]` when `transposed_b`.
+fn cpu_epilogue(
+    a: &[f32],
+    b: &[f32],
+    init: &[f32],
+    (m, k, n): (usize, usize, usize),
+    transposed_b: bool,
+    ep: Epilogue,
+) -> Vec<f32> {
+    (0..m * n)
+        .map(|i| {
+            let (r, c) = (i / n, i % n);
+            let dot: f64 = (0..k)
+                .map(|p| {
+                    let bv = if transposed_b {
+                        b[c * k + p]
+                    } else {
+                        b[p * n + c]
+                    };
+                    f64::from(a[r * k + p]) * f64::from(bv)
+                })
+                .sum();
+            let mut v = f64::from(ep.alpha) * dot;
+            if ep.beta != 0.0 {
+                v += f64::from(ep.beta) * f64::from(init[i]);
+            }
+            v as f32
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn matmul_epilogue_matches_cpu_on_every_path() {
+    let g = gpu();
+    // One shape per kernel: one row (the matrix-vector kernel for a@b, the
+    // thin kernel for a@bT), a thin a, a thin b (64x64 tiles with an f16 b),
+    // 64x64 tiles, and the small-M kernel with one slice of K and with three.
+    let small_m = |split| MatmulPath::SmallM {
+        tile: None,
+        split: Some(split),
+    };
+    let cases = [
+        ("one row", (1, 96, 80), MatmulPath::Previous),
+        ("thin a", (8, 96, 200), MatmulPath::Previous),
+        ("thin b", (200, 40, 8), MatmulPath::Previous),
+        ("tiles", (100, 72, 130), MatmulPath::Previous),
+        ("small-M, 1 slice", (64, 512, 256), small_m(1)),
+        ("small-M, 3 slices", (64, 512, 256), small_m(3)),
+    ];
+    let epilogues = [
+        Epilogue::STORE,
+        Epilogue::scaled(0.375),
+        Epilogue::ACCUMULATE,
+        Epilogue {
+            alpha: -2.0,
+            beta: 0.25,
+        },
+    ];
+    for (seed, (name, (m, k, n), path)) in cases.into_iter().enumerate() {
+        let seed = 9000 + 10 * seed as u64;
+        let a = rand_vec(m * k, seed);
+        // Multiples of 1/64 in [-1, 1] are exact in f16, so the f16 weight
+        // holds the same values as the f32 one.
+        let b: Vec<f32> = rand_vec(k * n, seed + 1)
+            .iter()
+            .map(|v| (v * 64.0).round() / 64.0)
+            .collect();
+        let init = rand_vec(m * n, seed + 2);
+        let a_up = upload(&a, &[m, k]);
+        for transposed_b in [false, true] {
+            let (b_stored, shape) = if transposed_b {
+                (transpose(&b, k, n), [n, k])
+            } else {
+                (b.clone(), [k, n])
+            };
+            let weights = [
+                ("f32", upload(&b_stored, &shape)),
+                (
+                    "f16",
+                    UnifiedTensor::from_f32_as_f16(&g.ctx, &b_stored, &shape),
+                ),
+            ];
+            for (dtype, b_up) in &weights {
+                let run = |ep: Epilogue, out: &UnifiedTensor| {
+                    g.engine
+                        .matmul_with_path_into(&g.ctx, transposed_b, [&a_up, b_up, out], path, ep)
+                        .unwrap();
+                };
+                let product = zeros(&[m, n]);
+                run(Epilogue::STORE, &product);
+                let product = read(&product);
+                for ep in epilogues {
+                    let label = format!("{name} {dtype} transposed_b {transposed_b} {ep:?}");
+                    // An out of NaN shows that beta = 0 never reads it.
+                    let start = if ep.beta == 0.0 {
+                        vec![f32::NAN; m * n]
+                    } else {
+                        init.clone()
+                    };
+                    let out = upload(&start, &[m, n]);
+                    run(ep, &out);
+                    let got = read(&out);
+                    let want = cpu_epilogue(&a, &b_stored, &init, (m, k, n), transposed_b, ep);
+                    assert_close(&label, &got, &want, 1e-4, 1e-4);
+                    // The product is rounded before the epilogue, so scaling
+                    // or adding the stored product gives the same bits.
+                    let from_product: Vec<f32> = product
+                        .iter()
+                        .zip(&init)
+                        .map(|(p, i)| {
+                            let v = ep.alpha * p;
+                            if ep.beta == 0.0 {
+                                v
+                            } else {
+                                v + ep.beta * i
+                            }
+                        })
+                        .collect();
+                    assert_eq!(bits(&got), bits(&from_product), "{label}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn transposed_a_matmul_accumulates_into_out() {
+    // The weight-gradient product a^T @ b added into an earlier gradient,
+    // as a second micro-batch adds its own: the thin kernel for a LoRA-rank
+    // output and 64x64 tiles for a wide one.
+    let g = gpu();
+    for (seed, (m, k, n)) in [(8, 200, 96), (72, 50, 90)].into_iter().enumerate() {
+        let seed = 9100 + 10 * seed as u64;
+        let a = rand_vec(k * m, seed);
+        let b = rand_vec(k * n, seed + 1);
+        let init = rand_vec(m * n, seed + 2);
+        let (a_up, b_up) = (upload(&a, &[k, m]), upload(&b, &[k, n]));
+        let out = upload(&init, &[m, n]);
+        g.engine
+            .matmul_at_into(&g.ctx, &a_up, &b_up, &out, Epilogue::ACCUMULATE);
+        let got = read(&out);
+        let want = cpu_epilogue(
+            &transpose(&a, k, m),
+            &b,
+            &init,
+            (m, k, n),
+            false,
+            Epilogue::ACCUMULATE,
+        );
+        assert_close(&format!("aT@b {m}x{k}x{n}"), &got, &want, 1e-4, 1e-4);
+        // The same bits as a separate product and add.
+        let product = zeros(&[m, n]);
+        g.engine.matmul_at(&g.ctx, &a_up, &b_up, &product);
+        let sum = zeros(&[m, n]);
+        g.engine
+            .add(&g.ctx, &upload(&init, &[m, n]), &product, &sum);
+        assert_eq!(bits(&got), bits(&read(&sum)), "aT@b {m}x{k}x{n}");
+    }
 }

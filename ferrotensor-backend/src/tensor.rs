@@ -329,6 +329,13 @@ impl UnifiedTensor {
         }
     }
 
+    /// Whether no other tensor, view or clone shares this tensor's storage, so
+    /// writing into it in place changes nothing anyone else reads.
+    #[must_use]
+    pub fn is_unique(&self) -> bool {
+        Arc::strong_count(&self.data) == 1
+    }
+
     /// Copies the tensor back to the CPU, waiting for queued GPU work.
     pub async fn to_vec(&self, context: &WgpuContext) -> Vec<f32> {
         let start = Instant::now();

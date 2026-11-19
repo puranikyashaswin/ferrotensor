@@ -19,7 +19,7 @@ mod small_m;
 mod training;
 
 pub use attention::AttentionOptions;
-pub use matmul::MatmulPath;
+pub use matmul::{Epilogue, MatmulPath};
 pub use small_m::{SmallMLaunch, SmallMTile};
 pub use training::{AdamParams, MASKED_CE_SKIP, SUM_SQUARES_CHUNK};
 
@@ -122,7 +122,7 @@ fn q4_b_matmul(src: &str) -> String {
     const B_DECL: &str = "var<storage, read> mmb_b: array<f32>;";
     const B_LOAD: &str =
         "    if (mode == 1u) { return mmb_b[gn * k + gk]; }\n    return mmb_b[gk * n + gn];";
-    const MODE: &str = "    let mode = mmb_params.w;";
+    const MODE: &str = "    let mode = mmb_params[0].w;";
     const K_INNER: &str = "fn mmb_b_k_inner(mode: u32) -> bool { return mode == 1u; }";
     assert!(
         src.contains(B_DECL) && src.contains(B_LOAD) && src.contains(MODE) && src.contains(K_INNER),
@@ -130,9 +130,9 @@ fn q4_b_matmul(src: &str) -> String {
     );
     src.replace(
         B_LOAD,
-        "    var j = gn * k + gk;\n    if (mode == 1u) { j = gk * n + gn; }\n    let lg = mmb_params.w >> 8u;\n    let q = (mmb_b[j >> 3u] >> ((j & 7u) * 4u)) & 15u;\n    let groups = (k * n + (1u << lg) - 1u) >> lg;\n    let sm = unpack2x16float(mmb_b[(groups << (lg - 3u)) + (j >> lg)]);\n    return f32(q) * sm.x + sm.y;",
+        "    var j = gn * k + gk;\n    if (mode == 1u) { j = gk * n + gn; }\n    let lg = mmb_params[0].w >> 8u;\n    let q = (mmb_b[j >> 3u] >> ((j & 7u) * 4u)) & 15u;\n    let groups = (k * n + (1u << lg) - 1u) >> lg;\n    let sm = unpack2x16float(mmb_b[(groups << (lg - 3u)) + (j >> lg)]);\n    return f32(q) * sm.x + sm.y;",
     )
-    .replace(MODE, "    let mode = mmb_params.w & 255u;")
+    .replace(MODE, "    let mode = mmb_params[0].w & 255u;")
     .replace(
         K_INNER,
         "fn mmb_b_k_inner(mode: u32) -> bool { return mode == 0u; }",

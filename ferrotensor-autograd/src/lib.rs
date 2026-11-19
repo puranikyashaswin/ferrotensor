@@ -14,7 +14,7 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
 use ferrotensor_backend::{
-    AdamParams, AttentionOptions, ComputeEngine, DType, UnifiedTensor, WgpuContext,
+    AdamParams, AttentionOptions, ComputeEngine, DType, Epilogue, UnifiedTensor, WgpuContext,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -61,6 +61,17 @@ pub trait AutogradNode {
     fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor>;
     /// The tensors this op consumed.
     fn inputs(&self) -> Vec<Tensor>;
+    /// Adds this op's input gradients straight into the inputs' gradient
+    /// slots and returns `true`, or returns `false` (the default) so that
+    /// [`Tensor::backward`] adds the gradients
+    /// [`backward`](AutogradNode::backward) returns.
+    ///
+    /// Ops whose gradients are matmul products override it, so the matmul
+    /// adds into the slot (see [`Tensor::accumulate_grad_with`]) instead of
+    /// writing a new buffer that a second kernel then adds.
+    fn backward_accumulate(&self, _grad: &UnifiedTensor, _engine: &ComputeEngine) -> bool {
+        false
+    }
 }
 
 /// A GPU tensor that records the ops applied to it for backpropagation.
@@ -188,6 +199,9 @@ impl Tensor {
             let Some(grad) = tensor.grad.borrow_mut().take() else {
                 continue;
             };
+            if creator.backward_accumulate(&grad, engine) {
+                continue;
+            }
             let input_grads = creator.backward(&grad, engine);
             let inputs = creator.inputs();
             for (input, input_grad) in inputs.iter().zip(input_grads) {
@@ -214,6 +228,42 @@ impl Tensor {
         } else {
             // Defensive: every node returns its input's shape today.
             *grad_ref = Some(new_grad.reshaped(&self.data.shape));
+        }
+    }
+
+    /// Add a matmul product to this tensor's gradient: `run(out, ep)` records
+    /// a matmul that stores `ep.alpha * product + ep.beta * out` in `out`.
+    ///
+    /// When this tensor already has a gradient that nothing else shares, the
+    /// product is added into it in place (`Epilogue::ACCUMULATE`); the kernel
+    /// rounds the product to f32 and then adds, so the result has the bits
+    /// [`accumulate_grad`](Self::accumulate_grad) gives. A shared gradient is
+    /// left untouched and the sum goes to a new buffer, as there.
+    pub fn accumulate_grad_with(
+        &self,
+        engine: &ComputeEngine,
+        run: impl FnOnce(&UnifiedTensor, Epilogue),
+    ) {
+        let mut grad_ref = self.grad.borrow_mut();
+        let size: usize = self.data.shape.iter().product();
+        match grad_ref.as_ref() {
+            Some(existing)
+                if existing.is_unique() && existing.shape.iter().product::<usize>() == size =>
+            {
+                run(existing, Epilogue::ACCUMULATE);
+            }
+            Some(existing) => {
+                let product = UnifiedTensor::empty(&self.ctx, &self.data.shape);
+                run(&product, Epilogue::STORE);
+                let res = UnifiedTensor::empty(&self.ctx, &self.data.shape);
+                engine.add(&self.ctx, existing, &product, &res);
+                *grad_ref = Some(res);
+            }
+            None => {
+                let product = UnifiedTensor::empty(&self.ctx, &self.data.shape);
+                run(&product, Epilogue::STORE);
+                *grad_ref = Some(product);
+            }
         }
     }
 
@@ -286,6 +336,123 @@ impl AutogradNode for MatMulNode {
             UnifiedTensor::empty(&self.b.ctx, &[1])
         };
         vec![grad_a, grad_b]
+    }
+    /// The same gradients as [`backward`](AutogradNode::backward), each
+    /// added into its input's slot by the matmul that computes it.
+    fn backward_accumulate(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> bool {
+        let ctx = &self.a.ctx;
+        if self.a.requires_grad {
+            self.a.accumulate_grad_with(engine, |out, ep| {
+                engine.matmul_bt_into(ctx, grad, &self.b.data, out, ep);
+            });
+        }
+        if self.b.requires_grad {
+            self.b.accumulate_grad_with(engine, |out, ep| {
+                engine.matmul_at_into(ctx, &self.a.data, grad, out, ep);
+            });
+        }
+        true
+    }
+}
+
+/// Backward node of [`Tensor::lora_matmul`]: `y = x @ w + scale * (x @ a) @ b`.
+pub struct LoraMatMulNode {
+    /// Input `[M, K]`.
+    pub x: Tensor,
+    /// Base weight `[K, N]` (f32, f16 or 4-bit).
+    pub w: Tensor,
+    /// Adapter down-projection `[K, R]`.
+    pub a: Tensor,
+    /// Adapter up-projection `[R, N]`.
+    pub b: Tensor,
+    /// `scale * (x @ a)`, `[M, R]`, kept from the forward pass.
+    pub xa: UnifiedTensor,
+    /// The adapter's scale, `alpha / rank`.
+    pub scale: f32,
+}
+impl LoraMatMulNode {
+    /// The gradient of `x @ a`: `scale * grad @ b^T`, with the bits of the
+    /// separate matmul and scale ops.
+    fn grad_xa(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> UnifiedTensor {
+        let g = UnifiedTensor::empty(&self.x.ctx, &self.xa.shape);
+        let ep = Epilogue::scaled(self.scale);
+        engine.matmul_bt_into(&self.x.ctx, grad, &self.b.data, &g, ep);
+        g
+    }
+}
+impl AutogradNode for LoraMatMulNode {
+    fn inputs(&self) -> Vec<Tensor> {
+        vec![
+            self.x.clone(),
+            self.w.clone(),
+            self.a.clone(),
+            self.b.clone(),
+        ]
+    }
+    /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
+    fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
+        let ctx = &self.x.ctx;
+        // Inputs that need no gradient get a placeholder, as in MatMulNode.
+        let slot = |t: &Tensor| {
+            let shape: &[usize] = if t.requires_grad { &t.data.shape } else { &[1] };
+            UnifiedTensor::empty(ctx, shape)
+        };
+        let (grad_x, grad_w, grad_a, grad_b) =
+            (slot(&self.x), slot(&self.w), slot(&self.a), slot(&self.b));
+        if self.x.requires_grad || self.a.requires_grad {
+            let g_xa = self.grad_xa(grad, engine);
+            if self.x.requires_grad {
+                engine.matmul_bt_into(ctx, &g_xa, &self.a.data, &grad_x, Epilogue::STORE);
+            }
+            if self.a.requires_grad {
+                engine.matmul_at_into(ctx, &self.x.data, &g_xa, &grad_a, Epilogue::STORE);
+            }
+        }
+        if self.x.requires_grad {
+            engine.matmul_bt_into(ctx, grad, &self.w.data, &grad_x, Epilogue::ACCUMULATE);
+        }
+        if self.w.requires_grad {
+            engine.matmul_at_into(ctx, &self.x.data, grad, &grad_w, Epilogue::STORE);
+        }
+        if self.b.requires_grad {
+            engine.matmul_at_into(ctx, &self.xa, grad, &grad_b, Epilogue::STORE);
+        }
+        vec![grad_x, grad_w, grad_a, grad_b]
+    }
+    /// Adds the gradients into the inputs' slots in the order the separate
+    /// matmul, scale and add ops reached them: the adapter's share of `x`'s
+    /// gradient before the base weight's, so every sum keeps its bits.
+    fn backward_accumulate(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> bool {
+        let ctx = &self.x.ctx;
+        if self.b.requires_grad {
+            self.b.accumulate_grad_with(engine, |out, ep| {
+                engine.matmul_at_into(ctx, &self.xa, grad, out, ep);
+            });
+        }
+        if self.x.requires_grad || self.a.requires_grad {
+            let g_xa = self.grad_xa(grad, engine);
+            if self.x.requires_grad {
+                self.x.accumulate_grad_with(engine, |out, ep| {
+                    engine.matmul_bt_into(ctx, &g_xa, &self.a.data, out, ep);
+                });
+            }
+            if self.a.requires_grad {
+                self.a.accumulate_grad_with(engine, |out, ep| {
+                    engine.matmul_at_into(ctx, &self.x.data, &g_xa, out, ep);
+                });
+            }
+        }
+        if self.x.requires_grad {
+            self.x.accumulate_grad_with(engine, |out, ep| {
+                engine.matmul_bt_into(ctx, grad, &self.w.data, out, ep);
+            });
+        }
+        if self.w.requires_grad {
+            self.w.accumulate_grad_with(engine, |out, ep| {
+                engine.matmul_at_into(ctx, &self.x.data, grad, out, ep);
+            });
+        }
+        true
     }
 }
 
@@ -1021,6 +1188,38 @@ impl Tensor {
             b: b.clone(),
         });
         Tensor::with_creator(a.ctx.clone(), out_data, node)
+    }
+    /// `x @ w + scale * (x @ a) @ b`: a linear layer with a low-rank adapter,
+    /// in three matmuls. `x` is `[M, K]`, `w` `[K, N]` (f32, f16 or 4-bit),
+    /// and the adapter's `a` `[K, R]` and `b` `[R, N]` are f32.
+    ///
+    /// The values are those of [`matmul`](Self::matmul), [`scale`](Self::scale)
+    /// and [`add`](Self::add) applied in that order: the scale is applied to
+    /// the rounded `x @ a`, and the adapter's product is added to the rounded
+    /// base product. Backward adds into the gradients in the same order.
+    pub fn lora_matmul(
+        x: &Tensor,
+        w: &Tensor,
+        (a, b): (&Tensor, &Tensor),
+        scale: f32,
+        engine: &ComputeEngine,
+    ) -> Tensor {
+        let ctx = &x.ctx;
+        let rows = x.data.shape[0];
+        let out = UnifiedTensor::empty(ctx, &[rows, w.data.shape[1]]);
+        engine.matmul_into(ctx, &x.data, &w.data, &out, Epilogue::STORE);
+        let xa = UnifiedTensor::empty(ctx, &[rows, a.data.shape[1]]);
+        engine.matmul_into(ctx, &x.data, &a.data, &xa, Epilogue::scaled(scale));
+        engine.matmul_into(ctx, &xa, &b.data, &out, Epilogue::ACCUMULATE);
+        let node = Arc::new(LoraMatMulNode {
+            x: x.clone(),
+            w: w.clone(),
+            a: a.clone(),
+            b: b.clone(),
+            xa,
+            scale,
+        });
+        Tensor::with_creator(ctx.clone(), out, node)
     }
     /// Element-wise sum of equally shaped tensors.
     pub fn add(a: &Tensor, b: &Tensor, engine: &ComputeEngine) -> Tensor {
