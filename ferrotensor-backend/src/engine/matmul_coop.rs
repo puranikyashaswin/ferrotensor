@@ -602,7 +602,7 @@ fn matmul_coop(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_i
 #[cfg(test)]
 #[allow(clippy::panic)]
 mod tests {
-    use super::{source, CoopKey, CoopTile, BK, TILES};
+    use super::{source, CoopKey, CoopTile, BK, PAD, TILES};
 
     fn keys() -> Vec<CoopKey> {
         let mut keys = Vec::new();
