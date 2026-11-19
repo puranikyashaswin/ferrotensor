@@ -1,7 +1,8 @@
 //! Rotary embeddings and fused (flash) attention.
 
-use super::{dummy_storage, groups64, uniform, ComputeEngine};
+use super::{groups64, ComputeEngine};
 use crate::{UnifiedTensor, WgpuContext};
+use std::sync::Arc;
 use wgpu::Buffer;
 
 impl ComputeEngine {
@@ -57,24 +58,21 @@ impl ComputeEngine {
         };
         let total = tensor.shape.iter().product::<usize>();
         let heads = total / (tokens * head_dim).max(1);
-        let params = uniform(
-            ctx,
-            bytemuck::cast_slice(&[
-                head_dim as u32,
-                seq_len as u32,
-                pos as u32,
-                heads as u32,
-                theta.to_bits(),
-                inverse as u32,
-                0,
-                0,
-            ]),
-        );
+        let params = ctx.uniform_buffer(bytemuck::cast_slice(&[
+            head_dim as u32,
+            seq_len as u32,
+            pos as u32,
+            heads as u32,
+            theta.to_bits(),
+            inverse as u32,
+            0,
+            0,
+        ]));
         let pairs = tensor.shape.iter().product::<usize>() / 2;
         self.run(
             ctx,
             &self.rope,
-            &[(0, tensor.buffer()), (1, &params)],
+            &[(0, tensor.shared_buffer()), (1, &params)],
             groups64(pairs),
         );
     }
@@ -145,14 +143,7 @@ impl ComputeEngine {
     ) {
         let dims = AttentionDims::new(q, k);
         let params = dims.params(ctx, opts, mask);
-        let dummy;
-        let mask_buf = match mask {
-            Some(m) => m.buffer(),
-            None => {
-                dummy = dummy_storage(ctx);
-                &dummy
-            }
-        };
+        let mask_buf = mask.map_or(&self.unused_storage, UnifiedTensor::shared_buffer);
         // One query (decoding) gets a kernel whose threads split the keys;
         // the other gives each thread a query, which would leave 127 idle.
         let kernel = if dims.seq_q == 1 {
@@ -164,10 +155,10 @@ impl ComputeEngine {
             ctx,
             kernel,
             &[
-                (0, q.buffer()),
-                (1, k.buffer()),
-                (2, v.buffer()),
-                (3, out.buffer()),
+                (0, q.shared_buffer()),
+                (1, k.shared_buffer()),
+                (2, v.shared_buffer()),
+                (3, out.shared_buffer()),
                 (4, &params),
                 (5, mask_buf),
             ],
@@ -246,37 +237,26 @@ impl ComputeEngine {
     ) {
         let dims = AttentionDims::new(q, k);
         let params = dims.params_bwd(ctx, opts, mask);
-        let dummy;
-        let mask_buf = match mask {
-            Some(m) => m.buffer(),
-            None => {
-                dummy = dummy_storage(ctx);
-                &dummy
-            }
-        };
-        // Per (batch, head, query) row: [Delta, LSE].
-        let stats = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Flash Bwd Stats"),
-            size: (dims.batch * dims.heads * dims.seq_q).max(1) as u64 * 8,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-        // Dropped at the end of this function, before the dispatches run.
-        ctx.memory().count_dispatch_buffer(stats.size());
+        let mask_buf = mask.map_or(&self.unused_storage, UnifiedTensor::shared_buffer);
+        // Per (batch, head, query) row: [Delta, LSE]. The dQ kernel writes
+        // every row before the dK/dV kernel reads it, so a pooled buffer
+        // with stale contents is fine.
+        let rows = (dims.batch * dims.heads * dims.seq_q).max(1) as usize;
+        let stats = UnifiedTensor::empty(ctx, &[rows, 2]);
         let (b, h, hkv) = (dims.batch, dims.heads, dims.kv_heads);
         self.run(
             ctx,
             &self.flash_attn_v2_bw_dq,
             &[
-                (0, q.buffer()),
-                (1, k.buffer()),
-                (2, v.buffer()),
-                (3, out.buffer()),
-                (4, grad_out.buffer()),
-                (5, grad_q.buffer()),
+                (0, q.shared_buffer()),
+                (1, k.shared_buffer()),
+                (2, v.shared_buffer()),
+                (3, out.shared_buffer()),
+                (4, grad_out.shared_buffer()),
+                (5, grad_q.shared_buffer()),
                 (8, &params),
                 (9, mask_buf),
-                (10, &stats),
+                (10, stats.shared_buffer()),
             ],
             (1, dims.seq_q.div_ceil(128), b * h),
         );
@@ -284,15 +264,15 @@ impl ComputeEngine {
             ctx,
             &self.flash_attn_v2_bw_dkdv,
             &[
-                (0, q.buffer()),
-                (1, k.buffer()),
-                (2, v.buffer()),
-                (4, grad_out.buffer()),
-                (6, grad_k.buffer()),
-                (7, grad_v.buffer()),
+                (0, q.shared_buffer()),
+                (1, k.shared_buffer()),
+                (2, v.shared_buffer()),
+                (4, grad_out.shared_buffer()),
+                (6, grad_k.shared_buffer()),
+                (7, grad_v.shared_buffer()),
                 (8, &params),
                 (9, mask_buf),
-                (10, &stats),
+                (10, stats.shared_buffer()),
             ],
             (1, dims.seq_k.div_ceil(128), b * hkv),
         );
@@ -355,7 +335,7 @@ impl AttentionDims {
         ctx: &WgpuContext,
         opts: &AttentionOptions,
         mask: Option<&UnifiedTensor>,
-    ) -> Buffer {
+    ) -> Arc<Buffer> {
         let (has_mask, s) = mask_strides(mask);
         let params: [u32; 20] = [
             self.batch,
@@ -367,7 +347,7 @@ impl AttentionDims {
             self.scale().to_bits(),
             self.kv_heads,
             opts.dropout_prob.to_bits(),
-            opts.seed as u32,
+            opts.kernel_seed() as u32,
             has_mask,
             opts.causal_offset,
             s[0],
@@ -375,11 +355,11 @@ impl AttentionDims {
             s[2],
             s[3],
             opts.window,
-            (opts.seed >> 32) as u32,
+            (opts.kernel_seed() >> 32) as u32,
             0,
             0,
         ];
-        uniform(ctx, bytemuck::cast_slice(&params))
+        ctx.uniform_buffer(bytemuck::cast_slice(&params))
     }
 
     /// Uniform for the backward kernels (`FlashBwdParams`).
@@ -388,7 +368,7 @@ impl AttentionDims {
         ctx: &WgpuContext,
         opts: &AttentionOptions,
         mask: Option<&UnifiedTensor>,
-    ) -> Buffer {
+    ) -> Arc<Buffer> {
         let (has_mask, s) = mask_strides(mask);
         let params: [u32; 20] = [
             self.batch,
@@ -399,7 +379,7 @@ impl AttentionDims {
             self.kv_heads,
             self.scale().to_bits(),
             opts.dropout_prob.to_bits(),
-            opts.seed as u32,
+            opts.kernel_seed() as u32,
             opts.causal as u32,
             has_mask,
             opts.causal_offset,
@@ -408,11 +388,11 @@ impl AttentionDims {
             s[2],
             s[3],
             opts.window,
-            (opts.seed >> 32) as u32,
+            (opts.kernel_seed() >> 32) as u32,
             0,
             0,
         ];
-        uniform(ctx, bytemuck::cast_slice(&params))
+        ctx.uniform_buffer(bytemuck::cast_slice(&params))
     }
 }
 
@@ -435,6 +415,19 @@ pub struct AttentionOptions {
     pub dropout_prob: f32,
     /// Seed for the dropout pattern (all 64 bits are used).
     pub seed: u64,
+}
+
+impl AttentionOptions {
+    /// The seed written to the kernel parameters. The kernels ignore it
+    /// when `dropout_prob <= 0.0`, so it is 0 there and steps that differ
+    /// only in seed share one uniform buffer.
+    fn kernel_seed(&self) -> u64 {
+        if self.dropout_prob <= 0.0 {
+            0
+        } else {
+            self.seed
+        }
+    }
 }
 
 /// Broadcast strides `[b, h, q, k]` for an additive attention mask of shape

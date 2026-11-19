@@ -1,7 +1,9 @@
 //! Dequantisation kernels.
 
-use super::{groups64, ComputeEngine};
+use super::{groups64, record_dispatch, ComputeEngine};
+use crate::kernel_timing::KernelLabel;
 use crate::{UnifiedTensor, WgpuContext};
+use std::sync::Arc;
 
 impl ComputeEngine {
     /// Unpacks bytes to floats: element `i` of `out` is byte `i` of `input`
@@ -11,7 +13,7 @@ impl ComputeEngine {
         self.run(
             ctx,
             &self.dequant,
-            &[(0, input.buffer()), (1, out.buffer())],
+            &[(0, input.shared_buffer()), (1, out.shared_buffer())],
             groups64(words),
         );
     }
@@ -26,10 +28,22 @@ impl ComputeEngine {
         biases: &wgpu::Buffer,
         out: &UnifiedTensor,
     ) {
-        self.run(
+        // Raw buffers have no pool identity to cache a bind group by; this
+        // runs once per weight at load time.
+        let bind_group = ctx.create_bind_group(
+            &self.affine_dequant.layout,
+            &[(0, weight), (1, scales), (2, biases), (3, out.buffer())],
+        );
+        let label = KernelLabel {
+            entry: self.affine_dequant.entry_point,
+            layout: "",
+            size_class: "",
+        };
+        record_dispatch(
             ctx,
             &self.affine_dequant,
-            &[(0, weight), (1, scales), (2, biases), (3, out.buffer())],
+            Arc::new(bind_group),
+            label,
             groups64(out.shape.iter().product()),
         );
     }

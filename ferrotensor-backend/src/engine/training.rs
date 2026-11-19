@@ -1,6 +1,6 @@
 //! Losses, optimisers and gradient utilities.
 
-use super::{grid, groups64, uniform, ComputeEngine};
+use super::{grid, groups64, ComputeEngine};
 use crate::{UnifiedTensor, WgpuContext};
 
 /// Target id that excludes a row from [`ComputeEngine::masked_cross_entropy`].
@@ -40,11 +40,15 @@ impl ComputeEngine {
         grad: &UnifiedTensor,
         lr: f32,
     ) {
-        let lr_buf = uniform(ctx, bytemuck::cast_slice(&[lr]));
+        let lr_buf = ctx.uniform_buffer(bytemuck::cast_slice(&[lr]));
         self.run(
             ctx,
             &self.sgd,
-            &[(0, weight.buffer()), (1, grad.buffer()), (2, &lr_buf)],
+            &[
+                (0, weight.shared_buffer()),
+                (1, grad.shared_buffer()),
+                (2, &lr_buf),
+            ],
             groups64(weight.shape.iter().product()),
         );
     }
@@ -60,15 +64,15 @@ impl ComputeEngine {
         v: &UnifiedTensor,
         params: &AdamParams,
     ) {
-        let params_buf = uniform(ctx, bytemuck::bytes_of(params));
+        let params_buf = ctx.uniform_buffer(bytemuck::bytes_of(params));
         self.run(
             ctx,
             &self.adamw,
             &[
-                (0, weight.buffer()),
-                (1, grad.buffer()),
-                (3, m.buffer()),
-                (4, v.buffer()),
+                (0, weight.shared_buffer()),
+                (1, grad.shared_buffer()),
+                (3, m.shared_buffer()),
+                (4, v.shared_buffer()),
                 (5, &params_buf),
             ],
             groups64(weight.shape.iter().product()),
@@ -98,9 +102,9 @@ impl ComputeEngine {
             ctx,
             &self.mse_loss_bw,
             &[
-                (0, pred.buffer()),
-                (1, target.buffer()),
-                (3, grad_in.buffer()),
+                (0, pred.shared_buffer()),
+                (1, target.shared_buffer()),
+                (3, grad_in.shared_buffer()),
             ],
             groups64(pred.shape.iter().product()),
         );
@@ -115,11 +119,15 @@ impl ComputeEngine {
         loss_out: &UnifiedTensor,
     ) {
         let vocab_size = logits.shape.iter().product::<usize>() as u32;
-        let params = uniform(ctx, bytemuck::cast_slice(&[target, vocab_size, 0, 0]));
+        let params = ctx.uniform_buffer(bytemuck::cast_slice(&[target, vocab_size, 0, 0]));
         self.run(
             ctx,
             &self.ce_loss,
-            &[(0, logits.buffer()), (1, loss_out.buffer()), (2, &params)],
+            &[
+                (0, logits.shared_buffer()),
+                (1, loss_out.shared_buffer()),
+                (2, &params),
+            ],
             (1, 1, 1),
         );
     }
@@ -133,11 +141,15 @@ impl ComputeEngine {
         grad_out: &UnifiedTensor,
     ) {
         let vocab_size = logits.shape.iter().product::<usize>() as u32;
-        let params = uniform(ctx, bytemuck::cast_slice(&[target, vocab_size, 0, 0]));
+        let params = ctx.uniform_buffer(bytemuck::cast_slice(&[target, vocab_size, 0, 0]));
         self.run(
             ctx,
             &self.ce_loss_bw,
-            &[(0, logits.buffer()), (1, grad_out.buffer()), (2, &params)],
+            &[
+                (0, logits.shared_buffer()),
+                (1, grad_out.shared_buffer()),
+                (2, &params),
+            ],
             groups64(vocab_size as usize),
         );
     }
@@ -152,18 +164,18 @@ impl ComputeEngine {
         self.run(
             ctx,
             &self.grad_norm,
-            &[(0, input.buffer()), (1, out.buffer())],
+            &[(0, input.shared_buffer()), (1, out.shared_buffer())],
             groups64(input.shape.iter().product()),
         );
     }
 
     /// Clip gradients by scaling: grad *= min(1.0, max_norm / actual_norm)
     pub fn clip_grad_by_norm(&self, ctx: &WgpuContext, grad: &UnifiedTensor, scale: f32) {
-        let params = uniform(ctx, bytemuck::cast_slice(&[scale]));
+        let params = ctx.uniform_buffer(bytemuck::cast_slice(&[scale]));
         self.run(
             ctx,
             &self.grad_clip,
-            &[(0, grad.buffer()), (1, &params)],
+            &[(0, grad.shared_buffer()), (1, &params)],
             groups64(grad.shape.iter().product()),
         );
     }
@@ -179,7 +191,10 @@ impl ComputeEngine {
         self.run(
             ctx,
             &self.grad_accum,
-            &[(0, accum_grad.buffer()), (1, new_grad.buffer())],
+            &[
+                (0, accum_grad.shared_buffer()),
+                (1, new_grad.shared_buffer()),
+            ],
             groups64(accum_grad.shape.iter().product()),
         );
     }
@@ -187,11 +202,11 @@ impl ComputeEngine {
     /// Gradient scaling: grad *= scale_factor
     /// Used to average gradients after accumulation
     pub fn gradient_scale(&self, ctx: &WgpuContext, grad: &UnifiedTensor, scale: f32) {
-        let params = uniform(ctx, bytemuck::cast_slice(&[scale]));
+        let params = ctx.uniform_buffer(bytemuck::cast_slice(&[scale]));
         self.run(
             ctx,
             &self.grad_scale,
-            &[(0, grad.buffer()), (1, &params)],
+            &[(0, grad.shared_buffer()), (1, &params)],
             groups64(grad.shape.iter().product()),
         );
     }
@@ -238,20 +253,17 @@ impl ComputeEngine {
         if rows == 0 || vocab == 0 {
             return;
         }
-        let params = uniform(
-            ctx,
-            bytemuck::cast_slice(&[vocab as u32, rows as u32, 0, 0]),
-        );
+        let params = ctx.uniform_buffer(bytemuck::cast_slice(&[vocab as u32, rows as u32, 0, 0]));
         self.run(
             ctx,
             &self.masked_ce,
             &[
-                (0, logits.buffer()),
-                (1, targets.buffer()),
-                (2, grad.buffer()),
-                (3, row_loss.buffer()),
+                (0, logits.shared_buffer()),
+                (1, targets.shared_buffer()),
+                (2, grad.shared_buffer()),
+                (3, row_loss.shared_buffer()),
                 (4, &params),
-                (5, weights.buffer()),
+                (5, weights.shared_buffer()),
             ],
             grid(rows as u32),
         );
@@ -272,11 +284,15 @@ impl ComputeEngine {
         if chunks == 0 {
             return 0;
         }
-        let params = uniform(ctx, bytemuck::cast_slice(&[n as u32, offset as u32, 0, 0]));
+        let params = ctx.uniform_buffer(bytemuck::cast_slice(&[n as u32, offset as u32, 0, 0]));
         self.run(
             ctx,
             &self.sum_squares,
-            &[(0, input.buffer()), (1, out.buffer()), (2, &params)],
+            &[
+                (0, input.shared_buffer()),
+                (1, out.shared_buffer()),
+                (2, &params),
+            ],
             grid(chunks as u32),
         );
         chunks

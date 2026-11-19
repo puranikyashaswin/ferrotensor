@@ -120,6 +120,11 @@ impl UnifiedTensor {
         &self.data.buffer
     }
 
+    /// The buffer as shared with the pool, for the bind group cache.
+    pub(crate) fn shared_buffer(&self) -> &Arc<Buffer> {
+        &self.data.buffer
+    }
+
     /// Size of the tensor's data in bytes.
     pub fn size_in_bytes(&self) -> u64 {
         self.data.size_in_bytes

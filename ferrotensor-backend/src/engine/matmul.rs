@@ -1,6 +1,6 @@
 //! Matrix multiplication kernels.
 
-use super::{grid, uniform, ComputeEngine, Kernel};
+use super::{grid, ComputeEngine, Kernel};
 use crate::kernel_timing::KernelLabel;
 use crate::{DType, UnifiedTensor, WgpuContext};
 
@@ -200,16 +200,16 @@ impl ComputeEngine {
                     Thin::B => "n<=64",
                 },
             };
-            let params = uniform(ctx, bytemuck::cast_slice(&params));
+            let params = ctx.uniform_buffer(bytemuck::cast_slice(&params));
             // One 16x16 workgroup per 8 rows by 32 columns of the thin product.
             self.run_labeled(
                 ctx,
                 kernel,
                 label,
                 &[
-                    (0, t.buffer()),
-                    (1, w.buffer()),
-                    (2, out.buffer()),
+                    (0, t.shared_buffer()),
+                    (1, w.shared_buffer()),
+                    (2, out.shared_buffer()),
                     (3, &params),
                 ],
                 (rows.div_ceil(8), cols.div_ceil(32), 1),
@@ -223,16 +223,16 @@ impl ComputeEngine {
         };
         // The 4-bit kernel reads log2 of the group size above the layout.
         let mode = layout as u32 | b.q4_group().map_or(0, |g| g.size().trailing_zeros() << 8);
-        let params = uniform(ctx, bytemuck::cast_slice(&[m, k, n, mode]));
+        let params = ctx.uniform_buffer(bytemuck::cast_slice(&[m, k, n, mode]));
         // One 16x16 workgroup per 64x64 output tile.
         self.run_labeled(
             ctx,
             kernel,
             matmul_label(kernel, layout, m, k, n),
             &[
-                (0, a.buffer()),
-                (1, b.buffer()),
-                (2, out.buffer()),
+                (0, a.shared_buffer()),
+                (1, b.shared_buffer()),
+                (2, out.shared_buffer()),
                 (3, &params),
             ],
             (n.div_ceil(64), m.div_ceil(64), 1),
@@ -259,14 +259,14 @@ impl ComputeEngine {
                 b.q4_group().map_or(0, |g| g.size().trailing_zeros()),
             ),
         };
-        let params = uniform(ctx, bytemuck::cast_slice(&[k, n, log2_group, 0]));
+        let params = ctx.uniform_buffer(bytemuck::cast_slice(&[k, n, log2_group, 0]));
         self.run(
             ctx,
             kernel,
             &[
-                (0, a.buffer()),
-                (1, b.buffer()),
-                (2, out.buffer()),
+                (0, a.shared_buffer()),
+                (1, b.shared_buffer()),
+                (2, out.shared_buffer()),
                 (3, &params),
             ],
             grid(n.div_ceil(columns_per_group)),

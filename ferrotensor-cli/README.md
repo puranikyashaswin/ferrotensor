@@ -409,8 +409,8 @@ it does only after the work using it has run and the device is maintained
 (on every batch submission and device poll). Kernels are recorded and
 submitted in batches, and the host usually records well ahead of the GPU.
 Every tensor the pool does not keep (created from host data, or beyond its
-cap with pool overflow off), every per-dispatch uniform, dummy and scratch
-buffer, the readback copy after the read, and the temporary buffer of a
+cap with pool overflow off), every new kernel uniform buffer (afterwards
+kept for reuse and not counted), the readback copy after the read, and the temporary buffer of a
 quantised weight upload stay on the GPU until the batch recorded when they
 were dropped has finished; the report counts them as awaiting GPU until
 that is known (at a later submission, or at the latest the next wait for
@@ -438,7 +438,7 @@ the phase peak with their category, dtype and shape.
 The report counts only buffers Ferrotensor allocated through wgpu, so it is
 lower than `nvidia-smi` or Activity Monitor. Not counted: the driver's
 context and its allocator's blocks, alignment and slack, compiled
-pipelines, shaders and bind groups, the staging copies wgpu makes for
+pipelines, shaders, bind groups and the uniform buffers kept for reuse, the staging copies wgpu makes for
 uploads (released every 256 MiB of uploads), and buffers of the
 `ferrotensor` tensor API. A buffer is
 counted under the phase that created it; the logits, the loss gradient and
@@ -462,7 +462,9 @@ profile: median of <steps> optimizer steps by wall time
   dispatches                 <count> /step
   compute passes             <count> /step
   bind groups                <count> /step
+  bind groups reused         <count> /step
   uniform buffers            <count> /step
+  uniform buffers reused     <count> /step
   uniform bytes              <bytes> /step
   submits                    <count> /step
   device polls               <count> /step
@@ -473,7 +475,9 @@ profile: median of <steps> optimizer steps by wall time
   readback bytes             <bytes> /step
 ```
 
-The values in angle brackets are placeholders. Step time minus the time
+The values in angle brackets are placeholders. Bind groups and uniform
+buffers are created once and reused while their buffers live, so from the
+third step on most dispatches count as reused. Step time minus the time
 waiting on the GPU is roughly the time the host spends recording work;
 waiting includes the wait inside each readback, and forced synchronizes
 are the waits that free upload staging memory every 256 MiB of uploads.

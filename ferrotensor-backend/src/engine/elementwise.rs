@@ -48,7 +48,11 @@ impl ComputeEngine {
         self.run(
             ctx,
             kernel,
-            &[(0, a.buffer()), (1, b.buffer()), (2, out.buffer())],
+            &[
+                (0, a.shared_buffer()),
+                (1, b.shared_buffer()),
+                (2, out.shared_buffer()),
+            ],
             groups64(a.shape.iter().product()),
         );
     }
@@ -65,9 +69,9 @@ impl ComputeEngine {
             ctx,
             &self.add_bw,
             &[
-                (3, grad_out.buffer()),
-                (4, grad_a.buffer()),
-                (5, grad_b.buffer()),
+                (3, grad_out.shared_buffer()),
+                (4, grad_a.shared_buffer()),
+                (5, grad_b.shared_buffer()),
             ],
             groups64(grad_out.shape.iter().product()),
         );
@@ -85,9 +89,9 @@ impl ComputeEngine {
             ctx,
             &self.sub_bw,
             &[
-                (3, grad_out.buffer()),
-                (4, grad_a.buffer()),
-                (5, grad_b.buffer()),
+                (3, grad_out.shared_buffer()),
+                (4, grad_a.shared_buffer()),
+                (5, grad_b.shared_buffer()),
             ],
             groups64(grad_out.shape.iter().product()),
         );
@@ -107,11 +111,11 @@ impl ComputeEngine {
             ctx,
             &self.mul_bw,
             &[
-                (3, grad_out.buffer()),
-                (4, a.buffer()),
-                (5, b.buffer()),
-                (6, grad_a.buffer()),
-                (7, grad_b.buffer()),
+                (3, grad_out.shared_buffer()),
+                (4, a.shared_buffer()),
+                (5, b.shared_buffer()),
+                (6, grad_a.shared_buffer()),
+                (7, grad_b.shared_buffer()),
             ],
             groups64(grad_out.shape.iter().product()),
         );
@@ -122,7 +126,7 @@ impl ComputeEngine {
         self.run(
             ctx,
             &self.silu,
-            &[(0, input.buffer()), (1, out.buffer())],
+            &[(0, input.shared_buffer()), (1, out.shared_buffer())],
             groups64(input.shape.iter().product()),
         );
     }
@@ -140,9 +144,9 @@ impl ComputeEngine {
             ctx,
             &self.silu_bw,
             &[
-                (3, grad_out.buffer()),
-                (4, input.buffer()),
-                (5, grad_in.buffer()),
+                (3, grad_out.shared_buffer()),
+                (4, input.shared_buffer()),
+                (5, grad_in.shared_buffer()),
             ],
             groups64(grad_out.shape.iter().product()),
         );
@@ -153,7 +157,7 @@ impl ComputeEngine {
         self.run(
             ctx,
             &self.relu,
-            &[(0, input.buffer()), (1, out.buffer())],
+            &[(0, input.shared_buffer()), (1, out.shared_buffer())],
             groups64(input.shape.iter().product()),
         );
     }
@@ -170,9 +174,9 @@ impl ComputeEngine {
             ctx,
             &self.relu_bw,
             &[
-                (3, grad_out.buffer()),
-                (4, input.buffer()),
-                (5, grad_in.buffer()),
+                (3, grad_out.shared_buffer()),
+                (4, input.shared_buffer()),
+                (5, grad_in.shared_buffer()),
             ],
             groups64(grad_out.shape.iter().product()),
         );
@@ -204,11 +208,11 @@ impl ComputeEngine {
             ctx,
             &self.silu_gate_bw,
             &[
-                (0, up.buffer()),
-                (1, gate.buffer()),
-                (3, grad_out.buffer()),
-                (4, grad_up.buffer()),
-                (5, grad_gate.buffer()),
+                (0, up.shared_buffer()),
+                (1, gate.shared_buffer()),
+                (3, grad_out.shared_buffer()),
+                (4, grad_up.shared_buffer()),
+                (5, grad_gate.shared_buffer()),
             ],
             groups64(up.shape.iter().product()),
         );

@@ -1,5 +1,6 @@
 //! GPU device setup.
 
+use crate::dispatch_cache::DispatchCache;
 use crate::kernel_timing::{
     KernelLabel, KernelTimer, KernelTimes, KernelTiming, KernelTimingMode, PendingTimes,
 };
@@ -36,10 +37,12 @@ pub const UPLOAD_RELEASE_BYTES: u64 = 256 << 20;
 /// `queue`, so it runs after the recorded ops, and
 /// [`synchronize`](Self::synchronize) to wait for the GPU.
 ///
+/// Dispatches reuse uniform buffers and bind groups that the context caches.
 /// After each submission, and whenever it waits for the GPU, the context
-/// drops pooled buffers above the pool's cap that the GPU has finished with
-/// and polls the device without blocking, so wgpu destroys them at once (see
-/// [`BufferPool`] on overflow).
+/// drops pooled buffers above the pool's cap that the GPU has finished with,
+/// and the cached bind groups of dropped buffers, and polls the device
+/// without blocking, so wgpu destroys them at once (see [`BufferPool`] on
+/// overflow).
 ///
 /// Uploads (creating a tensor from host data, or writing one) go through a
 /// host-side staging buffer that wgpu frees only after a later submission
@@ -62,6 +65,7 @@ pub struct WgpuContext {
     /// Bytes uploaded since staging buffers were last released.
     staged: AtomicU64,
     pub(crate) counters: GpuCounters,
+    pub(crate) dispatch_cache: DispatchCache,
     /// Timestamp queries, with [`KernelTiming::On`] on an adapter that has them.
     timer: Option<KernelTimer>,
 }
@@ -88,7 +92,9 @@ impl std::fmt::Debug for Pending {
 /// One kernel dispatch waiting to be encoded.
 pub(crate) struct Dispatch {
     pub(crate) pipeline: Arc<ComputePipeline>,
-    pub(crate) bind_group: BindGroup,
+    /// Shared with the bind group cache; holding it here keeps the bind
+    /// group and the buffers it binds alive until the dispatch is encoded.
+    pub(crate) bind_group: Arc<BindGroup>,
     pub(crate) groups: (u32, u32, u32),
     pub(crate) label: KernelLabel,
 }
@@ -278,6 +284,7 @@ impl WgpuContext {
             pending: Mutex::new(Pending::default()),
             staged: AtomicU64::new(0),
             counters: GpuCounters::default(),
+            dispatch_cache: DispatchCache::default(),
             timer,
         })
     }
@@ -465,11 +472,13 @@ impl WgpuContext {
         }
     }
 
-    /// Drops pooled buffers above the cap that the GPU has finished with and,
-    /// if any, polls once without blocking so wgpu destroys them now rather
-    /// than at the next submission.
+    /// Drops pooled buffers above the cap that the GPU has finished with and
+    /// the cached bind groups of dropped buffers and, if any, polls once
+    /// without blocking so wgpu destroys them now rather than at the next
+    /// submission.
     fn release_idle_buffers(&self) {
-        if self.pool.trim() > 0 {
+        let trimmed = self.pool.trim();
+        if trimmed + self.evict_dead_bind_groups() > 0 {
             self.poll();
         }
     }
