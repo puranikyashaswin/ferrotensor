@@ -458,9 +458,91 @@ fn split_k_applies_alpha_beta_and_keeps_the_overflow_poison() {
     let Some(got) = got else {
         return;
     };
+    // Each column workgroup of row block 0 stages a[5] in slice 0, and each counts it once.
+    let gx = n.div_ceil(64) as u64;
     assert_eq!(
         pollster::block_on(g.engine.coop_f16_overflows(&g.ctx)).unwrap(),
-        before + 1
+        before + gx
     );
     assert!(got[0].is_nan(), "the tile's first element is poisoned");
+    assert!(
+        got[64].is_nan(),
+        "the second column workgroup's tile is poisoned too"
+    );
+    assert!(
+        got[64 * n].is_finite(),
+        "row block 1 never staged a[5], so its tile stays finite"
+    );
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn coop_overflow_count_is_per_column_workgroup() {
+    let Some(g) = coop_gpu("coop_overflow_count_is_per_column_workgroup") else {
+        return;
+    };
+    // The counter counts staging threads per workgroup, so one bad value of
+    // `a` is counted once for every column workgroup that stages it.
+    let (m, k) = (64, 64);
+    for tile in [CoopTile::ALL[3], CoopTile::ALL[4]] {
+        for n in [16, 64, 72, 200] {
+            let a = rand_vec(m * k, 21);
+            let b = rand_vec(k * n, 22);
+            let mut big = a.clone();
+            big[5] = 70_000.0;
+            let config = CoopConfig { tile, split: 1 };
+            let zeros = vec![0.0; m * n];
+            let before = pollster::block_on(g.engine.coop_f16_overflows(&g.ctx)).unwrap();
+            let ep = (Epilogue::STORE, zeros.as_slice());
+            let Some(got) = run_or_skip(g, (m, k, n), (&big, &b), false, ep, config) else {
+                continue;
+            };
+            let after = pollster::block_on(g.engine.coop_f16_overflows(&g.ctx)).unwrap();
+            let columns = n.div_ceil(tile.bn as usize);
+            assert_eq!(after - before, columns as u64, "{} n {n}", tile.name());
+            for j in 0..columns {
+                let first = j * tile.bn as usize;
+                assert!(
+                    got[first].is_nan(),
+                    "{} n {n}: column tile {j} is not poisoned",
+                    tile.name()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn coop_rounds_unrepresentable_a_within_one_ulp() {
+    let Some(g) = coop_gpu("coop_rounds_unrepresentable_a_within_one_ulp") else {
+        return;
+    };
+    // The kernel converts `a` to f16 on load, so with f32 `a` the output is
+    // that of the rounded values. Each product of `a` in [-1, 1) is off by at
+    // most 2^-11 of itself; the bound below allows twice that, so it holds
+    // under either neighbour the driver may round to.
+    for (m, k, n) in [(64, 64, 64), (77, 50, 33), (100, 37, 70), (130, 200, 72)] {
+        let a = rand_vec(m * k, 31);
+        let b = f16_round(&rand_vec(k * n, 32));
+        let want = cpu_matmul(&a, &b, (m, k, n));
+        let abs_a: Vec<f32> = a.iter().map(|v| v.abs()).collect();
+        let abs_b: Vec<f32> = b.iter().map(|v| v.abs()).collect();
+        let scale = cpu_matmul(&abs_a, &abs_b, (m, k, n));
+        let got = run_coop(
+            g,
+            (m, k, n),
+            &a,
+            &b,
+            false,
+            (Epilogue::STORE, &vec![0.0; m * n]),
+        );
+        for (i, ((&x, &w), &s)) in got.iter().zip(&want).zip(&scale).enumerate() {
+            let bound = s / 1024.0 + 1e-6;
+            assert!(
+                (f64::from(x) - w).abs() <= bound,
+                "{m}x{k}x{n} element {i}: got {x}, want {w}, bound {bound}"
+            );
+        }
+    }
 }

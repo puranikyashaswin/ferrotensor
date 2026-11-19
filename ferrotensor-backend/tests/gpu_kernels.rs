@@ -271,6 +271,16 @@ fn f16_round(x: &[f32]) -> Vec<f32> {
     x.iter().map(|&v| half::f16::from_f32(v).to_f32()).collect()
 }
 
+/// `x` as the f16-weight matmuls see it: with the cooperative-matrix kernel
+/// routed, `a` is converted to f16, so tests feed values f16 holds exactly.
+fn maybe_f16(x: Vec<f32>) -> Vec<f32> {
+    if gpu().engine.coop_matmul_active() {
+        f16_round(&x)
+    } else {
+        x
+    }
+}
+
 #[test]
 #[ignore = "needs a GPU; run with --ignored --test-threads=1"]
 fn matmul_with_f16_b_matches_cpu() {
@@ -282,7 +292,7 @@ fn matmul_with_f16_b_matches_cpu() {
         .chain(&[(3, 5, 7), (65, 33, 129)])
         .enumerate()
     {
-        let a = rand_vec(m * k, 300 + seed as u64);
+        let a = maybe_f16(rand_vec(m * k, 300 + seed as u64));
         let b = rand_vec(k * n, 400 + seed as u64);
         let b_h = UnifiedTensor::from_f32_as_f16(&g.ctx, &b, &[k, n]);
         assert!(b_h.size_in_bytes() <= ((k * n * 2).div_ceil(4) * 4).max(4) as u64);
@@ -577,7 +587,7 @@ fn thin_matmul_matches_cpu_in_every_layout() {
     // product); f16 `b` with few columns takes the tile kernel.
     let g = gpu();
     for (seed, &(m, k, n)) in THIN_SHAPES.iter().enumerate() {
-        let a = rand_vec(m * k, 3000 + seed as u64);
+        let a = maybe_f16(rand_vec(m * k, 3000 + seed as u64));
         let b: Vec<f32> = rand_vec(k * n, 3100 + seed as u64)
             .iter()
             .map(|v| v * 0.1)
@@ -692,7 +702,7 @@ const ALONG_K_SHAPES: &[(usize, usize, usize)] = &[
 fn matmul_with_b_along_k_matches_cpu_at_odd_shapes() {
     let g = gpu();
     for (seed, &(m, k, n)) in ALONG_K_SHAPES.iter().enumerate() {
-        let a = rand_vec(m * k, 3200 + seed as u64);
+        let a = maybe_f16(rand_vec(m * k, 3200 + seed as u64));
         // Weight-sized values keep the k = 2048 sums near 1, so the
         // tolerance below measures the kernel, not f32 rounding.
         let b: Vec<f32> = rand_vec(k * n, 3300 + seed as u64)
@@ -938,6 +948,8 @@ fn matmul_routes_few_rows_against_wide_weights_to_small_m() {
     // Vulkan have 32); the router takes no smaller step, so with 16 KiB
     // (DX12 on WARP) the previous kernels run.
     let bytes = g.ctx.device.limits().max_compute_workgroup_storage_size;
+    // With the cooperative-matrix kernel routed, f16 weights with 64 or more rows go there first.
+    let coop = g.engine.coop_matmul_active();
     let tile = |bk| SmallMTile {
         tm: 8,
         tn: 4,
@@ -953,11 +965,15 @@ fn matmul_routes_few_rows_against_wide_weights_to_small_m() {
         None
     };
     assert_eq!(route((64, 512, 256), true, DType::FP32), want, "{bytes} B");
-    assert_eq!(route((64, 512, 256), false, DType::FP16), want, "{bytes} B");
+    assert_eq!(
+        route((64, 512, 256), false, DType::FP16),
+        if coop { None } else { want },
+        "{bytes} B"
+    );
     // 160 rows: two row blocks of 80, with K steps of 16 in 22.5 KiB.
     assert_eq!(
         route((160, 256, 300), true, DType::FP16).map(SmallMTile::bm),
-        (bytes >= 23_040).then_some(80),
+        (bytes >= 23_040 && !coop).then_some(80),
         "{bytes} B"
     );
     // Too narrow, too shallow, too few or too many rows: the previous kernels.
