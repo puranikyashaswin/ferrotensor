@@ -1780,6 +1780,54 @@ fn flash_attention_v2_backward_matches_cpu() {
     }
 }
 
+/// Backward with groups of 3 query heads per KV head (the 135M, 360M and
+/// 1.7B head counts, and a batch), where dK and dV go through per-head
+/// partials and the group sum.
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn flash_attention_v2_backward_sums_the_heads_of_a_group() {
+    let g = gpu();
+    // (batch, seq, heads, kv heads, head_dim)
+    let cases: &[(usize, usize, usize, usize, usize)] = &[
+        (1, 256, 9, 3, 64),
+        (1, 100, 15, 5, 64),
+        (2, 45, 6, 2, 64),
+        (1, 33, 4, 1, 128),
+        (1, 40, 8, 8, 64),
+    ];
+    for (n, &(b, s, h, hkv, d)) in cases.iter().enumerate() {
+        let dims = (b, s, s, h, hkv, d);
+        let seed = 200 + 4 * n as u64;
+        let q = rand_vec(b * s * h * d, seed);
+        let k = rand_vec(b * s * hkv * d, seed + 1);
+        let v = rand_vec(b * s * hkv * d, seed + 2);
+        let dout = rand_vec(b * s * h * d, seed + 3);
+        let (out, probs) = cpu_attention(&q, &k, &v, None, dims, causal_rule(true));
+        let (want_dq, want_dk, want_dv) = cpu_attention_backward(&q, &k, &v, &dout, &probs, dims);
+        let (gq, gk, gv) = (
+            zeros(&[b, s, h, d]),
+            zeros(&[b, s, hkv, d]),
+            zeros(&[b, s, hkv, d]),
+        );
+        g.engine.flash_attention_v2_backward(
+            &g.ctx,
+            &upload(&q, &[b, s, h, d]),
+            &upload(&k, &[b, s, hkv, d]),
+            &upload(&v, &[b, s, hkv, d]),
+            &upload(&out, &[b, s, h, d]),
+            &upload(&dout, &[b, s, h, d]),
+            &gq,
+            &gk,
+            &gv,
+            true,
+        );
+        let name = format!("b{b} s{s} h{h}/{hkv} d{d}");
+        assert_close(&format!("dq {name}"), &read(&gq), &want_dq, 1e-4, 1e-3);
+        assert_close(&format!("dk {name}"), &read(&gk), &want_dk, 1e-4, 1e-3);
+        assert_close(&format!("dv {name}"), &read(&gv), &want_dv, 1e-4, 1e-3);
+    }
+}
+
 #[test]
 #[ignore = "needs a GPU; run with --ignored --test-threads=1"]
 fn flash_attention_single_head_backward_matches_cpu() {

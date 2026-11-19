@@ -1,6 +1,6 @@
 //! Rotary embeddings and fused (flash) attention.
 
-use super::{dummy_storage, groups64, uniform, Arg, ComputeEngine, Params, Scratch};
+use super::{dummy_storage, grid, groups64, uniform, Arg, ComputeEngine, Params, Scratch};
 use crate::{DType, UnifiedTensor, WgpuContext};
 
 /// Query or key rows per workgroup of the attention kernels (`FA_TILE_Q` and `FAB_ROWS` in WGSL).
@@ -414,7 +414,11 @@ impl ComputeEngine {
         if let Some(s) = saved {
             dims.check_stats(s);
         }
-        let params = dims.params_bwd(ctx, opts, mask, saved.is_some());
+        // With grouped-query attention each query head's dK and dV go to a
+        // partial that flash_group_sum adds up; with one query head per KV
+        // head they go straight to the gradients.
+        let group = dims.heads / dims.kv_heads;
+        let params = dims.params_bwd(ctx, opts, mask, (saved.is_some(), group == 1));
         let dummy;
         let mask_buf: &dyn Arg = match mask {
             Some(m) => m.buffer(),
@@ -440,7 +444,7 @@ impl ComputeEngine {
                 &scratch
             }
         };
-        let (b, h, hkv) = (dims.batch, dims.heads, dims.kv_heads);
+        let (b, h) = (dims.batch, dims.heads);
         self.run(
             ctx,
             &self.flash_attn_v2_bw_dq,
@@ -457,6 +461,43 @@ impl ComputeEngine {
             ],
             (1, dims.seq_q.div_ceil(ATTENTION_ROWS), b * h),
         );
+        let dkdv_grid = (1, dims.seq_k.div_ceil(ATTENTION_ROWS), b * h);
+        if group == 1 {
+            self.run(
+                ctx,
+                &self.flash_attn_v2_bw_dkdv,
+                &[
+                    (0, q.buffer()),
+                    (1, k.buffer()),
+                    (2, v.buffer()),
+                    (4, grad_out.buffer()),
+                    (6, grad_k.buffer()),
+                    (7, grad_v.buffer()),
+                    (8, &params),
+                    (9, mask_buf),
+                    (10, stats),
+                ],
+                dkdv_grid,
+            );
+            return;
+        }
+        // Per-query-head partials, [batch, seq_k, num_heads, head_dim], made for
+        // this call like the stats scratch above.
+        let partial_size = (b * dims.seq_k * h * dims.head_dim).max(1) as u64 * 4;
+        let partial = |label: &'static str| {
+            let buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: partial_size,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+            ctx.memory().count_dispatch_buffer(buffer.size());
+            Scratch(buffer)
+        };
+        let (dk_part, dv_part) = (
+            partial("Flash Bwd dK Partial"),
+            partial("Flash Bwd dV Partial"),
+        );
         self.run(
             ctx,
             &self.flash_attn_v2_bw_dkdv,
@@ -465,13 +506,26 @@ impl ComputeEngine {
                 (1, k.buffer()),
                 (2, v.buffer()),
                 (4, grad_out.buffer()),
-                (6, grad_k.buffer()),
-                (7, grad_v.buffer()),
+                (6, &dk_part),
+                (7, &dv_part),
                 (8, &params),
                 (9, mask_buf),
                 (10, stats),
             ],
-            (1, dims.seq_k.div_ceil(ATTENTION_ROWS), b * hkv),
+            dkdv_grid,
+        );
+        let elements = b * dims.seq_k * dims.kv_heads * dims.head_dim;
+        self.run(
+            ctx,
+            &self.flash_group_sum,
+            &[
+                (6, grad_k.buffer()),
+                (7, grad_v.buffer()),
+                (8, &params),
+                (11, &dk_part),
+                (12, &dv_part),
+            ],
+            grid(elements.div_ceil(256)),
         );
     }
 }
@@ -578,7 +632,7 @@ impl AttentionDims {
         ctx: &WgpuContext,
         opts: &AttentionOptions,
         mask: Option<&UnifiedTensor>,
-        lse_saved: bool,
+        (lse_saved, dkv_direct): (bool, bool),
     ) -> Params {
         let (has_mask, s) = mask_strides(mask);
         let params: [u32; 20] = [
@@ -601,7 +655,7 @@ impl AttentionDims {
             opts.window,
             (opts.seed >> 32) as u32,
             lse_saved as u32,
-            0,
+            dkv_direct as u32,
         ];
         uniform(ctx, bytemuck::cast_slice(&params))
     }
