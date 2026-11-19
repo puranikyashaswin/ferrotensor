@@ -138,7 +138,7 @@ impl GradScaler {
     /// If false, you should skip the optimizer step.
     #[expect(
         clippy::expect_used,
-        reason = "this API returns no Result, and a readback fails only when the GPU device was lost"
+        reason = "a readback fails only on device loss, and the caller has no error path"
     )]
     pub fn unscale_and_check(
         &mut self,

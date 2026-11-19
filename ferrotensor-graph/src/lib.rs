@@ -226,7 +226,7 @@ impl Embedding {
     /// so its output is a constant and `weight` gets no gradient from it.
     #[expect(
         clippy::expect_used,
-        reason = "this API returns no Result, and a readback fails only when the GPU device was lost"
+        reason = "a readback fails only on device loss, and the caller has no error path"
     )]
     pub fn forward(&self, ctx: &WgpuContext, _engine: &ComputeEngine, input_ids: &[u32]) -> Tensor {
         let hidden_dim = self.weight.data.shape[1];
