@@ -164,9 +164,15 @@ fn coop_matmul_matches_cpu_on_f16_rounded_inputs() {
                 "coop {m}x{k}x{n} transposed_b {transposed_b}: max rel err {e16:.2e} against f16-rounded inputs, {e32:.2e} against f32 inputs"
             );
             // f16 products are exact in f32; what is left is f32 summation.
-            assert!(e16 < 2e-5, "{m}x{k}x{n} transposed_b {transposed_b}: {e16:e}");
+            assert!(
+                e16 < 2e-5,
+                "{m}x{k}x{n} transposed_b {transposed_b}: {e16:e}"
+            );
             // Rounding a to f16 costs about 2^-11 relative per element.
-            assert!(e32 < 3e-3, "{m}x{k}x{n} transposed_b {transposed_b}: {e32:e}");
+            assert!(
+                e32 < 3e-3,
+                "{m}x{k}x{n} transposed_b {transposed_b}: {e32:e}"
+            );
         }
     }
 }

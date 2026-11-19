@@ -158,8 +158,8 @@ impl GradScaler {
             engine.gradient_scale(ctx, grad, inv_scale);
 
             // Check for inf/nan (CPU readback - sync point)
-            let data = pollster::block_on(grad.to_vec(ctx))
-                .expect("GPU device lost during readback");
+            let data =
+                pollster::block_on(grad.to_vec(ctx)).expect("GPU device lost during readback");
             if data.iter().any(|&x| x.is_infinite() || x.is_nan()) {
                 has_overflow = true;
                 break;

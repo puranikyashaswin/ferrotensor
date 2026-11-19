@@ -68,7 +68,10 @@ fn freed_buffer_is_reused_beyond_the_cap_with_overflow() {
     assert_eq!(ctx.pool.pooled_bytes(), 0);
     engine.gradient_scale(&ctx, &src, 2.0);
     engine.copy_tensor(&ctx, &src, &b, 0);
-    assert_eq!(pollster::block_on(b.to_vec(&ctx)).expect("GPU readback"), vec![2.0; N]);
+    assert_eq!(
+        pollster::block_on(b.to_vec(&ctx)).expect("GPU readback"),
+        vec![2.0; N]
+    );
     drop(b);
     assert_eq!(ctx.pool.pooled_bytes(), bytes);
     // Once the GPU has finished, the next wait trims the pool to its cap.

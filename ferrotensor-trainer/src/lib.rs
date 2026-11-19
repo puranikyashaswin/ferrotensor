@@ -812,8 +812,8 @@ pub fn masked_cross_entropy(
 ) -> Option<MaskedLoss> {
     let ce = masked_ce_on_gpu(logits, target_ids, loss_mask, 1, 1.0, engine)?;
     let ctx = &logits.ctx;
-    let losses = pollster::block_on(ce.row_loss.to_vec(ctx))
-        .expect("GPU device lost during readback");
+    let losses =
+        pollster::block_on(ce.row_loss.to_vec(ctx)).expect("GPU device lost during readback");
     let (value, tokens) = ce.per_sequence(&losses)[0];
     let data = UnifiedTensor::new(ctx, &[value], &[1]);
     let tensor = ce_loss_tensor(logits, ce.grad, data, None);
@@ -874,8 +874,8 @@ pub fn masked_cross_entropy_batch(
 ) -> Option<BatchLoss> {
     let ce = masked_ce_on_gpu(logits, target_ids, loss_mask, sequences, 1.0, engine)?;
     let ctx = &logits.ctx;
-    let losses = pollster::block_on(ce.row_loss.to_vec(ctx))
-        .expect("GPU device lost during readback");
+    let losses =
+        pollster::block_on(ce.row_loss.to_vec(ctx)).expect("GPU device lost during readback");
     let per_sequence = ce.per_sequence(&losses);
     let total: f32 = per_sequence.iter().map(|&(l, _)| l).sum();
     let data = UnifiedTensor::new(ctx, &[total], &[1]);

@@ -14,7 +14,6 @@
 
 use super::{uniform, ComputeEngine, Epilogue, Kernel};
 use crate::kernel_timing::KernelLabel;
-use crate::adapters::EXPERIMENTAL_ENV;
 use crate::{DType, ReadbackError, UnifiedTensor, WgpuContext};
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -99,7 +98,7 @@ pub(super) struct Coop {
     kernels: Mutex<HashMap<CoopKey, Arc<Kernel>>>,
     /// One `u32` counter of workgroups that clamped an `a` value.
     overflows: UnifiedTensor,
-    /// Whether [`EXPERIMENTAL_ENV`] routes f16-weight matmuls here.
+    /// Whether [`EXPERIMENTAL_ENV`](crate::adapters::EXPERIMENTAL_ENV) routes f16-weight matmuls here.
     routed: bool,
     /// Workgroups a grid aims for, as for the small-M kernel.
     target: u32,
@@ -115,9 +114,10 @@ fn device_supports(ctx: &WgpuContext) -> bool {
     ctx.device.features().contains(wanted)
         && info.subgroup_min_size == SUBGROUP
         && info.subgroup_max_size == SUBGROUP
-        && ctx.cooperative_matrix().iter().any(|c| {
-            (c.m, c.n, c.k) == (16, 16, 16) && c.ab_type == "f16" && c.cr_type == "f32"
-        })
+        && ctx
+            .cooperative_matrix()
+            .iter()
+            .any(|c| (c.m, c.n, c.k) == (16, 16, 16) && c.ab_type == "f16" && c.cr_type == "f32")
 }
 
 impl Coop {
@@ -140,8 +140,7 @@ impl Coop {
     }
 
     fn fits(&self, tile: CoopTile, transposed_b: bool) -> bool {
-        tile.threads() <= self.max_threads
-            && tile.workgroup_bytes(transposed_b) <= self.max_bytes
+        tile.threads() <= self.max_threads && tile.workgroup_bytes(transposed_b) <= self.max_bytes
     }
 
     /// The largest tile whose grid over `m x n` reaches the target, else the
@@ -204,7 +203,7 @@ impl ComputeEngine {
     }
 
     /// Whether matmuls against f16 weights run on cooperative matrices: the
-    /// device has them and [`EXPERIMENTAL_ENV`] is `1`.
+    /// device has them and [`EXPERIMENTAL_ENV`](crate::adapters::EXPERIMENTAL_ENV) is `1`.
     #[must_use]
     pub fn coop_matmul_active(&self) -> bool {
         self.coop.as_ref().is_some_and(|c| c.routed)
@@ -634,7 +633,10 @@ mod tests {
                     | naga::valid::Capabilities::SHADER_FLOAT16,
             );
             if let Err(e) = validator.validate(&module) {
-                panic!("{key:?}: WGSL validation error:\n{}", e.emit_to_string(&src));
+                panic!(
+                    "{key:?}: WGSL validation error:\n{}",
+                    e.emit_to_string(&src)
+                );
             }
         }
     }
