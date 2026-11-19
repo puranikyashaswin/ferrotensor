@@ -337,6 +337,10 @@ impl UnifiedTensor {
     }
 
     /// Copies the tensor back to the CPU, waiting for queued GPU work.
+    ///
+    /// # Panics
+    /// Panics when the readback cannot be mapped, which happens only when
+    /// the GPU device was lost.
     pub async fn to_vec(&self, context: &WgpuContext) -> Vec<f32> {
         let start = Instant::now();
         let size = self.size_in_bytes();
@@ -367,7 +371,7 @@ impl UnifiedTensor {
         });
         context.poll_until(|| mapped.load(Ordering::Acquire));
 
-        let data = slice.get_mapped_range();
+        let data = mapped_view(&slice);
         let res = bytemuck::cast_slice(&data).to_vec();
         drop(data);
         staging.unmap();
@@ -378,6 +382,9 @@ impl UnifiedTensor {
     /// Reads the f32 values of every tensor in `tensors` back to the host
     /// with one copy into one staging buffer, so the queue drains once
     /// however many tensors there are.
+    ///
+    /// # Panics
+    /// As [`to_vec`](Self::to_vec).
     pub async fn read_many(context: &WgpuContext, tensors: &[&UnifiedTensor]) -> Vec<Vec<f32>> {
         let start = Instant::now();
         let sizes: Vec<u64> = tensors.iter().map(|t| t.size_in_bytes()).collect();
@@ -416,7 +423,7 @@ impl UnifiedTensor {
         });
         context.poll_until(|| mapped.load(Ordering::Acquire));
 
-        let data = slice.get_mapped_range();
+        let data = mapped_view(&slice);
         let all: &[f32] = bytemuck::cast_slice(&data);
         let mut res = Vec::with_capacity(tensors.len());
         let mut at = 0;
@@ -469,11 +476,18 @@ impl UnifiedTensor {
     }
 
     /// A tensor of `dtype` whose first `size_in_bytes` bytes `fill` writes
-    /// straight into the buffer's mapped memory (zeroed beforehand). The
+    /// (into zeroed memory). The
     /// buffer is laid out as by `create_buffer_init`, which
     /// [`from_bytes_with_dtype`](Self::from_bytes_with_dtype) uses: its
     /// size is rounded up to whole 32-bit words, at least one, with zeros
     /// after the data, and a zero-byte tensor gets an empty, unmapped buffer.
+    ///
+    /// # Panics
+    /// Panics when wgpu refuses the buffer's mapping, which it creates mapped.
+    #[expect(
+        clippy::panic,
+        reason = "documented panic; a buffer created mapped is always mappable"
+    )]
     fn from_fill(
         context: &WgpuContext,
         size_in_bytes: usize,
@@ -503,9 +517,13 @@ impl UnifiedTensor {
                 usage,
                 mapped_at_creation: true,
             });
-            {
-                let mut mapped = buffer.slice(..).get_mapped_range_mut();
-                fill(&mut mapped[..size_in_bytes]);
+            // wgpu hands out mapped memory write-only, so `fill` writes into
+            // host memory that is then copied in.
+            let mut host = vec![0u8; size_in_bytes];
+            fill(&mut host);
+            match buffer.slice(..).get_mapped_range_mut() {
+                Ok(mut mapped) => mapped.slice(..size_in_bytes).copy_from_slice(&host),
+                Err(e) => panic!("a buffer mapped at creation could not be written: {e}"),
             }
             buffer.unmap();
             buffer
@@ -573,6 +591,22 @@ fn write_transposed(src: &[f32], rows: usize, cols: usize, dtype: DType, out: &m
             }
         }
         DType::Q4 => unreachable!("from_f32_transposed rejects DType::Q4"),
+    }
+}
+
+/// The mapped bytes of `slice`, whose `map_async` callback has fired.
+///
+/// # Panics
+/// Panics when the slice is not mapped, which happens only when the GPU
+/// device was lost before the mapping finished.
+#[expect(
+    clippy::panic,
+    reason = "documented panic; readbacks return plain values, and a lost device has no result to return"
+)]
+fn mapped_view(slice: &wgpu::BufferSlice<'_>) -> wgpu::BufferView {
+    match slice.get_mapped_range() {
+        Ok(view) => view,
+        Err(e) => panic!("GPU readback failed, most likely because the device was lost: {e}"),
     }
 }
 

@@ -161,7 +161,9 @@ impl Kernel {
                 label: Some(entry_point),
                 layout: None,
                 module,
-                entry_point,
+                entry_point: Some(entry_point),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
             }),
         );
         let layout = pipeline.get_bind_group_layout(0);

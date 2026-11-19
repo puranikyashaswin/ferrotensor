@@ -3,7 +3,7 @@
 
 use crate::Exit;
 use clap::Args;
-use ferrotensor_backend::adapters::{self, AdapterReport, CheckResult};
+use ferrotensor_backend::adapters::{self, AdapterReport, CheckResult, CoopMatrixConfig};
 use ferrotensor_backend::{KernelTimingMode, WgpuContext};
 use serde_json::{json, Value};
 
@@ -23,6 +23,17 @@ fn mib(bytes: u64) -> String {
     format!("{} MiB", bytes / (1024 * 1024))
 }
 
+fn coop_json(c: &CoopMatrixConfig) -> Value {
+    json!({
+        "m": c.m,
+        "n": c.n,
+        "k": c.k,
+        "ab_type": c.ab_type,
+        "cr_type": c.cr_type,
+        "saturating_accumulation": c.saturating_accumulation,
+    })
+}
+
 fn adapter_json(a: &AdapterReport) -> Value {
     json!({
         "name": a.name,
@@ -36,6 +47,7 @@ fn adapter_json(a: &AdapterReport) -> Value {
         "max_compute_workgroup_storage_size": a.max_compute_workgroup_storage_size,
         "shader_f16": a.shader_f16,
         "kernel_timing": a.kernel_timing.map(KernelTimingMode::name),
+        "cooperative_matrix": a.cooperative_matrix.iter().map(coop_json).collect::<Vec<_>>(),
         "selected": a.selected,
     })
 }

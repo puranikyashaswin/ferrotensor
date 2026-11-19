@@ -32,7 +32,7 @@ fn wait_for_gpu(ctx: &WgpuContext) {
     ctx.queue
         .on_submitted_work_done(move || flag.store(true, Ordering::Release));
     while !done.load(Ordering::Acquire) {
-        ctx.device.poll(wgpu::Maintain::Poll);
+        assert!(ctx.device.poll(wgpu::PollType::Poll).is_ok(), "the device was lost");
         std::thread::yield_now();
     }
 }

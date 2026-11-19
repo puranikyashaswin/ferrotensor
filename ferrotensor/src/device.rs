@@ -432,9 +432,9 @@ impl GpuContext {
     /// Poll the device until a GPU callback sends on `rx`: busy-polling for
     /// up to [`SPIN_WAIT`], then sleeping [`POLL_SLEEP`] between polls.
     ///
-    /// Never blocks in `Maintain::Wait`: wgpu-core 0.19 gives up waiting
-    /// there after 5 s and then frees the still-running submission's
-    /// resources as if it had finished, which crashes drivers that are still
+    /// Never blocks in a waiting poll: wgpu-core 0.19 gave up waiting
+    /// there after 5 s and then freed the still-running submission's
+    /// resources as if it had finished, which crashed drivers that were still
     /// reading them.
     #[expect(
         clippy::panic,
@@ -443,7 +443,12 @@ impl GpuContext {
     pub(crate) fn wait_for<T>(&self, rx: &Receiver<T>) -> T {
         let start = Instant::now();
         loop {
-            self.device.poll(wgpu::Maintain::Poll);
+            match self.device.poll(wgpu::PollType::Poll) {
+                Ok(_) => {}
+                // A non-blocking poll fails only when the device is lost; the
+                // callback is then dropped, which the match below reports.
+                Err(_) => {}
+            }
             match rx.try_recv() {
                 Ok(value) => return value,
                 Err(TryRecvError::Empty) if start.elapsed() < SPIN_WAIT => std::thread::yield_now(),
@@ -552,27 +557,25 @@ impl Device {
     pub async fn gpu_async() -> Option<Self> {
         // WGPU_BACKEND (e.g. "vulkan", "metal", "dx12", "gl") restricts the backends tried.
         // WGPU_DX12_COMPILER ("dxc" or "fxc") picks the DX12 shader compiler.
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::util::backend_bits_from_env().unwrap_or(wgpu::Backends::all()),
-            dx12_shader_compiler: wgpu::util::dx12_shader_compiler_from_env().unwrap_or_default(),
-            ..Default::default()
-        });
+        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+        desc.backends = wgpu::Backends::from_env().unwrap_or(wgpu::Backends::all());
+        desc.backend_options = wgpu::BackendOptions::from_env_or_default();
+        let instance = wgpu::Instance::new(desc);
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: None,
                 force_fallback_adapter: false,
             })
-            .await?;
+            .await
+            .ok()?;
         let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("Ferrotensor Device"),
-                    required_features: wgpu::Features::empty(),
-                    required_limits: adapter.limits(),
-                },
-                None,
-            )
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("Ferrotensor Device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: adapter.limits(),
+                ..Default::default()
+            })
             .await
             .ok()?;
         Some(Self {

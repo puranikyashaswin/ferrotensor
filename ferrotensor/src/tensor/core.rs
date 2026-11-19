@@ -494,7 +494,9 @@ async fn download(ctx: &GpuContext, buffer: &Buffer, n: usize) -> Vec<f32> {
     });
     ctx.wait_for(&rx).expect("failed to map GPU buffer");
 
-    let data = slice.get_mapped_range();
+    let data = slice
+        .get_mapped_range()
+        .expect("failed to read the mapped GPU buffer");
     let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
     drop(data);
     staging.unmap();

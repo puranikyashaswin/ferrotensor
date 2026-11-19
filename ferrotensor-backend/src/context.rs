@@ -243,11 +243,7 @@ impl WgpuContext {
         timing: KernelTiming,
     ) -> Result<Self, ContextError> {
         let backends = crate::adapters::backends();
-        let instance = Instance::new(wgpu::InstanceDescriptor {
-            backends,
-            dx12_shader_compiler: wgpu::util::dx12_shader_compiler_from_env().unwrap_or_default(),
-            ..Default::default()
-        });
+        let instance = crate::adapters::instance(backends);
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference,
@@ -255,7 +251,7 @@ impl WgpuContext {
                 compatible_surface: None,
             })
             .await
-            .ok_or(ContextError::NoAdapter {
+            .map_err(|_| ContextError::NoAdapter {
                 backends,
                 force_fallback_adapter,
             })?;
@@ -264,19 +260,20 @@ impl WgpuContext {
             KernelTiming::Off => None,
             KernelTiming::On => KernelTimingMode::for_features(adapter.features()),
         };
+        let required_features = timing_mode
+            .map_or(wgpu::Features::empty(), KernelTimingMode::features)
+            | crate::adapters::optional_features(&adapter);
         let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("Ferrotensor Device"),
-                    required_features: timing_mode
-                        .map_or(wgpu::Features::empty(), KernelTimingMode::features),
-                    // Use what the hardware supports rather than the WebGPU
-                    // defaults (e.g. 8 storage buffers per stage, 128 MiB
-                    // bindings), which are too small for model weights.
-                    required_limits: adapter.limits(),
-                },
-                None,
-            )
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("Ferrotensor Device"),
+                required_features,
+                // Use what the hardware supports rather than the WebGPU
+                // defaults (e.g. 8 storage buffers per stage, 128 MiB
+                // bindings), which are too small for model weights.
+                required_limits: adapter.limits(),
+                experimental_features: crate::adapters::experimental_features(required_features),
+                ..Default::default()
+            })
             .await
             .map_err(|source| ContextError::DeviceRefused {
                 adapter: adapter.get_info().name,
@@ -442,9 +439,9 @@ impl WgpuContext {
 
     /// Polls the device until `done` returns true.
     ///
-    /// Never blocks in `Maintain::Wait`: wgpu-core 0.19 gives up waiting
+    /// Never blocks in a waiting poll: wgpu-core 0.19 gave up waiting
     /// there after 5 s and then frees the still-running submission's
-    /// resources as if it had finished, which crashes drivers that are still
+    /// resources as if it had finished, which crashed drivers that were still
     /// reading them (seen with long batches on lavapipe).
     pub(crate) fn poll_until(&self, done: impl Fn() -> bool) {
         let start = Instant::now();
@@ -509,7 +506,12 @@ impl WgpuContext {
     /// maintenance, whose cost grows with the number of live buffers.
     fn poll(&self) {
         self.counters.device_polls.fetch_add(1, Ordering::Relaxed);
-        self.device.poll(wgpu::Maintain::Poll);
+        match self.device.poll(wgpu::PollType::Poll) {
+            Ok(_) => {}
+            // A non-blocking poll fails only when the device is lost, which
+            // the next submission or readback reports.
+            Err(_) => {}
+        }
     }
 
     /// Byte counters of this context's tensors: live, peak, idle in the
@@ -539,6 +541,20 @@ impl WgpuContext {
                 timer.collect();
                 timer.totals()
             })
+    }
+
+    /// The cooperative-matrix configurations this device can run; empty when
+    /// it was opened without cooperative matrices.
+    pub fn cooperative_matrix(&self) -> Vec<crate::adapters::CoopMatrixConfig> {
+        if self
+            .device
+            .features()
+            .contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
+        {
+            crate::adapters::cooperative_matrix_configs(&self.adapter)
+        } else {
+            Vec::new()
+        }
     }
 
     /// Adapter name and backend, e.g. `"Apple M2 (Metal)"`.

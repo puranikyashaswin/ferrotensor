@@ -68,7 +68,9 @@ impl ComputeEngine {
                     label: Some(name),
                     layout: None,
                     module: &module,
-                    entry_point: name,
+                    entry_point: Some(name),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    cache: None,
                 });
                 let layout = pipeline.get_bind_group_layout(0);
                 (name, (pipeline, layout))

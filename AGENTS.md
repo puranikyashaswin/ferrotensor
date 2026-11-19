@@ -69,7 +69,7 @@ is `null`. On an error stdout carries `{"error": "<message>"}` instead.
 | `merge` | `out_dir`, `merged` (tensors with the adapter added), `copied` (tensors copied byte for byte) |
 | `export-gguf` | `out_file`, `tensors` (tensors in the GGUF file), `merged` (tensors with the `--lora` adapter added; 0 without it) |
 | `pretrain` | every `train` key, then `parameters`, `vocab_size` (259 for the byte-level tokenizer, `--vocab-size` for BPE) and `tokenizer` (`"byte"` or `"bpe"`) |
-| `info` | `ferrotensor`, `os`, `arch`, `adapters` (one object per GPU, `selected` marks the one used, `kernel_timing` the mode `--profile` would time kernels in, or null), `checks` (null without `--check`), and `error` only on failure |
+| `info` | `ferrotensor`, `os`, `arch`, `adapters` (one object per GPU, `selected` marks the one used, `kernel_timing` the mode `--profile` would time kernels in, or null, `cooperative_matrix` the cooperative-matrix shapes it offers: `m`, `n`, `k`, `ab_type`, `cr_type`, `saturating_accumulation`), `checks` (null without `--check`), and `error` only on failure |
 | `q4-report` | `model`, `group`, `tensors` (one object per 2-D weight, by name: `name`, `shape` as stored, `relative_error`, `max_abs_error`, `groups`, `outlier_groups`, `outlier_fraction`) |
 
 `chat` is the one command that prints more than one object: it reads one

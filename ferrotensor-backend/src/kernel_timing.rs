@@ -355,19 +355,20 @@ impl KernelTimer {
                 MAPPING => i += 1,
                 MAPPED => {
                     let done = in_flight.swap_remove(i);
-                    let ticks: Vec<u64> = done
-                        .slot
-                        .readback
-                        .slice(..)
-                        .get_mapped_range()
-                        .as_chunks::<8>()
-                        .0
-                        .iter()
-                        .map(|bytes| u64::from_le_bytes(*bytes))
-                        .collect();
-                    add_timestamp_pairs(totals, &done.labels, &ticks, self.period_ns);
-                    done.slot.readback.unmap();
-                    free.push(done.slot);
+                    // The range fails to map only when the device is lost;
+                    // the slot and its timestamps are then dropped.
+                    if let Ok(view) = done.slot.readback.slice(..).get_mapped_range() {
+                        let ticks: Vec<u64> = view
+                            .as_chunks::<8>()
+                            .0
+                            .iter()
+                            .map(|bytes| u64::from_le_bytes(*bytes))
+                            .collect();
+                        drop(view);
+                        add_timestamp_pairs(totals, &done.labels, &ticks, self.period_ns);
+                        done.slot.readback.unmap();
+                        free.push(done.slot);
+                    }
                 }
                 // Mapping fails only when the device is lost; the slot and
                 // its timestamps are dropped.
