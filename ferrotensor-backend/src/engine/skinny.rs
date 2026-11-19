@@ -14,7 +14,6 @@
 use super::{immediate_params, uniform, ComputeEngine, Epilogue, Kernel};
 use crate::kernel_timing::KernelLabel;
 use crate::{DType, UnifiedTensor, WgpuContext};
-use std::borrow::Cow;
 use std::sync::{Arc, PoisonError};
 
 /// Most output columns the router sends to the skinny kernel.
@@ -252,12 +251,9 @@ impl ComputeEngine {
                 src = immediate_params(&src);
             }
             let module = ctx
-                .device
-                .create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("matmul_skinny"),
-                    source: wgpu::ShaderSource::Wgsl(Cow::Owned(src)),
-                });
-            Arc::new(Kernel::new(&ctx.device, &module, "matmul_skinny"))
+                .shader_checks()
+                .module(&ctx.device, "matmul_skinny", src);
+            Arc::new(Kernel::new(ctx, &module, "matmul_skinny"))
         }))
     }
 

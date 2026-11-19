@@ -11,7 +11,6 @@
 use super::matmul_coop::immediate_source;
 use super::{attention::AttentionOptions, Arg, ComputeEngine, Kernel, Params};
 use crate::{UnifiedTensor, WgpuContext};
-use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, OnceLock};
 
@@ -80,12 +79,7 @@ impl FlashCoop {
             if ctx.uses_immediates() {
                 src = immediate_source(&src);
             }
-            let module = ctx
-                .device
-                .create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("flash_coop"),
-                    source: wgpu::ShaderSource::Wgsl(Cow::Owned(src)),
-                });
+            let module = ctx.shader_checks().module(&ctx.device, "flash_coop", src);
             let kernel = |entry_point: &'static str| {
                 let pipeline = Arc::new(ctx.device.create_compute_pipeline(
                     &wgpu::ComputePipelineDescriptor {
