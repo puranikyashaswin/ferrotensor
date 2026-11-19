@@ -103,11 +103,15 @@ fn experimental_opt_in() -> bool {
 
 /// The optional features [`WgpuContext`] asks for when `adapter` has them:
 /// `f16` in shaders, immediates when they hold the largest kernel
-/// parameters, and cooperative matrices when [`EXPERIMENTAL_ENV`] is `1`.
-/// None of them is required.
+/// parameters (not on DX12), and cooperative matrices when
+/// [`EXPERIMENTAL_ENV`] is `1`. None of them is required.
 pub fn optional_features(adapter: &wgpu::Adapter) -> wgpu::Features {
     let mut wanted = wgpu::Features::SHADER_F16;
-    if adapter.limits().max_immediate_size >= crate::engine::IMMEDIATE_BYTES {
+    // naga's HLSL writer cannot yet translate an immediate that is not a
+    // struct (gfx-rs/wgpu#5683), and most kernel parameters are vectors or
+    // arrays, so DX12 keeps uniform buffers.
+    let hlsl = adapter.get_info().backend == wgpu::Backend::Dx12;
+    if !hlsl && adapter.limits().max_immediate_size >= crate::engine::IMMEDIATE_BYTES {
         wanted |= wgpu::Features::IMMEDIATES;
     }
     if experimental_opt_in() {
