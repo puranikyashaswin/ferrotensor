@@ -349,3 +349,52 @@ fn flat_step_first_update_has_the_closed_form_values() {
         "second moment of b",
     );
 }
+
+#[test]
+#[ignore = "needs a GPU"]
+fn flat_step_uploads_nothing_from_the_host() {
+    let rig = rig();
+    let (ctx, engine) = (&rig.ctx, &rig.engine);
+    // Padded to chunks these are 8192 + 4096 + 12288 = 24,576 elements, so
+    // each arena is 98,304 bytes. Zero-filling the gradient and weight
+    // arenas from the host would upload 2 * 98,304 = 196,608 bytes per step,
+    // and the first step's two moment buffers another 196,608.
+    let sizes = [5000usize, 7, 2 * SUM_SQUARES_CHUNK + 3];
+    let init: Vec<Vec<f32>> = sizes
+        .iter()
+        .enumerate()
+        .map(|(i, &n)| rand_vec(n, 30 + i as u64, 1.0))
+        .collect();
+    let p = params(&rig, &init);
+    let mut opt = AdamW::new(Arc::clone(engine), LR);
+
+    for step in 0..3u64 {
+        // Setting the gradients is the backward pass's job, not the step's.
+        let grads: Vec<Vec<f32>> = sizes
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| rand_vec(n, 40 + 10 * step + i as u64, 0.5))
+            .collect();
+        let gs = set_grads(&rig, &p, &grads);
+        ctx.synchronize();
+
+        let before = ctx.gpu_counters();
+        let flat = FlatGrads::new(ctx, &sizes).expect("the gradients fit one buffer");
+        flat.pack(ctx, engine, &gs).expect("pack");
+        opt.step_flat(&p, &flat).expect("flat step");
+        let used = ctx.gpu_counters().since(&before);
+        assert_eq!(
+            used.upload_bytes, 0,
+            "step {step}: the arenas are cleared on the GPU, {used:?}"
+        );
+        drop(flat);
+        ctx.synchronize();
+    }
+
+    // The next arena reuses a pooled buffer that held gradients; its gaps and
+    // padding must read as zero all the same.
+    let again = FlatGrads::new(ctx, &sizes).expect("fits");
+    let all = pollster::block_on(again.data.to_vec(ctx));
+    assert_eq!(all.len(), again.layout.total());
+    assert!(all.iter().all(|&x| x.to_bits() == 0), "not zeroed");
+}

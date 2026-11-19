@@ -1715,7 +1715,7 @@ impl FlatGrads {
     /// would not fit one buffer.
     pub fn new(ctx: &WgpuContext, sizes: &[usize]) -> Option<Self> {
         let layout = FlatLayout::new(sizes)?;
-        let data = UnifiedTensor::zeros(ctx, &[layout.total()]);
+        let data = UnifiedTensor::zeros_on_gpu(ctx, &[layout.total()]);
         Some(Self { layout, data })
     }
 
@@ -1925,8 +1925,8 @@ impl AdamW {
         }
         self.spill_flat();
         let total = [layout.total()];
-        let m = UnifiedTensor::zeros(ctx, &total);
-        let v = UnifiedTensor::zeros(ctx, &total);
+        let m = UnifiedTensor::zeros_on_gpu(ctx, &total);
+        let v = UnifiedTensor::zeros_on_gpu(ctx, &total);
         for (i, key) in ptrs.iter().enumerate() {
             if let Some(old) = self.m_states.remove(key) {
                 self.engine.copy_into_flat(ctx, &old, &m, layout.offset(i));
@@ -1980,7 +1980,7 @@ impl AdamW {
         };
         // The weights only need the buffer for this step, so it is made
         // here and freed after, and does not stay live between steps.
-        let weights = UnifiedTensor::zeros(&ctx, &[grads.layout.total()]);
+        let weights = UnifiedTensor::zeros_on_gpu(&ctx, &[grads.layout.total()]);
         for (i, param) in ts.iter().enumerate() {
             self.engine
                 .copy_into_flat(&ctx, &param.data, &weights, grads.layout.offset(i));
