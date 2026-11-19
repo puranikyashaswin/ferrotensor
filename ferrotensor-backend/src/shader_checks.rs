@@ -7,7 +7,8 @@ use std::fmt;
 /// built-in kernels, read once when a [`WgpuContext`](crate::WgpuContext) is
 /// created: `default` (all of wgpu's checks), or a comma-separated list of
 /// the checks to leave out: `noloop`, `nobounds`, `nodiv`, `nozeroinit`, or
-/// `none` for all of them. Unset, it is [`ShaderChecks::DEFAULT`].
+/// `none` for all of them. Unset, it is [`ShaderChecks::DEFAULT`], which is
+/// `noloop`.
 pub const SHADER_CHECKS_ENV: &str = "FERROTENSOR_SHADER_CHECKS";
 
 /// Which of wgpu's runtime checks the built-in kernels are compiled with.
@@ -26,7 +27,7 @@ pub struct ShaderChecks {
 }
 
 impl ShaderChecks {
-    /// Every check wgpu compiles in by default.
+    /// Every check wgpu compiles in by default (`default`).
     pub const CHECKED: Self = Self {
         loop_bounding: true,
         bounds: true,
@@ -42,8 +43,13 @@ impl ShaderChecks {
         zero_workgroup_memory: false,
     };
 
-    /// The checks used when [`SHADER_CHECKS_ENV`] is unset or empty.
-    pub const DEFAULT: Self = Self::CHECKED;
+    /// The checks used when [`SHADER_CHECKS_ENV`] is unset or empty: all but
+    /// the forced loop bounding, which adds a counter and a branch to every
+    /// iteration of the kernels' inner loops, all of them already bounded.
+    pub const DEFAULT: Self = Self {
+        loop_bounding: false,
+        ..Self::CHECKED
+    };
 
     /// Parses a [`SHADER_CHECKS_ENV`] value; an empty value is [`Self::DEFAULT`].
     ///
@@ -134,8 +140,8 @@ impl ShaderChecks {
         // none runs forever without the loop counter. Their indices are kept
         // in bounds by those sizes, and their integer divisors are constants
         // or the dimensions and head counts of a tensor shape, which are never
-        // zero for a shape that is dispatched. The checks are left out only
-        // when `FERROTENSOR_SHADER_CHECKS` asks for it.
+        // zero for a shape that is dispatched. Only the loop bounding is left
+        // out unless `FERROTENSOR_SHADER_CHECKS` asks for more.
         unsafe { device.create_shader_module_trusted(desc, runtime_checks) }
     }
 }
@@ -218,6 +224,28 @@ mod tests {
             }
         );
         assert_eq!(ShaderChecks::parse("NONE").unwrap(), ShaderChecks::NONE);
+    }
+
+    #[test]
+    fn the_default_leaves_out_only_loop_bounding() {
+        assert_eq!(
+            ShaderChecks::DEFAULT,
+            ShaderChecks {
+                loop_bounding: false,
+                bounds: true,
+                int_div: true,
+                zero_workgroup_memory: true,
+            }
+        );
+        assert_eq!(
+            ShaderChecks::parse("noloop").unwrap(),
+            ShaderChecks::DEFAULT
+        );
+        assert_eq!(ShaderChecks::default().to_string(), "noloop");
+        assert_ne!(
+            ShaderChecks::parse("default").unwrap(),
+            ShaderChecks::DEFAULT
+        );
     }
 
     #[test]
