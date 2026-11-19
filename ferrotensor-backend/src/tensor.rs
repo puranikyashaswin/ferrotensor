@@ -601,7 +601,10 @@ fn map_for_read(
     let state = Arc::new(AtomicU8::new(0));
     let flag = state.clone();
     slice.map_async(wgpu::MapMode::Read, move |result| {
-        flag.store(if result.is_ok() { MAPPED } else { FAILED }, Ordering::Release)
+        flag.store(
+            if result.is_ok() { MAPPED } else { FAILED },
+            Ordering::Release,
+        )
     });
     context.poll_until(|| state.load(Ordering::Acquire) != 0);
     if state.load(Ordering::Acquire) == FAILED {

@@ -254,7 +254,9 @@ fn param_kernels(ctx: &WgpuContext, engine: &ComputeEngine) -> Vec<(&'static str
 
 /// `n` values in [-1, 1] that differ for each `seed`.
 fn wave(n: usize, seed: usize) -> Vec<f32> {
-    (0..n).map(|i| ((i * 7 + seed * 13) as f32 * 0.37).sin()).collect()
+    (0..n)
+        .map(|i| ((i * 7 + seed * 13) as f32 * 0.37).sin())
+        .collect()
 }
 
 /// The results of [`param_kernels`], computed on the host.
@@ -327,7 +329,10 @@ fn immediates_and_uniform_params_give_the_same_results() {
     }
 
     if !ctx.uses_immediates() {
-        eprintln!("skipped the immediates half: {} has no immediates", ctx.adapter_info());
+        eprintln!(
+            "skipped the immediates half: {} has no immediates",
+            ctx.adapter_info()
+        );
         return;
     }
     let before = ctx.gpu_counters();
