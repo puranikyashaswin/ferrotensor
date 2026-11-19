@@ -1,5 +1,6 @@
 //! Matrix multiplication kernels.
 
+use super::small_m::{self, SmallMLaunch, SmallMTile};
 use super::{grid, uniform, ComputeEngine, Kernel};
 use crate::kernel_timing::KernelLabel;
 use crate::{DType, UnifiedTensor, WgpuContext};
@@ -24,6 +25,27 @@ impl Layout {
             Self::TransposedA => "aT@b",
         }
     }
+}
+
+/// The kernel [`ComputeEngine::matmul_with_path`] runs: the one
+/// [`ComputeEngine::matmul`] would pick, or one forced, so a benchmark or a
+/// test can compare them on the same inputs.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatmulPath {
+    /// The kernel the router picks for the shape.
+    Auto,
+    /// The kernels from before the small-M kernel: matrix-vector, thin or
+    /// 64x64 tiles.
+    Previous,
+    /// The small-M kernel.
+    SmallM {
+        /// The tile, or `None` for the default tile for M on this device.
+        tile: Option<SmallMTile>,
+        /// How many slices to split K into, or `None` for the heuristic's
+        /// count.
+        split: Option<u32>,
+    },
 }
 
 /// The operand the thin kernel reads as its thin side `t`.
@@ -164,11 +186,138 @@ impl ComputeEngine {
         self.matmul_run(ctx, Layout::TransposedB, dims, a, b, out);
     }
 
+    /// [`matmul`](Self::matmul) (`transposed_b` false) or
+    /// [`matmul_bt`](Self::matmul_bt) (true) with the kernel `path` names,
+    /// returning the small-M tile and split when that kernel ran. `b` is
+    /// f32 or f16, or 4-bit for the previous kernels.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the shapes do not match, or when the small-M
+    /// kernel is asked for with a 4-bit `b`, a tile this device cannot run
+    /// or a grid past the dispatch limit.
+    #[doc(hidden)]
+    pub fn matmul_with_path(
+        &self,
+        ctx: &WgpuContext,
+        transposed_b: bool,
+        a: &UnifiedTensor,
+        b: &UnifiedTensor,
+        out: &UnifiedTensor,
+        path: MatmulPath,
+    ) -> Result<Option<SmallMLaunch>, String> {
+        let ([m, k], [b0, b1]) = (a.shape.as_slice(), b.shape.as_slice()) else {
+            return Err(format!(
+                "matmul_with_path: a and b must be 2-D, got {:?} and {:?}",
+                a.shape, b.shape
+            ));
+        };
+        let (b_k, n) = if transposed_b { (b1, b0) } else { (b0, b1) };
+        if b_k != k || out.shape.iter().product::<usize>() != m * n {
+            return Err(format!(
+                "matmul_with_path: a {:?}, b {:?} (transposed_b {transposed_b}) and out {:?} do not match",
+                a.shape, b.shape, out.shape
+            ));
+        }
+        let (m, k, n) = (*m as u32, *k as u32, *n as u32);
+        let layout = if transposed_b {
+            Layout::TransposedB
+        } else {
+            Layout::Plain
+        };
+        match path {
+            MatmulPath::Auto => Ok(self.matmul_run(ctx, layout, (m, k, n), a, b, out)),
+            MatmulPath::Previous => {
+                self.matmul_previous(ctx, layout, (m, k, n), a, b, out);
+                Ok(None)
+            }
+            MatmulPath::SmallM { tile, split } => {
+                if !matches!(b.dtype, DType::FP32 | DType::FP16) {
+                    return Err("matmul_with_path: the small-M kernel reads f32 or f16 b".into());
+                }
+                let tile = match tile {
+                    Some(tile) => tile,
+                    None => self.small_m_tile(m, transposed_b).ok_or_else(|| {
+                        format!("matmul_with_path: no small-M tile for {m} rows fits this device")
+                    })?,
+                };
+                if !self.small_m_fits(tile, transposed_b) {
+                    return Err(format!(
+                        "matmul_with_path: this device cannot run the small-M tile {tile:?}"
+                    ));
+                }
+                if !Self::small_m_grid_fits(tile, m, n, split) {
+                    return Err(format!(
+                        "matmul_with_path: the grid of {tile:?} over {m} x {n} with split {split:?} is past the dispatch limit"
+                    ));
+                }
+                Ok(Some(self.matmul_small_m(
+                    ctx,
+                    transposed_b,
+                    (m, k, n),
+                    [a, b, out],
+                    tile,
+                    split,
+                )))
+            }
+        }
+    }
+
     /// Runs `out[M, N] = op(a) @ op(b)` with the kernel that suits the shape
-    /// and `b`'s storage: the matrix-vector kernel for one row, the thin
-    /// kernel when [`thin_side`] finds a thin operand, else the 64x64-tile
-    /// kernel.
+    /// and `b`'s storage: the small-M kernel when [`small_m::routes`] takes
+    /// the shape and a tile fits the device, else
+    /// [`matmul_previous`](Self::matmul_previous). Returns the small-M tile
+    /// and split when that kernel ran.
     fn matmul_run(
+        &self,
+        ctx: &WgpuContext,
+        layout: Layout,
+        (m, k, n): (u32, u32, u32),
+        a: &UnifiedTensor,
+        b: &UnifiedTensor,
+        out: &UnifiedTensor,
+    ) -> Option<SmallMLaunch> {
+        if let Some((transposed_b, tile)) = self.small_m_route(layout, b.dtype, (m, k, n)) {
+            return Some(self.matmul_small_m(
+                ctx,
+                transposed_b,
+                (m, k, n),
+                [a, b, out],
+                tile,
+                None,
+            ));
+        }
+        self.matmul_previous(ctx, layout, (m, k, n), a, b, out);
+        None
+    }
+
+    /// Whether `b` is stored `[N, K]` and the default tile, when the router
+    /// sends a product of `layout` with a `dtype` weight to the small-M
+    /// kernel.
+    fn small_m_route(
+        &self,
+        layout: Layout,
+        dtype: DType,
+        (m, k, n): (u32, u32, u32),
+    ) -> Option<(bool, SmallMTile)> {
+        let transposed_b = match layout {
+            Layout::Plain => false,
+            Layout::TransposedB => true,
+            Layout::TransposedA => return None,
+        };
+        if !small_m::routes(dtype, (m, k, n)) {
+            return None;
+        }
+        let tile = self
+            .small_m_tile(m, transposed_b)
+            .filter(|tile| tile.bk >= small_m::ROUTE_MIN_BK)?;
+        Self::small_m_grid_fits(tile, m, n, None).then_some((transposed_b, tile))
+    }
+
+    /// Runs `out[M, N] = op(a) @ op(b)` with the kernels from before the
+    /// small-M kernel: the matrix-vector kernel for one row, the thin kernel
+    /// when [`thin_side`] finds a thin operand, else the 64x64-tile kernel.
+    fn matmul_previous(
         &self,
         ctx: &WgpuContext,
         layout: Layout,
