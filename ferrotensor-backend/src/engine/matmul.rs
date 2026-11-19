@@ -482,7 +482,10 @@ impl ComputeEngine {
         // The 4-bit kernel reads log2 of the group size above the layout.
         let mode = layout as u32 | b.q4_group().map_or(0, |g| g.size().trailing_zeros() << 8);
         let [alpha, beta] = ep.bits();
-        let params = uniform(ctx, bytemuck::cast_slice(&[m, k, n, mode, alpha, beta, 0, 0]));
+        let params = uniform(
+            ctx,
+            bytemuck::cast_slice(&[m, k, n, mode, alpha, beta, 0, 0]),
+        );
         // One 16x16 workgroup per 64x64 output tile.
         self.run_labeled(
             ctx,
