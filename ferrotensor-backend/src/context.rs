@@ -447,19 +447,25 @@ impl WgpuContext {
     /// resources as if it had finished, which crashes drivers that are still
     /// reading them (seen with long batches on lavapipe).
     pub(crate) fn poll_until(&self, done: impl Fn() -> bool) {
+        self.poll_until_done(done);
+        // Callers wait for the last submitted work, so that poll let wgpu
+        // destroy every buffer dropped before it.
+        self.memory().gpu_reclaimed();
+        self.release_idle_buffers();
+        if let Some(timer) = &self.timer {
+            timer.collect();
+        }
+    }
+
+    /// Polls the device until `done` returns true, counting the time as GPU
+    /// wait; see [`poll_until`](Self::poll_until) for why it never blocks.
+    fn poll_until_done(&self, done: impl Fn() -> bool) {
         let start = Instant::now();
         let mut polls = 0u32;
         loop {
             self.poll();
             if done() {
                 GpuCounters::add_elapsed(&self.counters.gpu_wait_nanos, start);
-                // Callers wait for the last submitted work, so that poll let
-                // wgpu destroy every buffer dropped before it.
-                self.memory().gpu_reclaimed();
-                self.release_idle_buffers();
-                if let Some(timer) = &self.timer {
-                    timer.collect();
-                }
                 return;
             }
             if polls < 100 {
@@ -469,6 +475,30 @@ impl WgpuContext {
             }
             polls += 1;
         }
+    }
+
+    /// Submits the recorded work and returns the number of the last
+    /// submission, to pass to [`wait_for_submission`](Self::wait_for_submission).
+    pub fn submission_mark(&self) -> u64 {
+        self.flush();
+        self.memory().recording_serial().saturating_sub(1)
+    }
+
+    /// Submits the recorded work, then polls until submission `mark` (from
+    /// [`submission_mark`](Self::submission_mark)) has finished on the GPU
+    /// and drops the pool's idle buffers above its cap that only that work
+    /// used.
+    ///
+    /// Work submitted after `mark` keeps running. A trainer that never reads
+    /// the GPU inside a window calls this once per micro-batch so the host
+    /// stays at most one micro-batch ahead; otherwise, on a GPU-bound model,
+    /// the pool cannot trim and holds the idle buffers of several
+    /// micro-batches at once.
+    pub fn wait_for_submission(&self, mark: u64) {
+        self.flush();
+        let memory = self.memory();
+        self.poll_until_done(|| memory.completed_serial() >= mark);
+        self.release_idle_buffers();
     }
 
     fn submit(&self, pending: &mut Pending) {
