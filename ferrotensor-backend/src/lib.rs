@@ -29,6 +29,7 @@
 pub use wgpu; // Re-export wgpu for downstream crates
 
 pub mod adapters;
+mod bind_cache;
 mod context;
 mod engine;
 mod kernel_timing;
@@ -40,7 +41,8 @@ pub mod q4;
 mod tensor;
 
 pub use context::{
-    ContextError, WgpuContext, PASS_DISPATCHES_ENV, PENDING_OPS_ENV, UPLOAD_RELEASE_BYTES,
+    ContextError, WgpuContext, PASS_DISPATCHES_ENV, PENDING_OPS_ENV, UNIFORM_PARAMS_ENV,
+    UPLOAD_RELEASE_BYTES,
 };
 pub use engine::{
     AdamParams, AttentionOptions, ComputeEngine, Epilogue, MASKED_CE_SKIP, SUM_SQUARES_CHUNK,

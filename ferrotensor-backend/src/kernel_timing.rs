@@ -280,10 +280,8 @@ impl KernelTimer {
                 for dispatch in dispatches {
                     let first = next_pair(dispatch);
                     pass.set_pipeline(&dispatch.pipeline);
-                    pass.set_bind_group(0, &dispatch.bind_group, &[]);
                     pass.write_timestamp(queries, first);
-                    let (x, y, z) = dispatch.groups;
-                    pass.dispatch_workgroups(x, y, z);
+                    dispatch.encode(&mut pass);
                     pass.write_timestamp(queries, first + 1);
                 }
                 1
@@ -300,9 +298,7 @@ impl KernelTimer {
                         }),
                     });
                     pass.set_pipeline(&dispatch.pipeline);
-                    pass.set_bind_group(0, &dispatch.bind_group, &[]);
-                    let (x, y, z) = dispatch.groups;
-                    pass.dispatch_workgroups(x, y, z);
+                    dispatch.encode(&mut pass);
                 }
                 dispatches.len() as u64
             }

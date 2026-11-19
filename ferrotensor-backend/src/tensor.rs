@@ -1,5 +1,6 @@
 //! GPU-resident tensors.
 
+use crate::bind_cache::BindGroupCache;
 use crate::memory::{Allocation, MemoryCategory};
 use crate::pool::BufferPool;
 use crate::profile::GpuCounters;
@@ -102,6 +103,8 @@ struct TensorData {
     pool: Option<Arc<BufferPool>>,
     /// Counted in the context's memory tracker; `None` only while dropping.
     memory: Option<Allocation>,
+    /// Evicts the buffer when the tensor owns it and drops it.
+    bind_groups: Arc<BindGroupCache>,
 }
 
 impl TensorData {
@@ -130,6 +133,7 @@ impl TensorData {
             size_in_bytes,
             pool,
             memory: Some(memory),
+            bind_groups: Arc::clone(context.pool.bind_groups()),
         }
     }
 }
@@ -139,8 +143,9 @@ impl Drop for TensorData {
         // Stop counting the bytes as live before the pool counts them idle
         // (or, past its cap, as awaiting GPU).
         drop(self.memory.take());
-        if let Some(pool) = &self.pool {
-            pool.return_buffer(self.size_in_bytes, self.buffer.clone());
+        match &self.pool {
+            Some(pool) => pool.return_buffer(self.size_in_bytes, self.buffer.clone()),
+            None => self.bind_groups.evict(&self.buffer),
         }
     }
 }

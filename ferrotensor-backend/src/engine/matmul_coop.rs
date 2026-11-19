@@ -17,7 +17,7 @@
 //! that is not 16-byte aligned reads or writes the aligned address below it
 //! (on the A10G a 4-byte atomic among them shifted the results by elements).
 
-use super::{uniform, ComputeEngine, Epilogue, Kernel};
+use super::{immediate_params, uniform, ComputeEngine, Epilogue, Kernel};
 use crate::kernel_timing::KernelLabel;
 use crate::{DType, ReadbackError, UnifiedTensor, WgpuContext};
 use std::borrow::Cow;
@@ -109,6 +109,17 @@ pub(super) struct Coop {
     target: u32,
     max_bytes: u32,
     max_threads: u32,
+    /// Whether the kernel reads its parameters from immediates.
+    immediates: bool,
+}
+
+/// `src` with its parameters moved to immediates. The `enable` directives
+/// must stay first in the module, so only the text after them is rewritten.
+fn immediate_source(src: &str) -> String {
+    const LAST_ENABLE: &str = "enable wgpu_cooperative_matrix;\n";
+    let split = src.find(LAST_ENABLE).map_or(0, |at| at + LAST_ENABLE.len());
+    let (directives, body) = src.split_at(split);
+    format!("{directives}{}", immediate_params(body))
 }
 
 /// Whether `ctx` can run the kernel: f16 in shaders, 16x16x16 f16
@@ -141,6 +152,7 @@ impl Coop {
             max_threads: limits
                 .max_compute_invocations_per_workgroup
                 .min(limits.max_compute_workgroup_size_x),
+            immediates: ctx.uses_immediates(),
         })
     }
 
@@ -169,11 +181,15 @@ impl Coop {
     fn kernel(&self, ctx: &WgpuContext, key: CoopKey) -> Arc<Kernel> {
         let mut cache = self.kernels.lock().unwrap_or_else(PoisonError::into_inner);
         Arc::clone(cache.entry(key).or_insert_with(|| {
+            let mut src = source(key);
+            if self.immediates {
+                src = immediate_source(&src);
+            }
             let module = ctx
                 .device
                 .create_shader_module(wgpu::ShaderModuleDescriptor {
                     label: Some("matmul_coop"),
-                    source: wgpu::ShaderSource::Wgsl(Cow::Owned(source(key))),
+                    source: wgpu::ShaderSource::Wgsl(Cow::Owned(src)),
                 });
             let pipeline = Arc::new(ctx.device.create_compute_pipeline(
                 &wgpu::ComputePipelineDescriptor {
@@ -636,6 +652,36 @@ mod tests {
                 naga::valid::Capabilities::COOPERATIVE_MATRIX
                     | naga::valid::Capabilities::SHADER_FLOAT16
                     | naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32,
+            );
+            if let Err(e) = validator.validate(&module) {
+                panic!(
+                    "{key:?}: WGSL validation error:\n{}",
+                    e.emit_to_string(&src)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_kernel_validates_with_immediates() {
+        for key in keys() {
+            let src = immediate_source(&source(key));
+            assert!(!src.contains("var<uniform>"), "{key:?}");
+            let module = match naga::front::wgsl::parse_str(&src) {
+                Ok(m) => m,
+                Err(e) => panic!("{key:?}: WGSL parse error:\n{}", e.emit_to_string(&src)),
+            };
+            assert_eq!(
+                naga::valid::ImmediateSlots::size_for_module(&module),
+                crate::engine::IMMEDIATE_BYTES,
+                "{key:?}"
+            );
+            let mut validator = naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::COOPERATIVE_MATRIX
+                    | naga::valid::Capabilities::SHADER_FLOAT16
+                    | naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32
+                    | naga::valid::Capabilities::IMMEDIATES,
             );
             if let Err(e) = validator.validate(&module) {
                 panic!(

@@ -125,3 +125,29 @@ fn awaiting_gpu_counts_only_unfinished_work() {
     ctx.synchronize();
     assert_eq!(mem.awaiting_gpu_bytes(), 0);
 }
+
+#[test]
+#[ignore = "needs a GPU"]
+fn waiting_for_a_submission_trims_the_idle_buffers_it_used() {
+    let (ctx, engine, src) = setup();
+    let bytes = wgpu_buffer_size(N as u64 * 4);
+    ctx.pool.set_overflow(true);
+    let synchronizes = ctx.gpu_counters().synchronizes;
+
+    let a = UnifiedTensor::empty(&ctx, &[N]);
+    engine.copy_tensor(&ctx, &src, &a, 0);
+    drop(a);
+    let mark = ctx.submission_mark();
+    // Submitted, but not known to be finished: kept beyond the cap.
+    assert_eq!(ctx.pool.pooled_bytes(), bytes);
+
+    ctx.wait_for_submission(mark);
+    assert_eq!(ctx.pool.pooled_bytes(), 0, "trimmed to the cap");
+    assert_eq!(ctx.memory().pool_idle_bytes(), 0);
+    assert_eq!(ctx.gpu_counters().synchronizes, synchronizes);
+
+    // A mark with nothing new recorded returns at once.
+    let mark = ctx.submission_mark();
+    ctx.wait_for_submission(mark);
+    assert_eq!(ctx.pool.pooled_bytes(), 0);
+}
