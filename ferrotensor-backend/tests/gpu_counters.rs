@@ -56,8 +56,15 @@ fn counters_match_a_known_sequence_of_ops() {
     );
     assert!(ops.device_polls >= 1, "the readback polls: {ops:?}");
     assert_eq!(ops.bind_groups, 3);
-    assert_eq!(ops.uniform_buffers, 2, "one f32 scale per gradient_scale");
-    assert_eq!(ops.uniform_bytes, 8);
+    // One f32 scale per gradient_scale, set with the dispatch as immediates
+    // or else in a uniform buffer.
+    let (uniform_buffers, uniform_bytes) = if ctx.uses_immediates() {
+        (0, 0)
+    } else {
+        (2, 8)
+    };
+    assert_eq!(ops.uniform_buffers, uniform_buffers);
+    assert_eq!(ops.uniform_bytes, uniform_bytes);
     assert_eq!(ops.submits, 1, "the readback submits all recorded work");
     assert_eq!(ops.synchronizes, 0);
     assert_eq!(ops.upload_bytes, 0);
@@ -204,4 +211,129 @@ fn kernel_times_span_several_submissions() {
     assert_eq!(times.len(), 1, "{times:?}");
     assert_eq!(times[0].0, "gradient_scale");
     assert_eq!(times[0].1.dispatches, 300);
+}
+
+/// Runs gradient_scale, rms_norm_eps, softmax, matmul and causal
+/// flash_attention_v2 on fixed inputs and reads every result back.
+fn param_kernels(ctx: &WgpuContext, engine: &ComputeEngine) -> Vec<(&'static str, Vec<f32>)> {
+    let t = |data: &[f32], shape: &[usize]| UnifiedTensor::new(ctx, data, shape);
+    let read = |x: &UnifiedTensor| pollster::block_on(x.to_vec(ctx)).unwrap();
+
+    let scaled = t(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[8]);
+    engine.gradient_scale(ctx, &scaled, 0.5);
+
+    let x = t(&wave(8, 1), &[2, 4]);
+    let weight = t(&[1.0, 0.5, 2.0, -1.0], &[4]);
+    let normed = UnifiedTensor::empty(ctx, &[2, 4]);
+    engine.rms_norm_eps(ctx, &x, &weight, &normed, 1e-5);
+
+    let logits = t(&wave(10, 2), &[2, 5]);
+    let soft = UnifiedTensor::empty(ctx, &[2, 5]);
+    engine.softmax(ctx, &logits, &soft);
+
+    let (a, b) = (t(&wave(12, 3), &[3, 4]), t(&wave(20, 4), &[4, 5]));
+    let product = UnifiedTensor::empty(ctx, &[3, 5]);
+    engine.matmul(ctx, &a, &b, &product);
+
+    // [batch 1, seq 4, heads 2, head_dim 8]
+    let shape = [1, 4, 2, 8];
+    let q = t(&wave(64, 5), &shape);
+    let k = t(&wave(64, 6), &shape);
+    let v = t(&wave(64, 7), &shape);
+    let attended = UnifiedTensor::empty(ctx, &shape);
+    engine.flash_attention_v2(ctx, &q, &k, &v, &attended, true, 0.0, 0, None);
+
+    vec![
+        ("gradient_scale", read(&scaled)),
+        ("rms_norm_eps", read(&normed)),
+        ("softmax", read(&soft)),
+        ("matmul", read(&product)),
+        ("flash_attention_v2", read(&attended)),
+    ]
+}
+
+/// `n` values in [-1, 1] that differ for each `seed`.
+fn wave(n: usize, seed: usize) -> Vec<f32> {
+    (0..n).map(|i| ((i * 7 + seed * 13) as f32 * 0.37).sin()).collect()
+}
+
+/// The results of [`param_kernels`], computed on the host.
+fn param_kernels_on_host() -> Vec<Vec<f32>> {
+    let scaled = vec![0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0];
+
+    let weight = [1.0, 0.5, 2.0, -1.0];
+    let mut normed = Vec::new();
+    for row in wave(8, 1).chunks(4) {
+        let inv = 1.0 / (row.iter().map(|v| v * v).sum::<f32>() / 4.0 + 1e-5).sqrt();
+        normed.extend(row.iter().zip(weight).map(|(v, w)| v * inv * w));
+    }
+
+    let mut soft = Vec::new();
+    for row in wave(10, 2).chunks(5) {
+        let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let sum: f32 = row.iter().map(|v| (v - max).exp()).sum();
+        soft.extend(row.iter().map(|v| (v - max).exp() / sum));
+    }
+
+    let (a, b) = (wave(12, 3), wave(20, 4));
+    let product: Vec<f32> = (0..15)
+        .map(|o| (0..4).map(|p| a[(o / 5) * 4 + p] * b[p * 5 + o % 5]).sum())
+        .collect();
+
+    let (q, k, v) = (wave(64, 5), wave(64, 6), wave(64, 7));
+    let at = |s: usize, h: usize| (s * 2 + h) * 8;
+    let mut attended = vec![0.0; 64];
+    for h in 0..2 {
+        for i in 0..4 {
+            // Causal: query i sees keys 0..=i.
+            let scores: Vec<f32> = (0..=i)
+                .map(|j| {
+                    let dot: f32 = (0..8).map(|d| q[at(i, h) + d] * k[at(j, h) + d]).sum();
+                    dot / 8f32.sqrt()
+                })
+                .collect();
+            let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let sum: f32 = scores.iter().map(|s| (s - max).exp()).sum();
+            for (j, s) in scores.iter().enumerate() {
+                let p = (s - max).exp() / sum;
+                for d in 0..8 {
+                    attended[at(i, h) + d] += p * v[at(j, h) + d];
+                }
+            }
+        }
+    }
+    vec![scaled, normed, soft, product, attended]
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn immediates_and_uniform_params_give_the_same_results() {
+    let ctx = pollster::block_on(WgpuContext::new());
+    let fallback = pollster::block_on(WgpuContext::new()).with_uniform_params();
+    let engine = ComputeEngine::new(&ctx);
+    let uniform_engine = ComputeEngine::new(&fallback);
+    assert!(!fallback.uses_immediates() && !uniform_engine.uses_immediates());
+    assert_eq!(engine.uses_immediates(), ctx.uses_immediates());
+
+    let before = fallback.gpu_counters();
+    let uniform = param_kernels(&fallback, &uniform_engine);
+    let made = fallback.gpu_counters().since(&before).uniform_buffers;
+    assert!(made >= 5, "at least one uniform buffer per kernel: {made}");
+    for ((name, got), want) in uniform.iter().zip(param_kernels_on_host()) {
+        assert_eq!(got.len(), want.len(), "{name}: length");
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert!((g - w).abs() <= 1e-4, "{name}[{i}]: got {g}, want {w}");
+        }
+    }
+
+    if !ctx.uses_immediates() {
+        eprintln!("skipped the immediates half: {} has no immediates", ctx.adapter_info());
+        return;
+    }
+    let before = ctx.gpu_counters();
+    let immediate = param_kernels(&ctx, &engine);
+    assert_eq!(ctx.gpu_counters().since(&before).uniform_buffers, 0);
+    for ((name, got), (_, want)) in immediate.iter().zip(&uniform) {
+        assert_eq!(got, want, "{name}: immediates and uniform buffers differ");
+    }
 }

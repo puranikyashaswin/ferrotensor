@@ -102,10 +102,14 @@ fn experimental_opt_in() -> bool {
 }
 
 /// The optional features [`WgpuContext`] asks for when `adapter` has them:
-/// `f16` in shaders, and cooperative matrices when [`EXPERIMENTAL_ENV`] is
-/// `1`. None of them is required.
+/// `f16` in shaders, immediates when they hold the largest kernel
+/// parameters, and cooperative matrices when [`EXPERIMENTAL_ENV`] is `1`.
+/// None of them is required.
 pub fn optional_features(adapter: &wgpu::Adapter) -> wgpu::Features {
     let mut wanted = wgpu::Features::SHADER_F16;
+    if adapter.limits().max_immediate_size >= crate::engine::IMMEDIATE_BYTES {
+        wanted |= wgpu::Features::IMMEDIATES;
+    }
     if experimental_opt_in() {
         wanted |= wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX;
     }

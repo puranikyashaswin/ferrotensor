@@ -1,8 +1,7 @@
 //! Rotary embeddings and fused (flash) attention.
 
-use super::{dummy_storage, groups64, uniform, ComputeEngine};
+use super::{dummy_storage, groups64, uniform, ComputeEngine, Params};
 use crate::{DType, UnifiedTensor, WgpuContext};
-use wgpu::Buffer;
 
 /// Query or key rows per workgroup of the attention kernels (`FA_TILE_Q` and `FAB_ROWS` in WGSL).
 const ATTENTION_ROWS: u32 = 16;
@@ -545,7 +544,7 @@ impl AttentionDims {
         opts: &AttentionOptions,
         mask: Option<&UnifiedTensor>,
         write_stats: bool,
-    ) -> Buffer {
+    ) -> Params {
         let (has_mask, s) = mask_strides(mask);
         let params: [u32; 20] = [
             self.batch,
@@ -579,7 +578,7 @@ impl AttentionDims {
         opts: &AttentionOptions,
         mask: Option<&UnifiedTensor>,
         lse_saved: bool,
-    ) -> Buffer {
+    ) -> Params {
         let (has_mask, s) = mask_strides(mask);
         let params: [u32; 20] = [
             self.batch,
