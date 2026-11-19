@@ -126,9 +126,8 @@ fn the_gpu_lookup_matches_the_host_lookup_bit_for_bit() {
             .borrow()
             .clone()
             .expect("the table has a gradient");
-        let bits = |t: &UnifiedTensor| -> Vec<u32> {
-            host(&ctx, t).iter().map(|v| v.to_bits()).collect()
-        };
+        let bits =
+            |t: &UnifiedTensor| -> Vec<u32> { host(&ctx, t).iter().map(|v| v.to_bits()).collect() };
         got.push((bits(&out.data), bits(&grad)));
     }
     assert_eq!(got[0].0, got[1].0, "rows");

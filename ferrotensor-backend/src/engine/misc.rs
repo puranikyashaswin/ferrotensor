@@ -111,7 +111,10 @@ impl ComputeEngine {
         if n == 0 || hidden == 0 {
             return;
         }
-        let params = uniform(ctx, bytemuck::cast_slice(&[hidden as u32, vocab as u32, 0, 0]));
+        let params = uniform(
+            ctx,
+            bytemuck::cast_slice(&[hidden as u32, vocab as u32, 0, 0]),
+        );
         self.run(
             ctx,
             &self.emb_gather,
