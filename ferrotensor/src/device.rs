@@ -443,11 +443,12 @@ impl GpuContext {
     pub(crate) fn wait_for<T>(&self, rx: &Receiver<T>) -> T {
         let start = Instant::now();
         loop {
-            match self.device.poll(wgpu::PollType::Poll) {
-                Ok(_) => {}
-                // A non-blocking poll fails only when the device is lost; the
-                // callback is then dropped, which the match below reports.
-                Err(_) => {}
+            // `PollType::Poll` neither waits nor names a submission, so
+            // neither `PollError` (a wait timeout, a wrong submission index)
+            // can occur; were one returned, `rx` stays empty and the loop
+            // polls again.
+            if let Err(e) = self.device.poll(wgpu::PollType::Poll) {
+                eprintln!("ferrotensor: non-blocking device poll failed: {e}");
             }
             match rx.try_recv() {
                 Ok(value) => return value,

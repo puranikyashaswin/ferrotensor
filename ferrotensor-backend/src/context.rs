@@ -507,11 +507,10 @@ impl WgpuContext {
     /// maintenance, whose cost grows with the number of live buffers.
     fn poll(&self) {
         self.counters.device_polls.fetch_add(1, Ordering::Relaxed);
-        match self.device.poll(wgpu::PollType::Poll) {
-            Ok(_) => {}
-            // A non-blocking poll fails only when the device is lost, which
-            // the next submission or readback reports.
-            Err(_) => {}
+        // `PollType::Poll` neither waits nor names a submission, so neither
+        // `PollError` (a wait timeout, a wrong submission index) can occur.
+        if let Err(e) = self.device.poll(wgpu::PollType::Poll) {
+            log::warn!("non-blocking device poll failed: {e}");
         }
     }
 

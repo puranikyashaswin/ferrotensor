@@ -445,7 +445,10 @@ mod shader_tests {
         };
         let mut validator = naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
-            naga::valid::Capabilities::empty(),
+            // The f16 kernels unpack halves with `unpack2x16float`, which naga
+            // 30 gates behind this capability; wgpu grants it from the adapter's
+            // `SHADER_F16_IN_F32` downlevel flag.
+            naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32,
         );
         if let Err(e) = validator.validate(&module) {
             panic!("WGSL validation error:\n{}", e.emit_to_string(&src));
