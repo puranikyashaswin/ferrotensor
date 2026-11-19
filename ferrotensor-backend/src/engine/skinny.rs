@@ -11,7 +11,7 @@
 //! workgroup memory adds the lanes' sums in a fixed order. One pass, no
 //! second reduction dispatch, and the same bits on every run.
 
-use super::{uniform, ComputeEngine, Epilogue, Kernel};
+use super::{immediate_params, uniform, ComputeEngine, Epilogue, Kernel};
 use crate::kernel_timing::KernelLabel;
 use crate::{DType, UnifiedTensor, WgpuContext};
 use std::borrow::Cow;
@@ -247,11 +247,15 @@ impl ComputeEngine {
     fn skinny_kernel(&self, ctx: &WgpuContext, key: SkinnyKey) -> Arc<Kernel> {
         let mut cache = self.skinny.lock().unwrap_or_else(PoisonError::into_inner);
         Arc::clone(cache.entry(key).or_insert_with(|| {
+            let mut src = source(key);
+            if self.immediates {
+                src = immediate_params(&src);
+            }
             let module = ctx
                 .device
                 .create_shader_module(wgpu::ShaderModuleDescriptor {
                     label: Some("matmul_skinny"),
-                    source: wgpu::ShaderSource::Wgsl(Cow::Owned(source(key))),
+                    source: wgpu::ShaderSource::Wgsl(Cow::Owned(src)),
                 });
             Arc::new(Kernel::new(&ctx.device, &module, "matmul_skinny"))
         }))
@@ -360,7 +364,7 @@ impl ComputeEngine {
 #[cfg(test)]
 #[allow(clippy::panic)]
 mod tests {
-    use super::{default_tile, source, SkinnyKey, SkinnyTile};
+    use super::{default_tile, immediate_params, source, SkinnyKey, SkinnyTile};
 
     fn keys() -> Vec<SkinnyKey> {
         let mut keys = Vec::new();
@@ -393,6 +397,33 @@ mod tests {
             let mut validator = naga::valid::Validator::new(
                 naga::valid::ValidationFlags::all(),
                 naga::valid::Capabilities::empty(),
+            );
+            if let Err(e) = validator.validate(&module) {
+                panic!(
+                    "{key:?}: WGSL validation error:\n{}",
+                    e.emit_to_string(&src)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_kernel_validates_with_immediates() {
+        for key in keys() {
+            let src = immediate_params(&source(key));
+            assert!(!src.contains("var<uniform>"), "{key:?}");
+            let module = match naga::front::wgsl::parse_str(&src) {
+                Ok(m) => m,
+                Err(e) => panic!("{key:?}: WGSL parse error:\n{}", e.emit_to_string(&src)),
+            };
+            assert_eq!(
+                naga::valid::ImmediateSlots::size_for_module(&module),
+                crate::engine::IMMEDIATE_BYTES,
+                "{key:?}"
+            );
+            let mut validator = naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::IMMEDIATES,
             );
             if let Err(e) = validator.validate(&module) {
                 panic!(

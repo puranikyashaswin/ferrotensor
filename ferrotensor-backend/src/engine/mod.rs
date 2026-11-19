@@ -1,9 +1,11 @@
 //! The compute engine: compiles the WGSL kernels and dispatches them.
 
+use crate::bind_cache::BindKey;
 use crate::context::Dispatch;
 use crate::kernel_timing::KernelLabel;
 use crate::{UnifiedTensor, WgpuContext};
 use std::borrow::Cow;
+use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Mutex};
@@ -46,6 +48,34 @@ fn shader_source() -> String {
     format!(
         "{kernels_src}\n{matmul_src}\n{matmul_h_src}\n{matmul_q4_src}\n{matvec_src}\n{matvec_h_src}\n{matvec_q4_src}\n{thin_src}\n{thin_h_src}\n{split_reduce_src}\n{flash_v2_src}\n{flash_v2_bw_src}"
     )
+}
+
+/// Bytes of immediate data every module declares when kernel parameters go
+/// through immediates: the largest parameters, the 20 words of
+/// `FlashV2Params` and `FlashBwdParams`.
+pub(crate) const IMMEDIATE_BYTES: u32 = 80;
+
+/// `src` with every `var<uniform>` kernel parameter turned into a
+/// `var<immediate>`. naga sizes a module's immediate data by its first
+/// immediate variable, so an unused one of [`IMMEDIATE_BYTES`] comes first;
+/// each entry point still reads only its own parameters, from offset 0.
+fn immediate_params(src: &str) -> String {
+    const UNIFORM: &str = "var<uniform>";
+    let mut out = String::with_capacity(src.len() + 64);
+    out.push_str("var<immediate> ft_immediate_size: array<vec4<u32>, 5>;\n");
+    for line in src.lines() {
+        // Every parameter is declared on one line as
+        // `@group(0) @binding(N) var<uniform> name: type;`.
+        match line.find(UNIFORM) {
+            Some(at) => {
+                out.push_str("var<immediate>");
+                out.push_str(&line[at + UNIFORM.len()..]);
+            }
+            None => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    out
 }
 
 /// `matvec_h`: the matrix-vector kernel with `w` stored as f16 pairs packed
@@ -195,9 +225,74 @@ fn groups64(n: usize) -> (u32, u32, u32) {
     grid((n as u32).div_ceil(64))
 }
 
+/// A kernel's parameters: the bytes of its `var<uniform>` (a `var<immediate>`
+/// when the context uses immediates), and the uniform buffer holding them
+/// when it does not.
+struct Params {
+    bytes: Vec<u8>,
+    buffer: OnceCell<Buffer>,
+}
+
+impl Params {
+    /// The uniform buffer holding the parameters, made on first use.
+    fn buffer(&self, ctx: &WgpuContext) -> &Buffer {
+        let bytes = &self.bytes;
+        self.buffer.get_or_init(|| uniform_buffer(ctx, bytes))
+    }
+}
+
+/// The parameters `bytes` for one or more dispatches on `ctx`. Without
+/// immediates they are put in a uniform buffer at once.
+fn uniform(ctx: &WgpuContext, bytes: &[u8]) -> Params {
+    let params = Params {
+        bytes: bytes.to_vec(),
+        buffer: OnceCell::new(),
+    };
+    if !ctx.uses_immediates() {
+        params.buffer(ctx);
+    }
+    params
+}
+
+/// What a dispatch binds: a tensor's buffer, a buffer made for this call
+/// alone, or the kernel's parameters.
+enum ArgRef<'a> {
+    Buffer(&'a Buffer),
+    Scratch(&'a Buffer),
+    Params(&'a Params),
+}
+
+/// A buffer made for one call and dropped after it. A dispatch that binds
+/// one does not cache its bind group, which could never be used again.
+struct Scratch(Buffer);
+
+impl Arg for Scratch {
+    fn arg(&self) -> ArgRef<'_> {
+        ArgRef::Scratch(&self.0)
+    }
+}
+
+/// A value [`ComputeEngine::run`] can bind, so a buffer and the kernel's
+/// parameters share one entry list.
+trait Arg {
+    fn arg(&self) -> ArgRef<'_>;
+}
+
+impl Arg for Buffer {
+    fn arg(&self) -> ArgRef<'_> {
+        ArgRef::Buffer(self)
+    }
+}
+
+impl Arg for Params {
+    fn arg(&self) -> ArgRef<'_> {
+        ArgRef::Params(self)
+    }
+}
+
 /// Creates a uniform buffer holding `bytes`. Callers drop it once the
 /// dispatch is recorded, so it is counted as awaiting GPU from the start.
-fn uniform(ctx: &WgpuContext, bytes: &[u8]) -> Buffer {
+fn uniform_buffer(ctx: &WgpuContext, bytes: &[u8]) -> Buffer {
     ctx.memory().count_dispatch_buffer(bytes.len() as u64);
     ctx.counters.uniform_buffers.fetch_add(1, Relaxed);
     ctx.counters
@@ -282,12 +377,20 @@ pub struct ComputeEngine {
     coop: Option<matmul_coop::Coop>,
     /// Skinny matmul kernels, compiled the first time a tile and layout run.
     skinny: Mutex<HashMap<skinny::SkinnyKey, Arc<Kernel>>>,
+    /// Whether the kernels read their parameters from immediates.
+    immediates: bool,
 }
 
 impl ComputeEngine {
-    /// Compiles every kernel for `ctx`'s device.
+    /// Compiles every kernel for `ctx`'s device, reading its parameters from
+    /// immediates when [`WgpuContext::uses_immediates`] says so.
     pub fn new(ctx: &WgpuContext) -> Self {
-        let combined_src = shader_source();
+        let immediates = ctx.uses_immediates();
+        let combined_src = if immediates {
+            immediate_params(&shader_source())
+        } else {
+            shader_source()
+        };
         let module = ctx
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -360,16 +463,23 @@ impl ComputeEngine {
                 small_m::split_target(ctx.adapter.get_info().device_type),
             ),
             skinny: Mutex::new(HashMap::new()),
+            immediates,
         }
     }
 
-    /// Binds `entries` (binding index, buffer) to `kernel` and records a
-    /// dispatch of `groups` workgroups into `ctx`'s pending work.
+    /// Whether the kernels read their parameters from immediates rather than
+    /// a uniform buffer per dispatch.
+    pub fn uses_immediates(&self) -> bool {
+        self.immediates
+    }
+
+    /// Binds `entries` (binding index, buffer or parameters) to `kernel` and
+    /// records a dispatch of `groups` workgroups into `ctx`'s pending work.
     fn run(
         &self,
         ctx: &WgpuContext,
         kernel: &Kernel,
-        entries: &[(u32, &Buffer)],
+        entries: &[(u32, &dyn Arg)],
         groups: (u32, u32, u32),
     ) {
         let label = KernelLabel {
@@ -387,28 +497,68 @@ impl ComputeEngine {
         ctx: &WgpuContext,
         kernel: &Kernel,
         label: KernelLabel,
-        entries: &[(u32, &Buffer)],
+        entries: &[(u32, &dyn Arg)],
         groups: (u32, u32, u32),
     ) {
-        let entries: Vec<wgpu::BindGroupEntry<'_>> = entries
-            .iter()
-            .map(|(binding, buf)| wgpu::BindGroupEntry {
-                binding: *binding,
-                resource: buf.as_entire_binding(),
+        let mut immediates = None;
+        // A group that binds a buffer made for this dispatch alone is not
+        // worth caching.
+        let mut cacheable = true;
+        let mut bound = Vec::with_capacity(entries.len());
+        for &(binding, arg) in entries {
+            let buffer = match arg.arg() {
+                ArgRef::Buffer(buffer) => buffer,
+                ArgRef::Params(params) if self.immediates => {
+                    immediates = Some(params.bytes.clone());
+                    continue;
+                }
+                ArgRef::Params(params) => {
+                    cacheable = false;
+                    params.buffer(ctx)
+                }
+                ArgRef::Scratch(buffer) => {
+                    cacheable = false;
+                    buffer
+                }
+            };
+            bound.push((binding, buffer));
+        }
+        let create = || {
+            let entries: Vec<wgpu::BindGroupEntry<'_>> = bound
+                .iter()
+                .map(|&(binding, buffer)| wgpu::BindGroupEntry {
+                    binding,
+                    resource: buffer.as_entire_binding(),
+                })
+                .collect();
+            ctx.counters.bind_groups.fetch_add(1, Relaxed);
+            ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &kernel.layout,
+                entries: &entries,
             })
-            .collect();
-        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &kernel.layout,
-            entries: &entries,
-        });
-        ctx.counters.bind_groups.fetch_add(1, Relaxed);
+        };
+        let bind_group = if cacheable {
+            let buffers = bound.iter().map(|&(b, buffer)| (b, buffer.clone()));
+            let key = BindKey::new(&kernel.pipeline, buffers.collect());
+            let (group, hit) = ctx.pool.bind_groups().get_or_create(key, create);
+            let counter = if hit {
+                &ctx.counters.bind_group_hits
+            } else {
+                &ctx.counters.bind_group_misses
+            };
+            counter.fetch_add(1, Relaxed);
+            group
+        } else {
+            create()
+        };
         ctx.counters.dispatches.fetch_add(1, Relaxed);
         ctx.record_dispatch(Dispatch {
             pipeline: Arc::clone(&kernel.pipeline),
             bind_group,
             groups,
             label,
+            immediates,
         });
     }
 
@@ -433,15 +583,17 @@ impl ComputeEngine {
 }
 
 /// A 4-byte storage buffer bound where a kernel needs a buffer that is unused.
-/// Counted like [`uniform`].
-fn dummy_storage(ctx: &WgpuContext) -> Buffer {
+/// Counted like [`uniform_buffer`].
+fn dummy_storage(ctx: &WgpuContext) -> Scratch {
     ctx.memory().count_dispatch_buffer(4);
-    ctx.device
+    let buffer = ctx
+        .device
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Dummy Storage"),
             contents: &[0u8; 4],
             usage: wgpu::BufferUsages::STORAGE,
-        })
+        });
+    Scratch(buffer)
 }
 
 #[cfg(test)]
@@ -466,5 +618,49 @@ mod shader_tests {
         if let Err(e) = validator.validate(&module) {
             panic!("WGSL validation error:\n{}", e.emit_to_string(&src));
         }
+    }
+
+    /// The immediates form of the kernels parses and validates, keeps no
+    /// uniform, and gives the module the immediate size the device is asked
+    /// for.
+    #[test]
+    fn immediate_params_validate() {
+        let Some(tile) = super::SmallMTile::for_rows(32, 16 * 1024) else {
+            panic!("no small-M tile for 32 rows");
+        };
+        let sources = [
+            super::immediate_params(&super::shader_source()),
+            super::immediate_params(&super::small_m::source(tile, true, true)),
+        ];
+        for src in &sources {
+            assert!(!src.contains("var<uniform>"));
+            let module = match naga::front::wgsl::parse_str(src) {
+                Ok(m) => m,
+                Err(e) => panic!("WGSL parse error:\n{}", e.emit_to_string(src)),
+            };
+            assert_eq!(
+                naga::valid::ImmediateSlots::size_for_module(&module),
+                super::IMMEDIATE_BYTES
+            );
+            let mut validator = naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32
+                    | naga::valid::Capabilities::IMMEDIATES,
+            );
+            if let Err(e) = validator.validate(&module) {
+                panic!("WGSL validation error:\n{}", e.emit_to_string(src));
+            }
+        }
+    }
+
+    /// Only the parameter declarations change, keeping their names and types.
+    #[test]
+    fn immediate_params_rewrites_declarations() {
+        let src = "@group(0) @binding(3) var<uniform> mv_params: vec4<u32>; // K, N\nfn f() {}";
+        assert_eq!(
+            super::immediate_params(src),
+            "var<immediate> ft_immediate_size: array<vec4<u32>, 5>;\n\
+             var<immediate> mv_params: vec4<u32>; // K, N\nfn f() {}\n"
+        );
     }
 }

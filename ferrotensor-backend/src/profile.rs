@@ -16,6 +16,8 @@ pub(crate) struct GpuCounters {
     pub(crate) dispatches: AtomicU64,
     pub(crate) compute_passes: AtomicU64,
     pub(crate) bind_groups: AtomicU64,
+    pub(crate) bind_group_hits: AtomicU64,
+    pub(crate) bind_group_misses: AtomicU64,
     pub(crate) uniform_buffers: AtomicU64,
     pub(crate) uniform_bytes: AtomicU64,
     pub(crate) submits: AtomicU64,
@@ -41,6 +43,8 @@ impl GpuCounters {
             dispatches: self.dispatches.load(Relaxed),
             compute_passes: self.compute_passes.load(Relaxed),
             bind_groups: self.bind_groups.load(Relaxed),
+            bind_group_hits: self.bind_group_hits.load(Relaxed),
+            bind_group_misses: self.bind_group_misses.load(Relaxed),
             uniform_buffers: self.uniform_buffers.load(Relaxed),
             uniform_bytes: self.uniform_bytes.load(Relaxed),
             submits: self.submits.load(Relaxed),
@@ -65,8 +69,17 @@ pub struct GpuCounterSnapshot {
     /// Compute passes the dispatches were encoded in: one per run of at most
     /// 8 dispatches between copies and submissions.
     pub compute_passes: u64,
-    /// Bind groups created, one per dispatch.
+    /// Bind groups created: one per dispatch the bind group cache did not
+    /// serve.
     pub bind_groups: u64,
+    /// Dispatches that reused a cached bind group: the same kernel bound to
+    /// the same buffers as an earlier dispatch.
+    pub bind_group_hits: u64,
+    /// Dispatches that looked in the bind group cache, missed and cached the
+    /// group they created. A dispatch that binds a buffer made for it alone,
+    /// such as a uniform buffer of parameters, does not look and counts as
+    /// neither.
+    pub bind_group_misses: u64,
     /// Uniform buffers created for kernel parameters.
     pub uniform_buffers: u64,
     /// Bytes of those uniform buffers, as requested.
@@ -103,6 +116,10 @@ impl GpuCounterSnapshot {
             dispatches: self.dispatches.saturating_sub(earlier.dispatches),
             compute_passes: self.compute_passes.saturating_sub(earlier.compute_passes),
             bind_groups: self.bind_groups.saturating_sub(earlier.bind_groups),
+            bind_group_hits: self.bind_group_hits.saturating_sub(earlier.bind_group_hits),
+            bind_group_misses: self
+                .bind_group_misses
+                .saturating_sub(earlier.bind_group_misses),
             uniform_buffers: self.uniform_buffers.saturating_sub(earlier.uniform_buffers),
             uniform_bytes: self.uniform_bytes.saturating_sub(earlier.uniform_bytes),
             submits: self.submits.saturating_sub(earlier.submits),
@@ -120,11 +137,13 @@ impl GpuCounterSnapshot {
     }
 
     /// Every count (not the times) with its snake-case name, in report order.
-    pub fn counts(&self) -> [(&'static str, u64); 12] {
+    pub fn counts(&self) -> [(&'static str, u64); 14] {
         [
             ("dispatches", self.dispatches),
             ("compute_passes", self.compute_passes),
             ("bind_groups", self.bind_groups),
+            ("bind_group_hits", self.bind_group_hits),
+            ("bind_group_misses", self.bind_group_misses),
             ("uniform_buffers", self.uniform_buffers),
             ("uniform_bytes", self.uniform_bytes),
             ("submits", self.submits),
@@ -153,6 +172,8 @@ mod tests {
         counters.dispatches.fetch_add(5, Relaxed);
         counters.compute_passes.fetch_add(2, Relaxed);
         counters.bind_groups.fetch_add(5, Relaxed);
+        counters.bind_group_hits.fetch_add(3, Relaxed);
+        counters.bind_group_misses.fetch_add(5, Relaxed);
         counters.uniform_buffers.fetch_add(2, Relaxed);
         counters.uniform_bytes.fetch_add(32, Relaxed);
         counters.submits.fetch_add(1, Relaxed);
@@ -172,6 +193,8 @@ mod tests {
                 dispatches: 5,
                 compute_passes: 2,
                 bind_groups: 5,
+                bind_group_hits: 3,
+                bind_group_misses: 5,
                 uniform_buffers: 2,
                 uniform_bytes: 32,
                 submits: 1,
