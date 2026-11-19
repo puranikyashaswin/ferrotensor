@@ -4,12 +4,11 @@ use crate::bind_cache::BindKey;
 use crate::context::Dispatch;
 use crate::kernel_timing::KernelLabel;
 use crate::{UnifiedTensor, WgpuContext};
-use std::borrow::Cow;
 use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Mutex};
-use wgpu::{util::DeviceExt, Buffer, Device};
+use wgpu::{util::DeviceExt, Buffer};
 
 mod attention;
 mod elementwise;
@@ -191,17 +190,19 @@ struct Kernel {
 }
 
 impl Kernel {
-    fn new(device: &Device, module: &wgpu::ShaderModule, entry_point: &'static str) -> Self {
-        let pipeline = Arc::new(
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+    /// Builds the pipeline for `entry_point` of `module`, zeroing workgroup
+    /// memory as `ctx`'s shader checks ask.
+    fn new(ctx: &WgpuContext, module: &wgpu::ShaderModule, entry_point: &'static str) -> Self {
+        let pipeline = Arc::new(ctx.device.create_compute_pipeline(
+            &wgpu::ComputePipelineDescriptor {
                 label: Some(entry_point),
                 layout: None,
                 module,
                 entry_point: Some(entry_point),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                compilation_options: ctx.shader_checks().compilation_options(),
                 cache: None,
-            }),
-        );
+            },
+        ));
         let layout = pipeline.get_bind_group_layout(0);
         Self {
             pipeline,
@@ -395,12 +396,9 @@ impl ComputeEngine {
             shader_source()
         };
         let module = ctx
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("Kernels"),
-                source: wgpu::ShaderSource::Wgsl(Cow::Owned(combined_src)),
-            });
-        let k = |entry: &'static str| Kernel::new(&ctx.device, &module, entry);
+            .shader_checks()
+            .module(&ctx.device, "Kernels", combined_src);
+        let k = |entry: &'static str| Kernel::new(ctx, &module, entry);
         let limits = ctx.device.limits();
 
         Self {

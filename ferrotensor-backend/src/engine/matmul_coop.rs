@@ -23,7 +23,6 @@
 use super::{grid, immediate_params, uniform, ComputeEngine, Epilogue, Kernel};
 use crate::kernel_timing::KernelLabel;
 use crate::{DType, ReadbackError, UnifiedTensor, WgpuContext};
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -306,12 +305,7 @@ impl Coop {
             if self.immediates {
                 src = immediate_source(&src);
             }
-            let module = ctx
-                .device
-                .create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("matmul_coop"),
-                    source: wgpu::ShaderSource::Wgsl(Cow::Owned(src)),
-                });
+            let module = ctx.shader_checks().module(&ctx.device, "matmul_coop", src);
             let pipeline = Arc::new(ctx.device.create_compute_pipeline(
                 &wgpu::ComputePipelineDescriptor {
                     label: Some("matmul_coop"),
