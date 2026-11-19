@@ -263,3 +263,37 @@ fn coop_matmul_counts_f16_overflow_and_poisons_its_tile() {
     assert!(got[0].is_nan(), "the tile's first element is poisoned");
     assert!(got.iter().any(|v| v.is_nan()));
 }
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn coop_matmul_probe_prints_an_identity_product() {
+    let Some(g) = coop_gpu("coop_matmul_probe_prints_an_identity_product") else {
+        return;
+    };
+    // a @ I is a rounded to f16; the rows printed show how a wrong result
+    // is wrong (shifted, transposed, zero or scaled).
+    let (m, k, n) = (64, 16, 16);
+    let a: Vec<f32> = (0..m * k).map(|i| (i % 1000) as f32).collect();
+    let mut eye = vec![0.0f32; k * n];
+    for i in 0..k {
+        eye[i * n + i] = 1.0;
+    }
+    for transposed_b in [false, true] {
+        let got = run_coop(
+            g,
+            (m, k, n),
+            &a,
+            &eye,
+            transposed_b,
+            (Epilogue::STORE, &vec![0.0; m * n]),
+        );
+        for row in [0usize, 1, 17] {
+            eprintln!(
+                "probe transposed_b {transposed_b} row {row}: got {:?}",
+                &got[row * n..row * n + n]
+            );
+        }
+        let bad = got.iter().zip(&a).filter(|(g, a)| g != a).count();
+        eprintln!("probe transposed_b {transposed_b}: {bad} of {} wrong", m * n);
+    }
+}

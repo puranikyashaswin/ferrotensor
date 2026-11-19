@@ -164,12 +164,7 @@ impl Coop {
     fn kernel(&self, ctx: &WgpuContext, key: CoopKey) -> Arc<Kernel> {
         let mut cache = self.kernels.lock().unwrap_or_else(PoisonError::into_inner);
         Arc::clone(cache.entry(key).or_insert_with(|| {
-            let module = ctx
-                .device
-                .create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("matmul_coop"),
-                    source: wgpu::ShaderSource::Wgsl(Cow::Owned(source(key))),
-                });
+            let module = trusted_module(ctx, source(key));
             let pipeline = Arc::new(ctx.device.create_compute_pipeline(
                 &wgpu::ComputePipelineDescriptor {
                     label: Some("matmul_coop"),
@@ -191,6 +186,39 @@ impl Coop {
                 entry_point: "matmul_coop",
             })
         }))
+    }
+}
+
+/// The kernel's module without wgpu's runtime bounds checks, which wrap the
+/// cooperative loads in index clamps and branches that the cooperative ops
+/// do not tolerate; `FERROTENSOR_COOP_CHECKED=1` keeps them, to compare.
+fn trusted_module(ctx: &WgpuContext, wgsl: String) -> wgpu::ShaderModule {
+    let desc = wgpu::ShaderModuleDescriptor {
+        label: Some("matmul_coop"),
+        source: wgpu::ShaderSource::Wgsl(Cow::Owned(wgsl)),
+    };
+    if std::env::var("FERROTENSOR_COOP_CHECKED").as_deref() == Ok("1") {
+        return ctx.device.create_shader_module(desc);
+    }
+    unchecked_module(ctx, desc)
+}
+
+#[expect(
+    unsafe_code,
+    reason = "wgpu marks shader modules without runtime checks unsafe; see the SAFETY note"
+)]
+fn unchecked_module(
+    ctx: &WgpuContext,
+    desc: wgpu::ShaderModuleDescriptor<'_>,
+) -> wgpu::ShaderModule {
+    // SAFETY: every global read and write in the kernel is guarded by an
+    // explicit test against M, K and N (the bound buffers hold M*K, K*N and
+    // M*N elements), and every workgroup index stays inside its array by the
+    // tile constants the source is generated from. The loops end because K
+    // is finite and the step BK is positive.
+    unsafe {
+        ctx.device
+            .create_shader_module_trusted(desc, wgpu::ShaderRuntimeChecks::unchecked())
     }
 }
 
