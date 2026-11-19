@@ -74,12 +74,13 @@ fn rope(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 
 // Out of place: rotates ropo_src into ropo_dst, so an autograd op needs no
 // copy of its input (forward) or of the upstream gradient (backward). The
-// math is rope's, line for line, so both give the same bits. It keeps its
-// own globals, like every other kernel here: a version that shared a helper
-// and rope_params with rope lost the device on DX12 (WARP).
+// math is rope's, line for line, so both give the same bits. Its uniform
+// comes last, as in every other kernel here: a version with the uniform at
+// binding 1 between the two buffers wrote nothing on Metal and lost the
+// device on DX12 (WARP), while software Vulkan passed.
 @group(0) @binding(0) var<storage, read> ropo_src: array<f32>;
-@group(0) @binding(1) var<uniform> ropo_params: array<vec4<u32>, 2>; // as rope_params
-@group(0) @binding(2) var<storage, read_write> ropo_dst: array<f32>;
+@group(0) @binding(1) var<storage, read_write> ropo_dst: array<f32>;
+@group(0) @binding(2) var<uniform> ropo_params: array<vec4<u32>, 2>; // as rope_params
 
 @compute @workgroup_size(64)
 fn rope_out(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {

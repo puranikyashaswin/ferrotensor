@@ -111,7 +111,7 @@ impl ComputeEngine {
             Some(out) => self.run(
                 ctx,
                 &self.rope_out,
-                &[(0, tensor.buffer()), (1, &params), (2, out.buffer())],
+                &[(0, tensor.buffer()), (1, out.buffer()), (2, &params)],
                 groups64(pairs),
             ),
         }
