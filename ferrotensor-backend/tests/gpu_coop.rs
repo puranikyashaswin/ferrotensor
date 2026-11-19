@@ -164,7 +164,11 @@ fn run_or_skip(
             Some(got)
         }
         Err(e) if e.contains("does not fit") => {
-            eprintln!("{} split {}: skipped, {e}", config.tile.name(), config.split);
+            eprintln!(
+                "{} split {}: skipped, {e}",
+                config.tile.name(),
+                config.split
+            );
             None
         }
         Err(e) => panic!("{} split {}: {e}", config.tile.name(), config.split),

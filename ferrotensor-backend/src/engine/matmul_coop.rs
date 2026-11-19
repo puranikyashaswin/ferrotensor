@@ -431,7 +431,9 @@ impl ComputeEngine {
             None => plan(dims, coop.target, fits),
         };
         let Some(config) = config else {
-            return Err(format!("matmul_coop_into: no tile fits {m} x {n} on this device"));
+            return Err(format!(
+                "matmul_coop_into: no tile fits {m} x {n} on this device"
+            ));
         };
         self.matmul_coop_run(ctx, transposed_b, dims, [a, b, out], config, ep)
             .ok_or_else(|| "matmul_coop_into: no cooperative-matrix kernel".into())
@@ -718,22 +720,29 @@ fn main_loop(key: CoopKey) -> String {
         );
     }
     let p1 = ("sa1", "sb1");
+    // naga takes a function-local variable such as the loop counter as
+    // non-uniform, and cooperative ops and barriers must sit in uniform
+    // control flow: so the loop runs whole pairs of steps, and only `let`s
+    // of uniform values guard the multiplies. Step 2p is in buffer 0, 2p + 1
+    // in buffer 1; an odd last step is in buffer 0.
     format!(
-        "  if (steps > 0u) {{\n{first}  }}
+        "  let pairs = steps / 2u;
+  let odd = steps % 2u;
+  if (steps > 0u) {{\n{first}  }}
   workgroupBarrier();
-  for (var t = 0u; t < steps; t += 2u) {{
-    if (t + 1u < steps) {{\n{load1}    }}
+  for (var p = 0u; p < pairs; p++) {{
+{load1}{mul0}    workgroupBarrier();
+    if (2u * p + 2u < steps) {{\n{load0}    }}
+{mul1}    workgroupBarrier();
+  }}
+  if (odd == 1u) {{
 {mul0}    workgroupBarrier();
-    if (t + 1u < steps) {{
-      if (t + 2u < steps) {{\n{load0}      }}
-{mul1}      workgroupBarrier();
-    }}
   }}
 ",
         first = load_step(key, "kb", p0),
-        load1 = load_step(key, "kb + (t + 1u) * BK", p1),
+        load1 = load_step(key, "kb + (2u * p + 1u) * BK", p1),
         mul0 = compute_step(key, p0),
-        load0 = load_step(key, "kb + (t + 2u) * BK", p0),
+        load0 = load_step(key, "kb + (2u * p + 2u) * BK", p0),
         mul1 = compute_step(key, p1),
     )
 }

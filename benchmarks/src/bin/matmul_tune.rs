@@ -104,7 +104,10 @@ fn options() -> Options {
             other => panic!("unknown flag {other}"),
         }
     }
-    assert!(o.calls > 0 && o.reps > 0, "--calls and --reps must be positive");
+    assert!(
+        o.calls > 0 && o.reps > 0,
+        "--calls and --reps must be positive"
+    );
     o
 }
 
@@ -371,7 +374,10 @@ fn bench_coop(b: &Bench<'_>, model: &str, s: Shape) {
             }
             seen.push(ran);
             line(&name(ran), us, max_diff(&b.read(&out), &reference));
-            all.push(Timing { name: name(ran), us });
+            all.push(Timing {
+                name: name(ran),
+                us,
+            });
         }
     }
     report(model, s, previous, &router, &all);
@@ -402,7 +408,11 @@ fn bench_skinny(b: &Bench<'_>, model: &str, s: Shape) {
             s.layout(),
             s.k,
             s.n,
-            if diff.is_nan() || diff > 1e-3 { "  MISMATCH" } else { "" },
+            if diff.is_nan() || diff > 1e-3 {
+                "  MISMATCH"
+            } else {
+                ""
+            },
         );
     };
     line("previous", previous, 0.0);
@@ -463,7 +473,10 @@ fn main() {
     println!("|---|---:|---|---|---:|---:|---:|---|---:|---|---:|---:|");
     let coop = engine.coop_matmul_available() && o.only.as_deref() != Some("skinny");
     let skinny = o.only.as_deref() != Some("coop");
-    for model in MODELS.iter().filter(|m| o.models.iter().any(|n| n == m.name)) {
+    for model in MODELS
+        .iter()
+        .filter(|m| o.models.iter().any(|n| n == m.name))
+    {
         for &m in &o.rows {
             if skinny {
                 for s in skinny_shapes(model, m) {

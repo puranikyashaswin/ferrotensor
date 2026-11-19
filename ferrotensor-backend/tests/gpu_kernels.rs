@@ -653,9 +653,9 @@ fn every_skinny_tile_matches_cpu_in_both_layouts() {
                     let out = upload(&old, &[m, n]);
                     let ep = Epilogue { alpha, beta };
                     let tensors = [&a_up, b_up, &out];
-                    let ran = g
-                        .engine
-                        .matmul_skinny_into(&g.ctx, *transposed_b, tensors, Some(tile), ep);
+                    let ran =
+                        g.engine
+                            .matmul_skinny_into(&g.ctx, *transposed_b, tensors, Some(tile), ep);
                     assert_eq!(ran, Ok(tile));
                     let want: Vec<f32> = product
                         .iter()
