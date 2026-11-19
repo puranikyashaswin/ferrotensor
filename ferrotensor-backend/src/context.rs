@@ -20,6 +20,26 @@ const MAX_PENDING_OPS: u32 = 128;
 /// dispatches made SmolLM2-1.7B steps slower than one pass per dispatch.
 const MAX_PASS_DISPATCHES: usize = 8;
 
+/// Environment variable that replaces `MAX_PENDING_OPS` when the context is
+/// created (a positive integer), to tune submission on a given GPU.
+pub const PENDING_OPS_ENV: &str = "FERROTENSOR_PENDING_OPS";
+
+/// Environment variable that replaces `MAX_PASS_DISPATCHES` when the context
+/// is created (a positive integer).
+pub const PASS_DISPATCHES_ENV: &str = "FERROTENSOR_PASS_DISPATCHES";
+
+/// A positive integer limit from an environment variable's `value`, or
+/// `default` when it is unset, zero or not a number.
+fn limit_from_env_value<T>(value: Option<&str>, default: T) -> T
+where
+    T: std::str::FromStr + PartialEq + From<u8>,
+{
+    match value.map(|v| v.trim().parse::<T>()) {
+        Some(Ok(n)) if n != T::from(0) => n,
+        _ => default,
+    }
+}
+
 /// Uploaded bytes after which [`WgpuContext::note_upload`] waits for the
 /// staging copies to finish so wgpu can free them.
 pub const UPLOAD_RELEASE_BYTES: u64 = 256 << 20;
@@ -64,6 +84,10 @@ pub struct WgpuContext {
     pub(crate) counters: GpuCounters,
     /// Timestamp queries, with [`KernelTiming::On`] on an adapter that has them.
     timer: Option<KernelTimer>,
+    /// Ops recorded before a submit, from [`PENDING_OPS_ENV`].
+    max_pending_ops: u32,
+    /// Dispatches per compute pass, from [`PASS_DISPATCHES_ENV`].
+    max_pass_dispatches: usize,
 }
 
 /// Recorded work not yet submitted: the encoder, and the dispatches not yet
@@ -268,7 +292,12 @@ impl WgpuContext {
                 .ok()
                 .as_deref(),
         ));
-        let timer = timing_mode.map(|mode| KernelTimer::new(mode, &queue, MAX_PENDING_OPS));
+        let env = |name: &str| std::env::var(name).ok();
+        let max_pending_ops =
+            limit_from_env_value(env(PENDING_OPS_ENV).as_deref(), MAX_PENDING_OPS);
+        let max_pass_dispatches =
+            limit_from_env_value(env(PASS_DISPATCHES_ENV).as_deref(), MAX_PASS_DISPATCHES);
+        let timer = timing_mode.map(|mode| KernelTimer::new(mode, &queue, max_pending_ops));
         Ok(Self {
             instance,
             adapter,
@@ -279,6 +308,8 @@ impl WgpuContext {
             staged: AtomicU64::new(0),
             counters: GpuCounters::default(),
             timer,
+            max_pending_ops,
+            max_pass_dispatches,
         })
     }
 
@@ -303,7 +334,7 @@ impl WgpuContext {
     pub(crate) fn record_dispatch(&self, dispatch: Dispatch) {
         let mut pending = self.pending.lock().unwrap();
         pending.dispatches.push(dispatch);
-        if pending.dispatches.len() >= MAX_PASS_DISPATCHES {
+        if pending.dispatches.len() >= self.max_pass_dispatches {
             self.encoder(&mut pending);
         }
         self.count_op(&mut pending);
@@ -311,7 +342,7 @@ impl WgpuContext {
 
     fn count_op(&self, pending: &mut Pending) {
         pending.ops += 1;
-        if pending.ops >= MAX_PENDING_OPS {
+        if pending.ops >= self.max_pending_ops {
             self.submit(pending);
         }
     }
@@ -520,6 +551,16 @@ impl WgpuContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn submit_limits_take_a_positive_integer_from_the_environment() {
+        assert_eq!(limit_from_env_value(None, 128u32), 128);
+        assert_eq!(limit_from_env_value(Some(" 64 "), 128u32), 64);
+        assert_eq!(limit_from_env_value(Some("1"), 8usize), 1);
+        for bad in ["0", "-3", "eight", ""] {
+            assert_eq!(limit_from_env_value(Some(bad), 8usize), 8, "{bad:?}");
+        }
+    }
 
     #[test]
     fn no_adapter_message_names_backends_and_what_to_do() {
