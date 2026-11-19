@@ -5,8 +5,39 @@
 
 use ferrotensor_autograd::Tensor;
 use ferrotensor_backend::{ComputeEngine, UnifiedTensor, WgpuContext};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+thread_local! {
+    static ADAPTERS_ENABLED: Cell<bool> = const { Cell::new(true) };
+}
+
+/// Run `f` with every LoRA adapter on this thread switched off: each
+/// [`Linear`] computes only `x @ weight (+ bias)`, so a model with adapters
+/// gives the logits of its base model without a second copy of the weights.
+///
+/// Calls nest, and the previous state is restored when `f` returns or
+/// panics. The switch is read when an op runs, so a block checkpointed
+/// inside `f` replays with its adapters on during a later backward: wrap the
+/// call in [`no_grad`](ferrotensor_autograd::no_grad) when nothing should
+/// train through it (the DPO reference pass).
+pub fn without_adapters<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ADAPTERS_ENABLED.with(|enabled| enabled.set(self.0));
+        }
+    }
+    let _restore = Restore(ADAPTERS_ENABLED.with(|enabled| enabled.replace(false)));
+    f()
+}
+
+/// Whether LoRA adapters apply on this thread (false inside
+/// [`without_adapters`]).
+pub fn adapters_enabled() -> bool {
+    ADAPTERS_ENABLED.with(Cell::get)
+}
 
 pub mod classifier;
 pub mod dropout;
@@ -112,7 +143,7 @@ impl Linear {
     fn project_2d(&self, engine: &ComputeEngine, x: &Tensor) -> Tensor {
         let mut out = Tensor::matmul(x, &self.weight, engine);
 
-        if let Some(lora) = &self.lora {
+        if let Some(lora) = self.lora.as_ref().filter(|_| adapters_enabled()) {
             let temp = Tensor::matmul(x, &lora.a, engine);
             let lora_out = Tensor::matmul(&temp, &lora.b, engine);
             let scaled_lora = Tensor::scale(&lora_out, lora.alpha / lora.rank as f32, engine);

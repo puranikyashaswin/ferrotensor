@@ -330,7 +330,7 @@ pub struct TrainingState {
     pub fp16: bool,
     /// What was trained (`lora`, `all`, `attn`, ...).
     pub train_modules: String,
-    /// Objective (`sft` or `pretrain`).
+    /// Objective (`sft`, `pretrain` or `dpo`).
     #[serde(default = "default_task")]
     pub task: String,
     /// Model directory.
