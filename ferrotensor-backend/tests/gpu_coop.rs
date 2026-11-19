@@ -1,4 +1,4 @@
-//! The cooperative-matrix matmul against CPU references.
+//! The cooperative-matrix matmul and flash attention against CPU references.
 //!
 //! These need a GPU with f16 cooperative matrices (16x16x16, f32
 //! accumulation) and subgroups of 32 threads, and `FERROTENSOR_EXPERIMENTAL=1`
@@ -11,8 +11,11 @@
 
 #![allow(clippy::unwrap_used, clippy::panic)]
 
+mod common;
+
+use common::attention::{cpu_attention, cpu_attention_backward, cpu_attention_lse};
 use ferrotensor_backend::{
-    ComputeEngine, CoopConfig, CoopTile, Epilogue, UnifiedTensor, WgpuContext,
+    AttentionOptions, ComputeEngine, CoopConfig, CoopTile, Epilogue, UnifiedTensor, WgpuContext,
 };
 use std::sync::OnceLock;
 
@@ -545,4 +548,465 @@ fn coop_rounds_unrepresentable_a_within_one_ulp() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Flash attention on cooperative matrices
+// ---------------------------------------------------------------------------
+
+/// The shared GPU with the attention kernels switched on; prints why the
+/// test skips if the device lacks them.
+fn flash_gpu(test: &str) -> Option<&'static Gpu> {
+    let g = gpu();
+    if g.engine.flash_coop_available() {
+        g.engine.set_flash_coop(true);
+        Some(g)
+    } else {
+        eprintln!(
+            "{test}: skipped, {} has no f16 cooperative matrices with f32 accumulation \
+             (or FERROTENSOR_EXPERIMENTAL is not 1)",
+            g.ctx.adapter_info()
+        );
+        None
+    }
+}
+
+fn upload(g: &Gpu, data: &[f32], shape: &[usize]) -> UnifiedTensor {
+    UnifiedTensor::new(&g.ctx, data, shape)
+}
+
+fn zeros(g: &Gpu, shape: &[usize]) -> UnifiedTensor {
+    UnifiedTensor::zeros(&g.ctx, shape)
+}
+
+fn read(g: &Gpu, t: &UnifiedTensor) -> Vec<f32> {
+    pollster::block_on(t.to_vec(&g.ctx)).unwrap()
+}
+
+fn max_abs(x: &[f32]) -> f32 {
+    x.iter().fold(0.0, |m, v| m.max(v.abs()))
+}
+
+#[track_caller]
+fn assert_near(name: &str, got: &[f32], want: &[f32], (atol, rtol): (f32, f32)) {
+    assert_eq!(got.len(), want.len(), "{name}: length mismatch");
+    for (i, (g, w)) in got.iter().zip(want).enumerate() {
+        let tol = atol + rtol * w.abs();
+        assert!(
+            g.is_finite() && (g - w).abs() <= tol,
+            "{name}: index {i}: got {g}, want {w}, tol {tol}"
+        );
+    }
+}
+
+/// An attention call: batch, query and key lengths, heads, KV heads, causal
+/// masking and the position of the first query. The head size is 64.
+struct FlashCase {
+    b: usize,
+    sq: usize,
+    sk: usize,
+    h: usize,
+    hkv: usize,
+    causal: bool,
+    offset: u32,
+}
+
+const HEAD: usize = 64;
+
+/// Lengths that are and are not multiples of 64, GQA with groups of 3, 3 and
+/// 1, a non-causal call with different query and key lengths, and a causal
+/// one that starts at an offset.
+const FLASH_CASES: &[FlashCase] = &[
+    FlashCase {
+        b: 1,
+        sq: 64,
+        sk: 64,
+        h: 1,
+        hkv: 1,
+        causal: true,
+        offset: 0,
+    },
+    FlashCase {
+        b: 1,
+        sq: 256,
+        sk: 256,
+        h: 9,
+        hkv: 3,
+        causal: true,
+        offset: 0,
+    },
+    FlashCase {
+        b: 2,
+        sq: 100,
+        sk: 100,
+        h: 15,
+        hkv: 5,
+        causal: true,
+        offset: 0,
+    },
+    FlashCase {
+        b: 1,
+        sq: 130,
+        sk: 130,
+        h: 32,
+        hkv: 32,
+        causal: true,
+        offset: 0,
+    },
+    FlashCase {
+        b: 1,
+        sq: 192,
+        sk: 192,
+        h: 3,
+        hkv: 3,
+        causal: false,
+        offset: 0,
+    },
+    FlashCase {
+        b: 1,
+        sq: 70,
+        sk: 150,
+        h: 2,
+        hkv: 1,
+        causal: false,
+        offset: 0,
+    },
+    FlashCase {
+        b: 1,
+        sq: 17,
+        sk: 17,
+        h: 2,
+        hkv: 2,
+        causal: true,
+        offset: 0,
+    },
+    FlashCase {
+        b: 1,
+        sq: 50,
+        sk: 80,
+        h: 4,
+        hkv: 2,
+        causal: true,
+        offset: 30,
+    },
+];
+
+impl FlashCase {
+    fn dims(&self) -> (usize, usize, usize, usize, usize, usize) {
+        (self.b, self.sq, self.sk, self.h, self.hkv, HEAD)
+    }
+
+    fn visible(&self) -> impl Fn(usize, usize) -> bool {
+        let (causal, offset) = (self.causal, self.offset as usize);
+        move |i, j| !causal || j <= i + offset
+    }
+
+    fn options(&self) -> AttentionOptions {
+        AttentionOptions {
+            causal: self.causal,
+            causal_offset: self.offset,
+            ..AttentionOptions::default()
+        }
+    }
+
+    fn name(&self) -> String {
+        format!(
+            "b{} q{} k{} h{}/{} causal={} offset={}",
+            self.b, self.sq, self.sk, self.h, self.hkv, self.causal, self.offset
+        )
+    }
+}
+
+/// f16-representable inputs for `case`: q, k, v and dO.
+fn flash_inputs(case: &FlashCase, seed: u64) -> [Vec<f32>; 4] {
+    let q = case.b * case.sq * case.h * HEAD;
+    let kv = case.b * case.sk * case.hkv * HEAD;
+    [
+        f16_round(&rand_vec(q, seed)),
+        f16_round(&rand_vec(kv, seed + 1)),
+        f16_round(&rand_vec(kv, seed + 2)),
+        f16_round(&rand_vec(q, seed + 3)),
+    ]
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn coop_flash_attention_matches_cpu_on_f16_rounded_inputs() {
+    let Some(g) = flash_gpu("coop_flash_attention_matches_cpu_on_f16_rounded_inputs") else {
+        return;
+    };
+    for (n, case) in FLASH_CASES.iter().enumerate() {
+        let name = case.name();
+        let (b, sq, sk, h, hkv) = (case.b, case.sq, case.sk, case.h, case.hkv);
+        let dims = case.dims();
+        let [q, k, v, dout] = flash_inputs(case, 200 + 4 * n as u64);
+        // The reference sees the same f16-rounded values the kernel stages.
+        let (want, probs) = cpu_attention(&q, &k, &v, None, dims, case.visible());
+        let (want_dq, want_dk, want_dv) = cpu_attention_backward(&q, &k, &v, &dout, &probs, dims);
+        let want_lse = cpu_attention_lse(&q, &k, None, dims, case.visible());
+
+        let (tq, tk, tv, tdo) = (
+            upload(g, &q, &[b, sq, h, HEAD]),
+            upload(g, &k, &[b, sk, hkv, HEAD]),
+            upload(g, &v, &[b, sk, hkv, HEAD]),
+            upload(g, &dout, &[b, sq, h, HEAD]),
+        );
+        let opts = case.options();
+        let out = zeros(g, &[b, sq, h, HEAD]);
+        let stats = zeros(g, &[b, h, sq, 2]);
+        let runs = g.engine.flash_coop_runs();
+        g.engine
+            .flash_attention_v2_with_stats(&g.ctx, &tq, &tk, &tv, &out, &stats, &opts, None);
+        assert_eq!(g.engine.flash_coop_runs().0, runs.0 + 1, "{name}: routed");
+        let got = read(g, &out);
+        // P is rounded to f16 before the PV product: 2^-11 relative per weight.
+        assert_near(&format!("fwd {name}"), &got, &want, (2e-3, 1e-2));
+        let lse: Vec<f32> = read(g, &stats).iter().skip(1).step_by(2).copied().collect();
+        assert_near(&format!("lse {name}"), &lse, &want_lse, (5e-4, 1e-4));
+
+        let (gq, gk, gv) = (
+            zeros(g, &[b, sq, h, HEAD]),
+            zeros(g, &[b, sk, hkv, HEAD]),
+            zeros(g, &[b, sk, hkv, HEAD]),
+        );
+        g.engine.flash_attention_v2_backward_with_stats(
+            &g.ctx, &tq, &tk, &tv, &out, &tdo, &gq, &gk, &gv, &stats, &opts, None,
+        );
+        assert_eq!(
+            g.engine.flash_coop_runs().1,
+            runs.1 + 1,
+            "{name}: bwd routed"
+        );
+        for (label, got, want) in [
+            ("dq", read(g, &gq), want_dq),
+            ("dk", read(g, &gk), want_dk),
+            ("dv", read(g, &gv), want_dv),
+        ] {
+            // P and dS are f16 in the products, so each term is off by about
+            // 2^-11 of itself; one percent of the largest gradient bounds the sums.
+            let atol = 0.01 * max_abs(&want);
+            assert_near(&format!("{label} {name}"), &got, &want, (atol, 2e-2));
+        }
+        // Delta = dO . O, from the kernel's own f32 output.
+        let delta = read(g, &stats);
+        for row in 0..b * h * sq {
+            let (bi, rest) = (row / (h * sq), row % (h * sq));
+            let (hi, i) = (rest / sq, rest % sq);
+            let at = ((bi * sq + i) * h + hi) * HEAD;
+            let want: f64 = (0..HEAD)
+                .map(|x| f64::from(dout[at + x]) * f64::from(got[at + x]))
+                .sum();
+            let d = f64::from(delta[2 * row]);
+            assert!(
+                (d - want).abs() <= 1e-4,
+                "{name}: Delta of row {row}: got {d}, want {want}"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn coop_flash_attention_agrees_with_a_numerical_gradient() {
+    let Some(g) = flash_gpu("coop_flash_attention_agrees_with_a_numerical_gradient") else {
+        return;
+    };
+    let case = FlashCase {
+        b: 1,
+        sq: 48,
+        sk: 48,
+        h: 2,
+        hkv: 1,
+        causal: true,
+        offset: 0,
+    };
+    let (b, sq, sk, h, hkv) = (case.b, case.sq, case.sk, case.h, case.hkv);
+    let [q, k, v, dout] = flash_inputs(&case, 900);
+    let (tq, tk, tv, tdo) = (
+        upload(g, &q, &[b, sq, h, HEAD]),
+        upload(g, &k, &[b, sk, hkv, HEAD]),
+        upload(g, &v, &[b, sk, hkv, HEAD]),
+        upload(g, &dout, &[b, sq, h, HEAD]),
+    );
+    let opts = case.options();
+    let out = zeros(g, &[b, sq, h, HEAD]);
+    let stats = zeros(g, &[b, h, sq, 2]);
+    g.engine
+        .flash_attention_v2_with_stats(&g.ctx, &tq, &tk, &tv, &out, &stats, &opts, None);
+    let (gq, gk, gv) = (
+        zeros(g, &[b, sq, h, HEAD]),
+        zeros(g, &[b, sk, hkv, HEAD]),
+        zeros(g, &[b, sk, hkv, HEAD]),
+    );
+    g.engine.flash_attention_v2_backward_with_stats(
+        &g.ctx, &tq, &tk, &tv, &out, &tdo, &gq, &gk, &gv, &stats, &opts, None,
+    );
+    let (gq, gk, gv) = (read(g, &gq), read(g, &gk), read(g, &gv));
+
+    // L = sum(dO * attention(q, k, v)) from the CPU forward pass, which has
+    // no f16 in it; the kernel's gradients must be its derivative.
+    let loss = |q: &[f32], k: &[f32], v: &[f32]| -> f64 {
+        let (o, _) = cpu_attention(q, k, v, None, case.dims(), case.visible());
+        o.iter()
+            .zip(&dout)
+            .map(|(x, y)| f64::from(*x) * f64::from(*y))
+            .sum()
+    };
+    let eps = 1e-2f32;
+    let numeric = |which: usize, at: usize| -> f32 {
+        let bump = |sign: f32| {
+            let (mut q2, mut k2, mut v2) = (q.clone(), k.clone(), v.clone());
+            match which {
+                0 => q2[at] += sign * eps,
+                1 => k2[at] += sign * eps,
+                _ => v2[at] += sign * eps,
+            }
+            loss(&q2, &k2, &v2)
+        };
+        ((bump(1.0) - bump(-1.0)) / (2.0 * f64::from(eps))) as f32
+    };
+    for (which, label, grad) in [(0, "dq", &gq), (1, "dk", &gk), (2, "dv", &gv)] {
+        let atol = 0.02 * max_abs(grad) + 2e-3;
+        for at in [0, 1, 37, 63, 64, 500, 1000, grad.len() / 2, grad.len() - 1] {
+            let want = numeric(which, at);
+            assert!(
+                grad[at].is_finite() && (grad[at] - want).abs() <= atol,
+                "{label}[{at}]: kernel {}, numerical {want}, tol {atol}",
+                grad[at]
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn coop_flash_attention_counts_f16_overflow_and_poisons_its_output() {
+    let Some(g) = flash_gpu("coop_flash_attention_counts_f16_overflow_and_poisons_its_output")
+    else {
+        return;
+    };
+    let case = FlashCase {
+        b: 1,
+        sq: 64,
+        sk: 64,
+        h: 1,
+        hkv: 1,
+        causal: true,
+        offset: 0,
+    };
+    let shape = [1, 64, 1, HEAD];
+    let count = || pollster::block_on(g.engine.coop_f16_overflows(&g.ctx)).unwrap();
+    let [q, k, v, dout] = flash_inputs(&case, 300);
+    let run = |q: &[f32], dout: &[f32]| {
+        let (tq, tk, tv, tdo) = (
+            upload(g, q, &shape),
+            upload(g, &k, &shape),
+            upload(g, &v, &shape),
+            upload(g, dout, &shape),
+        );
+        let opts = case.options();
+        let (out, stats) = (zeros(g, &shape), zeros(g, &[1, 1, 64, 2]));
+        g.engine
+            .flash_attention_v2_with_stats(&g.ctx, &tq, &tk, &tv, &out, &stats, &opts, None);
+        let (gq, gk, gv) = (zeros(g, &shape), zeros(g, &shape), zeros(g, &shape));
+        g.engine.flash_attention_v2_backward_with_stats(
+            &g.ctx, &tq, &tk, &tv, &out, &tdo, &gq, &gk, &gv, &stats, &opts, None,
+        );
+        (read(g, &out), read(g, &gq), read(g, &gk))
+    };
+
+    let before = count();
+    let (out, gq, gk) = run(&q, &dout);
+    assert_eq!(count(), before, "finite inputs count nothing");
+    assert!(out.iter().chain(&gq).chain(&gk).all(|v| v.is_finite()));
+
+    // One q value past the f16 range: the one thread that stages it counts it.
+    let mut big = q.clone();
+    big[5] = 70_000.0;
+    let before = count();
+    let (out, _, _) = run(&big, &dout);
+    assert!(count() > before, "the overflow is counted");
+    assert!(out[0].is_nan(), "the workgroup's first output is poisoned");
+
+    // A dO value past the range poisons dQ and dK of the workgroups that stage it.
+    let mut big = dout.clone();
+    big[7] = 70_000.0;
+    let before = count();
+    let (out, gq, gk) = run(&q, &big);
+    assert!(count() > before, "the dO overflow is counted");
+    assert!(
+        out.iter().all(|v| v.is_finite()),
+        "the forward pass is clean"
+    );
+    assert!(gq[0].is_nan(), "dQ is poisoned");
+    assert!(gk[0].is_nan(), "dK is poisoned");
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn flash_attention_keeps_the_scalar_kernels_for_what_the_coop_kernels_do_not_cover() {
+    let Some(g) = flash_gpu(
+        "flash_attention_keeps_the_scalar_kernels_for_what_the_coop_kernels_do_not_cover",
+    ) else {
+        return;
+    };
+    // (name, query length, head size, mask, window, dropout, switch on)
+    let calls = [
+        ("head size 128", 32, 128, false, 0, 0.0, true),
+        ("mask", 32, 64, true, 0, 0.0, true),
+        ("dropout", 32, 64, false, 0, 0.1, true),
+        ("window", 32, 64, false, 8, 0.0, true),
+        ("one query", 1, 64, false, 0, 0.0, true),
+        ("switched off", 32, 64, false, 0, 0.0, false),
+    ];
+    for (name, sq, d, masked, window, dropout, on) in calls {
+        g.engine.set_flash_coop(on);
+        let (b, sk, h, hkv) = (1, 32, 2, 2);
+        let q = rand_vec(b * sq * h * d, 70);
+        let k = rand_vec(b * sk * hkv * d, 71);
+        let v = rand_vec(b * sk * hkv * d, 72);
+        let mask = rand_vec(b * h * sq * sk, 73);
+        let opts = AttentionOptions {
+            causal: sq > 1,
+            window,
+            dropout_prob: dropout,
+            seed: 5,
+            ..AttentionOptions::default()
+        };
+        let out = zeros(g, &[b, sq, h, d]);
+        let stats = zeros(g, &[b, h, sq, 2]);
+        let tmask = upload(g, &mask, &[b, h, sq, sk]);
+        let runs = g.engine.flash_coop_runs();
+        g.engine.flash_attention_v2_with_stats(
+            &g.ctx,
+            &upload(g, &q, &[b, sq, h, d]),
+            &upload(g, &k, &[b, sk, hkv, d]),
+            &upload(g, &v, &[b, sk, hkv, d]),
+            &out,
+            &stats,
+            &opts,
+            masked.then_some(&tmask),
+        );
+        assert_eq!(
+            g.engine.flash_coop_runs(),
+            runs,
+            "{name}: stays on the scalar kernel"
+        );
+        let got = read(g, &out);
+        assert!(got.iter().all(|v| v.is_finite()), "{name}");
+        // Without dropout or a window the scalar kernel is f32 throughout.
+        if dropout == 0.0 && window == 0 {
+            let causal = opts.causal;
+            let (want, _) = cpu_attention(
+                &q,
+                &k,
+                &v,
+                masked.then_some(mask.as_slice()),
+                (b, sq, sk, h, hkv, d),
+                |i, j| !causal || j <= i,
+            );
+            assert_near(name, &got, &want, (1e-5, 1e-3));
+        }
+    }
+    g.engine.set_flash_coop(true);
 }
