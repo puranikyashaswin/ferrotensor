@@ -35,7 +35,9 @@ impl FlatLayout {
         let mut end = 0usize;
         for &n in sizes {
             offsets.push(end);
-            let padded = n.div_ceil(SUM_SQUARES_CHUNK).checked_mul(SUM_SQUARES_CHUNK)?;
+            let padded = n
+                .div_ceil(SUM_SQUARES_CHUNK)
+                .checked_mul(SUM_SQUARES_CHUNK)?;
             end = end.checked_add(padded)?;
             if end > FLAT_MAX_ELEMS {
                 return None;

@@ -2048,9 +2048,11 @@ impl Optimizer for AdamW {
             for (i, ptr) in flat.ptrs.iter().enumerate() {
                 let start = flat.layout.offset(i);
                 let end = start + flat.layout.sizes().get(i).copied().unwrap_or(0);
-                if let (Some(shape), Some(m), Some(v)) =
-                    (flat.shapes.get(i), m_all.get(start..end), v_all.get(start..end))
-                {
+                if let (Some(shape), Some(m), Some(v)) = (
+                    flat.shapes.get(i),
+                    m_all.get(start..end),
+                    v_all.get(start..end),
+                ) {
                     m_host.push((*ptr, shape.clone(), m.to_vec()));
                     v_host.push((*ptr, shape.clone(), v.to_vec()));
                 }

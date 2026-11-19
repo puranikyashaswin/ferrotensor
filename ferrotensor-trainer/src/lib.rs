@@ -515,7 +515,8 @@ impl Trainer {
                 let scale = max_norm / (norm + 1e-6);
                 match &self.flat_grads {
                     Some(packed) if flat => {
-                        self.engine.clip_grad_by_norm(&self.ctx, &packed.data, scale);
+                        self.engine
+                            .clip_grad_by_norm(&self.ctx, &packed.data, scale);
                     }
                     _ => {
                         for grad in &grads {

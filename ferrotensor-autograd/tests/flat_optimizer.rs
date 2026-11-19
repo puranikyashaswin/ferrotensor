@@ -213,21 +213,45 @@ fn flat_step_matches_per_tensor_steps_bit_for_bit() {
         };
         assert!(norm_per > max_norm, "step {step} should clip: {norm_per}");
         assert_eq!(norm_per.to_bits(), norm_flat.to_bits(), "norm, step {step}");
-        assert_eq!(norm_per.to_bits(), norm_mixed.to_bits(), "norm, step {step}");
+        assert_eq!(
+            norm_per.to_bits(),
+            norm_mixed.to_bits(),
+            "norm, step {step}"
+        );
 
         let scale = f64::from(max_norm / (norm_per + 1e-6));
         for i in 0..sizes.len() {
             let g: Vec<f64> = grads[i].iter().map(|&x| f64::from(x) * scale).collect();
-            adamw_ref(&mut w_ref[i], &g, &mut m_ref[i], &mut v_ref[i], LR_REF, step);
+            adamw_ref(
+                &mut w_ref[i],
+                &g,
+                &mut m_ref[i],
+                &mut v_ref[i],
+                LR_REF,
+                step,
+            );
         }
 
         let w_per = weights_of(&rig, &per_tensor);
         let w_flat = weights_of(&rig, &flat);
         let w_mixed = weights_of(&rig, &mixed);
         for i in 0..sizes.len() {
-            assert_eq!(bits(&w_per[i]), bits(&w_flat[i]), "flat, tensor {i}, step {step}");
-            assert_eq!(bits(&w_per[i]), bits(&w_mixed[i]), "mixed, tensor {i}, step {step}");
-            assert_close(&w_flat[i], &w_ref[i], (1e-4, 1.0), "weights against the f64 reference");
+            assert_eq!(
+                bits(&w_per[i]),
+                bits(&w_flat[i]),
+                "flat, tensor {i}, step {step}"
+            );
+            assert_eq!(
+                bits(&w_per[i]),
+                bits(&w_mixed[i]),
+                "mixed, tensor {i}, step {step}"
+            );
+            assert_close(
+                &w_flat[i],
+                &w_ref[i],
+                (1e-4, 1.0),
+                "weights against the f64 reference",
+            );
         }
     }
 
@@ -259,8 +283,17 @@ fn flat_step_matches_per_tensor_steps_bit_for_bit() {
             ("v", &s_per.v_states, &s_mixed.v_states, &v_ref[i], 1e-7),
         ] {
             assert_eq!(per[&key].shape, other[&key].shape, "{what} shape of {name}");
-            assert_eq!(bits(&per[&key].data), bits(&other[&key].data), "{what} of {name}");
-            assert_close(&other[&key].data, want, (1e-4, floor), "moments, f64 reference");
+            assert_eq!(
+                bits(&per[&key].data),
+                bits(&other[&key].data),
+                "{what} of {name}"
+            );
+            assert_close(
+                &other[&key].data,
+                want,
+                (1e-4, floor),
+                "moments, f64 reference",
+            );
         }
     }
 }
@@ -288,8 +321,31 @@ fn flat_step_first_update_has_the_closed_form_values() {
     ]);
     let OptimizerCheckpoint::AdamW(state) = opt.save_state(&rig.ctx, &named).expect("state");
     let tight = (1e-5, 1e-6);
-    assert_close(&state.m_states["a"].data, &[0.05], tight, "first moment of a");
-    assert_close(&state.m_states["b"].data, &[0.025, -0.05], tight, "first moment of b");
-    assert_close(&state.v_states["a"].data, &[0.00025], tight, "second moment of a");
-    assert_close(&state.v_states["b"].data, &[0.0000625, 0.00025], tight, "second moment of b");
+    // beta2 = 0.999 is stored as an f32, so 1 - beta2 is off by about 1e-6
+    // in relative terms and the second moment inherits that.
+    let loose = (1e-4, 1e-6);
+    assert_close(
+        &state.m_states["a"].data,
+        &[0.05],
+        tight,
+        "first moment of a",
+    );
+    assert_close(
+        &state.m_states["b"].data,
+        &[0.025, -0.05],
+        tight,
+        "first moment of b",
+    );
+    assert_close(
+        &state.v_states["a"].data,
+        &[0.00025],
+        loose,
+        "second moment of a",
+    );
+    assert_close(
+        &state.v_states["b"].data,
+        &[0.0000625, 0.00025],
+        loose,
+        "second moment of b",
+    );
 }
