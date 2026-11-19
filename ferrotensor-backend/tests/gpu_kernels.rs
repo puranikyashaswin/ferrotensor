@@ -1210,19 +1210,22 @@ fn rms_norm_backward_matches_cpu() {
         let go = rand_vec(rows * len, 72 + len as u64);
         let gx = zeros(&[rows, len]);
         let gw = zeros(&[len]);
-        g.engine.rms_norm_backward(
-            &g.ctx,
-            &upload(&x, &[rows, len]),
-            &upload(&w, &[len]),
-            &upload(&go, &[rows, len]),
-            &gx,
-            &gw,
-            eps,
+        let (tx, tw, tgo) = (
+            upload(&x, &[rows, len]),
+            upload(&w, &[len]),
+            upload(&go, &[rows, len]),
         );
+        let e = &g.engine;
+        e.rms_norm_backward(&g.ctx, &tx, &tw, &tgo, &gx, Some(&gw), eps);
         let (want_x, want_w) = cpu_rms_norm_backward(&x, &go, &w, len, eps);
         let name = format!("rms_norm_backward {rows}x{len}");
         assert_close(&format!("{name} grad_x"), &read(&gx), &want_x, 1e-4, 1e-3);
         assert_close(&format!("{name} grad_w"), &read(&gw), &want_w, 1e-4, 1e-3);
+        // A frozen weight gets no gradient: the input gradient is the same.
+        let gx_only = zeros(&[rows, len]);
+        e.rms_norm_backward(&g.ctx, &tx, &tw, &tgo, &gx_only, None, eps);
+        let bits = |t: &UnifiedTensor| read(t).iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&gx_only), bits(&gx), "{name} grad_x without grad_w");
     }
 }
 

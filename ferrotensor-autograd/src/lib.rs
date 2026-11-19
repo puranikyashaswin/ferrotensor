@@ -758,13 +758,16 @@ impl AutogradNode for RMSNormNode {
         let ctx = &self.input.ctx;
         let grad_x = UnifiedTensor::empty(ctx, &self.input.data.shape);
         let grad_w = UnifiedTensor::empty(ctx, &self.weight.data.shape);
+        // A frozen norm weight's gradient is never read, so its kernel is
+        // skipped; `grad_w` only fills the weight's place in the result.
+        let wanted = self.weight.requires_grad.then_some(&grad_w);
         engine.rms_norm_backward(
             ctx,
             &self.input.data,
             &self.weight.data,
             grad,
             &grad_x,
-            &grad_w,
+            wanted,
             self.eps,
         );
         vec![grad_x, grad_w]

@@ -48,7 +48,7 @@ impl ComputeEngine {
     /// `input` and `weight`, given the output gradient `grad_out`.
     ///
     /// `grad_input` has `input`'s shape; `grad_weight` has `weight`'s and is
-    /// summed over all rows.
+    /// summed over all rows, and `None` skips it (a frozen weight).
     #[allow(clippy::too_many_arguments)]
     pub fn rms_norm_backward(
         &self,
@@ -57,7 +57,7 @@ impl ComputeEngine {
         weight: &UnifiedTensor,
         grad_out: &UnifiedTensor,
         grad_input: &UnifiedTensor,
-        grad_weight: &UnifiedTensor,
+        grad_weight: Option<&UnifiedTensor>,
         eps: f32,
     ) {
         let size = *input.shape.last().unwrap_or(&1);
@@ -83,6 +83,9 @@ impl ComputeEngine {
             ],
             grid(rows as u32),
         );
+        let Some(grad_weight) = grad_weight else {
+            return;
+        };
         let params = uniform(ctx, bytemuck::cast_slice(&[size as u32, rows as u32, 0, 0]));
         self.run(
             ctx,
