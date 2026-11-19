@@ -1456,13 +1456,17 @@ fn cpu_attention_lse(
 }
 
 /// (batch, seq, heads, kv_heads, head_dim) for the saved-stats tests: every
-/// length is causal and lengths 17, 66 and 130 end inside a query block.
+/// length is causal, lengths 17, 66 and 130 end inside a 16-row block and
+/// 256 fills its blocks exactly.
 const SAVED_STATS_CASES: &[(usize, usize, usize, usize, usize)] = &[
     (1, 1, 2, 2, 64),
     (1, 17, 2, 1, 64),
     (1, 66, 4, 4, 64),
     (2, 130, 4, 2, 64),
     (1, 66, 2, 2, 128),
+    (1, 130, 2, 2, 96),
+    (1, 256, 2, 2, 64),
+    (1, 256, 2, 1, 128),
 ];
 
 #[test]
