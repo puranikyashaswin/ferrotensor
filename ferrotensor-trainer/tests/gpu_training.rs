@@ -641,7 +641,7 @@ fn deferred_loss_readback_matches_reading_every_micro_batch() {
     let counts: Vec<usize> = immediate.iter().map(Vec::len).collect();
     assert_eq!(counts, [1, 2, 1, 2, 2]);
     let counts: Vec<usize> = deferred.iter().map(Vec::len).collect();
-    assert_eq!(counts, [0, 0, 4, 0, 4], "deferred stats arrive at window ends");
+    assert_eq!(counts, [0, 0, 4, 0, 4], "stats arrive at window ends");
 
     let immediate: Vec<_> = immediate.into_iter().flatten().collect();
     let deferred: Vec<_> = deferred.into_iter().flatten().collect();
