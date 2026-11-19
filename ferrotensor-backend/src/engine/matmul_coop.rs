@@ -202,12 +202,7 @@ impl Tuned {
 /// only where it was at least 10% faster than the best unsplit configuration,
 /// since it costs a second pass and a partial-sum buffer that the bench's
 /// isolated calls charge only in part. The 1.7B products at 256 rows are not
-/// here: their bench winners (the 128x64 and 64x64 tiles with one staging
-/// buffer) took 1.3 to 2.4 times as long in a `--profile` of a 30-step 1.7B
-/// run, with micro-batches of 64 to 256 rows next to the other kernels of the
-/// step, as the double-buffered 64x64 tile with K split to fill the GPU. The
-/// bench times one product alone, repeated with a warm cache, and the step
-/// does not. Those products run the router's rule.
+/// here: see [`STEP_RULE`].
 const TUNED: &[Tuned] = &[
     // SmolLM2-135M
     Tuned::new(256, true, 576, 576, 12, 1),
@@ -287,6 +282,28 @@ fn tuned(m: u32, transposed_b: bool, k: u32, n: u32) -> Option<CoopConfig> {
     })
 }
 
+/// The 1.7B base-weight products of up to 256 rows, as `(a@bT, k, n)`, whose
+/// `matmul-tune` winners lose in a training step. The bench winners (the
+/// 128x64 and 64x64 tiles with one staging buffer, one K split of 3 or none)
+/// took 1.3 to 2.4 times as long in a `--profile` of a 30-step 1.7B run with
+/// micro-batches of 64 to 256 rows as the double-buffered 64x64 tile with K
+/// split to fill the GPU, and the 60-step median was 0.464 s against 0.327 s.
+/// The bench times one product alone, repeated with a warm cache, and the
+/// step does not. These products run [`STEP_TILES`] instead; the other 1.7B
+/// products and all of 135M and 360M keep their table rows or the rule above.
+const STEP_RULE: &[(bool, u32, u32)] = &[
+    (true, 2048, 2048),
+    (false, 2048, 2048),
+    (true, 2048, 8192),
+    (false, 8192, 2048),
+    (true, 8192, 2048),
+    (false, 2048, 8192),
+    (true, 2048, 49152),
+    (false, 49152, 2048),
+];
+/// Tiles [`STEP_RULE`] products try, in order, as for [`SMALL_M_TILES`].
+const STEP_TILES: [usize; 2] = [3, 4];
+
 /// `(splits, K per split)` for `requested` slices of K = `k` in steps of
 /// `bk`: every slice a whole number of steps, none empty.
 fn split_k(k: u32, bk: u32, requested: u32) -> (u32, u32) {
@@ -360,7 +377,7 @@ fn grid_fits(tile: CoopTile, m: u32, n: u32, split: u32) -> bool {
 /// The configuration the router runs an `m x k x n` product with. On a
 /// device the [`TUNED`] rows were measured on (`use_tuned`), a product with a
 /// row there runs that row's configuration when its tile `fits`. Any other
-/// product gets the first tile of the list for `m` that `fits` and whose grid
+/// product (a [`STEP_RULE`] one with its own list) gets the first tile of the list for `m` that `fits` and whose grid
 /// reaches `target` workgroups, else the last one that fits with K split
 /// until the grid reaches the target (at most one slice per
 /// [`MIN_STEPS_PER_SPLIT`] steps). The first kernel's tiles stand in on a
@@ -376,8 +393,11 @@ fn plan(
     if measured.is_some() {
         return measured;
     }
+    let in_step_rule = use_tuned && STEP_RULE.contains(&(transposed_b, k, n));
     let list: &[usize] = if m > 256 {
         &LARGE_M_TILES
+    } else if in_step_rule {
+        &STEP_TILES
     } else {
         &SMALL_M_TILES
     };
@@ -1285,13 +1305,13 @@ mod tests {
             assert_eq!((got.tile, got.split), (CoopTile::ALL[want], 1), "m {m}");
         }
         // 1.7B at up to 256 rows has no row, since the bench winners lost in
-        // a training step: the rule's tile runs, split until the grid fills
-        // the GPU.
+        // a training step: the double-buffered 64x64 tile runs, split until
+        // the grid fills the GPU.
         for (m, a_bt, k, n, want) in [
-            (128, false, 2048, 8192, (12, 1)),
-            (128, true, 2048, 2048, (11, 3)),
-            (64, true, 8192, 2048, (11, 5)),
-            (256, false, 2048, 8192, (12, 1)),
+            (128, false, 2048, 8192, (4, 1)),
+            (128, true, 2048, 2048, (4, 3)),
+            (64, true, 8192, 2048, (4, 5)),
+            (256, false, 2048, 8192, (3, 1)),
         ] {
             let got = plan((m, k, n), a_bt, (160, true), all).expect("a tile fits");
             assert_eq!(
@@ -1300,6 +1320,12 @@ mod tests {
                 "m {m} k {k} n {n}"
             );
         }
+        // Another 1.7B product, and the same product on a device without the
+        // table, run the router's own rule.
+        let got = plan((128, 2048, 49152), false, (160, true), all).expect("a tile fits");
+        assert_eq!((got.tile, got.split), (CoopTile::ALL[12], 1));
+        let got = plan((128, 2048, 8192), false, (160, false), all).expect("a tile fits");
+        assert_eq!((got.tile, got.split), (CoopTile::ALL[12], 1));
         // More rows than the table has run the router's own rule.
         let got = plan((4096, 576, 576), true, (160, true), all);
         assert_eq!(got.map(|c| c.tile), Some(CoopTile::ALL[1]));
