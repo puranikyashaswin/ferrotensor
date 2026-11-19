@@ -263,7 +263,7 @@ fn dropped_buffers_await_the_gpu_until_synchronize() {
 
     // The readback copy is staging while it runs, then awaits the GPU.
     let staging_before = mem.current().category(MemoryCategory::Staging).buffers;
-    let values = pollster::block_on(src.to_vec(ctx));
+    let values = pollster::block_on(src.to_vec(ctx)).expect("GPU readback");
     assert_eq!(values.len(), 1024);
     assert_eq!(
         mem.current().category(MemoryCategory::Staging).buffers,

@@ -21,7 +21,7 @@ fn setup() -> (Arc<WgpuContext>, ComputeEngine) {
 }
 
 fn host(ctx: &WgpuContext, t: &UnifiedTensor) -> Vec<f32> {
-    pollster::block_on(t.to_vec(ctx))
+    pollster::block_on(t.to_vec(ctx)).expect("GPU readback")
 }
 
 const TABLE: [f32; 6] = [0.5, -1.0, 2.0, 0.25, -3.0, 4.0];

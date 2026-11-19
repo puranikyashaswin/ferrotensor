@@ -224,11 +224,16 @@ impl Embedding {
     /// Looks up `input_ids` and returns `[1, seq, hidden]`. The lookup runs
     /// on the CPU (the table is read back from the GPU) and records no op,
     /// so its output is a constant and `weight` gets no gradient from it.
+    #[expect(
+        clippy::expect_used,
+        reason = "this API returns no Result, and a readback fails only when the GPU device was lost"
+    )]
     pub fn forward(&self, ctx: &WgpuContext, _engine: &ComputeEngine, input_ids: &[u32]) -> Tensor {
         let hidden_dim = self.weight.data.shape[1];
         let seq_len = input_ids.len();
         let mut out_data = Vec::with_capacity(seq_len * hidden_dim);
-        let w_data = pollster::block_on(self.weight.data.to_vec(ctx));
+        let w_data = pollster::block_on(self.weight.data.to_vec(ctx))
+            .expect("GPU device lost during readback");
         for &id in input_ids {
             let start = (id as usize) * hidden_dim;
             let end = start + hidden_dim;

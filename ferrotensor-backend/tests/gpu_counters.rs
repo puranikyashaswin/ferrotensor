@@ -44,7 +44,7 @@ fn counters_match_a_known_sequence_of_ops() {
     engine.gradient_scale(&ctx, &c, 2.0);
     engine.copy_tensor(&ctx, &c, &d, 0);
     engine.gradient_scale(&ctx, &d, 0.5);
-    let values = pollster::block_on(d.to_vec(&ctx));
+    let values = pollster::block_on(d.to_vec(&ctx)).unwrap();
     let ops = ctx.gpu_counters().since(&before);
 
     // (1 + 2) * 2 * 0.5
@@ -86,7 +86,7 @@ fn dispatches_sharing_a_pass_see_each_others_writes() {
     // Reads x as written by the last scale, then sum is scaled in place.
     engine.add(&ctx, &x, &y, &sum);
     engine.gradient_scale(&ctx, &sum, 0.5);
-    let values = pollster::block_on(sum.to_vec(&ctx));
+    let values = pollster::block_on(sum.to_vec(&ctx)).unwrap();
     let ops = ctx.gpu_counters().since(&before);
 
     // (1 * 2^10 + 3) * 0.5
@@ -141,8 +141,8 @@ fn kernel_times_count_each_dispatch_under_its_kernel() {
     engine.matmul(&ctx, &x, &y, &xy);
     engine.copy_tensor(&ctx, &c, &d, 0);
     engine.gradient_scale(&ctx, &d, 0.5);
-    let values = pollster::block_on(d.to_vec(&ctx));
-    let products = pollster::block_on(xy.to_vec(&ctx));
+    let values = pollster::block_on(d.to_vec(&ctx)).unwrap();
+    let products = pollster::block_on(xy.to_vec(&ctx)).unwrap();
     let wall = wall.elapsed();
     let ops = ctx.gpu_counters().since(&before);
     let kernels = ctx.kernel_times().since(&kernels_before);
@@ -194,7 +194,7 @@ fn kernel_times_span_several_submissions() {
     for _ in 0..300 {
         engine.gradient_scale(&ctx, &x, 1.0);
     }
-    let values = pollster::block_on(x.to_vec(&ctx));
+    let values = pollster::block_on(x.to_vec(&ctx)).unwrap();
     let ops = ctx.gpu_counters().since(&before);
 
     assert_eq!(values, vec![1.0; N]);

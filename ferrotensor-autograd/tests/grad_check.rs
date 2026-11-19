@@ -194,7 +194,7 @@ fn cases() -> Vec<Case> {
 }
 
 fn read(ctx: &WgpuContext, t: &UnifiedTensor) -> Vec<f32> {
-    pollster::block_on(t.to_vec(ctx))
+    pollster::block_on(t.to_vec(ctx)).expect("GPU readback")
 }
 
 /// Analytic gradients of `sum(w * f(inputs))`, and the forward output.

@@ -10,6 +10,7 @@
 //! Result: [12.0, 16.0, 20.0, 24.0]
 //! Verification Successful!
 //! ```
+#![allow(clippy::expect_used)]
 
 use ferrotensor_backend::{ComputeEngine, UnifiedTensor, WgpuContext};
 
@@ -34,7 +35,7 @@ fn main() {
         engine.add(&ctx, &tensor_a, &tensor_b, &temp);
         engine.mul(&ctx, &temp, &tensor_c, &tensor_out);
 
-        let result = tensor_out.to_vec(&ctx).await;
+        let result = tensor_out.to_vec(&ctx).await.expect("GPU readback");
         println!("Result: {:?}", result);
 
         // Verification: (1+5)*2=12, (2+6)*2=16, (3+7)*2=20, (4+8)*2=24

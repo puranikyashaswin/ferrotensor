@@ -229,7 +229,7 @@ fn pass(gpu: &Gpu, model: &Lfm2Model, rows: &[Vec<u32>], targets: &[Vec<u32>]) -
                 .grad
                 .borrow()
                 .as_ref()
-                .map(|g| pollster::block_on(g.to_vec(&gpu.ctx)));
+                .map(|g| pollster::block_on(g.to_vec(&gpu.ctx)).expect("GPU readback"));
             (name, g)
         })
         .collect();

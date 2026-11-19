@@ -69,7 +69,7 @@ pub fn run(args: InfoArgs) -> Result<Exit, Box<dyn std::error::Error>> {
     let adapters = adapters::list_adapters();
     let checks = if args.check && adapters.iter().any(|a| a.selected) {
         let ctx = pollster::block_on(WgpuContext::try_new())?;
-        Some(pollster::block_on(adapters::self_check(&ctx)))
+        Some(pollster::block_on(adapters::self_check(&ctx))?)
     } else {
         None
     };
@@ -119,7 +119,10 @@ pub fn run(args: InfoArgs) -> Result<Exit, Box<dyn std::error::Error>> {
                 println!("    driver            {}", a.driver);
             }
             println!("    max buffer        {}", mib(a.max_buffer_size));
-            println!("    max storage bind  {}", mib(a.max_storage_buffer_binding_size));
+            println!(
+                "    max storage bind  {}",
+                mib(a.max_storage_buffer_binding_size)
+            );
             println!(
                 "    workgroup         {} threads, {} KiB shared",
                 a.max_compute_invocations_per_workgroup,

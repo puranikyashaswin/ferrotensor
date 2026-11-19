@@ -9,13 +9,16 @@
 //! ```no_run
 //! use ferrotensor_backend::{ComputeEngine, UnifiedTensor, WgpuContext};
 //!
+//! # fn main() -> Result<(), ferrotensor_backend::ReadbackError> {
 //! let ctx = pollster::block_on(WgpuContext::new());
 //! let engine = ComputeEngine::new(&ctx);
 //! let a = UnifiedTensor::new(&ctx, &[1.0, 2.0, 3.0, 4.0], &[2, 2]);
 //! let b = UnifiedTensor::new(&ctx, &[1.0, 0.0, 0.0, 1.0], &[2, 2]);
 //! let c = UnifiedTensor::empty(&ctx, &[2, 2]);
 //! engine.matmul(&ctx, &a, &b, &c);
-//! assert_eq!(pollster::block_on(c.to_vec(&ctx)), vec![1.0, 2.0, 3.0, 4.0]);
+//! assert_eq!(pollster::block_on(c.to_vec(&ctx))?, vec![1.0, 2.0, 3.0, 4.0]);
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! Kernels are checked against CPU references in `tests/gpu_kernels.rs`
@@ -47,4 +50,4 @@ pub use engine::{MatmulPath, SmallMLaunch, SmallMTile};
 pub use kernel_timing::{KernelTime, KernelTimes, KernelTiming, KernelTimingMode};
 pub use memory::{MemoryCategory, MemorySnapshot, MemoryTracker};
 pub use profile::GpuCounterSnapshot;
-pub use tensor::{DType, UnifiedTensor};
+pub use tensor::{DType, ReadbackError, UnifiedTensor};

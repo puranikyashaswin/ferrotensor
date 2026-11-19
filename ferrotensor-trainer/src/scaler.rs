@@ -129,6 +129,10 @@ impl GradScaler {
     ///
     /// Returns true if gradients are valid (no overflow), false otherwise.
     /// If false, you should skip the optimizer step.
+    #[expect(
+        clippy::expect_used,
+        reason = "this API returns no Result, and a readback fails only when the GPU device was lost"
+    )]
     pub fn unscale_and_check(
         &mut self,
         gradients: &[UnifiedTensor],
@@ -147,7 +151,8 @@ impl GradScaler {
             engine.gradient_scale(ctx, grad, inv_scale);
 
             // Check for inf/nan (CPU readback - sync point)
-            let data = pollster::block_on(grad.to_vec(ctx));
+            let data = pollster::block_on(grad.to_vec(ctx))
+                .expect("GPU device lost during readback");
             if data.iter().any(|&x| x.is_infinite() || x.is_nan()) {
                 has_overflow = true;
                 break;

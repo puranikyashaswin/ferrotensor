@@ -788,9 +788,14 @@ impl AutogradNode for SelectTokenNode {
         vec![self.input.clone()]
     }
     /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
+    #[expect(
+        clippy::expect_used,
+        reason = "this API returns no Result, and a readback fails only when the GPU device was lost"
+    )]
     fn backward(&self, grad: &UnifiedTensor, _engine: &ComputeEngine) -> Vec<UnifiedTensor> {
         let mut full_grad = vec![0.0f32; self.input.data.shape.iter().product()];
-        let token_grad = pollster::block_on(grad.to_vec(&self.input.ctx));
+        let token_grad = pollster::block_on(grad.to_vec(&self.input.ctx))
+            .expect("GPU device lost during readback");
         let start = self.token_index * self.vocab_size;
         let end = start + self.vocab_size;
         full_grad[start..end].copy_from_slice(&token_grad);
@@ -814,9 +819,14 @@ impl AutogradNode for EmbeddingNode {
         vec![self.table.clone()]
     }
     /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
+    #[expect(
+        clippy::expect_used,
+        reason = "this API returns no Result, and a readback fails only when the GPU device was lost"
+    )]
     fn backward(&self, grad: &UnifiedTensor, _engine: &ComputeEngine) -> Vec<UnifiedTensor> {
         let hidden = self.table.data.shape[1];
-        let output_grad = pollster::block_on(grad.to_vec(&self.table.ctx));
+        let output_grad = pollster::block_on(grad.to_vec(&self.table.ctx))
+            .expect("GPU device lost during readback");
         let mut table_grad = vec![0.0f32; self.table.data.shape.iter().product()];
         // A repeated id sums the gradients of all its positions; an id outside
         // the table looked up zeros, so it gets nothing.
@@ -848,10 +858,15 @@ impl AutogradNode for MSELossNode {
         vec![self.pred.clone(), self.target.clone()]
     }
     /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
+    #[expect(
+        clippy::expect_used,
+        reason = "this API returns no Result, and a readback fails only when the GPU device was lost"
+    )]
     fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
         let grad_in = UnifiedTensor::empty(&self.pred.ctx, &self.pred.data.shape);
         engine.mse_loss_backward(&self.pred.ctx, &self.pred.data, &self.target.data, &grad_in);
         let upstream = pollster::block_on(grad.to_vec(&self.pred.ctx))
+            .expect("GPU device lost during readback")
             .first()
             .copied()
             .unwrap_or(1.0);
@@ -880,6 +895,10 @@ impl AutogradNode for CrossEntropyLossNode {
         vec![self.logits.clone()]
     }
     /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
+    #[expect(
+        clippy::expect_used,
+        reason = "this API returns no Result, and a readback fails only when the GPU device was lost"
+    )]
     fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
         let grad_logits = UnifiedTensor::empty(&self.logits.ctx, &self.logits.data.shape);
         engine.cross_entropy_backward(
@@ -889,6 +908,7 @@ impl AutogradNode for CrossEntropyLossNode {
             &grad_logits,
         );
         let upstream = pollster::block_on(grad.to_vec(&self.logits.ctx))
+            .expect("GPU device lost during readback")
             .first()
             .copied()
             .unwrap_or(1.0);
@@ -1287,11 +1307,16 @@ impl Tensor {
     /// Squared-error loss `0.5 * sum((pred - target)^2)`, shape `[1]`.
     ///
     /// Its gradient is `pred - target` (the backward kernel's output).
+    #[expect(
+        clippy::expect_used,
+        reason = "this API returns no Result, and a readback fails only when the GPU device was lost"
+    )]
     pub fn mse_loss(pred: &Tensor, target: &Tensor, engine: &ComputeEngine) -> Tensor {
         // The kernel writes 0.5 * (p - t)^2 per element; sum on the host.
         let per_element = UnifiedTensor::empty(&pred.ctx, &pred.data.shape);
         engine.mse_loss(&pred.ctx, &pred.data, &target.data, &per_element);
         let total: f32 = pollster::block_on(per_element.to_vec(&pred.ctx))
+            .expect("GPU device lost during readback")
             .iter()
             .sum();
         let out_data = UnifiedTensor::new(&pred.ctx, &[total], &[1]);
@@ -1401,7 +1426,8 @@ impl Tensor {
             .shape
             .last()
             .expect("select_token requires a non-empty tensor");
-        let full = pollster::block_on(input.data.to_vec(&input.ctx));
+        let full = pollster::block_on(input.data.to_vec(&input.ctx))
+            .expect("GPU device lost during readback");
         let start = token_index * vocab_size;
         let end = start + vocab_size;
         let out_data = UnifiedTensor::new(&input.ctx, &full[start..end], &[vocab_size]);
@@ -1786,6 +1812,10 @@ impl Optimizer for AdamW {
         self.clear_grads(params);
     }
     /// Serialize optimizer state keyed by parameter name (`None` if unsupported).
+    #[expect(
+        clippy::expect_used,
+        reason = "this API returns no Result, and a readback fails only when the GPU device was lost"
+    )]
     fn save_state(
         &self,
         ctx: &Arc<WgpuContext>,
@@ -1804,7 +1834,8 @@ impl Optimizer for AdamW {
                     name.clone(),
                     OptimizerTensorState {
                         shape: state.shape.clone(),
-                        data: pollster::block_on(state.to_vec(ctx)),
+                        data: pollster::block_on(state.to_vec(ctx))
+                            .expect("GPU device lost during readback"),
                     },
                 );
             }
@@ -1815,7 +1846,8 @@ impl Optimizer for AdamW {
                     name.clone(),
                     OptimizerTensorState {
                         shape: state.shape.clone(),
-                        data: pollster::block_on(state.to_vec(ctx)),
+                        data: pollster::block_on(state.to_vec(ctx))
+                            .expect("GPU device lost during readback"),
                     },
                 );
             }

@@ -671,6 +671,10 @@ impl Lfm2Model {
     }
 
     /// Embeddings `[rows, seq, hidden]` for equally long rows of ids.
+    #[expect(
+        clippy::expect_used,
+        reason = "this API returns no Result, and a readback fails only when the GPU device was lost"
+    )]
     fn lookup_embeddings(
         &self,
         ctx: &Arc<ferrotensor_backend::WgpuContext>,
@@ -682,10 +686,14 @@ impl Lfm2Model {
         let read_back;
         let mut cached = self.embed_host.borrow_mut();
         let table: &[f32] = if self.embed_tokens.requires_grad {
-            read_back = pollster::block_on(self.embed_tokens.data.to_vec(ctx));
+            read_back = pollster::block_on(self.embed_tokens.data.to_vec(ctx))
+                .expect("GPU device lost during readback");
             &read_back
         } else {
-            cached.get_or_insert_with(|| pollster::block_on(self.embed_tokens.data.to_vec(ctx)))
+            cached.get_or_insert_with(|| {
+                pollster::block_on(self.embed_tokens.data.to_vec(ctx))
+                    .expect("GPU device lost during readback")
+            })
         };
         Tensor::embedding(&self.embed_tokens, table, rows)
     }

@@ -5,7 +5,7 @@
 //! [`self_check`]. Both are meant for bug reports and for trying Ferrotensor
 //! on hardware it has not been tested on yet.
 
-use crate::{ComputeEngine, KernelTimingMode, UnifiedTensor, WgpuContext};
+use crate::{ComputeEngine, KernelTimingMode, ReadbackError, UnifiedTensor, WgpuContext};
 
 /// One adapter wgpu found, with the limits that matter for the kernels.
 #[derive(Clone, Debug, PartialEq)]
@@ -90,11 +90,26 @@ pub fn cooperative_matrix_configs(adapter: &wgpu::Adapter) -> Vec<CoopMatrixConf
         .collect()
 }
 
+/// Environment variable that opts in to wgpu's experimental features. Only
+/// with `FERROTENSOR_EXPERIMENTAL=1` does [`optional_features`] ask for
+/// cooperative matrices, so a default run never enables an experimental
+/// feature.
+pub const EXPERIMENTAL_ENV: &str = "FERROTENSOR_EXPERIMENTAL";
+
+/// Whether [`EXPERIMENTAL_ENV`] is set to `1`.
+fn experimental_opt_in() -> bool {
+    std::env::var(EXPERIMENTAL_ENV).is_ok_and(|v| v == "1")
+}
+
 /// The optional features [`WgpuContext`] asks for when `adapter` has them:
-/// `f16` in shaders and cooperative matrices. None of them is required.
+/// `f16` in shaders, and cooperative matrices when [`EXPERIMENTAL_ENV`] is
+/// `1`. None of them is required.
 pub fn optional_features(adapter: &wgpu::Adapter) -> wgpu::Features {
-    adapter.features()
-        & (wgpu::Features::SHADER_F16 | wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
+    let mut wanted = wgpu::Features::SHADER_F16;
+    if experimental_opt_in() {
+        wanted |= wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX;
+    }
+    adapter.features() & wanted
 }
 
 /// The token wgpu needs before a device may enable an experimental feature
@@ -114,7 +129,8 @@ pub(crate) fn experimental_features(features: wgpu::Features) -> wgpu::Experimen
 fn enable_experimental_features() -> wgpu::ExperimentalFeatures {
     // SAFETY: the opt-in only lets the device enable the experimental
     // cooperative-matrix feature. Ferrotensor dispatches no shader that uses
-    // cooperative matrices, so none of that feature's code paths run.
+    // cooperative matrices, so none of that feature's code paths run. It is
+    // reached only when `FERROTENSOR_EXPERIMENTAL=1` asks for the feature.
     unsafe { wgpu::ExperimentalFeatures::enabled() }
 }
 
@@ -238,7 +254,10 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
 
 /// Run matmul (odd, non-square sizes), softmax and RMSNorm on `ctx`'s GPU
 /// and compare each with a CPU reference computed in f64.
-pub async fn self_check(ctx: &WgpuContext) -> Vec<CheckResult> {
+///
+/// # Errors
+/// [`ReadbackError`] when a result cannot be read back from the GPU.
+pub async fn self_check(ctx: &WgpuContext) -> Result<Vec<CheckResult>, ReadbackError> {
     let engine = ComputeEngine::new(ctx);
     let mut results = Vec::new();
 
@@ -262,7 +281,7 @@ pub async fn self_check(ctx: &WgpuContext) -> Vec<CheckResult> {
     engine.matmul(ctx, &ga, &gb, &gc);
     results.push(CheckResult {
         name: format!("matmul {m}x{k} @ {k}x{n}"),
-        max_abs_err: max_abs_diff(&gc.to_vec(ctx).await, &want),
+        max_abs_err: max_abs_diff(&gc.to_vec(ctx).await?, &want),
         tolerance: 1e-4,
     });
 
@@ -283,7 +302,7 @@ pub async fn self_check(ctx: &WgpuContext) -> Vec<CheckResult> {
     engine.softmax(ctx, &gx, &gy);
     results.push(CheckResult {
         name: format!("softmax {rows}x{cols}"),
-        max_abs_err: max_abs_diff(&gy.to_vec(ctx).await, &want),
+        max_abs_err: max_abs_diff(&gy.to_vec(ctx).await?, &want),
         tolerance: 1e-6,
     });
 
@@ -307,11 +326,11 @@ pub async fn self_check(ctx: &WgpuContext) -> Vec<CheckResult> {
     engine.rms_norm(ctx, &gx, &gw, &gy);
     results.push(CheckResult {
         name: format!("rms_norm {rows}x{cols}"),
-        max_abs_err: max_abs_diff(&gy.to_vec(ctx).await, &want),
+        max_abs_err: max_abs_diff(&gy.to_vec(ctx).await?, &want),
         tolerance: 1e-4,
     });
 
-    results
+    Ok(results)
 }
 
 #[cfg(test)]

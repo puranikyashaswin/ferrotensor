@@ -1113,12 +1113,12 @@ async fn evaluate(
     model: &Lfm2Model,
     ds: &TextDataset,
     limit: usize,
-) -> (f32, usize) {
+) -> Result<(f32, usize)> {
     let mut loss_sum = 0.0f64;
     let mut tokens = 0usize;
     for ex in ds.examples().iter().take(limit) {
         let logits = no_grad(|| model.forward(&base.engine, &ex.input_ids, 0, None, None));
-        let host = logits.data.to_vec(&base.ctx).await;
+        let host = logits.data.to_vec(&base.ctx).await?;
         if let Some((loss, n)) = masked_cross_entropy_from_logits(
             &host,
             base.config.vocab_size,
@@ -1130,9 +1130,9 @@ async fn evaluate(
         }
     }
     if tokens == 0 {
-        (f32::NAN, 0)
+        Ok((f32::NAN, 0))
     } else {
-        ((loss_sum / tokens as f64) as f32, tokens)
+        Ok(((loss_sum / tokens as f64) as f32, tokens))
     }
 }
 
@@ -1146,7 +1146,7 @@ async fn eval(args: EvalArgs) -> Result<()> {
         eprintln!("{}", loaded_line(path, n, meta.as_ref()));
     }
     let t = Instant::now();
-    let (loss, tokens) = evaluate(&base, &model, &ds, usize::MAX).await;
+    let (loss, tokens) = evaluate(&base, &model, &ds, usize::MAX).await?;
     let summary = EvalSummary {
         examples: ds.len(),
         tokens,
@@ -1448,7 +1448,7 @@ async fn generate_tokens(
         Some(c) => c.feed(base, model, &prompt.ids[cached_tokens..]),
         None => model.forward(&base.engine, &tokens, 0, None, None),
     });
-    let mut next = sample_last_row(base, sampler, &logits.data).await;
+    let mut next = sample_last_row(base, sampler, &logits.data).await?;
     let prefill = start.elapsed();
     let after_prefill = profile_report::GpuMark::now(&base.ctx);
     let decode_start = Instant::now();
@@ -1472,7 +1472,7 @@ async fn generate_tokens(
             Some(c) => c.feed(base, model, &[next]),
             None => model.forward(&base.engine, &tokens, 0, None, None),
         });
-        next = sample_last_row(base, sampler, &logits.data).await;
+        next = sample_last_row(base, sampler, &logits.data).await?;
         decode_steps += 1;
     }
     Ok(Decoded {
@@ -1488,17 +1488,21 @@ async fn generate_tokens(
 /// The token `sampler` picks from the last row of `logits` `[.., vocab]`.
 /// Greedy decoding takes the argmax on the GPU and reads back token ids, not
 /// the logits.
-async fn sample_last_row(base: &Loaded, sampler: &mut Sampler, logits: &UnifiedTensor) -> u32 {
+async fn sample_last_row(
+    base: &Loaded,
+    sampler: &mut Sampler,
+    logits: &UnifiedTensor,
+) -> Result<u32> {
     let vocab = base.config.vocab_size;
     if sampler.is_greedy() {
         let rows = logits.shape.iter().product::<usize>() / vocab;
         let picks = UnifiedTensor::empty(&base.ctx, &[rows]);
         base.engine.argmax_rows(&base.ctx, logits, &picks);
-        let picks = picks.to_vec(&base.ctx).await;
-        return picks.last().map_or(0, |id| id.to_bits());
+        let picks = picks.to_vec(&base.ctx).await?;
+        return Ok(picks.last().map_or(0, |id| id.to_bits()));
     }
-    let host = logits.to_vec(&base.ctx).await;
-    sampler.sample(&host[host.len() - vocab..])
+    let host = logits.to_vec(&base.ctx).await?;
+    Ok(sampler.sample(&host[host.len() - vocab..]))
 }
 
 // ---------------------------------------------------------------------------
@@ -1782,7 +1786,7 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
 
     let eval_loss_before = match &eval_ds {
         Some(ds) => {
-            let (loss, tokens) = evaluate(&base, &trainer.model, ds, args.eval_samples).await;
+            let (loss, tokens) = evaluate(&base, &trainer.model, ds, args.eval_samples).await?;
             eprintln!(
                 "eval before: loss {loss:.4} ppl {:.3} ({tokens} tokens)",
                 loss.exp()
@@ -1936,7 +1940,7 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
                         && step < total_steps
                     {
                         let (loss, _) =
-                            evaluate(&base, &trainer.model, ds, args.eval_samples).await;
+                            evaluate(&base, &trainer.model, ds, args.eval_samples).await?;
                         eprintln!("eval @ {step}: loss {loss:.4} ppl {:.3}", loss.exp());
                         writeln!(
                             metrics,
@@ -1984,7 +1988,7 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
 
     let eval_loss_after = match &eval_ds {
         Some(ds) => {
-            let (loss, tokens) = evaluate(&base, &trainer.model, ds, args.eval_samples).await;
+            let (loss, tokens) = evaluate(&base, &trainer.model, ds, args.eval_samples).await?;
             eprintln!(
                 "eval after: loss {loss:.4} ppl {:.3} ({tokens} tokens)",
                 loss.exp()
@@ -2869,8 +2873,9 @@ mod tests {
     fn a_partial_step_moves_and_measures_only_the_selected_weights() {
         let dir = std::env::temp_dir().join(format!("ferrotensor-step-{}", std::process::id()));
         let base = tiny_base(&dir);
-        let host =
-            |data: &ferrotensor_backend::UnifiedTensor| pollster::block_on(data.to_vec(&base.ctx));
+        let host = |data: &ferrotensor_backend::UnifiedTensor| {
+            pollster::block_on(data.to_vec(&base.ctx)).expect("GPU readback")
+        };
         let (model, selected) = partial_model(&base, &dir, "attn");
         let params: Vec<_> = selected.values().cloned().collect();
         backward(&base, &model);

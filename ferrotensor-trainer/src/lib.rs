@@ -385,12 +385,17 @@ impl Trainer {
     /// Reads every per-row loss buffer of the window in one readback and
     /// fills in the deferred sequences' mean losses, summed in f64 as
     /// [`masked_cross_entropy`] does.
+    #[expect(
+        clippy::expect_used,
+        reason = "this API returns no Result, and a readback fails only when the GPU device was lost"
+    )]
     fn read_pending_losses(&mut self) {
         if self.pending_rows.is_empty() {
             return;
         }
         let buffers: Vec<&UnifiedTensor> = self.pending_rows.iter().collect();
-        let losses = pollster::block_on(UnifiedTensor::read_many(&self.ctx, &buffers));
+        let losses = pollster::block_on(UnifiedTensor::read_many(&self.ctx, &buffers))
+            .expect("GPU device lost during readback");
         for d in &mut self.deferred {
             if let Some((index, rows)) = d.rows.take() {
                 let sum: f64 = losses[index][rows].iter().map(|&l| l as f64).sum();
@@ -587,6 +592,10 @@ impl Trainer {
 
 /// L2 norm over all gradient tensors: partial sums of squares on the GPU,
 /// read back once and added up on the host in f64.
+#[expect(
+    clippy::expect_used,
+    reason = "this API returns no Result, and a readback fails only when the GPU device was lost"
+)]
 pub(crate) fn global_grad_norm(
     grads: &[UnifiedTensor],
     ctx: &WgpuContext,
@@ -610,6 +619,7 @@ pub(crate) fn global_grad_norm(
         offset += engine.sum_squares_partial(ctx, grad, &partials, offset);
     }
     let sum_sq: f64 = pollster::block_on(partials.to_vec(ctx))
+        .expect("GPU device lost during readback")
         .iter()
         .map(|&x| x as f64)
         .sum();
@@ -642,12 +652,17 @@ impl AutogradNode for MaskedCrossEntropyNode {
         vec![self.logits.clone()]
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "this API returns no Result, and a readback fails only when the GPU device was lost"
+    )]
     fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
         if self.applied_seed.is_some() {
             return vec![self.grad_logits.clone()];
         }
         let ctx = &self.logits.ctx;
         let upstream = pollster::block_on(grad.to_vec(ctx))
+            .expect("GPU device lost during readback")
             .first()
             .copied()
             .unwrap_or(1.0);
@@ -784,6 +799,10 @@ fn ce_loss_tensor(
 /// The loss and its gradient (`(softmax - onehot) / tokens` at supervised
 /// positions, zero elsewhere) are computed on the GPU; only the per-position
 /// losses are read back. Returns `None` when no position is supervised.
+#[expect(
+    clippy::expect_used,
+    reason = "this API returns no Result, and a readback fails only when the GPU device was lost"
+)]
 pub fn masked_cross_entropy(
     logits: &Tensor,
     target_ids: &[u32],
@@ -792,7 +811,8 @@ pub fn masked_cross_entropy(
 ) -> Option<MaskedLoss> {
     let ce = masked_ce_on_gpu(logits, target_ids, loss_mask, 1, 1.0, engine)?;
     let ctx = &logits.ctx;
-    let losses = pollster::block_on(ce.row_loss.to_vec(ctx));
+    let losses = pollster::block_on(ce.row_loss.to_vec(ctx))
+        .expect("GPU device lost during readback");
     let (value, tokens) = ce.per_sequence(&losses)[0];
     let data = UnifiedTensor::new(ctx, &[value], &[1]);
     let tensor = ce_loss_tensor(logits, ce.grad, data, None);
@@ -840,6 +860,10 @@ pub struct BatchLoss {
 /// [`masked_cross_entropy`] gradients of the sequences taken one at a time.
 /// `target_ids` and `loss_mask` hold one entry per row. Returns `None` when
 /// no position is supervised.
+#[expect(
+    clippy::expect_used,
+    reason = "this API returns no Result, and a readback fails only when the GPU device was lost"
+)]
 pub fn masked_cross_entropy_batch(
     logits: &Tensor,
     target_ids: &[u32],
@@ -849,7 +873,8 @@ pub fn masked_cross_entropy_batch(
 ) -> Option<BatchLoss> {
     let ce = masked_ce_on_gpu(logits, target_ids, loss_mask, sequences, 1.0, engine)?;
     let ctx = &logits.ctx;
-    let losses = pollster::block_on(ce.row_loss.to_vec(ctx));
+    let losses = pollster::block_on(ce.row_loss.to_vec(ctx))
+        .expect("GPU device lost during readback");
     let per_sequence = ce.per_sequence(&losses);
     let total: f32 = per_sequence.iter().map(|&(l, _)| l).sum();
     let data = UnifiedTensor::new(ctx, &[total], &[1]);

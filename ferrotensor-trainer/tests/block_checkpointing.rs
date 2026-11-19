@@ -156,7 +156,7 @@ fn loss_and_grads_with_dropout(
                 .grad
                 .borrow()
                 .as_ref()
-                .map(|g| pollster::block_on(g.to_vec(&gpu.ctx)));
+                .map(|g| pollster::block_on(g.to_vec(&gpu.ctx)).expect("GPU readback"));
             (name, g)
         })
         .collect();

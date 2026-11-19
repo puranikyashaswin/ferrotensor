@@ -61,7 +61,7 @@ fn setup() -> Setup {
         ctx.clone(),
         UnifiedTensor::new(&ctx, &b_data, &[RANK, OUT_DIM]),
     );
-    let a_data = pollster::block_on(lora.a.data.to_vec(&ctx));
+    let a_data = pollster::block_on(lora.a.data.to_vec(&ctx)).expect("GPU readback");
     let layer = Linear::with_lora(weight, lora.clone());
     Setup {
         ctx,
@@ -113,7 +113,7 @@ fn lora_forward_matches_cpu_reference() {
     let s = setup();
     let out = s.layer.forward(&s.engine, &s.x);
     assert_eq!(out.data.shape, vec![ROWS, OUT_DIM]);
-    let got = pollster::block_on(out.data.to_vec(&s.ctx));
+    let got = pollster::block_on(out.data.to_vec(&s.ctx)).expect("GPU readback");
 
     let base = matmul(&s.x_data, &s.weight_data, ROWS, IN_DIM, OUT_DIM);
     let xa = matmul(&s.x_data, &s.a_data, ROWS, IN_DIM, RANK);
@@ -166,7 +166,8 @@ fn lora_gradients_match_cpu_reference() {
             .as_ref()
             .expect("b has a gradient")
             .to_vec(&s.ctx),
-    );
+    )
+    .expect("GPU readback");
     let got_a = pollster::block_on(
         s.lora
             .a
@@ -175,7 +176,8 @@ fn lora_gradients_match_cpu_reference() {
             .as_ref()
             .expect("a has a gradient")
             .to_vec(&s.ctx),
-    );
+    )
+    .expect("GPU readback");
     assert_close("grad b", &got_b, &want_b, GRAD_TOL);
     assert_close("grad a", &got_a, &want_a, GRAD_TOL);
     assert!(
