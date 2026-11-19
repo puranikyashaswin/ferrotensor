@@ -172,6 +172,8 @@ mod tests {
         counters.dispatches.fetch_add(5, Relaxed);
         counters.compute_passes.fetch_add(2, Relaxed);
         counters.bind_groups.fetch_add(5, Relaxed);
+        counters.bind_group_hits.fetch_add(3, Relaxed);
+        counters.bind_group_misses.fetch_add(5, Relaxed);
         counters.uniform_buffers.fetch_add(2, Relaxed);
         counters.uniform_bytes.fetch_add(32, Relaxed);
         counters.submits.fetch_add(1, Relaxed);
@@ -191,6 +193,8 @@ mod tests {
                 dispatches: 5,
                 compute_passes: 2,
                 bind_groups: 5,
+                bind_group_hits: 3,
+                bind_group_misses: 5,
                 uniform_buffers: 2,
                 uniform_bytes: 32,
                 submits: 1,
