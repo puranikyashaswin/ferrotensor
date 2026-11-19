@@ -374,6 +374,62 @@ impl UnifiedTensor {
         GpuCounters::add_elapsed(&context.counters.readback_nanos, start);
         res
     }
+
+    /// Reads the f32 values of every tensor in `tensors` back to the host
+    /// with one copy into one staging buffer, so the queue drains once
+    /// however many tensors there are.
+    pub async fn read_many(context: &WgpuContext, tensors: &[&UnifiedTensor]) -> Vec<Vec<f32>> {
+        let start = Instant::now();
+        let sizes: Vec<u64> = tensors.iter().map(|t| t.size_in_bytes()).collect();
+        let size: u64 = sizes.iter().sum();
+        if size == 0 {
+            return tensors.iter().map(|_| Vec::new()).collect();
+        }
+        context.counters.readbacks.fetch_add(1, Ordering::Relaxed);
+        context
+            .counters
+            .readback_bytes
+            .fetch_add(size, Ordering::Relaxed);
+        let staging = context.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Staging"),
+            size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let _counted = context.memory().allocate_raw(MemoryCategory::Staging, size);
+        context.record(|encoder| {
+            let mut offset = 0;
+            for (t, &bytes) in tensors.iter().zip(&sizes) {
+                if bytes > 0 {
+                    encoder.copy_buffer_to_buffer(&t.data.buffer, 0, &staging, offset, bytes);
+                }
+                offset += bytes;
+            }
+        });
+        context.flush();
+
+        let slice = staging.slice(..);
+        let mapped = Arc::new(AtomicBool::new(false));
+        let flag = mapped.clone();
+        slice.map_async(wgpu::MapMode::Read, move |_| {
+            flag.store(true, Ordering::Release)
+        });
+        context.poll_until(|| mapped.load(Ordering::Acquire));
+
+        let data = slice.get_mapped_range();
+        let all: &[f32] = bytemuck::cast_slice(&data);
+        let mut res = Vec::with_capacity(tensors.len());
+        let mut at = 0;
+        for &bytes in &sizes {
+            let len = (bytes / 4) as usize;
+            res.push(all[at..at + len].to_vec());
+            at += len;
+        }
+        drop(data);
+        staging.unmap();
+        GpuCounters::add_elapsed(&context.counters.readback_nanos, start);
+        res
+    }
 }
 
 impl UnifiedTensor {

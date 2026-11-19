@@ -1692,7 +1692,8 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
     )
     .with_grad_accum_steps(micro_per_step)
     .with_clip_grad_norm(args.grad_clip)
-    .with_lr_scheduler(Box::new(scheduler));
+    .with_lr_scheduler(Box::new(scheduler))
+    .with_deferred_loss_readback();
     if distributed {
         let sync_dir = args
             .sync_dir

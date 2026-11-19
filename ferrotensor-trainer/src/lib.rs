@@ -107,8 +107,34 @@ pub struct Trainer {
     /// masks as an uninterrupted one. Has no effect when the model's
     /// attention dropout is 0.
     pub dropout_seed: u64,
+    /// Leave each micro-batch's per-row losses on the GPU and read them all
+    /// at once when the accumulation window ends (see
+    /// [`with_deferred_loss_readback`](Self::with_deferred_loss_readback)).
+    pub defer_loss_readback: bool,
     optimizer_step_count: usize,
+    /// Per-row loss buffers of the current window, not yet read back.
+    pending_rows: Vec<UnifiedTensor>,
+    /// Stats of the sequences trained so far and not yet returned, in order.
+    deferred: Vec<DeferredStats>,
 }
+
+/// A sequence's [`StepStats`], with its loss still on the GPU until `rows`
+/// is read.
+struct DeferredStats {
+    stats: StepStats,
+    /// The index of the sequence's per-row losses in
+    /// `Trainer::pending_rows`, and its rows there.
+    rows: Option<(usize, std::ops::Range<usize>)>,
+}
+
+/// Stats of a step with no supervised tokens.
+const EMPTY_STATS: StepStats = StepStats {
+    loss: 0.0,
+    tokens: 0,
+    optimizer_step: false,
+    grad_norm: None,
+    lr: None,
+};
 
 impl Trainer {
     /// A trainer with no clipping, accumulation, scaler or schedule.
@@ -131,8 +157,22 @@ impl Trainer {
             lr_scheduler: None,
             length_bucket: 32,
             dropout_seed: 0,
+            defer_loss_readback: false,
             optimizer_step_count: 0,
+            pending_rows: Vec::new(),
+            deferred: Vec::new(),
         }
+    }
+
+    /// Read the losses of a whole accumulation window back at once, when it
+    /// ends, instead of after each micro-batch, so training never waits for
+    /// the GPU in between. [`train_batch`](Self::train_batch) then returns
+    /// each sequence's stats on the call that ends its window (and none on
+    /// the calls before); [`take_deferred_stats`](Self::take_deferred_stats)
+    /// returns the rest of an unfinished window.
+    pub fn with_deferred_loss_readback(mut self) -> Self {
+        self.defer_loss_readback = true;
+        self
     }
 
     /// Pad sequences to a multiple of `tokens` (see
@@ -227,6 +267,9 @@ impl Trainer {
     ///
     /// Gradients accumulate into `train_params`; every `grad_accum_steps`
     /// calls they are (optionally) synced, clipped and applied, then cleared.
+    ///
+    /// The loss is read back before this returns, whether or not
+    /// [`defer_loss_readback`](Self::defer_loss_readback) is on.
     pub fn train_step_masked(
         &mut self,
         input_ids: &[u32],
@@ -234,6 +277,22 @@ impl Trainer {
         loss_mask: Option<&[u8]>,
         train_params: &[Tensor],
     ) -> Result<StepStats, TrainError> {
+        self.train_sequence(input_ids, target_ids, loss_mask, train_params)?;
+        // The stats of earlier sequences still deferred stay for
+        // `train_batch`; this one's are the last.
+        self.read_pending_losses();
+        Ok(self.deferred.pop().map_or(EMPTY_STATS, |d| d.stats))
+    }
+
+    /// [`train_step_masked`](Self::train_step_masked) with the sequence's
+    /// stats left in `self.deferred`.
+    fn train_sequence(
+        &mut self,
+        input_ids: &[u32],
+        target_ids: &[u32],
+        loss_mask: Option<&[u8]>,
+        train_params: &[Tensor],
+    ) -> Result<(), TrainError> {
         let len = input_ids.len().min(target_ids.len());
         let padded_len = len.div_ceil(self.length_bucket) * self.length_bucket;
         let mut inputs = input_ids[..len].to_vec();
@@ -255,41 +314,112 @@ impl Trainer {
             self.model
                 .forward_with_dropout(&self.engine, &inputs, 0, None, None, dropout_seed)
         };
-        memory::tag_loss(&logits);
-        let tag = self.ctx.memory().scope(MemoryCategory::Loss);
+        let labels = (targets.as_slice(), mask.as_slice());
+        self.loss_and_step(&logits, labels, 1, true, train_params)
+    }
 
-        let mut stats = StepStats {
-            loss: 0.0,
-            tokens: 0,
-            optimizer_step: false,
-            grad_norm: None,
-            lr: None,
-        };
-        if let Some(loss) = masked_cross_entropy(&logits, &targets, &mask, &self.engine) {
-            stats.loss = loss.value;
-            stats.tokens = loss.tokens;
-            // Seed backward with d(total)/d(loss): the accumulation average
-            // times the loss scale.
-            let mut seed = 1.0 / self.grad_accum_steps as f32;
-            if let Some(scaler) = self.scaler.as_ref() {
-                seed *= scaler.scale_factor();
+    /// The loss of a forward pass over `sequences` sequences of `logits`,
+    /// its backward pass, and an optimizer step when the window is full.
+    /// Each sequence's stats go to `self.deferred` with its loss left on the
+    /// GPU; `empty_stats` records zero stats when no token is supervised.
+    fn loss_and_step(
+        &mut self,
+        logits: &Tensor,
+        (targets, masks): (&[u32], &[u8]),
+        sequences: usize,
+        empty_stats: bool,
+        train_params: &[Tensor],
+    ) -> Result<(), TrainError> {
+        memory::tag_loss(logits);
+        let tag = self.ctx.memory().scope(MemoryCategory::Loss);
+        // Seed backward with d(total)/d(loss): the accumulation average
+        // times the loss scale. The kernel applies it to the gradient, so
+        // backward never reads it back.
+        let mut seed = 1.0 / self.grad_accum_steps as f32;
+        if let Some(scaler) = self.scaler.as_ref() {
+            seed *= scaler.scale_factor();
+        }
+        let ce = masked_ce_on_gpu(logits, targets, masks, sequences, seed, &self.engine);
+        if let Some(ce) = ce {
+            let index = self.pending_rows.len();
+            for (s, &tokens) in ce.tokens.iter().enumerate() {
+                self.deferred.push(DeferredStats {
+                    stats: StepStats {
+                        tokens,
+                        ..EMPTY_STATS
+                    },
+                    rows: Some((index, s * ce.seq_len..(s + 1) * ce.seq_len)),
+                });
             }
-            *loss.tensor.grad.borrow_mut() = Some(UnifiedTensor::new(&self.ctx, &[seed], &[1]));
+            self.pending_rows.push(ce.row_loss);
+            // Nothing reads the loss tensor's value: only the gradient
+            // flows back from it.
+            let value = UnifiedTensor::new(&self.ctx, &[0.0], &[1]);
+            let loss = ce_loss_tensor(logits, ce.grad, value, Some(seed));
+            *loss.grad.borrow_mut() = Some(UnifiedTensor::new(&self.ctx, &[seed], &[1]));
             let _tag = self.ctx.memory().scope(MemoryCategory::BackwardScratch);
-            loss.tensor.backward(&self.engine);
+            loss.backward(&self.engine);
             memory::tag_gradients(train_params);
-            memory::tag_loss(&logits);
+            memory::tag_loss(logits);
+        } else if empty_stats {
+            self.deferred.push(DeferredStats {
+                stats: EMPTY_STATS,
+                rows: None,
+            });
         }
         drop(tag);
 
-        self.step_in_accum += 1;
+        self.step_in_accum += sequences;
         if self.step_in_accum >= self.grad_accum_steps {
             self.step_in_accum = 0;
+            self.read_pending_losses();
+            let mut stats = self.deferred.pop().map_or(EMPTY_STATS, |d| d.stats);
             let applied = self.apply_gradients(train_params, &mut stats);
             self.optimizer.zero_grad(train_params);
+            self.deferred.push(DeferredStats { stats, rows: None });
             applied?;
         }
-        Ok(stats)
+        Ok(())
+    }
+
+    /// Reads every per-row loss buffer of the window in one readback and
+    /// fills in the deferred sequences' mean losses, summed in f64 as
+    /// [`masked_cross_entropy`] does.
+    fn read_pending_losses(&mut self) {
+        if self.pending_rows.is_empty() {
+            return;
+        }
+        let buffers: Vec<&UnifiedTensor> = self.pending_rows.iter().collect();
+        let losses = pollster::block_on(UnifiedTensor::read_many(&self.ctx, &buffers));
+        for d in &mut self.deferred {
+            if let Some((index, rows)) = d.rows.take() {
+                let sum: f64 = losses[index][rows].iter().map(|&l| l as f64).sum();
+                d.stats.loss = (sum / d.stats.tokens.max(1) as f64) as f32;
+            }
+        }
+        self.pending_rows.clear();
+    }
+
+    /// The stats of every sequence trained and not yet returned, with their
+    /// losses read back now: what is left of an unfinished window when
+    /// [`defer_loss_readback`](Self::defer_loss_readback) is on.
+    pub fn take_deferred_stats(&mut self) -> Vec<StepStats> {
+        self.read_pending_losses();
+        self.deferred.drain(..).map(|d| d.stats).collect()
+    }
+
+    /// The stats whose losses have been read, in order, leaving the rest
+    /// (all of them are read first unless the readback is deferred).
+    fn take_read_stats(&mut self) -> Vec<StepStats> {
+        if !self.defer_loss_readback {
+            self.read_pending_losses();
+        }
+        let read = self
+            .deferred
+            .iter()
+            .position(|d| d.rows.is_some())
+            .unwrap_or(self.deferred.len());
+        self.deferred.drain(..read).map(|d| d.stats).collect()
     }
 
     /// Sync, unscale, clip and apply the accumulated gradients.
@@ -394,17 +524,11 @@ impl Trainer {
             seqs.push((input_ids, target_ids, loss_mask));
         }
 
-        let mut out = Vec::with_capacity(seqs.len());
         if !self.model.supports_batching() || seqs.len() < 2 {
             for (input_ids, target_ids, loss_mask) in seqs {
-                out.push(self.train_step_masked(
-                    input_ids,
-                    target_ids,
-                    Some(loss_mask),
-                    train_params,
-                )?);
+                self.train_sequence(input_ids, target_ids, Some(loss_mask), train_params)?;
             }
-            return Ok(out);
+            return Ok(self.take_read_stats());
         }
         let mut rest = seqs.as_slice();
         while !rest.is_empty() {
@@ -415,19 +539,20 @@ impl Trainer {
                 .saturating_sub(self.step_in_accum)
                 .max(1);
             let (chunk, tail) = rest.split_at(room.min(rest.len()));
-            out.extend(self.train_chunk(chunk, train_params)?);
+            self.train_chunk(chunk, train_params)?;
             rest = tail;
         }
-        Ok(out)
+        Ok(self.take_read_stats())
     }
 
     /// One forward and backward over `chunk`, padded on the right to a
     /// common length; then an optimizer step if accumulation is complete.
+    /// The sequences' stats go to `self.deferred`.
     fn train_chunk(
         &mut self,
         chunk: &[(&[u32], &[u32], &[u8])],
         train_params: &[Tensor],
-    ) -> Result<Vec<StepStats>, TrainError> {
+    ) -> Result<(), TrainError> {
         let longest = chunk
             .iter()
             .map(|s| s.0.len().min(s.1.len()))
@@ -455,50 +580,8 @@ impl Trainer {
             self.model
                 .forward_batch_with_dropout(&self.engine, &rows, dropout_seed)
         };
-        memory::tag_loss(&logits);
-        let tag = self.ctx.memory().scope(MemoryCategory::Loss);
-
-        let mut out: Vec<StepStats> = Vec::with_capacity(chunk.len());
-        if let Some(loss) =
-            masked_cross_entropy_batch(&logits, &targets, &masks, chunk.len(), &self.engine)
-        {
-            for &(value, tokens) in &loss.per_sequence {
-                out.push(StepStats {
-                    loss: value,
-                    tokens,
-                    optimizer_step: false,
-                    grad_norm: None,
-                    lr: None,
-                });
-            }
-            let mut seed = 1.0 / self.grad_accum_steps as f32;
-            if let Some(scaler) = self.scaler.as_ref() {
-                seed *= scaler.scale_factor();
-            }
-            *loss.tensor.grad.borrow_mut() = Some(UnifiedTensor::new(&self.ctx, &[seed], &[1]));
-            let _tag = self.ctx.memory().scope(MemoryCategory::BackwardScratch);
-            loss.tensor.backward(&self.engine);
-            memory::tag_gradients(train_params);
-            memory::tag_loss(&logits);
-        }
-        drop(tag);
-
-        self.step_in_accum += chunk.len();
-        if self.step_in_accum >= self.grad_accum_steps {
-            self.step_in_accum = 0;
-            let mut stats = out.pop().unwrap_or(StepStats {
-                loss: 0.0,
-                tokens: 0,
-                optimizer_step: false,
-                grad_norm: None,
-                lr: None,
-            });
-            let applied = self.apply_gradients(train_params, &mut stats);
-            self.optimizer.zero_grad(train_params);
-            applied?;
-            out.push(stats);
-        }
-        Ok(out)
+        let labels = (targets.as_slice(), masks.as_slice());
+        self.loss_and_step(&logits, labels, chunk.len(), false, train_params)
     }
 }
 
@@ -548,6 +631,10 @@ pub struct MaskedLoss {
 struct MaskedCrossEntropyNode {
     logits: Tensor,
     grad_logits: UnifiedTensor,
+    /// The factor the kernel already applied to `grad_logits`: backward is
+    /// then seeded with exactly this value and returns the gradient as it
+    /// is, without reading the seed back. `None` reads the seed and scales.
+    applied_seed: Option<f32>,
 }
 
 impl AutogradNode for MaskedCrossEntropyNode {
@@ -556,6 +643,9 @@ impl AutogradNode for MaskedCrossEntropyNode {
     }
 
     fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
+        if self.applied_seed.is_some() {
+            return vec![self.grad_logits.clone()];
+        }
         let ctx = &self.logits.ctx;
         let upstream = pollster::block_on(grad.to_vec(ctx))
             .first()
@@ -571,62 +661,141 @@ impl AutogradNode for MaskedCrossEntropyNode {
     }
 }
 
+/// The masked cross-entropy of a batch of sequences as the kernel leaves
+/// it on the GPU, before anything is read back.
+struct GpuCrossEntropy {
+    /// `d loss / d logits`, times the seed it was computed for.
+    grad: UnifiedTensor,
+    /// The loss of each row (0 for a row left out).
+    row_loss: UnifiedTensor,
+    /// Rows per sequence.
+    seq_len: usize,
+    /// Supervised tokens of each sequence.
+    tokens: Vec<usize>,
+}
+
+impl GpuCrossEntropy {
+    /// Each sequence's mean loss over its supervised tokens, summed in f64
+    /// from the per-row losses `losses` (read back from `row_loss`).
+    fn per_sequence(&self, losses: &[f32]) -> Vec<(f32, usize)> {
+        let seq_len = self.seq_len;
+        self.tokens
+            .iter()
+            .enumerate()
+            .map(|(s, &t)| {
+                let sum: f64 = losses[s * seq_len..(s + 1) * seq_len]
+                    .iter()
+                    .map(|&l| l as f64)
+                    .sum();
+                ((sum / t.max(1) as f64) as f32, t)
+            })
+            .collect()
+    }
+}
+
+/// Runs the masked cross-entropy kernel over `sequences` equally long
+/// sequences of `logits`, with each supervised row's gradient weighted by
+/// `seed / supervised tokens of its sequence`. Returns `None` when no
+/// position is supervised or the rows do not split into `sequences`.
+fn masked_ce_on_gpu(
+    logits: &Tensor,
+    target_ids: &[u32],
+    loss_mask: &[u8],
+    sequences: usize,
+    seed: f32,
+    engine: &ComputeEngine,
+) -> Option<GpuCrossEntropy> {
+    let vocab = *logits.data.shape.last()?;
+    let rows = logits.data.shape.iter().product::<usize>() / vocab.max(1);
+    if vocab == 0 || sequences == 0 || !rows.is_multiple_of(sequences) {
+        return None;
+    }
+    let seq_len = rows / sequences;
+    let supervised = |r: usize| {
+        r < target_ids.len()
+            && r < loss_mask.len()
+            && loss_mask[r] != 0
+            && (target_ids[r] as usize) < vocab
+    };
+    let tokens: Vec<usize> = (0..sequences)
+        .map(|s| {
+            (s * seq_len..(s + 1) * seq_len)
+                .filter(|&r| supervised(r))
+                .count()
+        })
+        .collect();
+    if tokens.iter().all(|&t| t == 0) {
+        return None;
+    }
+    let mut targets = Vec::with_capacity(rows);
+    let mut weights = Vec::with_capacity(rows);
+    for r in 0..rows {
+        let t = tokens[r / seq_len];
+        if supervised(r) {
+            targets.push(target_ids[r]);
+            weights.push(seed / t as f32);
+        } else {
+            targets.push(MASKED_CE_SKIP);
+            weights.push(0.0);
+        }
+    }
+    let ctx = &logits.ctx;
+    let target_buf = UnifiedTensor::from_bytes(ctx, bytemuck::cast_slice(&targets), &[rows]);
+    let weight_buf = UnifiedTensor::new(ctx, &weights, &[rows]);
+    let grad = UnifiedTensor::empty(ctx, &logits.data.shape);
+    let row_loss = UnifiedTensor::empty(ctx, &[rows]);
+    engine.masked_cross_entropy_weighted(
+        ctx,
+        &logits.data,
+        &target_buf,
+        &weight_buf,
+        &grad,
+        &row_loss,
+    );
+    Some(GpuCrossEntropy {
+        grad,
+        row_loss,
+        seq_len,
+        tokens,
+    })
+}
+
+/// The scalar loss tensor `[1]` holding `value`, whose backward gives
+/// `ce.grad` to `logits`; `applied_seed` as in [`MaskedCrossEntropyNode`].
+// Autograd nodes are shared through `Arc` but used on one thread.
+#[allow(clippy::arc_with_non_send_sync)]
+fn ce_loss_tensor(
+    logits: &Tensor,
+    grad: UnifiedTensor,
+    value: UnifiedTensor,
+    applied_seed: Option<f32>,
+) -> Tensor {
+    let node = Arc::new(MaskedCrossEntropyNode {
+        logits: logits.clone(),
+        grad_logits: grad,
+        applied_seed,
+    });
+    Tensor::with_creator(logits.ctx.clone(), value, node)
+}
+
 /// Mean cross-entropy of `logits` (`[.., seq, vocab]`) against `target_ids`
 /// over the positions where `loss_mask` is 1, as a differentiable scalar.
 ///
 /// The loss and its gradient (`(softmax - onehot) / tokens` at supervised
 /// positions, zero elsewhere) are computed on the GPU; only the per-position
 /// losses are read back. Returns `None` when no position is supervised.
-// Autograd nodes are shared through `Arc` but used on one thread.
-#[allow(clippy::arc_with_non_send_sync)]
 pub fn masked_cross_entropy(
     logits: &Tensor,
     target_ids: &[u32],
     loss_mask: &[u8],
     engine: &ComputeEngine,
 ) -> Option<MaskedLoss> {
-    let vocab = *logits.data.shape.last()?;
-    if vocab == 0 {
-        return None;
-    }
-    let rows = logits.data.shape.iter().product::<usize>() / vocab;
-    let positions = rows.min(target_ids.len()).min(loss_mask.len());
-    let targets: Vec<u32> = (0..rows)
-        .map(|p| {
-            let supervised = p < positions && loss_mask[p] != 0 && (target_ids[p] as usize) < vocab;
-            if supervised {
-                target_ids[p]
-            } else {
-                MASKED_CE_SKIP
-            }
-        })
-        .collect();
-    let tokens = targets.iter().filter(|&&t| t != MASKED_CE_SKIP).count();
-    if tokens == 0 {
-        return None;
-    }
-    let ctx = logits.ctx.clone();
-    let target_buf = UnifiedTensor::from_bytes(&ctx, bytemuck::cast_slice(&targets), &[rows]);
-    let grad = UnifiedTensor::empty(&ctx, &logits.data.shape);
-    let row_loss = UnifiedTensor::empty(&ctx, &[rows]);
-    engine.masked_cross_entropy(
-        &ctx,
-        &logits.data,
-        &target_buf,
-        1.0 / tokens as f32,
-        &grad,
-        &row_loss,
-    );
-    let loss_sum: f64 = pollster::block_on(row_loss.to_vec(&ctx))
-        .iter()
-        .map(|&l| l as f64)
-        .sum();
-    let value = (loss_sum / tokens as f64) as f32;
-    let node = Arc::new(MaskedCrossEntropyNode {
-        logits: logits.clone(),
-        grad_logits: grad,
-    });
-    let tensor = Tensor::with_creator(ctx.clone(), UnifiedTensor::new(&ctx, &[value], &[1]), node);
+    let ce = masked_ce_on_gpu(logits, target_ids, loss_mask, 1, 1.0, engine)?;
+    let ctx = &logits.ctx;
+    let losses = pollster::block_on(ce.row_loss.to_vec(ctx));
+    let (value, tokens) = ce.per_sequence(&losses)[0];
+    let data = UnifiedTensor::new(ctx, &[value], &[1]);
+    let tensor = ce_loss_tensor(logits, ce.grad, data, None);
     Some(MaskedLoss {
         tensor,
         value,
@@ -671,8 +840,6 @@ pub struct BatchLoss {
 /// [`masked_cross_entropy`] gradients of the sequences taken one at a time.
 /// `target_ids` and `loss_mask` hold one entry per row. Returns `None` when
 /// no position is supervised.
-// Autograd nodes are shared through `Arc` but used on one thread.
-#[allow(clippy::arc_with_non_send_sync)]
 pub fn masked_cross_entropy_batch(
     logits: &Tensor,
     target_ids: &[u32],
@@ -680,71 +847,13 @@ pub fn masked_cross_entropy_batch(
     sequences: usize,
     engine: &ComputeEngine,
 ) -> Option<BatchLoss> {
-    let vocab = *logits.data.shape.last()?;
-    let rows = logits.data.shape.iter().product::<usize>() / vocab.max(1);
-    if vocab == 0 || sequences == 0 || !rows.is_multiple_of(sequences) {
-        return None;
-    }
-    let seq_len = rows / sequences;
-    let supervised = |r: usize| {
-        r < target_ids.len()
-            && r < loss_mask.len()
-            && loss_mask[r] != 0
-            && (target_ids[r] as usize) < vocab
-    };
-    let tokens: Vec<usize> = (0..sequences)
-        .map(|s| {
-            (s * seq_len..(s + 1) * seq_len)
-                .filter(|&r| supervised(r))
-                .count()
-        })
-        .collect();
-    if tokens.iter().all(|&t| t == 0) {
-        return None;
-    }
-    let mut targets = Vec::with_capacity(rows);
-    let mut weights = Vec::with_capacity(rows);
-    for r in 0..rows {
-        let t = tokens[r / seq_len];
-        if supervised(r) {
-            targets.push(target_ids[r]);
-            weights.push(1.0 / t as f32);
-        } else {
-            targets.push(MASKED_CE_SKIP);
-            weights.push(0.0);
-        }
-    }
-    let ctx = logits.ctx.clone();
-    let target_buf = UnifiedTensor::from_bytes(&ctx, bytemuck::cast_slice(&targets), &[rows]);
-    let weight_buf = UnifiedTensor::new(&ctx, &weights, &[rows]);
-    let grad = UnifiedTensor::empty(&ctx, &logits.data.shape);
-    let row_loss = UnifiedTensor::empty(&ctx, &[rows]);
-    engine.masked_cross_entropy_weighted(
-        &ctx,
-        &logits.data,
-        &target_buf,
-        &weight_buf,
-        &grad,
-        &row_loss,
-    );
-    let losses = pollster::block_on(row_loss.to_vec(&ctx));
-    let per_sequence: Vec<(f32, usize)> = tokens
-        .iter()
-        .enumerate()
-        .map(|(s, &t)| {
-            let sum: f64 = losses[s * seq_len..(s + 1) * seq_len]
-                .iter()
-                .map(|&l| l as f64)
-                .sum();
-            ((sum / t.max(1) as f64) as f32, t)
-        })
-        .collect();
+    let ce = masked_ce_on_gpu(logits, target_ids, loss_mask, sequences, 1.0, engine)?;
+    let ctx = &logits.ctx;
+    let losses = pollster::block_on(ce.row_loss.to_vec(ctx));
+    let per_sequence = ce.per_sequence(&losses);
     let total: f32 = per_sequence.iter().map(|&(l, _)| l).sum();
-    let node = Arc::new(MaskedCrossEntropyNode {
-        logits: logits.clone(),
-        grad_logits: grad,
-    });
-    let tensor = Tensor::with_creator(ctx.clone(), UnifiedTensor::new(&ctx, &[total], &[1]), node);
+    let data = UnifiedTensor::new(ctx, &[total], &[1]);
+    let tensor = ce_loss_tensor(logits, ce.grad, data, None);
     Some(BatchLoss {
         tensor,
         per_sequence,

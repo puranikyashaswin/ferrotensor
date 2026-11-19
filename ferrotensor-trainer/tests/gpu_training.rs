@@ -569,3 +569,132 @@ fn lora_init_is_identical_across_builds() {
         assert_eq!(x.2, y.2, "{} differs between builds", x.0);
     }
 }
+
+/// `(inputs, targets, loss mask)` slices of the pattern sequence, the first
+/// `unsupervised` positions left out of the loss.
+fn pattern_pieces(spans: &[(usize, usize, usize)]) -> Vec<(Vec<u32>, Vec<u32>, Vec<u8>)> {
+    let seq = pattern_sequence();
+    spans
+        .iter()
+        .map(|&(start, end, unsupervised)| {
+            let input = seq[start..end - 1].to_vec();
+            let target = seq[start + 1..end].to_vec();
+            let mask = (0..input.len())
+                .map(|i| u8::from(i >= unsupervised))
+                .collect();
+            (input, target, mask)
+        })
+        .collect()
+}
+
+/// The stats of `batches` from a fresh trainer with `accum`-step windows,
+/// each call's stats in a separate entry, and the adapter values after.
+fn run_batches(
+    gpu: &Gpu,
+    dir: &std::path::Path,
+    accum: usize,
+    deferred: bool,
+    batches: &[Batch],
+) -> (Vec<Vec<ferrotensor_trainer::StepStats>>, Vec<f32>) {
+    let model = build_model(gpu, dir);
+    let (_, params) = sorted_lora_params(&model);
+    let mut t = trainer(gpu, model, 1e-2).with_grad_accum_steps(accum);
+    if deferred {
+        t = t.with_deferred_loss_readback();
+    }
+    let stats = batches
+        .iter()
+        .map(|b| t.train_batch(b, &params).expect("train batch"))
+        .collect();
+    let values = params.iter().flat_map(|p| host(gpu, p)).collect();
+    (stats, values)
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn deferred_loss_readback_matches_reading_every_micro_batch() {
+    // Windows of four sequences, given as batches of one and two: the
+    // deferred trainer reports nothing until a window ends, then the same
+    // losses, tokens and gradient norms, bit for bit, as the trainer that
+    // reads after every call, and the adapters end up identical.
+    let dir = TempDir::new("deferred");
+    write_tiny_llama(dir.path());
+    let gpu = gpu();
+    let pieces = pattern_pieces(&[
+        (0, 10, 0),
+        (2, 17, 3),
+        (5, 12, 0),
+        (1, 20, 4),
+        (3, 15, 2),
+        (0, 24, 5),
+        (4, 13, 0),
+        (6, 22, 1),
+    ]);
+    let batches: Vec<Batch> = [0..1, 1..3, 3..4, 4..6, 6..8]
+        .into_iter()
+        .map(|r| make_batch(&pieces[r]))
+        .collect();
+
+    let (immediate, immediate_values) = run_batches(&gpu, dir.path(), 4, false, &batches);
+    let (deferred, deferred_values) = run_batches(&gpu, dir.path(), 4, true, &batches);
+
+    let counts: Vec<usize> = immediate.iter().map(Vec::len).collect();
+    assert_eq!(counts, [1, 2, 1, 2, 2]);
+    let counts: Vec<usize> = deferred.iter().map(Vec::len).collect();
+    assert_eq!(counts, [0, 0, 4, 0, 4], "deferred stats arrive at window ends");
+
+    let immediate: Vec<_> = immediate.into_iter().flatten().collect();
+    let deferred: Vec<_> = deferred.into_iter().flatten().collect();
+    for (i, (a, b)) in immediate.iter().zip(&deferred).enumerate() {
+        assert_eq!(a.loss.to_bits(), b.loss.to_bits(), "loss of sequence {i}");
+        assert_eq!(a.tokens, b.tokens, "tokens of sequence {i}");
+        assert_eq!(a.optimizer_step, b.optimizer_step, "step after {i}");
+        assert_eq!(
+            a.grad_norm.map(f32::to_bits),
+            b.grad_norm.map(f32::to_bits),
+            "grad norm after {i}"
+        );
+        assert_eq!(a.optimizer_step, i == 3 || i == 7);
+    }
+    assert_eq!(immediate_values, deferred_values);
+
+    // The first sequence's loss, before any update, against the loss
+    // computed on its own from a fresh model's logits.
+    let model = build_model(&gpu, dir.path());
+    let (input, target, mask) = &pieces[0];
+    let logits = model.forward(&gpu.engine, input, 0, None, None);
+    let reference = ferrotensor_trainer::masked_cross_entropy(&logits, target, mask, &gpu.engine)
+        .expect("loss");
+    assert_eq!(deferred[0].tokens, reference.tokens);
+    assert!(
+        (deferred[0].loss - reference.value).abs() <= 1e-4 * reference.value.abs(),
+        "loss {} vs {}",
+        deferred[0].loss,
+        reference.value
+    );
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn deferred_training_follows_the_same_loss_trajectory() {
+    // Six windows of the same two sequences: both trainers give the same
+    // loss at every step, the loss is finite and it falls.
+    let dir = TempDir::new("trajectory");
+    write_tiny_llama(dir.path());
+    let gpu = gpu();
+    let pieces = pattern_pieces(&[(0, 16, 2), (6, 24, 0)]);
+    let batches: Vec<Batch> = (0..12)
+        .map(|i| make_batch(&pieces[i % 2..i % 2 + 1]))
+        .collect();
+
+    let (immediate, _) = run_batches(&gpu, dir.path(), 2, false, &batches);
+    let (deferred, _) = run_batches(&gpu, dir.path(), 2, true, &batches);
+    let immediate: Vec<f32> = immediate.into_iter().flatten().map(|s| s.loss).collect();
+    let deferred: Vec<f32> = deferred.into_iter().flatten().map(|s| s.loss).collect();
+    assert_eq!(immediate.len(), 12);
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(bits(&immediate), bits(&deferred));
+    assert!(deferred.iter().all(|l| l.is_finite()), "{deferred:?}");
+    let window = |w: usize| deferred[2 * w] + deferred[2 * w + 1];
+    assert!(window(5) < window(0), "loss did not fall: {deferred:?}");
+}
