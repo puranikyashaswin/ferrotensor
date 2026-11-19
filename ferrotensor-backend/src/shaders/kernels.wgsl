@@ -45,16 +45,10 @@ fn row_max(lid: u32, v: f32) -> f32 {
 @group(0) @binding(0) var<storage, read_write> rope_data: array<f32>;
 @group(0) @binding(1) var<uniform> rope_params: array<vec4<u32>, 2>; // [head_dim, seq, pos, heads], [theta bits, inverse, 0, 0]
 
-// The pair of elements one RoPE thread rotates, and its angle's cosine and sine.
-struct RopePair {
-    idx1: u32,
-    idx2: u32,
-    cos_a: f32,
-    sin_a: f32,
-}
-
-fn rope_pair(gid: vec3<u32>, nwg: vec3<u32>) -> RopePair {
-    let idx = gid.x + gid.y * nwg.x * 64u;
+@compute @workgroup_size(64)
+fn rope(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let global_id = vec3<u32>(gid.x + gid.y * nwg.x * 64u, 0u, 0u);
+    let idx = global_id.x;
     let head_dim = rope_params[0].x;
     let half_dim = head_dim / 2u;
     let token_idx = idx / half_dim;
@@ -67,33 +61,51 @@ fn rope_pair(gid: vec3<u32>, nwg: vec3<u32>) -> RopePair {
     // inverse = 1 rotates by -angle: the transposed rotation, i.e. the backward pass.
     let dir = select(1.0, -1.0, rope_params[1].y != 0u);
     let angle = dir * pos * pow(bitcast<f32>(rope_params[1].x), freq_exp);
+    let cos_a = cos(angle);
+    let sin_a = sin(angle);
     let idx1 = token_idx * head_dim + dim_idx;
-    return RopePair(idx1, idx1 + half_dim, cos(angle), sin(angle));
+    let idx2 = idx1 + half_dim;
+    if (idx1 >= arrayLength(&rope_data)) { return; }
+    let v1 = rope_data[idx1];
+    let v2 = rope_data[idx2];
+    rope_data[idx1] = v1 * cos_a - v2 * sin_a;
+    rope_data[idx2] = v1 * sin_a + v2 * cos_a;
 }
 
-@compute @workgroup_size(64)
-fn rope(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
-    let p = rope_pair(gid, nwg);
-    if (p.idx1 >= arrayLength(&rope_data)) { return; }
-    let v1 = rope_data[p.idx1];
-    let v2 = rope_data[p.idx2];
-    rope_data[p.idx1] = v1 * p.cos_a - v2 * p.sin_a;
-    rope_data[p.idx2] = v1 * p.sin_a + v2 * p.cos_a;
-}
-
-// Out of place: rotates rope_src into rope_dst, so an autograd op needs no
-// copy of its input (forward) or of the upstream gradient (backward).
-@group(0) @binding(0) var<storage, read> rope_src: array<f32>;
-@group(0) @binding(2) var<storage, read_write> rope_dst: array<f32>;
+// Out of place: rotates ropo_src into ropo_dst, so an autograd op needs no
+// copy of its input (forward) or of the upstream gradient (backward). The
+// math is rope's, line for line, so both give the same bits. Its uniform
+// comes last, as in every other kernel here: a version with the uniform at
+// binding 1 between the two buffers wrote nothing on Metal and lost the
+// device on DX12 (WARP), while software Vulkan passed.
+@group(0) @binding(0) var<storage, read> ropo_src: array<f32>;
+@group(0) @binding(1) var<storage, read_write> ropo_dst: array<f32>;
+@group(0) @binding(2) var<uniform> ropo_params: array<vec4<u32>, 2>; // as rope_params
 
 @compute @workgroup_size(64)
 fn rope_out(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
-    let p = rope_pair(gid, nwg);
-    if (p.idx1 >= arrayLength(&rope_dst)) { return; }
-    let v1 = rope_src[p.idx1];
-    let v2 = rope_src[p.idx2];
-    rope_dst[p.idx1] = v1 * p.cos_a - v2 * p.sin_a;
-    rope_dst[p.idx2] = v1 * p.sin_a + v2 * p.cos_a;
+    let global_id = vec3<u32>(gid.x + gid.y * nwg.x * 64u, 0u, 0u);
+    let idx = global_id.x;
+    let head_dim = ropo_params[0].x;
+    let half_dim = head_dim / 2u;
+    let token_idx = idx / half_dim;
+    let dim_idx = idx % half_dim;
+    let seq_len = ropo_params[0].y;
+    let base_pos = ropo_params[0].z;
+    let heads = max(ropo_params[0].w, 1u);
+    let pos = f32(base_pos + (token_idx / heads) % seq_len);
+    let freq_exp = -2.0 * f32(dim_idx) / f32(head_dim);
+    let dir = select(1.0, -1.0, ropo_params[1].y != 0u);
+    let angle = dir * pos * pow(bitcast<f32>(ropo_params[1].x), freq_exp);
+    let cos_a = cos(angle);
+    let sin_a = sin(angle);
+    let idx1 = token_idx * head_dim + dim_idx;
+    let idx2 = idx1 + half_dim;
+    if (idx1 >= arrayLength(&ropo_dst)) { return; }
+    let v1 = ropo_src[idx1];
+    let v2 = ropo_src[idx2];
+    ropo_dst[idx1] = v1 * cos_a - v2 * sin_a;
+    ropo_dst[idx2] = v1 * sin_a + v2 * cos_a;
 }
 
 // --- 3. RMSNorm ---

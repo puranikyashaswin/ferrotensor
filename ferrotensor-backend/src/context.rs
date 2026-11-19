@@ -29,6 +29,11 @@ pub const PENDING_OPS_ENV: &str = "FERROTENSOR_PENDING_OPS";
 /// is created (a positive integer).
 pub const PASS_DISPATCHES_ENV: &str = "FERROTENSOR_PASS_DISPATCHES";
 
+/// Environment variable that, set to `1` when the context is created, passes
+/// kernel parameters in uniform buffers even on a device with immediates (see
+/// [`WgpuContext::uses_immediates`]).
+pub const UNIFORM_PARAMS_ENV: &str = "FERROTENSOR_UNIFORM_PARAMS";
+
 /// A positive integer limit from an environment variable's `value`, or
 /// `default` when it is unset, zero or not a number.
 fn limit_from_env_value<T>(value: Option<&str>, default: T) -> T
@@ -83,6 +88,8 @@ pub struct WgpuContext {
     /// Bytes uploaded since staging buffers were last released.
     staged: AtomicU64,
     pub(crate) counters: GpuCounters,
+    /// Whether kernel parameters go through immediates.
+    immediates: bool,
     /// Timestamp queries, with [`KernelTiming::On`] on an adapter that has them.
     timer: Option<KernelTimer>,
     /// Ops recorded before a submit, from [`PENDING_OPS_ENV`].
@@ -119,6 +126,21 @@ pub(crate) struct Dispatch {
     pub(crate) bind_group: BindGroup,
     pub(crate) groups: (u32, u32, u32),
     pub(crate) label: KernelLabel,
+    /// The kernel's parameters, when they go through immediates.
+    pub(crate) immediates: Option<Vec<u8>>,
+}
+
+impl Dispatch {
+    /// Binds this dispatch's buffers and parameters in `pass`, whose pipeline
+    /// is already set, and dispatches it.
+    pub(crate) fn encode(&self, pass: &mut wgpu::ComputePass<'_>) {
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        if let Some(bytes) = &self.immediates {
+            pass.set_immediates(0, bytes);
+        }
+        let (x, y, z) = self.groups;
+        pass.dispatch_workgroups(x, y, z);
+    }
 }
 
 /// Why [`WgpuContext::try_new_with_options`] could not open a GPU.
@@ -300,6 +322,9 @@ impl WgpuContext {
         let max_pass_dispatches =
             limit_from_env_value(env(PASS_DISPATCHES_ENV).as_deref(), MAX_PASS_DISPATCHES);
         let timer = timing_mode.map(|mode| KernelTimer::new(mode, &queue, max_pending_ops));
+        let immediates = device.features().contains(wgpu::Features::IMMEDIATES)
+            && device.limits().max_immediate_size >= crate::engine::IMMEDIATE_BYTES
+            && !env(UNIFORM_PARAMS_ENV).is_some_and(|v| v.trim() == "1");
         Ok(Self {
             instance,
             adapter,
@@ -313,7 +338,25 @@ impl WgpuContext {
             max_pending_ops,
             max_pass_dispatches,
             shader_checks: ShaderChecks::from_env(),
+            immediates,
         })
+    }
+
+    /// Whether [`ComputeEngine`](crate::ComputeEngine) passes kernel
+    /// parameters as immediates, set with each dispatch, rather than in a
+    /// uniform buffer made for it. True when the device has
+    /// `wgpu::Features::IMMEDIATES` for the largest parameters and
+    /// [`UNIFORM_PARAMS_ENV`] was not `1`.
+    pub fn uses_immediates(&self) -> bool {
+        self.immediates
+    }
+
+    /// This context with kernel parameters in uniform buffers, as
+    /// [`UNIFORM_PARAMS_ENV`] asks; build engines for it after this call.
+    #[must_use]
+    pub fn with_uniform_params(mut self) -> Self {
+        self.immediates = false;
+        self
     }
 
     /// Records GPU work into the pending command encoder; it runs after
@@ -388,9 +431,7 @@ impl WgpuContext {
                     pass.set_pipeline(&dispatch.pipeline);
                     bound = Some(&dispatch.pipeline);
                 }
-                pass.set_bind_group(0, &dispatch.bind_group, &[]);
-                let (x, y, z) = dispatch.groups;
-                pass.dispatch_workgroups(x, y, z);
+                dispatch.encode(&mut pass);
             }
             drop(pass);
             dispatches.clear();
@@ -450,19 +491,25 @@ impl WgpuContext {
     /// resources as if it had finished, which crashed drivers that were still
     /// reading them (seen with long batches on lavapipe).
     pub(crate) fn poll_until(&self, done: impl Fn() -> bool) {
+        self.poll_until_done(done);
+        // Callers wait for the last submitted work, so that poll let wgpu
+        // destroy every buffer dropped before it.
+        self.memory().gpu_reclaimed();
+        self.release_idle_buffers();
+        if let Some(timer) = &self.timer {
+            timer.collect();
+        }
+    }
+
+    /// Polls the device until `done` returns true, counting the time as GPU
+    /// wait; see [`poll_until`](Self::poll_until) for why it never blocks.
+    fn poll_until_done(&self, done: impl Fn() -> bool) {
         let start = Instant::now();
         let mut polls = 0u32;
         loop {
             self.poll();
             if done() {
                 GpuCounters::add_elapsed(&self.counters.gpu_wait_nanos, start);
-                // Callers wait for the last submitted work, so that poll let
-                // wgpu destroy every buffer dropped before it.
-                self.memory().gpu_reclaimed();
-                self.release_idle_buffers();
-                if let Some(timer) = &self.timer {
-                    timer.collect();
-                }
                 return;
             }
             if polls < 100 {
@@ -472,6 +519,30 @@ impl WgpuContext {
             }
             polls += 1;
         }
+    }
+
+    /// Submits the recorded work and returns the number of the last
+    /// submission, to pass to [`wait_for_submission`](Self::wait_for_submission).
+    pub fn submission_mark(&self) -> u64 {
+        self.flush();
+        self.memory().recording_serial().saturating_sub(1)
+    }
+
+    /// Submits the recorded work, then polls until submission `mark` (from
+    /// [`submission_mark`](Self::submission_mark)) has finished on the GPU
+    /// and drops the pool's idle buffers above its cap that only that work
+    /// used.
+    ///
+    /// Work submitted after `mark` keeps running. A trainer that never reads
+    /// the GPU inside a window calls this once per micro-batch so the host
+    /// stays at most one micro-batch ahead; otherwise, on a GPU-bound model,
+    /// the pool cannot trim and holds the idle buffers of several
+    /// micro-batches at once.
+    pub fn wait_for_submission(&self, mark: u64) {
+        self.flush();
+        let memory = self.memory();
+        self.poll_until_done(|| memory.completed_serial() >= mark);
+        self.release_idle_buffers();
     }
 
     fn submit(&self, pending: &mut Pending) {

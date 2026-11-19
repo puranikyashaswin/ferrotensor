@@ -240,14 +240,16 @@ fn dropped_buffers_await_the_gpu_until_synchronize() {
     assert_eq!(mem.awaiting_gpu_bytes(), bytes, "dropped past the cap");
     assert_eq!(mem.live_bytes(), live - 2 * bytes);
 
-    // A dispatch's uniform buffer is counted from the start.
+    // A dispatch's uniform buffer is counted from the start. With
+    // immediates the scale goes with the dispatch and there is none.
+    let uniform = if ctx.uses_immediates() { 0 } else { 4 };
     gpu.engine.gradient_scale(ctx, &src, 1.0);
-    assert_eq!(mem.awaiting_gpu_bytes(), bytes + 4);
+    assert_eq!(mem.awaiting_gpu_bytes(), bytes + uniform);
 
     ctx.flush();
     assert_eq!(
         mem.awaiting_gpu_bytes(),
-        bytes + 4,
+        bytes + uniform,
         "counted until the submission is known to have finished"
     );
     ctx.synchronize();
@@ -256,10 +258,10 @@ fn dropped_buffers_await_the_gpu_until_synchronize() {
         0,
         "synchronize lets wgpu free them"
     );
-    assert_eq!(mem.peak_awaiting_gpu_bytes(), bytes + 4);
+    assert_eq!(mem.peak_awaiting_gpu_bytes(), bytes + uniform);
     // Live + idle + awaiting stayed at `live + idle` through the drops,
-    // then the uniform added 4 bytes.
-    assert_eq!(mem.peak_total_bytes(), live + idle + 4);
+    // then the uniform buffer, if any, added its bytes.
+    assert_eq!(mem.peak_total_bytes(), live + idle + uniform);
 
     // The readback copy is staging while it runs, then awaits the GPU.
     let staging_before = mem.current().category(MemoryCategory::Staging).buffers;

@@ -1,3 +1,4 @@
+use crate::bind_cache::BindGroupCache;
 use crate::memory::MemoryTracker;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -49,6 +50,9 @@ pub struct BufferPool {
     buffers: Mutex<PoolState>,
     usage: BufferUsages,
     tracker: Arc<MemoryTracker>,
+    /// Bind groups of the context's dispatches; the pool evicts the buffers
+    /// it lets go.
+    bind_groups: Arc<BindGroupCache>,
     created: AtomicU64,
     reused: AtomicU64,
 }
@@ -165,6 +169,7 @@ impl BufferPool {
             }),
             usage,
             tracker: Arc::new(MemoryTracker::new()),
+            bind_groups: Arc::new(BindGroupCache::default()),
             created: AtomicU64::new(0),
             reused: AtomicU64::new(0),
         }
@@ -176,8 +181,14 @@ impl BufferPool {
         &self.tracker
     }
 
+    /// The bind group cache of the context that owns this pool.
+    pub(crate) fn bind_groups(&self) -> &Arc<BindGroupCache> {
+        &self.bind_groups
+    }
+
     fn release_all(&self, state: &mut PoolState) {
-        for (size, _) in state.lists.drain() {
+        for (size, buffer) in state.lists.drain() {
+            self.bind_groups.evict(&buffer);
             self.tracker.pool_take(size);
             self.tracker.gpu_dropped(size);
         }
@@ -282,6 +293,7 @@ impl BufferPool {
         if !state.overflow && state.lists.pooled_bytes + size > state.max_pooled_bytes {
             // Dropping the last reference releases the GPU memory once the
             // work using it has finished and the device is polled.
+            self.bind_groups.evict(&buffer);
             self.tracker.gpu_dropped(size);
             return;
         }
@@ -305,7 +317,8 @@ impl BufferPool {
             let max = state.max_pooled_bytes;
             state.lists.trim(max, self.tracker.completed_serial())
         };
-        for (size, _) in &dropped {
+        for (size, buffer) in &dropped {
+            self.bind_groups.evict(buffer);
             self.tracker.pool_take(*size);
         }
         dropped.len()
