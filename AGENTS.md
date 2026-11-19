@@ -213,7 +213,10 @@ the variable, or another GPU, keeps the f32 path.
   `#[allow(...)]` on `mod tests`.
 - `unsafe` is denied, except the loader's two documented memory-map sites and
   `enable_experimental_features` in `ferrotensor-backend/src/adapters.rs`, which
-  opts in to wgpu's experimental features only with `FERROTENSOR_EXPERIMENTAL=1`.
+  opts in to wgpu's experimental features only with `FERROTENSOR_EXPERIMENTAL=1`,
+  and `ShaderChecks::module` in `ferrotensor-backend/src/shader_checks.rs`, which
+  builds the crate's own WGSL kernels with `create_shader_module_trusted` when
+  `FERROTENSOR_SHADER_CHECKS` leaves out some of wgpu's runtime checks.
 - A comment says why the code does something. A doc comment is one summary sentence, plus
   `# Errors`, `# Panics` or `# Safety` when they apply.
 - No new dependency without the maintainer's approval. One concern per PR.

@@ -5,6 +5,7 @@ use crate::kernel_timing::{
 };
 use crate::pool::BufferPool;
 use crate::profile::{GpuCounterSnapshot, GpuCounters};
+use crate::shader_checks::ShaderChecks;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -88,6 +89,9 @@ pub struct WgpuContext {
     max_pending_ops: u32,
     /// Dispatches per compute pass, from [`PASS_DISPATCHES_ENV`].
     max_pass_dispatches: usize,
+    /// Runtime checks for the built-in kernels, from
+    /// [`SHADER_CHECKS_ENV`](crate::SHADER_CHECKS_ENV).
+    shader_checks: ShaderChecks,
 }
 
 /// Recorded work not yet submitted: the encoder, and the dispatches not yet
@@ -308,6 +312,7 @@ impl WgpuContext {
             timer,
             max_pending_ops,
             max_pass_dispatches,
+            shader_checks: ShaderChecks::from_env(),
         })
     }
 
@@ -523,6 +528,12 @@ impl WgpuContext {
     /// Totals of the GPU work recorded and waited for on this context.
     pub fn gpu_counters(&self) -> GpuCounterSnapshot {
         self.counters.snapshot()
+    }
+
+    /// The runtime checks the built-in kernels are compiled with, read from
+    /// [`SHADER_CHECKS_ENV`](crate::SHADER_CHECKS_ENV) when the context was created.
+    pub fn shader_checks(&self) -> ShaderChecks {
+        self.shader_checks
     }
 
     /// Where this context writes kernel timestamps; `None` when it was

@@ -20,7 +20,6 @@
 use super::{uniform, ComputeEngine, Epilogue, Kernel};
 use crate::kernel_timing::KernelLabel;
 use crate::{DType, ReadbackError, UnifiedTensor, WgpuContext};
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -170,11 +169,8 @@ impl Coop {
         let mut cache = self.kernels.lock().unwrap_or_else(PoisonError::into_inner);
         Arc::clone(cache.entry(key).or_insert_with(|| {
             let module = ctx
-                .device
-                .create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("matmul_coop"),
-                    source: wgpu::ShaderSource::Wgsl(Cow::Owned(source(key))),
-                });
+                .shader_checks()
+                .module(&ctx.device, "matmul_coop", source(key));
             let pipeline = Arc::new(ctx.device.create_compute_pipeline(
                 &wgpu::ComputePipelineDescriptor {
                     label: Some("matmul_coop"),

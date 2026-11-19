@@ -4,7 +4,6 @@
 use super::{grid, uniform, ComputeEngine, Epilogue, Kernel};
 use crate::kernel_timing::KernelLabel;
 use crate::{DType, UnifiedTensor, WgpuContext};
-use std::borrow::Cow;
 use std::sync::{Arc, PoisonError};
 
 /// Fewest output rows the router sends to the small-M kernel. Below this a
@@ -424,17 +423,12 @@ impl ComputeEngine {
     fn small_m_kernel(&self, ctx: &WgpuContext, key: SmallMKey) -> Arc<Kernel> {
         let mut cache = self.small_m.lock().unwrap_or_else(PoisonError::into_inner);
         Arc::clone(cache.entry(key).or_insert_with(|| {
-            let module = ctx
-                .device
-                .create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("matmul_small_m"),
-                    source: wgpu::ShaderSource::Wgsl(Cow::Owned(source(
-                        key.tile,
-                        key.transposed_b,
-                        key.half_b,
-                    ))),
-                });
-            Arc::new(Kernel::new(&ctx.device, &module, "matmul_small_m"))
+            let module = ctx.shader_checks().module(
+                &ctx.device,
+                "matmul_small_m",
+                source(key.tile, key.transposed_b, key.half_b),
+            );
+            Arc::new(Kernel::new(ctx, &module, "matmul_small_m"))
         }))
     }
 
