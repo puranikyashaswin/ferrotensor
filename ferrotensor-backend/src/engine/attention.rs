@@ -1,5 +1,6 @@
 //! Rotary embeddings and fused (flash) attention.
 
+use super::flash_coop::Shape;
 use super::{dummy_storage, grid, groups64, uniform, Arg, ComputeEngine, Params, Scratch};
 use crate::{DType, UnifiedTensor, WgpuContext};
 
@@ -268,6 +269,11 @@ impl ComputeEngine {
                 &stats_dummy
             }
         };
+        let shape = dims.shape();
+        if self.flash_coop_routes(shape, opts, mask.is_some()) {
+            self.flash_coop_forward(ctx, shape, [q, k, v, out], stats_buf, &params);
+            return;
+        }
         self.run(
             ctx,
             &self.flash_attn_v2,
@@ -445,24 +451,42 @@ impl ComputeEngine {
             }
         };
         let (b, h) = (dims.batch, dims.heads);
-        self.run(
-            ctx,
-            &self.flash_attn_v2_bw_dq,
-            &[
-                (0, q.buffer()),
-                (1, k.buffer()),
-                (2, v.buffer()),
-                (3, out.buffer()),
-                (4, grad_out.buffer()),
-                (5, grad_q.buffer()),
-                (8, &params),
-                (9, mask_buf),
-                (10, stats),
-            ],
-            (1, dims.seq_q.div_ceil(ATTENTION_ROWS), b * h),
-        );
+        // The cooperative kernels need the saved log-sum-exp.
+        let shape = dims.shape();
+        let coop = saved.is_some() && self.flash_coop_routes(shape, opts, mask.is_some());
+        if coop {
+            self.flash_coop_dq(
+                ctx,
+                shape,
+                [q, k, v, out, grad_out, grad_q],
+                (stats, &params),
+            );
+        } else {
+            self.run(
+                ctx,
+                &self.flash_attn_v2_bw_dq,
+                &[
+                    (0, q.buffer()),
+                    (1, k.buffer()),
+                    (2, v.buffer()),
+                    (3, out.buffer()),
+                    (4, grad_out.buffer()),
+                    (5, grad_q.buffer()),
+                    (8, &params),
+                    (9, mask_buf),
+                    (10, stats),
+                ],
+                (1, dims.seq_q.div_ceil(ATTENTION_ROWS), b * h),
+            );
+        }
         let dkdv_grid = (1, dims.seq_k.div_ceil(ATTENTION_ROWS), b * h);
-        if group == 1 {
+        // dK and dV go to `grads`: the gradients themselves, or the
+        // per-query-head partials.
+        let dkdv = |grads: (&dyn Arg, &dyn Arg)| {
+            if coop {
+                self.flash_coop_dkdv(ctx, shape, [q, k, v, grad_out], grads, (stats, &params));
+                return;
+            }
             self.run(
                 ctx,
                 &self.flash_attn_v2_bw_dkdv,
@@ -471,14 +495,17 @@ impl ComputeEngine {
                     (1, k.buffer()),
                     (2, v.buffer()),
                     (4, grad_out.buffer()),
-                    (6, grad_k.buffer()),
-                    (7, grad_v.buffer()),
+                    (6, grads.0),
+                    (7, grads.1),
                     (8, &params),
                     (9, mask_buf),
                     (10, stats),
                 ],
                 dkdv_grid,
             );
+        };
+        if group == 1 {
+            dkdv((grad_k.buffer(), grad_v.buffer()));
             return;
         }
         // Per-query-head partials, [batch, seq_k, num_heads, head_dim], made for
@@ -498,22 +525,7 @@ impl ComputeEngine {
             partial("Flash Bwd dK Partial"),
             partial("Flash Bwd dV Partial"),
         );
-        self.run(
-            ctx,
-            &self.flash_attn_v2_bw_dkdv,
-            &[
-                (0, q.buffer()),
-                (1, k.buffer()),
-                (2, v.buffer()),
-                (4, grad_out.buffer()),
-                (6, &dk_part),
-                (7, &dv_part),
-                (8, &params),
-                (9, mask_buf),
-                (10, stats),
-            ],
-            dkdv_grid,
-        );
+        dkdv((&dk_part, &dv_part));
         let elements = b * dims.seq_k * dims.kv_heads * dims.head_dim;
         self.run(
             ctx,
@@ -586,6 +598,16 @@ impl AttentionDims {
             stats.dtype,
             stats.shape
         );
+    }
+
+    fn shape(&self) -> Shape {
+        Shape {
+            batch: self.batch,
+            heads: self.heads,
+            seq_q: self.seq_q,
+            seq_k: self.seq_k,
+            head_dim: self.head_dim,
+        }
     }
 
     fn scale(&self) -> f32 {

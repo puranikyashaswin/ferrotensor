@@ -189,8 +189,11 @@ pub(super) struct CoopKey {
 /// The cooperative-matrix kernels of a device that has them.
 pub(super) struct Coop {
     kernels: Mutex<HashMap<CoopKey, Arc<Kernel>>>,
-    /// One `u32` counter of staging threads that clamped an `a` value.
-    overflows: UnifiedTensor,
+    /// One `u32` counter of staging threads that clamped an `a` value (or a
+    /// value the attention kernels staged).
+    pub(super) overflows: UnifiedTensor,
+    /// The attention kernels, compiled with the matmul's.
+    pub(super) flash: Option<super::flash_coop::FlashCoop>,
     /// Whether [`EXPERIMENTAL_ENV`](crate::adapters::EXPERIMENTAL_ENV) routes f16-weight matmuls here.
     routed: bool,
     /// Workgroups a grid aims for, as for the small-M kernel.
@@ -203,7 +206,7 @@ pub(super) struct Coop {
 
 /// `src` with its parameters moved to immediates. The `enable` directives
 /// must stay first in the module, so only the text after them is rewritten.
-fn immediate_source(src: &str) -> String {
+pub(super) fn immediate_source(src: &str) -> String {
     const LAST_ENABLE: &str = "enable wgpu_cooperative_matrix;\n";
     let split = src.find(LAST_ENABLE).map_or(0, |at| at + LAST_ENABLE.len());
     let (directives, body) = src.split_at(split);
@@ -281,6 +284,7 @@ impl Coop {
         Some(Self {
             kernels: Mutex::new(HashMap::new()),
             overflows: UnifiedTensor::zeros(ctx, &[1]),
+            flash: Some(super::flash_coop::FlashCoop::new()),
             routed: crate::adapters::experimental_opt_in(),
             target,
             max_bytes: limits.max_compute_workgroup_storage_size,

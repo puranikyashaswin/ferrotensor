@@ -13,6 +13,7 @@ use wgpu::{util::DeviceExt, Buffer, Device};
 
 mod attention;
 mod elementwise;
+mod flash_coop;
 mod matmul;
 mod matmul_coop;
 mod misc;
@@ -23,6 +24,7 @@ mod small_m;
 mod training;
 
 pub use attention::AttentionOptions;
+pub use flash_coop::FLASH_COOP_ENV;
 pub use matmul::{Epilogue, MatmulPath};
 pub use matmul_coop::{CoopConfig, CoopTile};
 pub use skinny::SkinnyTile;
