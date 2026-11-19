@@ -113,10 +113,16 @@ impl Linear {
         let mut out = Tensor::matmul(x, &self.weight, engine);
 
         if let Some(lora) = &self.lora {
-            let temp = Tensor::matmul(x, &lora.a, engine);
+            // (x @ A) is [rows, rank]: scaling it there touches rank/out of the
+            // elements that scaling the [rows, out] product would, and gives
+            // the same result. A scale of 1 needs no kernel at all.
+            let mut temp = Tensor::matmul(x, &lora.a, engine);
+            let scale = lora.alpha / lora.rank as f32;
+            if (scale - 1.0).abs() > f32::EPSILON {
+                temp = Tensor::scale(&temp, scale, engine);
+            }
             let lora_out = Tensor::matmul(&temp, &lora.b, engine);
-            let scaled_lora = Tensor::scale(&lora_out, lora.alpha / lora.rank as f32, engine);
-            out = Tensor::add(&out, &scaled_lora, engine);
+            out = Tensor::add(&out, &lora_out, engine);
         }
 
         if let Some(bias) = &self.bias {

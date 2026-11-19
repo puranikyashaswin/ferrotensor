@@ -1259,18 +1259,30 @@ impl Tensor {
         // Output shape same as Query
         let out_data = UnifiedTensor::empty(&q.ctx, &q.data.shape);
         let mask_data = mask.map(|m| &*m.data);
-
-        engine.flash_attention_v2(
-            &q.ctx,
-            &q.data,
-            &k.data,
-            &v.data,
-            &out_data,
+        let opts = AttentionOptions {
             causal,
             dropout_prob,
             seed,
-            mask_data,
-        );
+            ..Default::default()
+        };
+
+        // Backward reads the output and each query row's log-sum-exp
+        // instead of running the forward again. Without a graph to record
+        // into, nothing is kept.
+        let stats = if GRAD_ENABLED.with(Cell::get) {
+            let head_dim = q.data.shape.last().copied().unwrap_or(1).max(1);
+            let rows = q.data.shape.iter().product::<usize>() / head_dim;
+            let stats = UnifiedTensor::empty(&q.ctx, &[rows, 2]);
+            engine.flash_attention_v2_with_stats(
+                &q.ctx, &q.data, &k.data, &v.data, &out_data, &stats, &opts, mask_data,
+            );
+            Some(stats)
+        } else {
+            engine.flash_attention_v2_with(
+                &q.ctx, &q.data, &k.data, &v.data, &out_data, &opts, mask_data,
+            );
+            None
+        };
 
         let node = Arc::new(FlashAttentionNode {
             q: q.clone(),
@@ -1280,6 +1292,8 @@ impl Tensor {
             causal,
             dropout_prob,
             seed,
+            out: out_data.clone(),
+            stats,
         });
 
         Tensor::with_creator(q.ctx.clone(), out_data, node)
@@ -1302,6 +1316,13 @@ pub struct FlashAttentionNode {
     pub dropout_prob: f32,
     /// Dropout RNG seed.
     pub seed: u64,
+    /// The forward output, shared with the tensor this node created.
+    pub out: UnifiedTensor,
+    /// Per query row `[scratch, log-sum-exp]` from the forward pass (see
+    /// [`ComputeEngine::flash_attention_v2_with_stats`]); `None` when the
+    /// forward ran without recording, so backward recomputes the
+    /// log-sum-exp.
+    pub stats: Option<UnifiedTensor>,
 }
 
 impl AutogradNode for FlashAttentionNode {
@@ -1319,39 +1340,43 @@ impl AutogradNode for FlashAttentionNode {
         let grad_k = UnifiedTensor::empty(&self.k.ctx, &self.k.data.shape);
         let grad_v = UnifiedTensor::empty(&self.v.ctx, &self.v.data.shape);
 
-        let out_recomputed = UnifiedTensor::empty(&self.q.ctx, &self.q.data.shape);
         let mask_data = self.mask.as_ref().map(|m| &*m.data);
-        engine.flash_attention_v2(
-            &self.q.ctx,
-            &self.q.data,
-            &self.k.data,
-            &self.v.data,
-            &out_recomputed,
-            self.causal,
-            self.dropout_prob,
-            self.seed,
-            mask_data,
-        );
-
         let opts = AttentionOptions {
             causal: self.causal,
             dropout_prob: self.dropout_prob,
             seed: self.seed,
             ..Default::default()
         };
-        engine.flash_attention_v2_backward_with(
-            &self.q.ctx,
-            &self.q.data,
-            &self.k.data,
-            &self.v.data,
-            &out_recomputed,
-            grad,
-            &grad_q,
-            &grad_k,
-            &grad_v,
-            &opts,
-            mask_data,
-        );
+        let (q, k, v) = (&self.q.data, &self.k.data, &self.v.data);
+        match &self.stats {
+            Some(stats) => engine.flash_attention_v2_backward_with_stats(
+                &self.q.ctx,
+                q,
+                k,
+                v,
+                &self.out,
+                grad,
+                &grad_q,
+                &grad_k,
+                &grad_v,
+                stats,
+                &opts,
+                mask_data,
+            ),
+            None => engine.flash_attention_v2_backward_with(
+                &self.q.ctx,
+                q,
+                k,
+                v,
+                &self.out,
+                grad,
+                &grad_q,
+                &grad_k,
+                &grad_v,
+                &opts,
+                mask_data,
+            ),
+        }
 
         let mut grads = vec![grad_q, grad_k, grad_v];
         if let Some(m) = &self.mask {

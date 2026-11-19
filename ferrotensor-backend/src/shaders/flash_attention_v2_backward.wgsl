@@ -5,7 +5,9 @@
 // (uses its hash3 / dropout_scale helpers). Two passes, no atomics:
 //   1. flash_bwd_dq: per query row, Delta = dO . O, the log-sum-exp L of
 //      the scores (first sweep over keys) and dQ = scale * sum_j dS_ij K_j
-//      (second sweep). Delta and L are stored for pass 2.
+//      (second sweep). Delta and L are stored for pass 2. When lse_saved is
+//      set, the forward pass already wrote L into the stats and the first
+//      sweep is skipped.
 //   2. flash_bwd_dk_dv: per key row, dV_j = sum_i P_ij M_ij dO_i and
 //      dK_j = scale * sum_i dS_ij Q_i (summed over the query heads that
 //      share this KV head).
@@ -43,7 +45,7 @@ struct FlashBwdParams {
     mask_stride_k: u32,
     window: u32,
     seed_hi: u32,
-    _pad1: u32,
+    lse_saved: u32,
     _pad2: u32,
 };
 @group(0) @binding(8) var<uniform> fab2_params: FlashBwdParams;
@@ -213,29 +215,33 @@ fn flash_bwd_dq(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id
     let delta = delta4.x + delta4.y + delta4.z + delta4.w;
     let range = fab2_key_range(q0, min(q0 + FAB_ROWS, p.seq_q) - 1u);
 
-    // Sweep 1: log-sum-exp of this row's scores.
-    var m = FAB_MASKED;
-    var l = 0.0;
-    for (var k0 = range.x; k0 < range.y; k0 += FAB_TILE) {
-        fab2_load_kv(lid, 128u, b, kvh, k0, d4);
-        workgroupBarrier();
-        for (var j = 0u; j < FAB_TILE; j++) {
-            let kj = k0 + j;
-            if (!fab2_visible(qi, kj)) { continue; }
-            var dot4 = vec4<f32>(0.0);
-            for (var c = 0u; c < d4; c++) { dot4 = fma(q_reg[c], fab2_t0[j * FAB_D4 + c], dot4); }
-            let s = dot4.x + dot4.y + dot4.z + dot4.w + fab2_mask_at(b, h, qi, kj);
-            if (s > FAB_MASKED) {
-                let m_new = max(m, s);
-                l = l * exp(m - m_new) + exp(s - m_new);
-                m = m_new;
-            }
-        }
-        workgroupBarrier();
-    }
     // A fully masked row has no probability mass; make every P_ij zero.
     var lse = 3.0e38;
-    if (l > 0.0) { lse = m + log(l); }
+    if (p.lse_saved == 1u) {
+        if (valid) { lse = fab2_stats[fab2_row(b, h, qi)].y; }
+    } else {
+        // Sweep 1: log-sum-exp of this row's scores.
+        var m = FAB_MASKED;
+        var l = 0.0;
+        for (var k0 = range.x; k0 < range.y; k0 += FAB_TILE) {
+            fab2_load_kv(lid, 128u, b, kvh, k0, d4);
+            workgroupBarrier();
+            for (var j = 0u; j < FAB_TILE; j++) {
+                let kj = k0 + j;
+                if (!fab2_visible(qi, kj)) { continue; }
+                var dot4 = vec4<f32>(0.0);
+                for (var c = 0u; c < d4; c++) { dot4 = fma(q_reg[c], fab2_t0[j * FAB_D4 + c], dot4); }
+                let s = dot4.x + dot4.y + dot4.z + dot4.w + fab2_mask_at(b, h, qi, kj);
+                if (s > FAB_MASKED) {
+                    let m_new = max(m, s);
+                    l = l * exp(m - m_new) + exp(s - m_new);
+                    m = m_new;
+                }
+            }
+            workgroupBarrier();
+        }
+        if (l > 0.0) { lse = m + log(l); }
+    }
 
     // Sweep 2: dQ.
     for (var k0 = range.x; k0 < range.y; k0 += FAB_TILE) {

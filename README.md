@@ -85,7 +85,7 @@ sequences per optimizer step.
 - **Less GPU memory for LoRA.** Peak GPU memory (`nvidia-smi`, MiB) for 30
   optimizer steps with f16 base weights, batch 1 × 8-step accumulation
   unless noted, all measured in one session on one A10G: 0.6 is the
-  released v0.6.0, 0.7 is merged `main` (`af41068`); the time column
+  released v0.6.0, 0.7 is `main` at `af41068`, merged before the 0.7.0 release; the time column
   compares median seconds per step over the 30 steps:
 
   | Model | 0.6 | 0.7 default | 0.7 `--checkpoint-blocks` | Time per step with `--checkpoint-blocks` |
