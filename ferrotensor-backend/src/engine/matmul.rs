@@ -1,7 +1,7 @@
 //! Matrix multiplication kernels.
 
 use super::{grid, uniform, ComputeEngine, Kernel};
-use crate::kernel_timing::KernelLabel;
+use crate::kernel_timing::{KernelLabel, MatmulShape};
 use crate::{DType, UnifiedTensor, WgpuContext};
 
 /// Operand layout understood by the `matmul_blocked` kernel.
@@ -200,12 +200,14 @@ impl ComputeEngine {
                     Thin::B => "n<=64",
                 },
             };
+            let shape = matmul_shape(kernel, layout, (m, k, n));
             let params = uniform(ctx, bytemuck::cast_slice(&params));
             // One 16x16 workgroup per 8 rows by 32 columns of the thin product.
             self.run_labeled(
                 ctx,
                 kernel,
                 label,
+                Some(shape),
                 &[
                     (0, t.buffer()),
                     (1, w.buffer()),
@@ -229,6 +231,7 @@ impl ComputeEngine {
             ctx,
             kernel,
             matmul_label(kernel, layout, m, k, n),
+            Some(matmul_shape(kernel, layout, (m, k, n))),
             &[
                 (0, a.buffer()),
                 (1, b.buffer()),
@@ -271,6 +274,22 @@ impl ComputeEngine {
             ],
             grid(n.div_ceil(columns_per_group)),
         );
+    }
+}
+
+/// The shape kernel timing reports a matmul under: the caller's logical
+/// `out[m, n] = op(a) @ op(b)` with summed dimension `k`, whichever side
+/// the kernel runs as its thin one. The kernels are 2-D, so a batch of
+/// sequences is already folded into `m` by the caller and every dispatch is
+/// one product; there is no batch dimension to report. The one-row
+/// matrix-vector kernel (decode only) is not reported.
+fn matmul_shape(kernel: &Kernel, layout: Layout, (m, k, n): (u32, u32, u32)) -> MatmulShape {
+    MatmulShape {
+        entry: kernel.entry_point,
+        layout: layout.name(),
+        m,
+        n,
+        k,
     }
 }
 

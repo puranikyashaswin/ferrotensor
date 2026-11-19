@@ -89,6 +89,36 @@ impl KernelLabel {
     }
 }
 
+/// One matmul product `out[m, n] = op(a)[m, k] @ op(b)[k, n]`: the kernel
+/// that ran it and its exact dimensions.
+///
+/// Matmul kernels are 2-D, so there is no batch dimension: a caller with
+/// several sequences folds them into `m` (rows of `x` are sequences times
+/// padded length), and each dispatch is one product. The thin kernel may
+/// compute the transposed product internally; the shape is always the
+/// logical one of the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MatmulShape {
+    /// The kernel's entry point.
+    pub entry: &'static str,
+    /// Operand layout: `a@b`, `a@bT` or `aT@b`.
+    pub layout: &'static str,
+    /// Rows of the output.
+    pub m: u32,
+    /// Columns of the output.
+    pub n: u32,
+    /// Summed dimension.
+    pub k: u32,
+}
+
+/// What one timed dispatch was: its kernel label and, for a matmul, its
+/// shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Timed {
+    pub(crate) label: KernelLabel,
+    pub(crate) shape: Option<MatmulShape>,
+}
+
 /// How often a kernel ran and its summed GPU time.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct KernelTime {
@@ -143,20 +173,67 @@ impl KernelTimes {
     }
 }
 
+/// GPU time by matmul shape since a context opened, or between two moments.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MatmulShapes(BTreeMap<MatmulShape, KernelTime>);
+
+impl FromIterator<(MatmulShape, KernelTime)> for MatmulShapes {
+    fn from_iter<I: IntoIterator<Item = (MatmulShape, KernelTime)>>(iter: I) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
+impl MatmulShapes {
+    /// The shapes timed between `earlier` and `self`.
+    pub fn since(&self, earlier: &Self) -> Self {
+        self.0
+            .iter()
+            .filter_map(|(shape, now)| {
+                let before = earlier.0.get(shape).copied().unwrap_or_default();
+                let dispatches = now.dispatches.saturating_sub(before.dispatches);
+                (dispatches > 0).then(|| {
+                    let gpu_time = now.gpu_time.saturating_sub(before.gpu_time);
+                    (
+                        *shape,
+                        KernelTime {
+                            dispatches,
+                            gpu_time,
+                        },
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// Every shape, longest GPU time first.
+    pub fn by_gpu_time(&self) -> Vec<(MatmulShape, KernelTime)> {
+        let mut rows: Vec<_> = self.0.iter().map(|(s, t)| (*s, *t)).collect();
+        rows.sort_by(|a, b| b.1.gpu_time.cmp(&a.1.gpu_time).then(a.0.cmp(&b.0)));
+        rows
+    }
+}
+
 /// Adds the time between each pair of `ticks` to the kernel of the same
-/// index in `labels`. A pair that runs backwards (a counter that wrapped)
-/// adds a dispatch with no time.
+/// index in `timed`, and to its matmul shape when it has one. A pair that
+/// runs backwards (a counter that wrapped) adds a dispatch with no time.
 fn add_timestamp_pairs(
     totals: &mut HashMap<KernelLabel, KernelTime>,
-    labels: &[KernelLabel],
+    shapes: &mut HashMap<MatmulShape, KernelTime>,
+    timed: &[Timed],
     ticks: &[u64],
     period_ns: f32,
 ) {
-    for (label, pair) in labels.iter().zip(ticks.as_chunks::<2>().0) {
-        let total = totals.entry(*label).or_default();
-        total.dispatches += 1;
+    for (dispatch, pair) in timed.iter().zip(ticks.as_chunks::<2>().0) {
         let nanos = pair[1].saturating_sub(pair[0]) as f64 * f64::from(period_ns);
-        total.gpu_time += Duration::from_nanos(nanos as u64);
+        let gpu_time = Duration::from_nanos(nanos as u64);
+        let total = totals.entry(dispatch.label).or_default();
+        total.dispatches += 1;
+        total.gpu_time += gpu_time;
+        if let Some(shape) = dispatch.shape {
+            let total = shapes.entry(shape).or_default();
+            total.dispatches += 1;
+            total.gpu_time += gpu_time;
+        }
     }
 }
 
@@ -177,7 +254,7 @@ pub(crate) struct TimingSlot {
 #[derive(Debug)]
 struct InFlight {
     slot: TimingSlot,
-    labels: Vec<KernelLabel>,
+    timed: Vec<Timed>,
     state: Arc<AtomicU8>,
 }
 
@@ -186,7 +263,7 @@ struct InFlight {
 #[derive(Debug, Default)]
 pub(crate) struct PendingTimes {
     slot: Option<TimingSlot>,
-    labels: Vec<KernelLabel>,
+    timed: Vec<Timed>,
 }
 
 #[derive(Debug, Default)]
@@ -194,6 +271,7 @@ struct TimerState {
     free: Vec<TimingSlot>,
     in_flight: Vec<InFlight>,
     totals: HashMap<KernelLabel, KernelTime>,
+    shapes: HashMap<MatmulShape, KernelTime>,
 }
 
 /// Timestamp queries of one context.
@@ -263,15 +341,18 @@ impl KernelTimer {
         dispatches: &[Dispatch],
         times: &mut PendingTimes,
     ) -> u64 {
-        let PendingTimes { slot, labels } = times;
+        let PendingTimes { slot, timed } = times;
         let queries = &slot.get_or_insert_with(|| self.slot(device)).queries;
         debug_assert!(
-            2 * (labels.len() + dispatches.len()) <= self.queries_per_submit as usize,
+            2 * (timed.len() + dispatches.len()) <= self.queries_per_submit as usize,
             "a submission holds at most queries_per_submit / 2 dispatches"
         );
         let mut next_pair = |dispatch: &Dispatch| {
-            let first = 2 * labels.len() as u32;
-            labels.push(dispatch.label);
+            let first = 2 * timed.len() as u32;
+            timed.push(Timed {
+                label: dispatch.label,
+                shape: dispatch.shape,
+            });
             first
         };
         match self.mode {
@@ -313,7 +394,7 @@ impl KernelTimer {
     /// buffer; call it before the encoder is finished.
     pub(crate) fn resolve(&self, encoder: &mut CommandEncoder, times: &PendingTimes) {
         if let Some(slot) = &times.slot {
-            let count = 2 * times.labels.len() as u32;
+            let count = 2 * times.timed.len() as u32;
             encoder.resolve_query_set(&slot.queries, 0..count, &slot.resolved, 0);
             let bytes = u64::from(count) * u64::from(wgpu::QUERY_SIZE);
             encoder.copy_buffer_to_buffer(&slot.resolved, 0, &slot.readback, 0, bytes);
@@ -335,7 +416,7 @@ impl KernelTimer {
             });
         self.lock().in_flight.push(InFlight {
             slot,
-            labels: std::mem::take(&mut times.labels),
+            timed: std::mem::take(&mut times.timed),
             state,
         });
     }
@@ -348,6 +429,7 @@ impl KernelTimer {
             free,
             in_flight,
             totals,
+            shapes,
         } = &mut *state;
         let mut i = 0;
         while i < in_flight.len() {
@@ -365,7 +447,7 @@ impl KernelTimer {
                         .iter()
                         .map(|bytes| u64::from_le_bytes(*bytes))
                         .collect();
-                    add_timestamp_pairs(totals, &done.labels, &ticks, self.period_ns);
+                    add_timestamp_pairs(totals, shapes, &done.timed, &ticks, self.period_ns);
                     done.slot.readback.unmap();
                     free.push(done.slot);
                 }
@@ -386,6 +468,15 @@ impl KernelTimer {
             .map(|(label, time)| (label.name(), *time))
             .collect()
     }
+
+    /// Totals by matmul shape of every timestamp collected so far.
+    pub(crate) fn shape_totals(&self) -> MatmulShapes {
+        self.lock()
+            .shapes
+            .iter()
+            .map(|(shape, time)| (*shape, *time))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -403,15 +494,28 @@ mod tests {
         size_class: "",
     };
 
+    const SHAPE: MatmulShape = MatmulShape {
+        entry: "matmul_blocked",
+        layout: "a@b",
+        m: 66,
+        n: 2048,
+        k: 2048,
+    };
+
+    fn plain(label: KernelLabel) -> Timed {
+        Timed { label, shape: None }
+    }
+
     #[test]
     fn pairs_add_to_their_kernel_scaled_by_the_period() {
         let mut totals = HashMap::new();
-        let labels = [MATMUL_LARGE, ROPE, MATMUL_LARGE];
+        let mut shapes = HashMap::new();
+        let timed = [plain(MATMUL_LARGE), plain(ROPE), plain(MATMUL_LARGE)];
         // Ticks of 2 ns: 100, 7 and 50 ticks.
         let ticks = [1_000, 1_100, 1_100, 1_107, 2_000, 2_050];
-        add_timestamp_pairs(&mut totals, &labels, &ticks, 2.0);
+        add_timestamp_pairs(&mut totals, &mut shapes, &timed, &ticks, 2.0);
         // A wrapped counter: the end tick is below the start.
-        add_timestamp_pairs(&mut totals, &[ROPE], &[500, 10], 2.0);
+        add_timestamp_pairs(&mut totals, &mut shapes, &[plain(ROPE)], &[500, 10], 2.0);
 
         assert_eq!(
             totals[&MATMUL_LARGE],
@@ -427,6 +531,68 @@ mod tests {
                 gpu_time: Duration::from_nanos(14),
             }
         );
+        assert!(shapes.is_empty(), "dispatches without a shape add none");
+    }
+
+    #[test]
+    fn shapes_add_up_per_distinct_shape_and_leave_kernel_totals_alone() {
+        let other = MatmulShape { n: 8192, ..SHAPE };
+        let with = |shape| Timed {
+            label: MATMUL_LARGE,
+            shape: Some(shape),
+        };
+        let mut totals = HashMap::new();
+        let mut shapes = HashMap::new();
+        let timed = [with(SHAPE), with(other), with(SHAPE), plain(ROPE)];
+        // Ticks of 1 ns: 100, 450, 300 and 5 ticks.
+        let ticks = [0, 100, 100, 550, 550, 850, 850, 855];
+        add_timestamp_pairs(&mut totals, &mut shapes, &timed, &ticks, 1.0);
+
+        assert_eq!(
+            totals[&MATMUL_LARGE],
+            KernelTime {
+                dispatches: 3,
+                gpu_time: Duration::from_nanos(850),
+            }
+        );
+        let shapes: MatmulShapes = shapes.into_iter().collect();
+        assert_eq!(
+            shapes.by_gpu_time(),
+            vec![
+                (
+                    other,
+                    KernelTime {
+                        dispatches: 1,
+                        gpu_time: Duration::from_nanos(450),
+                    }
+                ),
+                (
+                    SHAPE,
+                    KernelTime {
+                        dispatches: 2,
+                        gpu_time: Duration::from_nanos(400),
+                    }
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn shapes_since_subtracts_and_drops_shapes_that_did_not_run() {
+        let time = |dispatches, nanos| KernelTime {
+            dispatches,
+            gpu_time: Duration::from_nanos(nanos),
+        };
+        let other = MatmulShape { k: 64, ..SHAPE };
+        let earlier: MatmulShapes = [(SHAPE, time(2, 100)), (other, time(1, 10))]
+            .into_iter()
+            .collect();
+        let later: MatmulShapes = [(SHAPE, time(5, 400)), (other, time(1, 10))]
+            .into_iter()
+            .collect();
+        let step = later.since(&earlier);
+        assert_eq!(step.by_gpu_time(), vec![(SHAPE, time(3, 300))]);
+        assert_eq!(later.since(&later), MatmulShapes::default());
     }
 
     #[test]

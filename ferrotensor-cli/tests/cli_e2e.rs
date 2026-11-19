@@ -207,6 +207,7 @@ fn train_writes_adapter_state_and_metrics() {
         "each step waits for the GPU at least once: {profile}"
     );
     assert_kernels(&profile, "_per_step");
+    assert_matmul_shapes(&profile);
 
     for name in RUN_FILES {
         let path = out.path().join(name);
@@ -217,8 +218,23 @@ fn train_writes_adapter_state_and_metrics() {
 
     let metrics = std::fs::read_to_string(out.path().join("metrics.jsonl")).expect("metrics");
     for line in metrics.lines().filter(|l| !l.trim().is_empty()) {
-        serde_json::from_str::<serde_json::Value>(line)
+        let value = serde_json::from_str::<serde_json::Value>(line)
             .unwrap_or_else(|e| panic!("metrics line {line:?} is not JSON: {e}"));
+        if value.get("loss").is_none() {
+            continue;
+        }
+        let rows: Vec<u64> = value["micro_batch_m"]
+            .as_array()
+            .unwrap_or_else(|| panic!("micro_batch_m is an array: {line}"))
+            .iter()
+            .map(|m| m.as_u64().expect("an M is a count"))
+            .collect();
+        assert!(!rows.is_empty() && rows.iter().all(|&m| m > 0), "{line}");
+        assert_eq!(value["input_tokens"], rows.iter().sum::<u64>(), "{line}");
+        assert!(
+            value["input_tokens"].as_u64() >= value["tokens"].as_u64(),
+            "padding only adds rows to the supervised tokens: {line}"
+        );
     }
 }
 
@@ -461,6 +477,33 @@ fn assert_kernels(report: &serde_json::Value, suffix: &str) {
         (seconds.iter().sum::<f64>() - total).abs() < 1e-9,
         "{report}"
     );
+}
+
+fn assert_matmul_shapes(report: &serde_json::Value) {
+    let shapes = report["matmul_shapes"]
+        .as_array()
+        .expect("matmul_shapes is an array");
+    if report["kernel_timing"].is_null() {
+        assert!(shapes.is_empty(), "{report}");
+        return;
+    }
+    assert!(!shapes.is_empty(), "{report}");
+    let seconds: Vec<f64> = shapes
+        .iter()
+        .map(|s| {
+            for key in ["entry", "layout"] {
+                assert!(s[key].as_str().is_some_and(|v| !v.is_empty()), "{s}");
+            }
+            for key in ["m", "n", "k"] {
+                assert!(s[key].as_u64() > Some(0), "{s}");
+            }
+            assert!(s["dispatches_per_step"].as_f64() > Some(0.0), "{s}");
+            let seconds = s["gpu_seconds_per_step"].as_f64().expect("seconds");
+            assert!(s["tflops"].is_null() == (seconds == 0.0), "{s}");
+            seconds
+        })
+        .collect();
+    assert!(seconds.windows(2).all(|w| w[0] >= w[1]), "{report}");
 }
 
 #[test]

@@ -1,7 +1,8 @@
 //! GPU device setup.
 
 use crate::kernel_timing::{
-    KernelLabel, KernelTimer, KernelTimes, KernelTiming, KernelTimingMode, PendingTimes,
+    KernelLabel, KernelTimer, KernelTimes, KernelTiming, KernelTimingMode, MatmulShape,
+    MatmulShapes, PendingTimes,
 };
 use crate::pool::BufferPool;
 use crate::profile::{GpuCounterSnapshot, GpuCounters};
@@ -91,6 +92,8 @@ pub(crate) struct Dispatch {
     pub(crate) bind_group: BindGroup,
     pub(crate) groups: (u32, u32, u32),
     pub(crate) label: KernelLabel,
+    /// The product a matmul dispatch computes; only read when timing.
+    pub(crate) shape: Option<MatmulShape>,
 }
 
 /// Why [`WgpuContext::try_new_with_options`] could not open a GPU.
@@ -507,6 +510,18 @@ impl WgpuContext {
             .map_or_else(KernelTimes::default, |timer| {
                 timer.collect();
                 timer.totals()
+            })
+    }
+
+    /// GPU time of matmul dispatches by exact shape, with the same reach as
+    /// [`kernel_times`](Self::kernel_times); empty without kernel timing.
+    /// Never waits.
+    pub fn matmul_shapes(&self) -> MatmulShapes {
+        self.timer
+            .as_ref()
+            .map_or_else(MatmulShapes::default, |timer| {
+                timer.collect();
+                timer.shape_totals()
             })
     }
 

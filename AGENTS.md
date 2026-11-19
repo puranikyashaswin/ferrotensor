@@ -41,7 +41,12 @@ tokens); `generate --raw` works with any model.
 
 `finetune` writes into `--out` (default `outputs/run`): `lora_adapters.safetensors`,
 its `.state.json` and `.state.safetensors` for `--resume`, `metrics.jsonl` and
-`training_state.json`.
+`training_state.json`. A training line of `metrics.jsonl` has `step`, `loss`,
+`grad_norm`, `lr`, `tokens` (supervised tokens since the last line),
+`seconds`, `elapsed`, and for the optimizer step it logs: `input_tokens`
+(rows through the forward passes, padding included) and `micro_batch_m`
+(the rows `M` of each forward pass of that step: sequences times padded
+length).
 
 ## Data format
 
@@ -62,7 +67,7 @@ is `null`. On an error stdout carries `{"error": "<message>"}` instead.
 |---|---|
 | `plan` | `adapter`, `backend`, `device_type`, `budget_mib`, `budget_source`, `model`, `parameters`, `chosen`, `estimated_peak_mib`, `margin`, `fits`, `train_command`, `notes`; without `--model` the per-model keys are in a `models` array |
 | `finetune` | `chosen` (`batch_size`, `seq_len`, `rank`, `precision`, `checkpoint_blocks`), `grad_accum`, `budget_mib`, `estimated_peak_mib`, `fits`, then every `train` key |
-| `train` | `steps`, `first_loss`, `final_loss`, `eval_loss_before`, `eval_loss_after` (null without `--eval-data`), `measured_peak_mib`, `seconds`, `out_dir`, `adapter` (null on ranks above 0, which save nothing), and with `--q4-weights` only, `q4_weights` (`modules`, `skip`, `group`, `tensors`: the 4-bit selection and how many tensors it stored at 4 bits) |
+| `train` | `steps`, `first_loss`, `final_loss`, `eval_loss_before`, `eval_loss_after` (null without `--eval-data`), `measured_peak_mib`, `seconds`, `mean_input_tokens_per_step` (mean rows through the forward passes per optimizer step, padding included; null without a step), `out_dir`, `adapter` (null on ranks above 0, which save nothing), and with `--q4-weights` only, `q4_weights` (`modules`, `skip`, `group`, `tensors`: the 4-bit selection and how many tensors it stored at 4 bits) |
 | `eval` | `examples`, `tokens`, `loss`, `perplexity`, `seconds` |
 | `generate` | `text`, `prompt_tokens`, `new_tokens`, `tokens_per_second` (decode speed: one-token forward passes after the prompt per second, prompt time left out; null when none ran), `prefill_seconds` (time to run the prompt), `kv_cache`, and with `--profile` only, `profile` (`kernel_timing`, `prefill` and `decode`: see [GPU time by kernel](#gpu-time-by-kernel---profile)) |
 | `chat` | one object per reply, each on its own line: `reply`, `prompt_tokens` (the whole conversation), `cached_tokens` (prompt tokens taken from the KV cache of earlier turns, not run again), `new_tokens`, `tokens_per_second` and `prefill_seconds` (as for `generate`; with the kept cache the prefill runs only the uncached tokens) |
@@ -84,7 +89,11 @@ stdout line by line. An error ends the session with a one-line
 timestamp queries, `kernel_timing` (`"inside_passes"`, `"pass_boundaries"`
 or null when the adapter has none), `kernel_gpu_seconds_per_step` and
 `kernels`: one object per kernel, longest GPU time first, with `name`,
-`dispatches_per_step` and `gpu_seconds_per_step`. `generate --profile
+`dispatches_per_step` and `gpu_seconds_per_step`; and `matmul_shapes`: one
+object per distinct matmul, longest GPU time first, with `entry`, `layout`,
+`m`, `n`, `k` (of `out[m, n] = op(a) @ op(b)`, summed over `k`),
+`dispatches_per_step`, `gpu_seconds_per_step` and `tflops` (null when the
+GPU time is 0). `generate --profile
 --json` adds `profile` with `kernel_timing`, `prefill` (`gpu_wait_seconds`,
 `kernel_gpu_seconds`, `kernels` of `name`, `dispatches`, `gpu_seconds`) and
 `decode` (`tokens`, `gpu_wait_seconds_per_token`,

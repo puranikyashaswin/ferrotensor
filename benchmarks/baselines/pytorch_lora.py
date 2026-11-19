@@ -24,9 +24,18 @@ On an Apple-silicon Mac pass --device mps (float32 only). That path is driven
 by scripts/bench_mac.py, which also uses --data-root, --summary, --warmup-steps
 and --record-steps; see docs/benchmarks-mac.md. Without those options and with
 the default --device cuda, behaviour is as described above.
+
+--torch-profile N (CUDA only) runs N extra optimizer steps under torch.profiler
+after the timed steps and before the final evaluation, and writes
+torch_profile.json (a chrome trace) and torch_kernels.json (the 60 CUDA kernels
+with the most self CUDA time, per step) next to the summary. Those steps are not
+in the median step time or the loss curve, and the adapter weights and
+optimizer state are put back afterwards, so the held-out loss after training is
+the same as without the flag.
 """
 
 import argparse
+import copy
 import json
 import math
 import random
@@ -128,6 +137,61 @@ def synchronize(device):
         torch.mps.synchronize()
 
 
+def profile_steps(model, opt, train, order, cursor, args, dtype, device, out_dir):
+    """Run args.torch_profile optimizer steps under torch.profiler and write the reports.
+
+    The steps use the same recipe as the timed ones, at the last step's learning
+    rate. The trainable weights and the optimizer state are restored afterwards.
+    Kernel input shapes come from record_shapes, which usually records them on the
+    CPU ops that launch a kernel and not on the kernel itself, so they may be empty.
+    """
+    from torch.profiler import ProfilerActivity, profile
+
+    params = [p for p in model.parameters() if p.requires_grad]
+    saved_params = [p.detach().clone() for p in params]
+    saved_opt = copy.deepcopy(opt.state_dict())
+    per_step = args.batch_size * args.grad_accum
+    for g in opt.param_groups:
+        g["lr"] = lr_at(args.steps, 5e-4, args.warmup_steps, args.steps)
+    synchronize(device)
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
+        for _ in range(args.torch_profile):
+            for _ in range(args.grad_accum):
+                idx = [order[(cursor + i) % len(order)] for i in range(args.batch_size)]
+                cursor += args.batch_size
+                seq_loss, _, _ = per_sequence_loss(model, [train[i] for i in idx], device, dtype)
+                (seq_loss.sum() / per_step).backward()
+            torch.nn.utils.clip_grad_norm_(params, 1.0)
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+        synchronize(device)
+    with torch.no_grad():
+        for p, saved in zip(params, saved_params):
+            p.copy_(saved)
+    opt.load_state_dict(saved_opt)
+
+    trace = out_dir / "torch_profile.json"
+    prof.export_chrome_trace(str(trace))
+    kernels = []
+    for e in prof.key_averages(group_by_input_shape=True):
+        if getattr(e, "device_type", None) != torch.autograd.DeviceType.CUDA:
+            continue
+        # Microseconds; the attribute was called self_cuda_time_total before torch 2.4.
+        micros = getattr(e, "self_device_time_total", None)
+        if micros is None:
+            micros = e.self_cuda_time_total
+        kernels.append({
+            "name": e.key,
+            "calls": e.count,
+            "self_cuda_seconds_per_step": micros / 1e6 / args.torch_profile,
+            "input_shapes": e.input_shapes or None,
+        })
+    kernels.sort(key=lambda k: k["self_cuda_seconds_per_step"], reverse=True)
+    report = out_dir / "torch_kernels.json"
+    report.write_text(json.dumps(kernels[:60], indent=2) + "\n")
+    print(f"torch profile: {trace}, {report}", flush=True)
+
+
 def mps_memory_gb():
     """(driver-allocated, tensor-allocated) bytes of the MPS device, in GB.
 
@@ -161,11 +225,18 @@ def main():
     ap.add_argument("--warmup-steps", type=int, default=20, help="linear learning-rate warmup steps")
     ap.add_argument("--data-root", default="data", help="where models and data are cached")
     ap.add_argument("--summary", help="write the summary here instead of under <data-root>/runs")
+    ap.add_argument("--torch-profile", type=int, default=0, metavar="N",
+                    help="after the timed steps, profile N more optimizer steps with torch.profiler "
+                         "(CUDA only; writes torch_profile.json and torch_kernels.json)")
     ap.add_argument("--record-steps", action="store_true",
                     help="add every step's seconds and mean loss to the summary")
     args = ap.parse_args()
     if args.device == "mps" and args.dtype != "f32":
         ap.error("--device mps supports --dtype f32 only")
+    if args.torch_profile < 0:
+        ap.error("--torch-profile must not be negative")
+    if args.torch_profile and args.device != "cuda":
+        ap.error("--torch-profile needs --device cuda")
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -230,6 +301,13 @@ def main():
         if step % 10 == 0:
             curve.append({"step": step, "loss": statistics.fmean(losses)})
             print(f"{step:6d} | {statistics.fmean(losses):.4f} | {step_times[-1]:.2f} s", flush=True)
+    summary_path = Path(args.summary) if args.summary else run / "summary.json"
+    peak_gpu_bytes = None
+    if args.torch_profile:
+        # The profiler's own allocations and extra steps stay out of the reported peak.
+        peak_gpu_bytes = torch.cuda.max_memory_allocated()
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        profile_steps(model, opt, train, order, cursor, args, dtype, device, summary_path.parent)
     model.eval()
     after, _ = heldout(model, val, device, dtype)
     print(f"eval after: loss {after:.4f}", flush=True)
@@ -251,7 +329,9 @@ def main():
         "train_loss_curve": curve,
     }
     if device == "cuda":
-        summary["peak_gpu_memory_gb"] = round(torch.cuda.max_memory_allocated() / 1e9, 2)
+        if peak_gpu_bytes is None:
+            peak_gpu_bytes = torch.cuda.max_memory_allocated()
+        summary["peak_gpu_memory_gb"] = round(peak_gpu_bytes / 1e9, 2)
     else:
         # Sampled after every step and after the final evaluation, not a true peak.
         summary["mps_driver_allocated_max_gb"] = round(mps_driver_gb, 4)
@@ -259,7 +339,6 @@ def main():
     if args.record_steps:
         summary["step_seconds"] = step_times
         summary["step_losses"] = step_losses
-    summary_path = Path(args.summary) if args.summary else run / "summary.json"
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.write_text(json.dumps(summary, indent=2) + "\n")
     print(f"summary: {summary_path}")

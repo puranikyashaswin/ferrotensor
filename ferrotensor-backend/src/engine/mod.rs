@@ -1,7 +1,7 @@
 //! The compute engine: compiles the WGSL kernels and dispatches them.
 
 use crate::context::Dispatch;
-use crate::kernel_timing::KernelLabel;
+use crate::kernel_timing::{KernelLabel, MatmulShape};
 use crate::{UnifiedTensor, WgpuContext};
 use std::borrow::Cow;
 use std::sync::atomic::Ordering::Relaxed;
@@ -331,16 +331,17 @@ impl ComputeEngine {
             layout: "",
             size_class: "",
         };
-        self.run_labeled(ctx, kernel, label, entries, groups);
+        self.run_labeled(ctx, kernel, label, None, entries, groups);
     }
 
     /// [`run`](Self::run), with the `label` kernel timing reports the
-    /// dispatch under.
+    /// dispatch under and, for a matmul, its `shape`.
     fn run_labeled(
         &self,
         ctx: &WgpuContext,
         kernel: &Kernel,
         label: KernelLabel,
+        shape: Option<MatmulShape>,
         entries: &[(u32, &Buffer)],
         groups: (u32, u32, u32),
     ) {
@@ -363,6 +364,7 @@ impl ComputeEngine {
             bind_group,
             groups,
             label,
+            shape,
         });
     }
 
