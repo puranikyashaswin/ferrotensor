@@ -11,6 +11,11 @@
 //! for the product, counted in [`ComputeEngine::coop_f16_overflows`], and the
 //! first element of that workgroup's output tile is set to NaN, so a dynamic
 //! loss scaler sees the overflow as a non-finite gradient.
+//!
+//! Every workgroup array is a multiple of 16 bytes long. The driver packs
+//! them one after another, and a cooperative load or store from an address
+//! that is not 16-byte aligned reads or writes the aligned address below it
+//! (on the A10G a 4-byte atomic among them shifted the results by elements).
 
 use super::{uniform, ComputeEngine, Epilogue, Kernel};
 use crate::kernel_timing::KernelLabel;
@@ -63,7 +68,7 @@ impl CoopTile {
         } else {
             BK * (self.bn + PAD) * 2
         };
-        a + b + self.warps() * 256 * 4 + 4
+        a + b + self.warps() * 256 * 4
     }
 
     fn groups(self, m: u32, n: u32) -> (u32, u32) {
@@ -96,7 +101,7 @@ pub(super) struct CoopKey {
 /// The cooperative-matrix kernels of a device that has them.
 pub(super) struct Coop {
     kernels: Mutex<HashMap<CoopKey, Arc<Kernel>>>,
-    /// One `u32` counter of workgroups that clamped an `a` value.
+    /// One `u32` counter of staging threads that clamped an `a` value.
     overflows: UnifiedTensor,
     /// Whether [`EXPERIMENTAL_ENV`](crate::adapters::EXPERIMENTAL_ENV) routes f16-weight matmuls here.
     routed: bool,
@@ -209,9 +214,9 @@ impl ComputeEngine {
         self.coop.as_ref().is_some_and(|c| c.routed)
     }
 
-    /// Workgroups of the cooperative-matrix matmul that met an input value
-    /// beyond the f16 range (or NaN) since the engine was created; 0 without
-    /// the kernel. Reading it waits for the GPU.
+    /// Staging threads of the cooperative-matrix matmul that met an input
+    /// value beyond the f16 range (or NaN) since the engine was created; 0
+    /// without the kernel. Reading it waits for the GPU.
     ///
     /// # Errors
     ///
@@ -548,7 +553,6 @@ const F16_MAX: f32 = 65504.0;
 var<workgroup> sa: array<f16, {sa_len}>;
 var<workgroup> sb: array<f16, {sb_len}>;
 var<workgroup> cs: array<f32, {cs_len}>;
-var<workgroup> wg_overflow: atomic<u32>;
 
 @compute @workgroup_size({nt})
 fn matmul_coop(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {{
@@ -564,15 +568,15 @@ fn matmul_coop(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_i
   let m0 = wg.y * BM;
   let n0 = wg.x * BN;
   for (var i = li; i < {cs_len}u; i += {nt}u) {{ cs[i] = 0.0; }}
-  if (li == 0u) {{ atomicStore(&wg_overflow, 0u); }}
   workgroupBarrier();
 {init}  var overflow = false;
   for (var k0 = 0u; k0 < k; k0 += BK) {{
 {load_a}{load_b}    workgroupBarrier();
 {steps}    workgroupBarrier();
   }}
-  if (overflow) {{ atomicOr(&wg_overflow, 1u); }}
-{store}  if (li == 0u && atomicLoad(&wg_overflow) != 0u) {{
+{store}  // After the epilogue's writes, so the poison is the last write to that element.
+  storageBarrier();
+  if (overflow) {{
     atomicAdd(&overflows[0], 1u);
     c[m0 * n + n0] = bitcast<f32>(0x7fc00000u);
   }}
@@ -657,6 +661,15 @@ mod tests {
             assert_eq!(BK * t.bn % nt, 0, "{t:?} b");
             assert!(t.workgroup_bytes(true) <= 32 * 1024, "{t:?}");
             assert!(t.workgroup_bytes(false) <= 32 * 1024, "{t:?}");
+            // Each workgroup array (sa, sb either way, cs) is a multiple of
+            // 16 bytes, so the packed arrays all start 16-byte aligned.
+            assert_eq!(t.bm * (BK + PAD) * 2 % 16, 0, "{t:?} sa");
+            assert_eq!(t.bn * (BK + PAD) * 2 % 16, 0, "{t:?} sb transposed");
+            assert_eq!(BK * (t.bn + PAD) * 2 % 16, 0, "{t:?} sb");
+            assert_eq!(t.warps() * 256 * 4 % 16, 0, "{t:?} cs");
+            // Row strides in bytes keep every fragment 16-byte aligned.
+            assert_eq!((BK + PAD) * 2 % 16, 0);
+            assert_eq!((t.bn + PAD) * 2 % 16, 0, "{t:?}");
         }
         assert_eq!(CoopTile::new(128, 64, 64, 32).threads(), 128);
     }

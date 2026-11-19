@@ -228,7 +228,9 @@ fn coop_matmul_counts_f16_overflow_and_poisons_its_tile() {
     let Some(g) = coop_gpu("coop_matmul_counts_f16_overflow_and_poisons_its_tile") else {
         return;
     };
-    let (m, k, n) = (256, 64, 64);
+    // N = 16 is one column of workgroups whatever the tile, so exactly one
+    // staging thread loads the value set below.
+    let (m, k, n) = (256, 64, 16);
     let before = pollster::block_on(g.engine.coop_f16_overflows(&g.ctx)).unwrap();
     let b = rand_vec(k * n, 11);
     let fine = rand_vec(m * k, 12);
@@ -245,7 +247,7 @@ fn coop_matmul_counts_f16_overflow_and_poisons_its_tile() {
         pollster::block_on(g.engine.coop_f16_overflows(&g.ctx)).unwrap(),
         before
     );
-    // One value past the f16 range in row 3: one workgroup counts it.
+    // One value past the f16 range in row 3: the one thread that stages it counts it.
     let mut big = fine.clone();
     big[3 * k + 5] = 70_000.0;
     let got = run_coop(
@@ -262,4 +264,33 @@ fn coop_matmul_counts_f16_overflow_and_poisons_its_tile() {
     );
     assert!(got[0].is_nan(), "the tile's first element is poisoned");
     assert!(got.iter().any(|v| v.is_nan()));
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn coop_matmul_times_identity_returns_a_unshifted() {
+    let Some(g) = coop_gpu("coop_matmul_times_identity_returns_a_unshifted") else {
+        return;
+    };
+    // Integers below 2048 are exact in f16, so `a @ I` must equal `a`
+    // element for element; a fragment read or written off its 16-byte
+    // alignment shows up as values shifted along the rows.
+    let (m, k, n) = (64, 16, 16);
+    let a: Vec<f32> = (0..m * k).map(|i| (i % 1000) as f32).collect();
+    let mut eye = vec![0.0f32; k * n];
+    for i in 0..k {
+        eye[i * n + i] = 1.0;
+    }
+    for transposed_b in [false, true] {
+        let got = run_coop(
+            g,
+            (m, k, n),
+            &a,
+            &eye,
+            transposed_b,
+            (Epilogue::STORE, &vec![0.0; m * n]),
+        );
+        assert_eq!(&got[..n], &a[..n], "transposed_b {transposed_b} row 0");
+        assert_eq!(got, a, "transposed_b {transposed_b}");
+    }
 }
