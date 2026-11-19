@@ -360,6 +360,7 @@ mod tests {
                 out_dir: "runs/a".into(),
                 adapter: Some("runs/a/lora_adapters.safetensors".into()),
                 q4_weights: None,
+                loss_scaler: None,
             },
         };
         assert_eq!(

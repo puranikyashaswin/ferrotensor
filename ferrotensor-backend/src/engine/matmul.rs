@@ -367,7 +367,8 @@ impl ComputeEngine {
     /// Runs `out[M, N] = alpha * op(a) @ op(b) + beta * out` with the kernel
     /// that suits the shape and `b`'s storage: the small-M kernel when
     /// [`small_m::routes`] takes the shape and a tile fits the device, else
-    /// [`matmul_previous`](Self::matmul_previous). Returns the small-M tile
+    /// [`matmul_previous`](Self::matmul_previous). With the cooperative-matrix
+    /// kernel turned on, products against f16 weights go to it first. Returns the small-M tile
     /// and split when that kernel ran.
     fn matmul_run(
         &self,
@@ -377,6 +378,16 @@ impl ComputeEngine {
         [a, b, out]: [&UnifiedTensor; 3],
         ep: Epilogue,
     ) -> Option<SmallMLaunch> {
+        let coop_layout = match layout {
+            Layout::Plain => Some(false),
+            Layout::TransposedB => Some(true),
+            Layout::TransposedA => None,
+        };
+        if let Some(transposed_b) = coop_layout.filter(|_| self.coop_routes(b.dtype, (m, k, n))) {
+            if self.matmul_coop(ctx, transposed_b, (m, k, n), [a, b, out], ep) {
+                return None;
+            }
+        }
         if let Some((transposed_b, tile)) = self.small_m_route(layout, b.dtype, (m, k, n)) {
             return Some(self.matmul_small_m(
                 ctx,

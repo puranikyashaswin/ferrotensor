@@ -48,7 +48,7 @@ use ferrotensor_trainer::checkpoint::{
 use ferrotensor_trainer::peft::{export_peft_adapter, is_peft_adapter_dir, load_peft_adapter};
 use ferrotensor_trainer::{
     build_sft_example, masked_cross_entropy_from_logits, DataLoader, Dataset, FileGradSyncConfig,
-    TextDataset, Trainer,
+    GradScaler, TextDataset, Trainer,
 };
 use model_id::resolve_model;
 use std::collections::HashMap;
@@ -1564,6 +1564,21 @@ struct TrainSummary {
     /// The base weights stored at 4 bits; left out without `--q4-weights`.
     #[serde(skip_serializing_if = "Option::is_none")]
     q4_weights: Option<Q4Record>,
+    /// The dynamic loss scaler; left out unless matmuls ran on f16
+    /// cooperative matrices.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    loss_scaler: Option<LossScalerRecord>,
+}
+
+/// Where dynamic loss scaling ended up at the end of a run.
+#[derive(serde::Serialize, Debug, Clone, PartialEq)]
+struct LossScalerRecord {
+    /// The final loss scale.
+    scale: f32,
+    /// Optimizer steps skipped because a gradient overflowed.
+    skipped_steps: u64,
+    /// Workgroups that clamped an input past the f16 range.
+    f16_overflows: u64,
 }
 
 /// Runs `train` and returns its summary.
@@ -1698,6 +1713,15 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
     .with_clip_grad_norm(args.grad_clip)
     .with_lr_scheduler(Box::new(scheduler))
     .with_deferred_loss_readback();
+    if base.engine.coop_matmul_active() {
+        // The matmuls round activations and gradients to f16, so small
+        // gradients need the loss scaled up to stay representable.
+        eprintln!(
+            "matmuls: f16 cooperative matrices ({}=1), dynamic loss scaling on",
+            ferrotensor_backend::adapters::EXPERIMENTAL_ENV
+        );
+        trainer = trainer.with_grad_scaler(GradScaler::new());
+    }
     if distributed {
         let sync_dir = args
             .sync_dir
@@ -1737,6 +1761,11 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
                 if let Some(warning) = verdict {
                     log::warn!("{}: {warning}", resume_state.display());
                 }
+            }
+            if let (Some(scaler), Some(saved)) =
+                (trainer.scaler.as_mut(), ckpt.grad_scaler_state.as_ref())
+            {
+                scaler.load_checkpoint(saved);
             }
             start_step = ckpt.training_state.step;
             args.seed = ckpt.training_state.seed;
@@ -1839,7 +1868,7 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
         TrainingCheckpoint {
             training_state: state,
             optimizer_state: trainer.optimizer.save_state(&base.ctx, &named_params),
-            grad_scaler_state: None,
+            grad_scaler_state: trainer.scaler.as_ref().map(GradScaler::checkpoint),
         }
         .save(&state_path)?;
         Ok(())
@@ -2031,6 +2060,14 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
             args.out.display()
         );
     }
+    let mut loss_scaler = None;
+    if let Some(scaler) = trainer.scaler.as_ref() {
+        loss_scaler = Some(LossScalerRecord {
+            scale: scaler.scale_factor(),
+            skipped_steps: scaler.skipped_steps(),
+            f16_overflows: base.engine.coop_f16_overflows(&base.ctx).await?,
+        });
+    }
     Ok(TrainSummary {
         steps: step,
         first_loss,
@@ -2042,6 +2079,7 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
         out_dir: args.out,
         adapter: is_root.then_some(adapter_path),
         q4_weights,
+        loss_scaler,
     })
 }
 
@@ -2613,6 +2651,7 @@ mod tests {
             out_dir: PathBuf::from("runs/a"),
             adapter: Some(PathBuf::from("runs/a/lora_adapters.safetensors")),
             q4_weights: None,
+            loss_scaler: None,
         };
         assert_eq!(
             serde_json::to_value(&summary).unwrap(),
@@ -2627,6 +2666,18 @@ mod tests {
                 "out_dir": "runs/a",
                 "adapter": "runs/a/lora_adapters.safetensors",
             })
+        );
+        let scaled = TrainSummary {
+            loss_scaler: Some(LossScalerRecord {
+                scale: 32768.0,
+                skipped_steps: 1,
+                f16_overflows: 4,
+            }),
+            ..summary
+        };
+        assert_eq!(
+            serde_json::to_value(&scaled).unwrap()["loss_scaler"],
+            serde_json::json!({ "scale": 32768.0, "skipped_steps": 1, "f16_overflows": 4 })
         );
     }
 

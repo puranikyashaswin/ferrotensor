@@ -97,7 +97,7 @@ pub fn cooperative_matrix_configs(adapter: &wgpu::Adapter) -> Vec<CoopMatrixConf
 pub const EXPERIMENTAL_ENV: &str = "FERROTENSOR_EXPERIMENTAL";
 
 /// Whether [`EXPERIMENTAL_ENV`] is set to `1`.
-fn experimental_opt_in() -> bool {
+pub(crate) fn experimental_opt_in() -> bool {
     std::env::var(EXPERIMENTAL_ENV).is_ok_and(|v| v == "1")
 }
 
