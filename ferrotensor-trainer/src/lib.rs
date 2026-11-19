@@ -14,9 +14,10 @@
 //! weights as a Hugging Face checkpoint, and [`classify`] fine-tunes a decoder with LoRA as a sequence
 //! classifier ([`ClassifierTrainer`]).
 
-use ferrotensor_autograd::{AutogradNode, LRScheduler, Optimizer, Tensor};
+use ferrotensor_autograd::{AutogradNode, FlatGrads, LRScheduler, Optimizer, Tensor};
 use ferrotensor_backend::{
-    ComputeEngine, MemoryCategory, UnifiedTensor, WgpuContext, MASKED_CE_SKIP, SUM_SQUARES_CHUNK,
+    ComputeEngine, DType, MemoryCategory, UnifiedTensor, WgpuContext, MASKED_CE_SKIP,
+    SUM_SQUARES_CHUNK,
 };
 use ferrotensor_graph::lfm::Lfm2Model;
 use std::sync::Arc;
@@ -119,6 +120,9 @@ pub struct Trainer {
     /// With deferred readback, the submission that ended the previous
     /// micro-batch's backward pass; the next backward waits for it.
     backward_mark: Option<u64>,
+    /// The gradients packed into one buffer for the norm, the clip and the
+    /// optimizer step, kept between steps while their sizes stay the same.
+    flat_grads: Option<FlatGrads>,
 }
 
 /// A sequence's [`StepStats`], with its loss still on the GPU until `rows`
@@ -165,6 +169,7 @@ impl Trainer {
             pending_rows: Vec::new(),
             deferred: Vec::new(),
             backward_mark: None,
+            flat_grads: None,
         }
     }
 
@@ -437,6 +442,29 @@ impl Trainer {
         self.deferred.drain(..read).map(|d| d.stats).collect()
     }
 
+    /// Packs `grads` into the cached flat buffer when the optimizer can step
+    /// from one and they fit in one. Returns whether it did.
+    fn pack_flat_grads(&mut self, grads: &[UnifiedTensor]) -> bool {
+        if grads.len() < 2
+            || !self.optimizer.supports_flat_step()
+            || grads.iter().any(|g| g.dtype != DType::FP32)
+        {
+            return false;
+        }
+        let sizes: Vec<usize> = grads.iter().map(|g| g.shape.iter().product()).collect();
+        let same = self
+            .flat_grads
+            .as_ref()
+            .is_some_and(|f| f.layout.sizes() == sizes.as_slice());
+        if !same {
+            self.flat_grads = FlatGrads::new(&self.ctx, &sizes);
+        }
+        match &self.flat_grads {
+            Some(packed) => packed.pack(&self.ctx, &self.engine, grads).is_ok(),
+            None => false,
+        }
+    }
+
     /// Sync, unscale, clip and apply the accumulated gradients.
     fn apply_gradients(
         &mut self,
@@ -472,7 +500,11 @@ impl Trainer {
             }
         }
 
-        let norm = global_grad_norm(&grads, &self.ctx, &self.engine);
+        let flat = self.pack_flat_grads(&grads);
+        let norm = match &self.flat_grads {
+            Some(packed) if flat => flat_grad_norm(packed, &self.ctx, &self.engine),
+            _ => global_grad_norm(&grads, &self.ctx, &self.engine),
+        };
         stats.grad_norm = Some(norm);
         if !norm.is_finite() {
             log::warn!("gradient norm is {norm}; skipping optimizer step");
@@ -481,8 +513,15 @@ impl Trainer {
         if let Some(max_norm) = self.clip_grad_norm {
             if norm > max_norm {
                 let scale = max_norm / (norm + 1e-6);
-                for grad in &grads {
-                    self.engine.clip_grad_by_norm(&self.ctx, grad, scale);
+                match &self.flat_grads {
+                    Some(packed) if flat => {
+                        self.engine.clip_grad_by_norm(&self.ctx, &packed.data, scale);
+                    }
+                    _ => {
+                        for grad in &grads {
+                            self.engine.clip_grad_by_norm(&self.ctx, grad, scale);
+                        }
+                    }
                 }
             }
         }
@@ -497,7 +536,14 @@ impl Trainer {
         }
         {
             let _tag = self.ctx.memory().scope(MemoryCategory::OptimizerState);
-            self.optimizer.step(train_params);
+            let stepped = match &self.flat_grads {
+                Some(packed) if flat => self.optimizer.step_flat(train_params, packed),
+                _ => {
+                    self.optimizer.step(train_params);
+                    Ok(())
+                }
+            };
+            stepped.map_err(TrainError)?;
         }
         self.optimizer_step_count += 1;
         stats.optimizer_step = true;
@@ -624,6 +670,27 @@ pub(crate) fn global_grad_norm(
     for grad in grads {
         offset += engine.sum_squares_partial(ctx, grad, &partials, offset);
     }
+    let sum_sq: f64 = pollster::block_on(partials.to_vec(ctx))
+        .iter()
+        .map(|&x| x as f64)
+        .sum();
+    sum_sq.sqrt() as f32
+}
+
+/// [`global_grad_norm`] over gradients packed into one buffer: one dispatch.
+/// Each gradient starts on a chunk boundary, so the partial sums are the same
+/// as the per-tensor ones and so is the norm.
+pub(crate) fn flat_grad_norm(
+    packed_grads: &FlatGrads,
+    ctx: &WgpuContext,
+    engine: &ComputeEngine,
+) -> f32 {
+    let chunks = packed_grads.layout.total() / SUM_SQUARES_CHUNK;
+    if chunks == 0 {
+        return 0.0;
+    }
+    let partials = UnifiedTensor::empty(ctx, &[chunks]);
+    engine.sum_squares_partial(ctx, &packed_grads.data, &partials, 0);
     let sum_sq: f64 = pollster::block_on(partials.to_vec(ctx))
         .iter()
         .map(|&x| x as f64)

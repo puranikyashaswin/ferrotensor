@@ -10,6 +10,60 @@ pub const MASKED_CE_SKIP: u32 = u32::MAX;
 /// [`ComputeEngine::sum_squares_partial`].
 pub const SUM_SQUARES_CHUNK: usize = 4096;
 
+/// Most elements one flat buffer of a [`FlatLayout`] may hold: 64 MiB of
+/// `f32`, under wgpu's default 128 MiB limit on one storage binding.
+pub const FLAT_MAX_ELEMS: usize = 1 << 24;
+
+/// Where each of a list of `f32` tensors starts in one flat buffer.
+///
+/// Every tensor starts on a [`SUM_SQUARES_CHUNK`] boundary and the gap after
+/// it stays zero. A sum of squares over the flat buffer then fills the same
+/// chunks, with the same elements in each, as one run per tensor, so its
+/// partial sums are bit-equal to theirs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FlatLayout {
+    offsets: Vec<usize>,
+    sizes: Vec<usize>,
+    total: usize,
+}
+
+impl FlatLayout {
+    /// The layout of tensors with `sizes` elements, or `None` when the flat
+    /// buffer would hold more than [`FLAT_MAX_ELEMS`] elements.
+    pub fn new(sizes: &[usize]) -> Option<Self> {
+        let mut offsets = Vec::with_capacity(sizes.len());
+        let mut end = 0usize;
+        for &n in sizes {
+            offsets.push(end);
+            let padded = n.div_ceil(SUM_SQUARES_CHUNK).checked_mul(SUM_SQUARES_CHUNK)?;
+            end = end.checked_add(padded)?;
+            if end > FLAT_MAX_ELEMS {
+                return None;
+            }
+        }
+        Some(Self {
+            offsets,
+            sizes: sizes.to_vec(),
+            total: end,
+        })
+    }
+
+    /// Element offset of tensor `i`, or 0 when there is no such tensor.
+    pub fn offset(&self, i: usize) -> usize {
+        self.offsets.get(i).copied().unwrap_or(0)
+    }
+
+    /// Elements of each tensor, as given to [`new`](Self::new).
+    pub fn sizes(&self) -> &[usize] {
+        &self.sizes
+    }
+
+    /// Elements of the flat buffer: a multiple of [`SUM_SQUARES_CHUNK`].
+    pub fn total(&self) -> usize {
+        self.total
+    }
+}
+
 /// Hyper-parameters for [`ComputeEngine::adamw_update`]; laid out to match
 /// the WGSL uniform.
 #[repr(C)]
@@ -73,6 +127,37 @@ impl ComputeEngine {
             ],
             groups64(weight.shape.iter().product()),
         );
+    }
+
+    /// Copies all of `src` into the flat buffer `flat` at element `offset`.
+    pub fn copy_into_flat(
+        &self,
+        ctx: &WgpuContext,
+        src: &UnifiedTensor,
+        flat: &UnifiedTensor,
+        offset: usize,
+    ) {
+        self.copy_tensor(ctx, src, flat, offset * 4);
+    }
+
+    /// Fills all of `dst` from the flat buffer `flat`, starting at element
+    /// `offset`.
+    pub fn copy_from_flat(
+        &self,
+        ctx: &WgpuContext,
+        flat: &UnifiedTensor,
+        offset: usize,
+        dst: &UnifiedTensor,
+    ) {
+        ctx.record(|encoder| {
+            encoder.copy_buffer_to_buffer(
+                flat.buffer(),
+                (offset * 4) as u64,
+                dst.buffer(),
+                0,
+                dst.size_in_bytes(),
+            );
+        });
     }
 
     /// Per-element squared error `out = 0.5 * (pred - target)^2` (not reduced).
@@ -280,5 +365,34 @@ impl ComputeEngine {
             grid(chunks as u32),
         );
         chunks
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::{FlatLayout, FLAT_MAX_ELEMS, SUM_SQUARES_CHUNK};
+
+    #[test]
+    fn flat_layout_starts_every_tensor_on_a_chunk_boundary() {
+        let layout = FlatLayout::new(&[5000, 7, 4096, 0, 4097]).expect("fits");
+        assert_eq!(layout.offset(0), 0);
+        assert_eq!(layout.offset(1), 8192);
+        assert_eq!(layout.offset(2), 12288);
+        assert_eq!(layout.offset(3), 16384);
+        assert_eq!(layout.offset(4), 16384);
+        assert_eq!(layout.total(), 16384 + 8192);
+        assert_eq!(layout.sizes(), &[5000, 7, 4096, 0, 4097]);
+        assert_eq!(layout.total() % SUM_SQUARES_CHUNK, 0);
+        // An index past the end has no tensor.
+        assert_eq!(layout.offset(5), 0);
+    }
+
+    #[test]
+    fn flat_layout_refuses_more_than_the_element_cap() {
+        let half = FLAT_MAX_ELEMS / 2;
+        assert!(FlatLayout::new(&[half, half]).is_some());
+        assert!(FlatLayout::new(&[half, half + 1]).is_none());
+        assert!(FlatLayout::new(&[usize::MAX]).is_none());
     }
 }

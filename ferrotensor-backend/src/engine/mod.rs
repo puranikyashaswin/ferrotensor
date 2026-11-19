@@ -21,7 +21,7 @@ mod training;
 pub use attention::AttentionOptions;
 pub use matmul::{Epilogue, MatmulPath};
 pub use small_m::{SmallMLaunch, SmallMTile};
-pub use training::{AdamParams, MASKED_CE_SKIP, SUM_SQUARES_CHUNK};
+pub use training::{AdamParams, FlatLayout, FLAT_MAX_ELEMS, MASKED_CE_SKIP, SUM_SQUARES_CHUNK};
 
 /// The full WGSL source compiled into the engine's shader module.
 fn shader_source() -> String {

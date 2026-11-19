@@ -40,7 +40,8 @@ pub use context::{
     ContextError, WgpuContext, PASS_DISPATCHES_ENV, PENDING_OPS_ENV, UPLOAD_RELEASE_BYTES,
 };
 pub use engine::{
-    AdamParams, AttentionOptions, ComputeEngine, Epilogue, MASKED_CE_SKIP, SUM_SQUARES_CHUNK,
+    AdamParams, AttentionOptions, ComputeEngine, Epilogue, FlatLayout, FLAT_MAX_ELEMS,
+    MASKED_CE_SKIP, SUM_SQUARES_CHUNK,
 };
 #[doc(hidden)]
 pub use engine::{MatmulPath, SmallMLaunch, SmallMTile};
