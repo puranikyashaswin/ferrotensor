@@ -673,7 +673,7 @@ impl Lfm2Model {
     /// Embeddings `[rows, seq, hidden]` for equally long rows of ids.
     #[expect(
         clippy::expect_used,
-        reason = "this API returns no Result, and a readback fails only when the GPU device was lost"
+        reason = "a readback fails only on device loss, and the caller has no error path"
     )]
     fn lookup_embeddings(
         &self,
