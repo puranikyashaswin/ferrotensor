@@ -18,6 +18,7 @@
 
 mod chat;
 mod classify;
+mod dpo;
 mod export_gguf;
 mod finetune;
 mod info;
@@ -148,6 +149,9 @@ enum Command {
     Finetune(Box<finetune::FinetuneArgs>),
     /// LoRA fine-tuning (SFT with response-only loss) or LM pretraining.
     Train(Box<TrainArgs>),
+    /// LoRA training on JSONL {"prompt", "chosen", "rejected"} preference
+    /// pairs with DPO; the reference model is the base with the adapters off.
+    Dpo(Box<dpo::DpoArgs>),
     /// Mean loss and perplexity of a model (plus optional adapter) on a dataset.
     Eval(EvalArgs),
     /// Generate text from a prompt (top-k / top-p / temperature sampling).
@@ -606,6 +610,7 @@ fn main() {
     let json = match &cli.command {
         Command::Finetune(args) => args.train.json,
         Command::Train(args) => args.json,
+        Command::Dpo(args) => args.json,
         Command::Eval(args) => args.json,
         Command::Generate(args) => args.json,
         Command::Chat(args) => args.json,
@@ -648,6 +653,12 @@ fn run(command: Command, matches: &clap::ArgMatches, json: bool) -> Result<Exit>
         }
         Command::Train(args) => {
             let summary = pollster::block_on(train(*args))?;
+            if json {
+                print_json(&summary)?;
+            }
+        }
+        Command::Dpo(args) => {
+            let summary = pollster::block_on(dpo::run(*args))?;
             if json {
                 print_json(&summary)?;
             }

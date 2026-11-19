@@ -26,6 +26,7 @@ pub mod classify;
 pub mod data;
 pub mod demo;
 pub mod distributed;
+pub mod dpo;
 pub mod gguf;
 pub mod memory;
 pub mod merge;
@@ -34,8 +35,12 @@ pub mod pretrain;
 pub mod scaler;
 
 pub use classify::{ClassifierStepStats, ClassifierTrainer};
-pub use data::{build_sft_example, Batch, DataLoader, Dataset, TextDataset, TrainingExample};
+pub use data::{
+    build_preference_pair, build_sft_example, load_preference_jsonl, Batch, DataLoader, Dataset,
+    PreferencePair, TextDataset, TrainingExample,
+};
 pub use demo::{print_banner, run_demo, DemoConfig};
+pub use dpo::{dpo_loss, DpoLoss, DpoStats};
 pub use scaler::{GradScaler, GradScalerStats};
 
 pub use distributed::FileGradSyncConfig;

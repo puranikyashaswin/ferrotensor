@@ -279,12 +279,27 @@ pub fn build_sft_example(
         )
     };
 
+    Ok(sft_example_from_tokens(
+        prompt_tokens,
+        response_tokens,
+        max_len,
+    ))
+}
+
+/// The tokenized half of [`build_sft_example`]: `prompt_tokens` followed by
+/// `response_tokens`, response-masked and cut to `max_len` input tokens, or
+/// `None` when the prompt leaves no room for a supervised response token.
+fn sft_example_from_tokens(
+    prompt_tokens: Vec<u32>,
+    response_tokens: Vec<u32>,
+    max_len: usize,
+) -> Option<TrainingExample> {
     if prompt_tokens.is_empty() || response_tokens.is_empty() {
-        return Ok(None);
+        return None;
     }
     // The first supervised target sits at index prompt_len - 1.
     if max_len < 2 || prompt_tokens.len() > max_len {
-        return Ok(None);
+        return None;
     }
 
     let mut example = TrainingExample::from_sft_prompt_response(prompt_tokens, response_tokens);
@@ -294,9 +309,137 @@ pub fn build_sft_example(
         example.loss_mask.truncate(max_len);
     }
     if example.input_ids.len() < 2 || !example.loss_mask.contains(&1) {
-        return Ok(None);
+        return None;
     }
-    Ok(Some(example))
+    Some(example)
+}
+
+/// One DPO example: a prompt with a preferred (`chosen`) and a dispreferred
+/// (`rejected`) response, each a response-masked [`TrainingExample`] built
+/// as [`build_sft_example`] builds one, so both start with the same prompt.
+#[derive(Clone, Debug)]
+pub struct PreferencePair {
+    /// The prompt followed by the preferred response.
+    pub chosen: TrainingExample,
+    /// The prompt followed by the dispreferred response.
+    pub rejected: TrainingExample,
+}
+
+impl PreferencePair {
+    /// A pair from token ids: `prompt` followed by each response, with the
+    /// loss mask on response targets only and each side cut to `max_len`
+    /// input tokens. `None` when either side keeps no supervised token.
+    pub fn from_tokens(
+        prompt: &[u32],
+        chosen: &[u32],
+        rejected: &[u32],
+        max_len: usize,
+    ) -> Option<Self> {
+        Some(Self {
+            chosen: sft_example_from_tokens(prompt.to_vec(), chosen.to_vec(), max_len)?,
+            rejected: sft_example_from_tokens(prompt.to_vec(), rejected.to_vec(), max_len)?,
+        })
+    }
+
+    /// Supervised (response) target tokens of both sides together.
+    pub fn supervised_tokens(&self) -> usize {
+        [&self.chosen, &self.rejected]
+            .iter()
+            .map(|e| e.loss_mask.iter().filter(|&&m| m != 0).count())
+            .sum()
+    }
+}
+
+/// Tokenize one preference example into a [`PreferencePair`], with the chat
+/// template and response-only masking of [`build_sft_example`]. Pairs where
+/// either side keeps no response token within `max_len` are dropped
+/// (`Ok(None)`).
+///
+/// # Errors
+///
+/// If the tokenizer fails to encode the prompt or a response.
+pub fn build_preference_pair(
+    tokenizer: &Tokenizer,
+    prompt: &str,
+    chosen: &str,
+    rejected: &str,
+    system: Option<&str>,
+    use_chat_template: bool,
+    max_len: usize,
+) -> Result<Option<PreferencePair>, String> {
+    let prompt_tokens = if use_chat_template {
+        tokenizer.encode_chat(system, prompt)?
+    } else {
+        tokenizer.encode(prompt)?
+    };
+    let response = |text: &str| -> Result<Vec<u32>, String> {
+        let mut tokens = tokenizer.encode_continuation(text)?;
+        if use_chat_template {
+            tokens.push(tokenizer.eos_token_id);
+        }
+        Ok(tokens)
+    };
+    Ok(PreferencePair::from_tokens(
+        &prompt_tokens,
+        &response(chosen)?,
+        &response(rejected)?,
+        max_len,
+    ))
+}
+
+/// Read a JSONL preference dataset, one `{"prompt", "chosen", "rejected"}`
+/// object per line with an optional `"system"`, into [`PreferencePair`]s
+/// built by [`build_preference_pair`]. Blank lines are skipped.
+///
+/// # Errors
+///
+/// If the file cannot be read, a line is not such an object (the error
+/// names the line), or the tokenizer fails.
+pub fn load_preference_jsonl<P: AsRef<Path>>(
+    path: P,
+    tokenizer: &Tokenizer,
+    use_chat_template: bool,
+    max_len: usize,
+) -> Result<Vec<PreferencePair>, std::io::Error> {
+    #[derive(Deserialize)]
+    struct JsonlPair {
+        prompt: String,
+        chosen: String,
+        rejected: String,
+        #[serde(default)]
+        system: Option<String>,
+    }
+
+    let content = fs::read_to_string(path)?;
+    let mut pairs = Vec::new();
+    for (line_no, line) in content.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let pair = serde_json::from_str::<JsonlPair>(line).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "line {}: expected {{\"prompt\": ..., \"chosen\": ..., \"rejected\": ...}}: {e}",
+                    line_no + 1
+                ),
+            )
+        })?;
+        if let Some(p) = build_preference_pair(
+            tokenizer,
+            &pair.prompt,
+            &pair.chosen,
+            &pair.rejected,
+            pair.system.as_deref(),
+            use_chat_template,
+            max_len,
+        )
+        .map_err(|e| std::io::Error::other(format!("line {}: {e}", line_no + 1)))?
+        {
+            pairs.push(p);
+        }
+    }
+    Ok(pairs)
 }
 
 impl Default for TextDataset {
@@ -510,6 +653,19 @@ impl<D: Dataset> Iterator for DataLoader<D> {
     }
 }
 
+/// The order of `0..len` for `epoch` of a run seeded with `seed`: the
+/// shuffle a seeded [`DataLoader`] uses, for data it does not hold (such as
+/// preference pairs).
+pub fn shuffled_indices(len: usize, seed: u64, epoch: u64) -> Vec<usize> {
+    let mut indices: Vec<usize> = (0..len).collect();
+    let mut rng = SimpleRng::new(seed ^ epoch.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    for i in (1..indices.len()).rev() {
+        let j = (rng.next() >> 33) as usize % (i + 1);
+        indices.swap(i, j);
+    }
+    indices
+}
+
 /// Simple LCG random number generator (no external deps)
 struct SimpleRng {
     state: u64,
@@ -589,6 +745,38 @@ mod tests {
     }
 
     #[test]
+    fn preference_pair_masks_only_each_response() {
+        let pair = PreferencePair::from_tokens(&[10, 11, 12], &[20, 21], &[30, 31, 32], 16)
+            .expect("both sides fit");
+        // chosen full = [10,11,12,20,21]; rejected full = [10,11,12,30,31,32].
+        assert_eq!(pair.chosen.input_ids, vec![10, 11, 12, 20]);
+        assert_eq!(pair.chosen.target_ids, vec![11, 12, 20, 21]);
+        assert_eq!(pair.chosen.loss_mask, vec![0, 0, 1, 1]);
+        assert_eq!(pair.rejected.input_ids, vec![10, 11, 12, 30, 31]);
+        assert_eq!(pair.rejected.target_ids, vec![11, 12, 30, 31, 32]);
+        assert_eq!(pair.rejected.loss_mask, vec![0, 0, 1, 1, 1]);
+        assert_eq!(pair.supervised_tokens(), 5);
+        // The same masking as an SFT example of each side.
+        let sft = TrainingExample::from_sft_prompt_response(vec![10, 11, 12], vec![30, 31, 32]);
+        assert_eq!(pair.rejected.loss_mask, sft.loss_mask);
+    }
+
+    #[test]
+    fn preference_pair_is_cut_per_side_and_dropped_without_room() {
+        // max_len 4 keeps the prompt and the first response tokens of each side.
+        let pair = PreferencePair::from_tokens(&[10, 11, 12], &[20, 21], &[30, 31, 32], 4)
+            .expect("both sides keep a response token");
+        assert_eq!(pair.chosen.loss_mask, vec![0, 0, 1, 1]);
+        assert_eq!(pair.rejected.input_ids, vec![10, 11, 12, 30]);
+        assert_eq!(pair.rejected.target_ids, vec![11, 12, 30, 31]);
+        assert_eq!(pair.rejected.loss_mask, vec![0, 0, 1, 1]);
+        // A prompt longer than max_len leaves no response token on either side.
+        assert!(PreferencePair::from_tokens(&[10, 11, 12], &[20], &[30], 2).is_none());
+        // An empty response on one side drops the whole pair.
+        assert!(PreferencePair::from_tokens(&[10, 11, 12], &[20], &[], 16).is_none());
+    }
+
+    #[test]
     fn test_dataloader_batching() {
         let dataset = TextDataset::from_sequences(vec![
             vec![1, 2],
@@ -599,6 +787,23 @@ mod tests {
         ]);
         let loader = DataLoader::new(dataset, 2, false);
         assert_eq!(loader.num_batches(), 3);
+    }
+
+    #[test]
+    fn shuffled_indices_follow_the_seeded_loader() {
+        let sequences: Vec<Vec<u32>> = (0..9u32).map(|i| vec![i, i + 100]).collect();
+        let mut loader =
+            DataLoader::new(TextDataset::from_sequences(sequences), 1, true).with_seed(7);
+        loader.set_epoch(3);
+        loader.reset();
+        let from_loader: Vec<usize> = loader.map(|b| b.input_ids[0][0] as usize).collect();
+        let order = shuffled_indices(9, 7, 3);
+        assert_eq!(order, from_loader);
+        assert_ne!(order, (0..9).collect::<Vec<_>>());
+        assert_ne!(order, shuffled_indices(9, 7, 4));
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..9).collect::<Vec<_>>());
     }
 
     #[test]

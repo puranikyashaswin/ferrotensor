@@ -2,6 +2,7 @@
 
 The `ferrotensor-cli` command line for [Ferrotensor](../README.md): a GPU
 check (`info`), memory planning (`plan`), LoRA fine-tuning (`finetune`, `train`),
+preference tuning (`dpo`),
 evaluation (`eval`), sampling (`generate`, alias `infer`), conversation (`chat`),
 adapter export and merging (`export-adapter`, `merge`), GGUF export for
 llama.cpp and Ollama (`export-gguf`) and training a small
@@ -138,7 +139,7 @@ ferrotensor chat --model HuggingFaceTB/SmolLM2-135M
 
 ## Scripting: `--json` and exit codes
 
-`plan`, `finetune`, `train`, `eval`, `generate`, `chat`, `merge`,
+`plan`, `finetune`, `train`, `dpo`, `eval`, `generate`, `chat`, `merge`,
 `export-gguf`, `pretrain` and `info` take `--json`: stdout then carries one JSON object when the
 command ends, and progress and other text go to stderr (`generate` and `chat`
 stream their text there too). On an error stdout carries
@@ -289,6 +290,39 @@ run of the one-command path on SmolLM2-1.7B (`--lr 5e-4 --warmup-steps 20`)
 took the held-out loss from 2.6474 to 1.0612. The full table is in
 [benchmarks/RESULTS.md](../benchmarks/RESULTS.md#real-hardware-run-16-november-2026).
 
+## Preference tuning: `dpo`
+
+`dpo` trains a LoRA adapter with Direct Preference Optimization. Each line
+of the data file has a `prompt`, a `chosen` answer and a `rejected` answer.
+
+```bash
+ferrotensor dpo --model ./data/models/SmolLM2-360M --data pairs.jsonl
+ferrotensor dpo --model ./data/models/SmolLM2-360M --data pairs.jsonl --beta 0.2 --json
+```
+
+- It is its own command, not `finetune --objective dpo`. The data format,
+  the `--beta` flag and the metrics differ from SFT, and `finetune` is the
+  memory-planning wrapper around `train`. `dpo` does not plan memory; set
+  `--seq-len`, `--batch-size` (pairs per micro step) and `--checkpoint-blocks`
+  yourself.
+- The policy is the base model with LoRA adapters. The reference is the same
+  base with the adapters switched off and no gradients, so there is no
+  second copy of the model. Because the adapters start at zero, the first
+  loss is ln 2 (0.6931).
+- The score of an answer is the sum of its token log-probabilities over the
+  response tokens only. The loss is `-log sigmoid(beta * ((pi_c - ref_c) -
+  (pi_r - ref_r)))`, averaged over the pairs; `--beta` defaults to 0.1.
+- Each log step prints the loss, the reward margin (chosen minus rejected
+  implicit reward) and the preference accuracy (share of pairs with a
+  positive margin). `metrics.jsonl` and the `--json` summary carry them.
+- The prompt template, optimizer, warmup and cosine schedule, gradient
+  clipping, `--grad-accum` (counted in pairs), `--save-every`, `--resume`
+  and the output files are the same as for `train`. `export-adapter` turns
+  the result into a PEFT adapter. `training_state.json` has `"task": "dpo"`,
+  and `--resume` refuses a checkpoint from another task.
+- Not in `dpo`: `--eval-data`, `--world-size`, `--q4-weights` and the memory
+  and profile reports.
+
 ## What fits this machine: `plan`
 
 `plan` estimates the peak GPU memory of LoRA training and prints the
@@ -302,8 +336,8 @@ ferrotensor plan                 # the documented SmolLM2 sizes and which fit
 ```
 
 - Budget: `--memory-mib` wins; else `--vram-mib`; else, on a GPU that
-  shares system RAM (integrated GPUs, Apple silicon), 60% of the system
-  RAM; else, on an NVIDIA GPU, the smallest `memory.total` that
+  shares system RAM (integrated GPUs, Apple silicon), the system RAM less a
+  2,048 MiB reserve for the OS and the process; else, on an NVIDIA GPU, the smallest `memory.total` that
   `nvidia-smi` lists; else an assumed 4,096 MiB, because wgpu does not
   report the memory of a discrete GPU. The output says which (`measured`,
   `assumed`, `user`).

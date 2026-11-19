@@ -29,6 +29,7 @@ and nothing is downloaded.
 ferrotensor plan --model DIR --json                       # what fits this GPU
 ferrotensor finetune --model DIR --data train.jsonl --json # train with that plan
 ferrotensor eval --model DIR --data val.jsonl --lora outputs/run/lora_adapters.safetensors --json
+ferrotensor dpo --model DIR --data pairs.jsonl --json      # preference tuning on chosen and rejected answers
 ferrotensor chat --model DIR --lora outputs/run/lora_adapters.safetensors --json < questions.txt
 ferrotensor merge --model DIR --lora outputs/run/lora_adapters.safetensors --out outputs/merged --json
 ferrotensor export-gguf --model outputs/merged --out model.gguf --json  # for llama.cpp and Ollama
@@ -49,6 +50,11 @@ its `.state.json` and `.state.safetensors` for `--resume`, `metrics.jsonl` and
   object per line with an optional `"system"`, or a `.json` array of them.
   Loss is on response tokens only; prompts are wrapped in ChatML unless
   `--no-chat-template`.
+- DPO (`ferrotensor dpo`): `.jsonl`, one `{"prompt": ..., "chosen": ...,
+  "rejected": ...}` object per line with an optional `"system"`. It uses the
+  same ChatML wrapping and response-only masking as SFT. The loss is on the
+  response tokens of both answers. A line missing a field, or a pair whose
+  prompt leaves no room for a response in `--seq-len`, is skipped.
 - Pretraining (`--task pretrain`): `.txt` lines, a `.json` array of strings or
   token ids, or packed little-endian `u32` tokens in `.bin`.
 
@@ -63,6 +69,7 @@ is `null`. On an error stdout carries `{"error": "<message>"}` instead.
 | `plan` | `adapter`, `backend`, `device_type`, `budget_mib`, `budget_source`, `model`, `parameters`, `chosen`, `estimated_peak_mib`, `margin`, `fits`, `train_command`, `notes`; without `--model` the per-model keys are in a `models` array |
 | `finetune` | `chosen` (`batch_size`, `seq_len`, `rank`, `precision`, `checkpoint_blocks`), `grad_accum`, `budget_mib`, `estimated_peak_mib`, `fits`, then every `train` key |
 | `train` | `steps`, `first_loss`, `final_loss`, `eval_loss_before`, `eval_loss_after` (null without `--eval-data`), `measured_peak_mib`, `seconds`, `out_dir`, `adapter` (null on ranks above 0, which save nothing), and with `--q4-weights` only, `q4_weights` (`modules`, `skip`, `group`, `tensors`: the 4-bit selection and how many tensors it stored at 4 bits) |
+| `dpo` | `steps`, `first_loss`, `final_loss`, `reward_margin` and `accuracy` (the last two over the final logging window; accuracy is the share of pairs where the chosen answer has the higher implicit reward), `measured_peak_mib`, `seconds`, `out_dir`, `adapter` |
 | `eval` | `examples`, `tokens`, `loss`, `perplexity`, `seconds` |
 | `generate` | `text`, `prompt_tokens`, `new_tokens`, `tokens_per_second` (decode speed: one-token forward passes after the prompt per second, prompt time left out; null when none ran), `prefill_seconds` (time to run the prompt), `kv_cache`, and with `--profile` only, `profile` (`kernel_timing`, `prefill` and `decode`: see [GPU time by kernel](#gpu-time-by-kernel---profile)) |
 | `chat` | one object per reply, each on its own line: `reply`, `prompt_tokens` (the whole conversation), `cached_tokens` (prompt tokens taken from the KV cache of earlier turns, not run again), `new_tokens`, `tokens_per_second` and `prefill_seconds` (as for `generate`; with the kept cache the prefill runs only the uncached tokens) |
@@ -139,7 +146,7 @@ also exit with 2, with the usage text on stderr and nothing on stdout.
 Run `ferrotensor plan --json` (no `--model`) to see which documented SmolLM2
 size fits; it decides from the GPU memory budget. `--memory-mib` sets the
 budget; else on a GPU that shares system RAM (Apple silicon, integrated GPUs)
-it is 60% of system RAM, on an NVIDIA GPU the `nvidia-smi` total, and
+it is system RAM less a 2,048 MiB reserve, on an NVIDIA GPU the `nvidia-smi` total, and
 otherwise an assumed 4,096 MiB, so pass `--vram-mib` for other discrete GPUs.
 
 Measured peak GPU memory (`nvidia-smi`, MiB) on one NVIDIA A10G (24 GB), f16

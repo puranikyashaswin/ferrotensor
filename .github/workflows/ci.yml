@@ -118,17 +118,22 @@ jobs:
       # PyTorch and transformers (CPU wheels) for the checks against them. The
       # Qwen2 fixture is generated here rather than committed: a tiny random
       # Qwen2ForCausalLM and its logits and gradients, read by
-      # ferrotensor-trainer/tests/qwen2_family.rs in the next step.
-      - name: PyTorch venv and Qwen2 fixture
+      # ferrotensor-trainer/tests/qwen2_family.rs in the next step. The DPO
+      # reference (loss and LoRA gradients from PyTorch autograd on the
+      # gradient-parity model) is made the same way, for
+      # ferrotensor-trainer/tests/dpo.rs.
+      - name: PyTorch venv, Qwen2 and DPO fixtures
         run: |
           venv="$RUNNER_TEMP/peft-venv"
           python3 -m venv "$venv"
           "$venv/bin/pip" install -q --index-url https://download.pytorch.org/whl/cpu torch==2.14.1
           "$venv/bin/pip" install -q transformers==5.20.2 peft==0.21.2 safetensors==0.8.0
           "$venv/bin/python" scripts/gen_qwen2_fixture.py "$RUNNER_TEMP/qwen2-fixture"
+          "$venv/bin/python" scripts/gen_dpo_fixture.py "$RUNNER_TEMP/dpo-fixture"
       - name: GPU suites (ignored tests)
         env:
           FERROTENSOR_QWEN2_FIXTURE: ${{ runner.temp }}/qwen2-fixture
+          FERROTENSOR_DPO_FIXTURE: ${{ runner.temp }}/dpo-fixture
         run: cargo test --release --workspace -- --ignored --test-threads=1
       # A LoRA adapter trained here, exported with `export-adapter --format
       # peft`, must give the same logits in PyTorch + PEFT (CPU wheels), and
