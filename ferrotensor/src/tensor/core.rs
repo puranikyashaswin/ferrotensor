@@ -471,7 +471,7 @@ const TENSOR_USAGE: BufferUsages = BufferUsages::STORAGE
 
 #[expect(
     clippy::expect_used,
-    reason = "a failed buffer map means the device is lost, and to_vec returns no Result"
+    reason = "a failed buffer map or mapped-range read means the device is lost, and the caller has no error path"
 )]
 async fn download(ctx: &GpuContext, buffer: &Buffer, n: usize) -> Vec<f32> {
     if n == 0 {
@@ -496,7 +496,7 @@ async fn download(ctx: &GpuContext, buffer: &Buffer, n: usize) -> Vec<f32> {
 
     let data = slice
         .get_mapped_range()
-        .expect("failed to read the mapped GPU buffer");
+        .expect("GPU device lost: failed to read the mapped buffer");
     let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
     drop(data);
     staging.unmap();
