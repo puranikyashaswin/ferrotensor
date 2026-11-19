@@ -8,11 +8,12 @@
 //! cargo test -p ferrotensor-autograd --test fused_grads -- --ignored --test-threads=1
 //! ```
 
-#![allow(clippy::expect_used, clippy::panic)]
+#![allow(clippy::expect_used, clippy::panic, clippy::arc_with_non_send_sync)]
 
+use std::cell::Cell;
 use std::sync::Arc;
 
-use ferrotensor_autograd::Tensor;
+use ferrotensor_autograd::{AutogradNode, Tensor};
 use ferrotensor_backend::{ComputeEngine, UnifiedTensor, WgpuContext};
 
 fn setup() -> (Arc<WgpuContext>, ComputeEngine) {
@@ -326,4 +327,81 @@ fn matmul_adds_in_place_only_into_a_gradient_nothing_shares() {
     let thrice: Vec<f64> = once.iter().map(|v| 3.0 * v).collect();
     assert_close("third pass", &grad_of(&ctx, &p), &thrice);
     assert_ne!(grad_buffer(&p), buffer_of(&held));
+}
+
+/// Passes its gradient on unchanged and records which buffer it was.
+struct Probe {
+    input: Tensor,
+    seen: Cell<Option<*const ()>>,
+}
+
+impl AutogradNode for Probe {
+    fn backward(&self, grad: &UnifiedTensor, _engine: &ComputeEngine) -> Vec<UnifiedTensor> {
+        self.seen.set(Some(buffer_of(grad)));
+        vec![grad.clone()]
+    }
+
+    fn inputs(&self) -> Vec<Tensor> {
+        vec![self.input.clone()]
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn add_hands_on_its_gradient_and_a_shared_slot_is_copied_before_a_write() {
+    // h = y + probe(y @ w) with y = x * 1: the add gives both sides the
+    // seed's own buffer, so when the matmul adds its share of y's gradient,
+    // y's slot holds a buffer the matmul is still reading. The sum must go
+    // to a new buffer, leaving the seed as it was.
+    let (ctx, engine) = setup();
+    let (m, k) = (6, 20);
+    let leaf = |n: usize, shape: &[usize], seed: u64| {
+        Tensor::new(
+            ctx.clone(),
+            UnifiedTensor::new(&ctx, &rand_vec(n, seed), shape),
+        )
+    };
+    let x = leaf(m * k, &[m, k], 30);
+    let w = leaf(k * k, &[k, k], 31);
+    let y = Tensor::scale(&x, 1.0, &engine);
+    let z = Tensor::matmul(&y, &w, &engine);
+    let probe = Arc::new(Probe {
+        input: z.clone(),
+        seen: Cell::new(None),
+    });
+    let p = Tensor::with_creator(ctx.clone(), z.data.as_ref().clone(), probe.clone());
+    let h = Tensor::add(&y, &p, &engine);
+    let g = rand_vec(m * k, 32);
+    let seed = UnifiedTensor::new(&ctx, &g, &[m, k]);
+    *h.grad.borrow_mut() = Some(seed.clone());
+    h.backward(&engine);
+
+    assert_eq!(probe.seen.get(), Some(buffer_of(&seed)), "add copied");
+    assert_eq!(bits(&host(&ctx, &seed)), bits(&g), "seed written");
+    // dx = g + g @ w^T, dw = x^T @ g.
+    let xs = f64s(&host(&ctx, &x.data));
+    let ws = f64s(&host(&ctx, &w.data));
+    let gs = f64s(&g);
+    let gw = mm(&gs, &ws, (m, k, k), false, true);
+    let dx: Vec<f64> = gs.iter().zip(&gw).map(|(a, b)| a + b).collect();
+    assert_close("dx", &grad_of(&ctx, &x), &dx);
+    let dw = mm(&xs, &gs, (k, m, k), true, false);
+    assert_close("dw", &grad_of(&ctx, &w), &dw);
+
+    // Two parameters summed get a buffer each, so scaling one in place (as
+    // gradient clipping does) leaves the other and the seed alone.
+    let a = leaf(m * k, &[m, k], 33);
+    let b = leaf(m * k, &[m, k], 34);
+    let s = Tensor::add(&a, &b, &engine);
+    *s.grad.borrow_mut() = Some(seed.clone());
+    s.backward(&engine);
+    assert_ne!(grad_buffer(&a), grad_buffer(&b));
+    assert_ne!(grad_buffer(&a), buffer_of(&seed));
+    assert_eq!(bits(&grad_of(&ctx, &a)), bits(&g));
+    let a_grad = a.grad.borrow().clone().expect("a gradient");
+    engine.gradient_scale(&ctx, &a_grad, 2.0);
+    assert_eq!(bits(&grad_of(&ctx, &b)), bits(&g));
+    assert_eq!(bits(&host(&ctx, &seed)), bits(&g));
+    let doubled: Vec<f64> = g.iter().map(|&v| 2.0 * f64::from(v)).collect();
+    assert_close("scaled a", &grad_of(&ctx, &a), &doubled);
 }

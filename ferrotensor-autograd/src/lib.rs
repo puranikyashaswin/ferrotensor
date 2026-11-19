@@ -469,10 +469,20 @@ impl AutogradNode for AddNode {
     }
     /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
     fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
-        let grad_a = UnifiedTensor::empty(&self.a.ctx, &self.a.data.shape);
-        let grad_b = UnifiedTensor::empty(&self.b.ctx, &self.b.data.shape);
-        engine.add_backward(&self.a.ctx, grad, &grad_a, &grad_b);
-        vec![grad_a, grad_b]
+        // Both gradients equal `grad`, so an op's output gets `grad` itself:
+        // its gradient is only ever written in place by
+        // `accumulate_grad_with`, which copies a buffer anything else holds.
+        // A parameter's gradient is scaled and clipped in place before the
+        // optimizer step, so a leaf gets a buffer of its own.
+        let own = |t: &Tensor| {
+            if t.creator.is_some() || !t.requires_grad {
+                return grad.clone();
+            }
+            let copy = UnifiedTensor::empty(&t.ctx, &grad.shape);
+            engine.copy_tensor(&t.ctx, grad, &copy, 0);
+            copy
+        };
+        vec![own(&self.a), own(&self.b)]
     }
 }
 
