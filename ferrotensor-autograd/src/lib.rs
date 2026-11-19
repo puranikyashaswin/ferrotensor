@@ -836,6 +836,32 @@ impl AutogradNode for EmbeddingNode {
     }
 }
 
+/// Backward node of [`Tensor::embedding_gpu`].
+pub struct GpuEmbeddingNode {
+    /// Table `[vocab, hidden]`.
+    pub table: Tensor,
+    /// The looked-up id of each output row, in order.
+    pub ids: Vec<u32>,
+}
+impl AutogradNode for GpuEmbeddingNode {
+    fn inputs(&self) -> Vec<Tensor> {
+        vec![self.table.clone()]
+    }
+    /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
+    fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
+        let ctx = &self.table.ctx;
+        // The ids are known on the host, so the index of which positions
+        // feed which row is built here and the gradient never comes back.
+        let (index, slots) =
+            ComputeEngine::embedding_scatter_index(&self.ids, self.table.data.shape[0]);
+        let index_bytes: Vec<u8> = index.iter().flat_map(|i| i.to_le_bytes()).collect();
+        let index_buf = UnifiedTensor::from_bytes(ctx, &index_bytes, &[index.len()]);
+        let table_grad = UnifiedTensor::empty(ctx, &self.table.data.shape);
+        engine.embedding_scatter(ctx, grad, &index_buf, slots, &table_grad);
+        vec![table_grad]
+    }
+}
+
 /// Backward node of [`Tensor::mse_loss`].
 pub struct MSELossNode {
     /// Predictions.
@@ -1388,6 +1414,34 @@ impl Tensor {
             ids: rows.iter().flat_map(|r| r.iter().copied()).collect(),
         });
         Tensor::with_creator(table.ctx.clone(), out_data, node)
+    }
+
+    /// [`embedding`](Self::embedding) gathered on the GPU from `table`
+    /// itself, for a table that trains: it needs no host copy, so no lookup
+    /// waits for the GPU to read the table back, and the gradient is summed
+    /// on the GPU too. Same values as [`embedding`](Self::embedding); a table
+    /// that is not `f32` or an empty lookup takes the host path.
+    pub fn embedding_gpu(table: &Tensor, rows: &[&[u32]], engine: &ComputeEngine) -> Tensor {
+        let ids: Vec<u32> = rows.iter().flat_map(|r| r.iter().copied()).collect();
+        let seq_len = rows.first().map_or(0, |r| r.len());
+        let (vocab, hidden) = (table.data.shape[0], table.data.shape[1]);
+        if table.data.dtype != DType::FP32 || ids.is_empty() || vocab * hidden == 0 {
+            let host = pollster::block_on(table.data.to_vec(&table.ctx));
+            return Self::embedding(table, &host, rows);
+        }
+        let ctx = &table.ctx;
+        let id_bytes: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
+        let id_buf = UnifiedTensor::from_bytes(ctx, &id_bytes, &[ids.len()]);
+        let out_data = UnifiedTensor::empty(ctx, &[rows.len(), seq_len, hidden]);
+        engine.embedding_gather(ctx, &table.data, &id_buf, &out_data);
+        if !table.requires_grad {
+            return Tensor::frozen(ctx.clone(), out_data);
+        }
+        let node = Arc::new(GpuEmbeddingNode {
+            table: table.clone(),
+            ids,
+        });
+        Tensor::with_creator(ctx.clone(), out_data, node)
     }
 
     /// Row `token_index` of `[seq, vocab]` logits.

@@ -356,8 +356,8 @@ impl Lfm2Model {
 
     /// Let `embed_tokens` receive a gradient (it is frozen otherwise, even
     /// when the other base weights train). While it trains, every lookup
-    /// reads the table back from the GPU, so it sees each optimizer step;
-    /// the host copy is dropped. A tied `lm_head` is a separate copy and does
+    /// gathers its rows on the GPU, so it sees each optimizer step; the host
+    /// copy is dropped. A tied `lm_head` is a separate copy and does
     /// not follow the table.
     pub fn with_trainable_embedding(mut self, on: bool) -> Self {
         self.embed_tokens.requires_grad = on;
@@ -557,7 +557,7 @@ impl Lfm2Model {
 
         // 1. Embedding
         // Note: Generic Embedding.forward usually handles this, manual here for LFM specific
-        let mut x = self.lookup_embeddings(&ctx, &[input_ids]);
+        let mut x = self.lookup_embeddings(engine, &ctx, &[input_ids]);
         if let Some(norm) = &self.embedding_norm {
             x = norm.forward(engine, &x);
         }
@@ -610,7 +610,7 @@ impl Lfm2Model {
             "forward_batch: rows must have the same length"
         );
         let ctx = self.embed_tokens.ctx.clone();
-        let mut x = self.lookup_embeddings(&ctx, rows);
+        let mut x = self.lookup_embeddings(engine, &ctx, rows);
         if let Some(norm) = &self.embedding_norm {
             x = norm.forward(engine, &x);
         }
@@ -657,7 +657,7 @@ impl Lfm2Model {
             self.layers.len()
         );
         let ctx = self.embed_tokens.ctx.clone();
-        let mut x = self.lookup_embeddings(&ctx, rows);
+        let mut x = self.lookup_embeddings(engine, &ctx, rows);
         if let Some(norm) = &self.embedding_norm {
             x = norm.forward(engine, &x);
         }
@@ -673,20 +673,20 @@ impl Lfm2Model {
     /// Embeddings `[rows, seq, hidden]` for equally long rows of ids.
     fn lookup_embeddings(
         &self,
+        engine: &ComputeEngine,
         ctx: &Arc<ferrotensor_backend::WgpuContext>,
         rows: &[&[u32]],
     ) -> Tensor {
-        // The lookup runs on the host (there is no GPU gather kernel yet).
-        // A frozen table reads a cached copy; a training table changes every
-        // optimizer step, so it is read back each time.
-        let read_back;
+        // A training table changes every optimizer step, so its rows are
+        // gathered on the GPU rather than read back and gathered on the host,
+        // which would wait for the GPU on every forward. A frozen table keeps
+        // the host lookup from a cached copy: one upload and no dispatch.
+        if self.embed_tokens.requires_grad {
+            return Tensor::embedding_gpu(&self.embed_tokens, rows, engine);
+        }
         let mut cached = self.embed_host.borrow_mut();
-        let table: &[f32] = if self.embed_tokens.requires_grad {
-            read_back = pollster::block_on(self.embed_tokens.data.to_vec(ctx));
-            &read_back
-        } else {
-            cached.get_or_insert_with(|| pollster::block_on(self.embed_tokens.data.to_vec(ctx)))
-        };
+        let table =
+            cached.get_or_insert_with(|| pollster::block_on(self.embed_tokens.data.to_vec(ctx)));
         Tensor::embedding(&self.embed_tokens, table, rows)
     }
 

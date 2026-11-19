@@ -1,4 +1,5 @@
-//! Top-k and argmax selection, and depthwise 1-D convolution.
+//! Top-k and argmax selection, depthwise 1-D convolution, and the embedding
+//! lookup with its gradient.
 
 use super::{grid, groups64, uniform, ComputeEngine};
 use crate::{UnifiedTensor, WgpuContext};
@@ -93,5 +94,112 @@ impl ComputeEngine {
             ],
             groups64(dim),
         );
+    }
+
+    /// Writes into `out` (`[n, hidden]`) the rows of `table` (`[vocab,
+    /// hidden]`) named by `ids`, `n` ids stored as `u32`s; an id outside the
+    /// table gives a row of zeros.
+    pub fn embedding_gather(
+        &self,
+        ctx: &WgpuContext,
+        table: &UnifiedTensor,
+        ids: &UnifiedTensor,
+        out: &UnifiedTensor,
+    ) {
+        let n = out.shape.iter().product::<usize>();
+        let (vocab, hidden) = (table.shape[0], table.shape[1]);
+        if n == 0 || hidden == 0 {
+            return;
+        }
+        let params = uniform(ctx, bytemuck::cast_slice(&[hidden as u32, vocab as u32, 0, 0]));
+        self.run(
+            ctx,
+            &self.emb_gather,
+            &[
+                (0, table.buffer()),
+                (1, ids.buffer()),
+                (2, out.buffer()),
+                (3, &params),
+            ],
+            groups64(n),
+        );
+    }
+
+    /// Writes into `table_grad` (`[vocab, hidden]`) the gradient of
+    /// [`embedding_gather`](Self::embedding_gather): each row is the sum, in
+    /// position order, of the rows of `grad` (`[n, hidden]`) whose id it is,
+    /// and zero for a row no position looked up. `index` is the `u32` layout
+    /// [`embedding_scatter_index`](Self::embedding_scatter_index) builds from
+    /// the ids, with `slots` unique ids.
+    pub fn embedding_scatter(
+        &self,
+        ctx: &WgpuContext,
+        grad: &UnifiedTensor,
+        index: &UnifiedTensor,
+        slots: usize,
+        table_grad: &UnifiedTensor,
+    ) {
+        let (vocab, hidden) = (table_grad.shape[0], table_grad.shape[1]);
+        if vocab == 0 || hidden == 0 {
+            return;
+        }
+        let params = uniform(
+            ctx,
+            bytemuck::cast_slice(&[hidden as u32, vocab as u32, slots as u32, 0]),
+        );
+        self.run(
+            ctx,
+            &self.emb_scatter,
+            &[
+                (0, grad.buffer()),
+                (1, index.buffer()),
+                (2, table_grad.buffer()),
+                (3, &params),
+            ],
+            groups64(vocab * hidden),
+        );
+    }
+
+    /// The index [`embedding_scatter`](Self::embedding_scatter) reads for the
+    /// looked-up `ids` of a `vocab`-row table, and its number of unique
+    /// in-table ids: per table row the slot of its id or `u32::MAX`, the
+    /// start of each slot's positions (one more entry than slots), then the
+    /// positions grouped by slot in ascending order. Ids outside the table
+    /// get no slot.
+    pub fn embedding_scatter_index(ids: &[u32], vocab: usize) -> (Vec<u32>, usize) {
+        let mut slot_of_row = vec![u32::MAX; vocab];
+        let mut counts: Vec<u32> = Vec::new();
+        for &id in ids {
+            if let Some(slot) = slot_of_row.get_mut(id as usize) {
+                if *slot == u32::MAX {
+                    *slot = counts.len() as u32;
+                    counts.push(0);
+                }
+                counts[*slot as usize] += 1;
+            }
+        }
+        let slots = counts.len();
+        let mut index = slot_of_row;
+        index.reserve(slots + 1 + ids.len());
+        let mut start = 0u32;
+        for &count in &counts {
+            index.push(start);
+            start += count;
+        }
+        index.push(start);
+        let mut next: Vec<u32> = index[vocab..vocab + slots].to_vec();
+        index.resize(vocab + slots + 1 + start as usize, 0);
+        let positions = vocab + slots + 1;
+        // Walking the ids in position order keeps each slot's positions
+        // ascending, the order the host scatter-add sums them in.
+        for (position, &id) in ids.iter().enumerate() {
+            let row = id as usize;
+            if row < vocab {
+                let at = &mut next[index[row] as usize];
+                index[positions + *at as usize] = position as u32;
+                *at += 1;
+            }
+        }
+        (index, slots)
     }
 }
