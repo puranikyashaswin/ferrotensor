@@ -13,6 +13,7 @@ use wgpu::{util::DeviceExt, Buffer};
 mod attention;
 mod elementwise;
 mod flash_coop;
+mod lora_group;
 mod matmul;
 mod matmul_coop;
 mod misc;
@@ -24,6 +25,7 @@ mod training;
 
 pub use attention::AttentionOptions;
 pub use flash_coop::FLASH_COOP_ENV;
+pub use lora_group::{LoraGrad, LoraMirror, LoraProj, LORA_GROUP_MAX, LORA_GROUP_MAX_RANK};
 pub use matmul::{Epilogue, MatmulPath};
 pub use matmul_coop::{CoopConfig, CoopTile};
 pub use skinny::SkinnyTile;
@@ -383,6 +385,9 @@ pub struct ComputeEngine {
     coop: Option<matmul_coop::Coop>,
     /// Skinny matmul kernels, compiled the first time a tile and layout run.
     skinny: Mutex<HashMap<skinny::SkinnyKey, Arc<Kernel>>>,
+    /// Grouped LoRA kernels, compiled the first time a kernel, group size and
+    /// rank run.
+    lora_group: Mutex<HashMap<lora_group::Key, Arc<Kernel>>>,
     /// Whether the kernels read their parameters from immediates.
     immediates: bool,
 }
@@ -469,6 +474,7 @@ impl ComputeEngine {
                 small_m::split_target(ctx.adapter.get_info().device_type),
             ),
             skinny: Mutex::new(HashMap::new()),
+            lora_group: Mutex::new(HashMap::new()),
             immediates,
         }
     }
