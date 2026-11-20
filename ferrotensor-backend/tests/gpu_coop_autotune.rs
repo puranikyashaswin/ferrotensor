@@ -10,7 +10,7 @@
 //!   cargo test -p ferrotensor-backend --test gpu_coop_autotune -- --ignored --test-threads=1
 //! ```
 
-#![allow(clippy::unwrap_used, clippy::panic)]
+#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use ferrotensor_backend::{ComputeEngine, UnifiedTensor, WgpuContext, AUTOTUNE_ENV};
 
