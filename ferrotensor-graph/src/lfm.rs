@@ -671,6 +671,10 @@ impl Lfm2Model {
     }
 
     /// Embeddings `[rows, seq, hidden]` for equally long rows of ids.
+    #[expect(
+        clippy::expect_used,
+        reason = "a readback fails only on device loss, and the caller has no error path"
+    )]
     fn lookup_embeddings(
         &self,
         engine: &ComputeEngine,
@@ -685,8 +689,10 @@ impl Lfm2Model {
             return Tensor::embedding_gpu(&self.embed_tokens, rows, engine);
         }
         let mut cached = self.embed_host.borrow_mut();
-        let table =
-            cached.get_or_insert_with(|| pollster::block_on(self.embed_tokens.data.to_vec(ctx)));
+        let table = cached.get_or_insert_with(|| {
+            pollster::block_on(self.embed_tokens.data.to_vec(ctx))
+                .expect("GPU device lost during readback")
+        });
         Tensor::embedding(&self.embed_tokens, table, rows)
     }
 

@@ -213,6 +213,7 @@ fn frozen_base_weights_receive_no_gradient() {
         .filter_map(|t| t.grad.borrow().clone())
         .map(|g| {
             pollster::block_on(g.to_vec(&gpu.ctx))
+                .expect("GPU readback")
                 .iter()
                 .map(|x| x * x)
                 .sum::<f32>()

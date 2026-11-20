@@ -5,6 +5,7 @@
 //!
 //! Every weight is a constant, so by symmetry all four output values must be
 //! equal and finite; the example exits with an error otherwise.
+#![allow(clippy::expect_used)]
 
 use ferrotensor_autograd::Tensor;
 use ferrotensor_backend::{ComputeEngine, UnifiedTensor, WgpuContext};
@@ -66,7 +67,7 @@ fn main() {
         println!("Running Llama Block...");
         let out = block.forward(&engine, &input, 0, None, None);
 
-        let result = out.data.to_vec(&ctx).await;
+        let result = out.data.to_vec(&ctx).await.expect("GPU readback");
         println!("Block Output: {:?}", result);
 
         assert_eq!(result.len(), dim);

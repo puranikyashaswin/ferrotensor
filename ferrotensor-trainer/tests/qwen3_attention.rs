@@ -477,7 +477,7 @@ fn qwen3_lora_gradients_through_the_norms_match_finite_differences() {
             for part in ["A", "B"] {
                 let name = format!("{prefix}.lora_{part}.weight");
                 let grad = named[&name].grad.borrow().clone().expect("LoRA gradient");
-                let grad = pollster::block_on(grad.to_vec(&gpu.ctx));
+                let grad = pollster::block_on(grad.to_vec(&gpu.ctx)).expect("GPU readback");
                 // The three largest entries, where a wrong gradient shows
                 // most clearly against the finite-difference noise.
                 let mut order: Vec<usize> = (0..grad.len()).collect();

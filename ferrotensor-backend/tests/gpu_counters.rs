@@ -12,7 +12,8 @@
 #![allow(clippy::unwrap_used)]
 
 use ferrotensor_backend::{
-    wgpu, ComputeEngine, KernelTiming, KernelTimingMode, UnifiedTensor, WgpuContext,
+    wgpu, ComputeEngine, GpuCounterSnapshot, KernelTiming, KernelTimingMode, UnifiedTensor,
+    WgpuContext,
 };
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -44,7 +45,7 @@ fn counters_match_a_known_sequence_of_ops() {
     engine.gradient_scale(&ctx, &c, 2.0);
     engine.copy_tensor(&ctx, &c, &d, 0);
     engine.gradient_scale(&ctx, &d, 0.5);
-    let values = pollster::block_on(d.to_vec(&ctx));
+    let values = pollster::block_on(d.to_vec(&ctx)).unwrap();
     let ops = ctx.gpu_counters().since(&before);
 
     // (1 + 2) * 2 * 0.5
@@ -55,9 +56,18 @@ fn counters_match_a_known_sequence_of_ops() {
         "add and the first scale share a pass; the copy ends it"
     );
     assert!(ops.device_polls >= 1, "the readback polls: {ops:?}");
-    assert_eq!(ops.bind_groups, 3);
-    assert_eq!(ops.uniform_buffers, 2, "one f32 scale per gradient_scale");
-    assert_eq!(ops.uniform_bytes, 8);
+    assert_eq!(ops.bind_groups, 3, "each dispatch binds new buffers");
+    assert_eq!(ops.bind_group_hits, 0);
+    // One f32 scale per gradient_scale, set with the dispatch as immediates
+    // or else in a uniform buffer, whose bind group is not cached.
+    let (uniform_buffers, uniform_bytes, misses) = if ctx.uses_immediates() {
+        (0, 0, 3)
+    } else {
+        (2, 8, 1)
+    };
+    assert_eq!(ops.bind_group_misses, misses);
+    assert_eq!(ops.uniform_buffers, uniform_buffers);
+    assert_eq!(ops.uniform_bytes, uniform_bytes);
     assert_eq!(ops.submits, 1, "the readback submits all recorded work");
     assert_eq!(ops.synchronizes, 0);
     assert_eq!(ops.upload_bytes, 0);
@@ -86,7 +96,7 @@ fn dispatches_sharing_a_pass_see_each_others_writes() {
     // Reads x as written by the last scale, then sum is scaled in place.
     engine.add(&ctx, &x, &y, &sum);
     engine.gradient_scale(&ctx, &sum, 0.5);
-    let values = pollster::block_on(sum.to_vec(&ctx));
+    let values = pollster::block_on(sum.to_vec(&ctx)).unwrap();
     let ops = ctx.gpu_counters().since(&before);
 
     // (1 * 2^10 + 3) * 0.5
@@ -141,8 +151,8 @@ fn kernel_times_count_each_dispatch_under_its_kernel() {
     engine.matmul(&ctx, &x, &y, &xy);
     engine.copy_tensor(&ctx, &c, &d, 0);
     engine.gradient_scale(&ctx, &d, 0.5);
-    let values = pollster::block_on(d.to_vec(&ctx));
-    let products = pollster::block_on(xy.to_vec(&ctx));
+    let values = pollster::block_on(d.to_vec(&ctx)).unwrap();
+    let products = pollster::block_on(xy.to_vec(&ctx)).unwrap();
     let wall = wall.elapsed();
     let ops = ctx.gpu_counters().since(&before);
     let kernels = ctx.kernel_times().since(&kernels_before);
@@ -194,7 +204,7 @@ fn kernel_times_span_several_submissions() {
     for _ in 0..300 {
         engine.gradient_scale(&ctx, &x, 1.0);
     }
-    let values = pollster::block_on(x.to_vec(&ctx));
+    let values = pollster::block_on(x.to_vec(&ctx)).unwrap();
     let ops = ctx.gpu_counters().since(&before);
 
     assert_eq!(values, vec![1.0; N]);
@@ -204,4 +214,196 @@ fn kernel_times_span_several_submissions() {
     assert_eq!(times.len(), 1, "{times:?}");
     assert_eq!(times[0].0, "gradient_scale");
     assert_eq!(times[0].1.dispatches, 300);
+}
+
+/// Runs gradient_scale, rms_norm_eps, softmax, matmul and causal
+/// flash_attention_v2 on fixed inputs and reads every result back.
+fn param_kernels(ctx: &WgpuContext, engine: &ComputeEngine) -> Vec<(&'static str, Vec<f32>)> {
+    let t = |data: &[f32], shape: &[usize]| UnifiedTensor::new(ctx, data, shape);
+    let read = |x: &UnifiedTensor| pollster::block_on(x.to_vec(ctx)).unwrap();
+
+    let scaled = t(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[8]);
+    engine.gradient_scale(ctx, &scaled, 0.5);
+
+    let x = t(&wave(8, 1), &[2, 4]);
+    let weight = t(&[1.0, 0.5, 2.0, -1.0], &[4]);
+    let normed = UnifiedTensor::empty(ctx, &[2, 4]);
+    engine.rms_norm_eps(ctx, &x, &weight, &normed, 1e-5);
+
+    let logits = t(&wave(10, 2), &[2, 5]);
+    let soft = UnifiedTensor::empty(ctx, &[2, 5]);
+    engine.softmax(ctx, &logits, &soft);
+
+    let (a, b) = (t(&wave(12, 3), &[3, 4]), t(&wave(20, 4), &[4, 5]));
+    let product = UnifiedTensor::empty(ctx, &[3, 5]);
+    engine.matmul(ctx, &a, &b, &product);
+
+    // [batch 1, seq 4, heads 2, head_dim 8]
+    let shape = [1, 4, 2, 8];
+    let q = t(&wave(64, 5), &shape);
+    let k = t(&wave(64, 6), &shape);
+    let v = t(&wave(64, 7), &shape);
+    let attended = UnifiedTensor::empty(ctx, &shape);
+    engine.flash_attention_v2(ctx, &q, &k, &v, &attended, true, 0.0, 0, None);
+
+    vec![
+        ("gradient_scale", read(&scaled)),
+        ("rms_norm_eps", read(&normed)),
+        ("softmax", read(&soft)),
+        ("matmul", read(&product)),
+        ("flash_attention_v2", read(&attended)),
+    ]
+}
+
+/// `n` values in [-1, 1] that differ for each `seed`.
+fn wave(n: usize, seed: usize) -> Vec<f32> {
+    (0..n)
+        .map(|i| ((i * 7 + seed * 13) as f32 * 0.37).sin())
+        .collect()
+}
+
+/// The results of [`param_kernels`], computed on the host.
+fn param_kernels_on_host() -> Vec<Vec<f32>> {
+    let scaled = vec![0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0];
+
+    let weight = [1.0, 0.5, 2.0, -1.0];
+    let mut normed = Vec::new();
+    for row in wave(8, 1).chunks(4) {
+        let inv = 1.0 / (row.iter().map(|v| v * v).sum::<f32>() / 4.0 + 1e-5).sqrt();
+        normed.extend(row.iter().zip(weight).map(|(v, w)| v * inv * w));
+    }
+
+    let mut soft = Vec::new();
+    for row in wave(10, 2).chunks(5) {
+        let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let sum: f32 = row.iter().map(|v| (v - max).exp()).sum();
+        soft.extend(row.iter().map(|v| (v - max).exp() / sum));
+    }
+
+    let (a, b) = (wave(12, 3), wave(20, 4));
+    let product: Vec<f32> = (0..15)
+        .map(|o| (0..4).map(|p| a[(o / 5) * 4 + p] * b[p * 5 + o % 5]).sum())
+        .collect();
+
+    let (q, k, v) = (wave(64, 5), wave(64, 6), wave(64, 7));
+    let at = |s: usize, h: usize| (s * 2 + h) * 8;
+    let mut attended = vec![0.0; 64];
+    for h in 0..2 {
+        for i in 0..4 {
+            // Causal: query i sees keys 0..=i.
+            let scores: Vec<f32> = (0..=i)
+                .map(|j| {
+                    let dot: f32 = (0..8).map(|d| q[at(i, h) + d] * k[at(j, h) + d]).sum();
+                    dot / 8f32.sqrt()
+                })
+                .collect();
+            let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let sum: f32 = scores.iter().map(|s| (s - max).exp()).sum();
+            for (j, s) in scores.iter().enumerate() {
+                let p = (s - max).exp() / sum;
+                for d in 0..8 {
+                    attended[at(i, h) + d] += p * v[at(j, h) + d];
+                }
+            }
+        }
+    }
+    vec![scaled, normed, soft, product, attended]
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn immediates_and_uniform_params_give_the_same_results() {
+    let ctx = pollster::block_on(WgpuContext::new());
+    let fallback = pollster::block_on(WgpuContext::new()).with_uniform_params();
+    let engine = ComputeEngine::new(&ctx);
+    let uniform_engine = ComputeEngine::new(&fallback);
+    assert!(!fallback.uses_immediates() && !uniform_engine.uses_immediates());
+    assert_eq!(engine.uses_immediates(), ctx.uses_immediates());
+
+    let before = fallback.gpu_counters();
+    let uniform = param_kernels(&fallback, &uniform_engine);
+    let made = fallback.gpu_counters().since(&before).uniform_buffers;
+    assert!(made >= 5, "at least one uniform buffer per kernel: {made}");
+    for ((name, got), want) in uniform.iter().zip(param_kernels_on_host()) {
+        assert_eq!(got.len(), want.len(), "{name}: length");
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert!((g - w).abs() <= 1e-4, "{name}[{i}]: got {g}, want {w}");
+        }
+    }
+
+    if !ctx.uses_immediates() {
+        eprintln!(
+            "skipped the immediates half: {} has no immediates",
+            ctx.adapter_info()
+        );
+        return;
+    }
+    let before = ctx.gpu_counters();
+    let immediate = param_kernels(&ctx, &engine);
+    assert_eq!(ctx.gpu_counters().since(&before).uniform_buffers, 0);
+    for ((name, got), (_, want)) in immediate.iter().zip(&uniform) {
+        assert_eq!(got, want, "{name}: immediates and uniform buffers differ");
+    }
+}
+
+fn read(ctx: &WgpuContext, x: &UnifiedTensor) -> Vec<f32> {
+    pollster::block_on(x.to_vec(ctx)).unwrap()
+}
+
+/// (bind groups created, cache hits, cache misses) since `before`.
+fn bind_counts(ctx: &WgpuContext, before: &GpuCounterSnapshot) -> (u64, u64, u64) {
+    let ops = ctx.gpu_counters().since(before);
+    (ops.bind_groups, ops.bind_group_hits, ops.bind_group_misses)
+}
+
+/// A dispatch that binds the same buffers to the same kernel reuses the
+/// cached bind group. When the pool hands a dropped tensor's buffer to a new
+/// tensor, the group reads the new tensor's data; when the buffer is freed,
+/// a new buffer gets a new group.
+#[test]
+#[ignore = "needs a GPU"]
+fn bind_group_cache_follows_reused_and_freed_buffers() {
+    let ctx = pollster::block_on(WgpuContext::new());
+    let engine = ComputeEngine::new(&ctx);
+    let a = UnifiedTensor::new(&ctx, &[1.0, 2.0, 3.0, 4.0], &[4]);
+    let b = UnifiedTensor::new(&ctx, &[10.0, 20.0, 30.0, 40.0], &[4]);
+    let x = UnifiedTensor::empty(&ctx, &[4]);
+    let sum = UnifiedTensor::empty(&ctx, &[4]);
+
+    let before = ctx.gpu_counters();
+    engine.add(&ctx, &a, &b, &x);
+    engine.add(&ctx, &x, &b, &sum);
+    assert_eq!(read(&ctx, &sum), vec![21.0, 42.0, 63.0, 84.0]);
+    assert_eq!(bind_counts(&ctx, &before), (2, 0, 2));
+
+    // The same kernel on the same buffers: the cached group.
+    let before = ctx.gpu_counters();
+    engine.add(&ctx, &a, &b, &x);
+    assert_eq!(read(&ctx, &x), vec![11.0, 22.0, 33.0, 44.0]);
+    assert_eq!(bind_counts(&ctx, &before), (0, 1, 0));
+
+    // The pool hands x's buffer to y, which holds other data.
+    let x_buffer = x.buffer().clone();
+    drop(x);
+    let y = UnifiedTensor::empty(&ctx, &[4]);
+    assert!(*y.buffer() == x_buffer, "the pool reused x's buffer");
+    drop(x_buffer);
+    engine.add(&ctx, &a, &a, &y);
+    let before = ctx.gpu_counters();
+    engine.add(&ctx, &y, &b, &sum);
+    assert_eq!(bind_counts(&ctx, &before), (0, 1, 0), "x's group, cached");
+    assert_eq!(read(&ctx, &sum), vec![12.0, 24.0, 36.0, 48.0], "y's data");
+
+    // Freed, y's buffer cannot come back: z gets a new buffer and group.
+    drop(y);
+    ctx.synchronize();
+    ctx.pool.clear();
+    let created = ctx.pool.buffers_created();
+    let z = UnifiedTensor::empty(&ctx, &[4]);
+    assert_eq!(ctx.pool.buffers_created(), created + 1, "a new buffer");
+    engine.add(&ctx, &b, &b, &z);
+    let before = ctx.gpu_counters();
+    engine.add(&ctx, &z, &b, &sum);
+    assert_eq!(bind_counts(&ctx, &before), (1, 0, 1));
+    assert_eq!(read(&ctx, &sum), vec![30.0, 60.0, 90.0, 120.0], "z's data");
 }

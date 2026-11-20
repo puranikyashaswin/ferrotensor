@@ -51,7 +51,7 @@ fn uploads_do_not_keep_every_staging_copy() {
     let growth = peak_rss().saturating_sub(before);
 
     assert_eq!(
-        pollster::block_on(tensors[count - 1].to_vec(&ctx))[0],
+        pollster::block_on(tensors[count - 1].to_vec(&ctx)).expect("GPU readback")[0],
         1.0,
         "uploaded data did not arrive"
     );

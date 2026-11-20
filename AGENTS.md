@@ -69,7 +69,7 @@ is `null`. On an error stdout carries `{"error": "<message>"}` instead.
 | `merge` | `out_dir`, `merged` (tensors with the adapter added), `copied` (tensors copied byte for byte) |
 | `export-gguf` | `out_file`, `tensors` (tensors in the GGUF file), `merged` (tensors with the `--lora` adapter added; 0 without it) |
 | `pretrain` | every `train` key, then `parameters`, `vocab_size` (259 for the byte-level tokenizer, `--vocab-size` for BPE) and `tokenizer` (`"byte"` or `"bpe"`) |
-| `info` | `ferrotensor`, `os`, `arch`, `adapters` (one object per GPU, `selected` marks the one used, `kernel_timing` the mode `--profile` would time kernels in, or null), `checks` (null without `--check`), and `error` only on failure |
+| `info` | `ferrotensor`, `os`, `arch`, `adapters` (one object per GPU, `selected` marks the one used, `kernel_timing` the mode `--profile` would time kernels in, or null, `cooperative_matrix` the cooperative-matrix shapes it offers: `m`, `n`, `k`, `ab_type`, `cr_type`, `saturating_accumulation`; the device asks for them only with `FERROTENSOR_EXPERIMENTAL=1`), `checks` (null without `--check`), and `error` only on failure |
 | `q4-report` | `model`, `group`, `tensors` (one object per 2-D weight, by name: `name`, `shape` as stored, `relative_error`, `max_abs_error`, `groups`, `outlier_groups`, `outlier_fraction`) |
 
 `chat` is the one command that prints more than one object: it reads one
@@ -201,7 +201,9 @@ weight matrix on the host, without a GPU. See
 - In library code a lint is suppressed with `#[expect(lint, reason = "...")]`.
   Test and example files carry one `#![allow(...)]` at the top, or one
   `#[allow(...)]` on `mod tests`.
-- `unsafe` is denied, except the loader's two documented memory-map sites.
+- `unsafe` is denied, except the loader's two documented memory-map sites and
+  `enable_experimental_features` in `ferrotensor-backend/src/adapters.rs`, which
+  opts in to wgpu's experimental features only with `FERROTENSOR_EXPERIMENTAL=1`.
 - A comment says why the code does something. A doc comment is one summary sentence, plus
   `# Errors`, `# Panics` or `# Safety` when they apply.
 - No new dependency without the maintainer's approval. One concern per PR.

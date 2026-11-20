@@ -143,7 +143,7 @@ pub async fn save_lora_checkpoint<P: AsRef<Path>>(
             )
             .into());
         }
-        let values = tensor.data.to_vec(ctx).await;
+        let values = tensor.data.to_vec(ctx).await?;
         let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
         data_to_save.push((name.clone(), tensor.data.shape.clone(), bytes));
     }

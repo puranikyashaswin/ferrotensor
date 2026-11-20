@@ -1281,6 +1281,7 @@ mod tests {
             max_compute_workgroup_storage_size: 16384,
             shader_f16: false,
             kernel_timing: None,
+            cooperative_matrix: Vec::new(),
             selected: true,
         }
     }

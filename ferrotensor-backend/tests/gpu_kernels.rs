@@ -57,7 +57,7 @@ fn zeros(shape: &[usize]) -> UnifiedTensor {
 }
 
 fn read(t: &UnifiedTensor) -> Vec<f32> {
-    pollster::block_on(t.to_vec(&gpu().ctx))
+    pollster::block_on(t.to_vec(&gpu().ctx)).unwrap()
 }
 
 #[track_caller]
@@ -2503,7 +2503,7 @@ fn large_dispatches_use_a_2d_grid() {
 #[ignore = "needs a GPU; run with --ignored --test-threads=1"]
 fn self_check_passes_and_an_adapter_is_selected() {
     let g = gpu();
-    for r in pollster::block_on(ferrotensor_backend::adapters::self_check(&g.ctx)) {
+    for r in pollster::block_on(ferrotensor_backend::adapters::self_check(&g.ctx)).unwrap() {
         assert!(
             r.passed(),
             "{}: max error {} > {}",

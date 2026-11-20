@@ -205,7 +205,7 @@ fn merge_adapters(
 // ---------------------------------------------------------------------------
 
 fn host(gpu: &Gpu, t: &Tensor) -> Vec<f32> {
-    pollster::block_on(t.data.to_vec(&gpu.ctx))
+    pollster::block_on(t.data.to_vec(&gpu.ctx)).expect("GPU readback")
 }
 
 /// Logits of `model` for `ids`, checked to be `[1, ids.len(), VOCAB]`.

@@ -200,7 +200,7 @@ impl Bench<'_> {
 }
 
 fn read(ctx: &WgpuContext, t: &UnifiedTensor) -> Vec<f32> {
-    pollster::block_on(t.to_vec(ctx))
+    pollster::block_on(t.to_vec(ctx)).expect("GPU readback")
 }
 
 fn json_f64(v: Option<f64>) -> String {

@@ -67,7 +67,7 @@ fn params(rig: &Rig, weights: &[Vec<f32>]) -> Vec<Tensor> {
 fn weights_of(rig: &Rig, params: &[Tensor]) -> Vec<Vec<f32>> {
     params
         .iter()
-        .map(|p| pollster::block_on(p.data.to_vec(&rig.ctx)))
+        .map(|p| pollster::block_on(p.data.to_vec(&rig.ctx)).expect("GPU readback"))
         .collect()
 }
 
@@ -85,6 +85,7 @@ fn set_grads(rig: &Rig, params: &[Tensor], grads: &[Vec<f32>]) -> Vec<UnifiedTen
 
 fn host_norm(rig: &Rig, partials: &UnifiedTensor) -> f32 {
     let sum_sq: f64 = pollster::block_on(partials.to_vec(&rig.ctx))
+        .expect("GPU readback")
         .iter()
         .map(|&x| f64::from(x))
         .sum();
@@ -394,7 +395,7 @@ fn flat_step_uploads_nothing_from_the_host() {
     // The next arena reuses a pooled buffer that held gradients; its gaps and
     // padding must read as zero all the same.
     let again = FlatGrads::new(ctx, &sizes).expect("fits");
-    let all = pollster::block_on(again.data.to_vec(ctx));
+    let all = pollster::block_on(again.data.to_vec(ctx)).expect("GPU readback");
     assert_eq!(all.len(), again.layout.total());
     assert!(all.iter().all(|&x| x.to_bits() == 0), "not zeroed");
 }

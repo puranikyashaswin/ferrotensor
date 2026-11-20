@@ -38,7 +38,7 @@ harness = false
 ferrotensor = { path = "../ferrotensor", version = "0.7.0" }
 ferrotensor-backend = { path = "../ferrotensor-backend", version = "0.7.0" }
 pollster = "0.3"
-wgpu = "0.19"
+wgpu = "=30.0.2"
 rand = "0.8"
 
 [lints]

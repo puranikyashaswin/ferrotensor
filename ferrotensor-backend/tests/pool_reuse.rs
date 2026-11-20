@@ -5,6 +5,7 @@
 //! ```text
 //! cargo test -p ferrotensor-backend --test pool_reuse -- --ignored --test-threads=1
 //! ```
+#![allow(clippy::expect_used)]
 
 use ferrotensor_backend::memory::wgpu_buffer_size;
 use ferrotensor_backend::{wgpu, ComputeEngine, UnifiedTensor, WgpuContext};
@@ -32,7 +33,10 @@ fn wait_for_gpu(ctx: &WgpuContext) {
     ctx.queue
         .on_submitted_work_done(move || flag.store(true, Ordering::Release));
     while !done.load(Ordering::Acquire) {
-        ctx.device.poll(wgpu::Maintain::Poll);
+        assert!(
+            ctx.device.poll(wgpu::PollType::Poll).is_ok(),
+            "the device was lost"
+        );
         std::thread::yield_now();
     }
 }
@@ -64,7 +68,10 @@ fn freed_buffer_is_reused_beyond_the_cap_with_overflow() {
     assert_eq!(ctx.pool.pooled_bytes(), 0);
     engine.gradient_scale(&ctx, &src, 2.0);
     engine.copy_tensor(&ctx, &src, &b, 0);
-    assert_eq!(pollster::block_on(b.to_vec(&ctx)), vec![2.0; N]);
+    assert_eq!(
+        pollster::block_on(b.to_vec(&ctx)).expect("GPU readback"),
+        vec![2.0; N]
+    );
     drop(b);
     assert_eq!(ctx.pool.pooled_bytes(), bytes);
     // Once the GPU has finished, the next wait trims the pool to its cap.

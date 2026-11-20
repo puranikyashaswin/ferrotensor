@@ -1,8 +1,7 @@
 //! Rotary embeddings and fused (flash) attention.
 
-use super::{dummy_storage, groups64, uniform, ComputeEngine};
+use super::{dummy_storage, groups64, uniform, Arg, ComputeEngine, Params, Scratch};
 use crate::{DType, UnifiedTensor, WgpuContext};
-use wgpu::Buffer;
 
 /// Query or key rows per workgroup of the attention kernels (`FA_TILE_Q` and `FAB_ROWS` in WGSL).
 const ATTENTION_ROWS: u32 = 16;
@@ -234,7 +233,7 @@ impl ComputeEngine {
         }
         let params = dims.params(ctx, opts, mask, stats.is_some());
         let dummy;
-        let mask_buf = match mask {
+        let mask_buf: &dyn Arg = match mask {
             Some(m) => m.buffer(),
             None => {
                 dummy = dummy_storage(ctx);
@@ -262,7 +261,7 @@ impl ComputeEngine {
             return;
         }
         let stats_dummy;
-        let stats_buf = match stats {
+        let stats_buf: &dyn Arg = match stats {
             Some(s) => s.buffer(),
             None => {
                 stats_dummy = dummy_storage(ctx);
@@ -417,7 +416,7 @@ impl ComputeEngine {
         }
         let params = dims.params_bwd(ctx, opts, mask, saved.is_some());
         let dummy;
-        let mask_buf = match mask {
+        let mask_buf: &dyn Arg = match mask {
             Some(m) => m.buffer(),
             None => {
                 dummy = dummy_storage(ctx);
@@ -426,17 +425,18 @@ impl ComputeEngine {
         };
         // Per (batch, head, query) row: [Delta, LSE].
         let scratch;
-        let stats = match saved {
+        let stats: &dyn Arg = match saved {
             Some(s) => s.buffer(),
             None => {
-                scratch = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                let buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("Flash Bwd Stats"),
                     size: (dims.batch * dims.heads * dims.seq_q).max(1) as u64 * 8,
                     usage: wgpu::BufferUsages::STORAGE,
                     mapped_at_creation: false,
                 });
                 // Dropped at the end of this function, before the dispatches run.
-                ctx.memory().count_dispatch_buffer(scratch.size());
+                ctx.memory().count_dispatch_buffer(buffer.size());
+                scratch = Scratch(buffer);
                 &scratch
             }
         };
@@ -545,7 +545,7 @@ impl AttentionDims {
         opts: &AttentionOptions,
         mask: Option<&UnifiedTensor>,
         write_stats: bool,
-    ) -> Buffer {
+    ) -> Params {
         let (has_mask, s) = mask_strides(mask);
         let params: [u32; 20] = [
             self.batch,
@@ -579,7 +579,7 @@ impl AttentionDims {
         opts: &AttentionOptions,
         mask: Option<&UnifiedTensor>,
         lse_saved: bool,
-    ) -> Buffer {
+    ) -> Params {
         let (has_mask, s) = mask_strides(mask);
         let params: [u32; 20] = [
             self.batch,

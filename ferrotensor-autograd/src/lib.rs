@@ -789,9 +789,14 @@ impl AutogradNode for SelectTokenNode {
         vec![self.input.clone()]
     }
     /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
+    #[expect(
+        clippy::expect_used,
+        reason = "a readback fails only on device loss, and the caller has no error path"
+    )]
     fn backward(&self, grad: &UnifiedTensor, _engine: &ComputeEngine) -> Vec<UnifiedTensor> {
         let mut full_grad = vec![0.0f32; self.input.data.shape.iter().product()];
-        let token_grad = pollster::block_on(grad.to_vec(&self.input.ctx));
+        let token_grad = pollster::block_on(grad.to_vec(&self.input.ctx))
+            .expect("GPU device lost during readback");
         let start = self.token_index * self.vocab_size;
         let end = start + self.vocab_size;
         full_grad[start..end].copy_from_slice(&token_grad);
@@ -815,9 +820,14 @@ impl AutogradNode for EmbeddingNode {
         vec![self.table.clone()]
     }
     /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
+    #[expect(
+        clippy::expect_used,
+        reason = "a readback fails only on device loss, and the caller has no error path"
+    )]
     fn backward(&self, grad: &UnifiedTensor, _engine: &ComputeEngine) -> Vec<UnifiedTensor> {
         let hidden = self.table.data.shape[1];
-        let output_grad = pollster::block_on(grad.to_vec(&self.table.ctx));
+        let output_grad = pollster::block_on(grad.to_vec(&self.table.ctx))
+            .expect("GPU device lost during readback");
         let mut table_grad = vec![0.0f32; self.table.data.shape.iter().product()];
         // A repeated id sums the gradients of all its positions; an id outside
         // the table looked up zeros, so it gets nothing.
@@ -875,10 +885,15 @@ impl AutogradNode for MSELossNode {
         vec![self.pred.clone(), self.target.clone()]
     }
     /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
+    #[expect(
+        clippy::expect_used,
+        reason = "a readback fails only on device loss, and the caller has no error path"
+    )]
     fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
         let grad_in = UnifiedTensor::empty(&self.pred.ctx, &self.pred.data.shape);
         engine.mse_loss_backward(&self.pred.ctx, &self.pred.data, &self.target.data, &grad_in);
         let upstream = pollster::block_on(grad.to_vec(&self.pred.ctx))
+            .expect("GPU device lost during readback")
             .first()
             .copied()
             .unwrap_or(1.0);
@@ -907,6 +922,10 @@ impl AutogradNode for CrossEntropyLossNode {
         vec![self.logits.clone()]
     }
     /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
+    #[expect(
+        clippy::expect_used,
+        reason = "a readback fails only on device loss, and the caller has no error path"
+    )]
     fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
         let grad_logits = UnifiedTensor::empty(&self.logits.ctx, &self.logits.data.shape);
         engine.cross_entropy_backward(
@@ -916,6 +935,7 @@ impl AutogradNode for CrossEntropyLossNode {
             &grad_logits,
         );
         let upstream = pollster::block_on(grad.to_vec(&self.logits.ctx))
+            .expect("GPU device lost during readback")
             .first()
             .copied()
             .unwrap_or(1.0);
@@ -1314,11 +1334,16 @@ impl Tensor {
     /// Squared-error loss `0.5 * sum((pred - target)^2)`, shape `[1]`.
     ///
     /// Its gradient is `pred - target` (the backward kernel's output).
+    #[expect(
+        clippy::expect_used,
+        reason = "a readback fails only on device loss, and the caller has no error path"
+    )]
     pub fn mse_loss(pred: &Tensor, target: &Tensor, engine: &ComputeEngine) -> Tensor {
         // The kernel writes 0.5 * (p - t)^2 per element; sum on the host.
         let per_element = UnifiedTensor::empty(&pred.ctx, &pred.data.shape);
         engine.mse_loss(&pred.ctx, &pred.data, &target.data, &per_element);
         let total: f32 = pollster::block_on(per_element.to_vec(&pred.ctx))
+            .expect("GPU device lost during readback")
             .iter()
             .sum();
         let out_data = UnifiedTensor::new(&pred.ctx, &[total], &[1]);
@@ -1422,12 +1447,17 @@ impl Tensor {
     /// waits for the GPU to read the table back, and the gradient is summed
     /// on the GPU too. Same values as [`embedding`](Self::embedding); a table
     /// that is not `f32` or an empty lookup takes the host path.
+    #[expect(
+        clippy::expect_used,
+        reason = "a readback fails only on device loss, and the caller has no error path"
+    )]
     pub fn embedding_gpu(table: &Tensor, rows: &[&[u32]], engine: &ComputeEngine) -> Tensor {
         let ids: Vec<u32> = rows.iter().flat_map(|r| r.iter().copied()).collect();
         let seq_len = rows.first().map_or(0, |r| r.len());
         let (vocab, hidden) = (table.data.shape[0], table.data.shape[1]);
         if table.data.dtype != DType::FP32 || ids.is_empty() || vocab * hidden == 0 {
-            let host = pollster::block_on(table.data.to_vec(&table.ctx));
+            let host = pollster::block_on(table.data.to_vec(&table.ctx))
+                .expect("GPU device lost during readback");
             return Self::embedding(table, &host, rows);
         }
         let ctx = &table.ctx;
@@ -1448,7 +1478,7 @@ impl Tensor {
     /// Row `token_index` of `[seq, vocab]` logits.
     #[expect(
         clippy::expect_used,
-        reason = "shape precondition: input has at least one dimension"
+        reason = "shape precondition: input has at least one dimension; the readback fails only on device loss, and this API has no error path"
     )]
     pub fn select_token(input: &Tensor, token_index: usize) -> Tensor {
         let vocab_size = *input
@@ -1456,7 +1486,8 @@ impl Tensor {
             .shape
             .last()
             .expect("select_token requires a non-empty tensor");
-        let full = pollster::block_on(input.data.to_vec(&input.ctx));
+        let full = pollster::block_on(input.data.to_vec(&input.ctx))
+            .expect("GPU device lost during readback");
         let start = token_index * vocab_size;
         let end = start + vocab_size;
         let out_data = UnifiedTensor::new(&input.ctx, &full[start..end], &[vocab_size]);
@@ -2023,6 +2054,10 @@ impl Optimizer for AdamW {
         self.clear_grads(params);
     }
     /// Serialize optimizer state keyed by parameter name (`None` if unsupported).
+    #[expect(
+        clippy::expect_used,
+        reason = "a readback fails only on device loss, and the caller has no error path"
+    )]
     fn save_state(
         &self,
         ctx: &Arc<WgpuContext>,
@@ -2036,16 +2071,30 @@ impl Optimizer for AdamW {
         let mut m_host: Vec<(usize, Vec<usize>, Vec<f32>)> = self
             .m_states
             .iter()
-            .map(|(ptr, s)| (*ptr, s.shape.clone(), pollster::block_on(s.to_vec(ctx))))
+            .map(|(ptr, s)| {
+                (
+                    *ptr,
+                    s.shape.clone(),
+                    pollster::block_on(s.to_vec(ctx)).expect("GPU device lost during readback"),
+                )
+            })
             .collect();
         let mut v_host: Vec<(usize, Vec<usize>, Vec<f32>)> = self
             .v_states
             .iter()
-            .map(|(ptr, s)| (*ptr, s.shape.clone(), pollster::block_on(s.to_vec(ctx))))
+            .map(|(ptr, s)| {
+                (
+                    *ptr,
+                    s.shape.clone(),
+                    pollster::block_on(s.to_vec(ctx)).expect("GPU device lost during readback"),
+                )
+            })
             .collect();
         if let Some(flat) = &self.flat {
-            let m_all = pollster::block_on(flat.m.to_vec(ctx));
-            let v_all = pollster::block_on(flat.v.to_vec(ctx));
+            let m_all =
+                pollster::block_on(flat.m.to_vec(ctx)).expect("GPU device lost during readback");
+            let v_all =
+                pollster::block_on(flat.v.to_vec(ctx)).expect("GPU device lost during readback");
             for (i, ptr) in flat.ptrs.iter().enumerate() {
                 let start = flat.layout.offset(i);
                 let end = start + flat.layout.sizes().get(i).copied().unwrap_or(0);

@@ -1,14 +1,46 @@
 //! GPU-resident tensors.
 
+use crate::bind_cache::BindGroupCache;
 use crate::memory::{Allocation, MemoryCategory};
 use crate::pool::BufferPool;
 use crate::profile::GpuCounters;
 use crate::q4::{Q4Error, Q4Group};
 use crate::WgpuContext;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::fmt;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use wgpu::{util::DeviceExt, Buffer};
+
+/// Why a readback ([`UnifiedTensor::to_vec`], [`UnifiedTensor::read_many`])
+/// returned no values: wgpu could not map the staging buffer, which happens
+/// when the GPU device was lost.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum ReadbackError {
+    /// The staging buffer's `map_async` reported a failure.
+    Map(wgpu::BufferAsyncError),
+    /// The mapped range of the staging buffer could not be read.
+    Range(wgpu::MapRangeError),
+}
+
+impl fmt::Display for ReadbackError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Map(e) => write!(f, "GPU readback failed to map its staging buffer: {e}"),
+            Self::Range(e) => write!(f, "GPU readback failed to read its staging buffer: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ReadbackError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Map(e) => Some(e),
+            Self::Range(e) => Some(e),
+        }
+    }
+}
 
 /// Element type of a tensor buffer.
 ///
@@ -71,6 +103,8 @@ struct TensorData {
     pool: Option<Arc<BufferPool>>,
     /// Counted in the context's memory tracker; `None` only while dropping.
     memory: Option<Allocation>,
+    /// Evicts the buffer when the tensor owns it and drops it.
+    bind_groups: Arc<BindGroupCache>,
 }
 
 impl TensorData {
@@ -99,6 +133,7 @@ impl TensorData {
             size_in_bytes,
             pool,
             memory: Some(memory),
+            bind_groups: Arc::clone(context.pool.bind_groups()),
         }
     }
 }
@@ -108,8 +143,9 @@ impl Drop for TensorData {
         // Stop counting the bytes as live before the pool counts them idle
         // (or, past its cap, as awaiting GPU).
         drop(self.memory.take());
-        if let Some(pool) = &self.pool {
-            pool.return_buffer(self.size_in_bytes, self.buffer.clone());
+        match &self.pool {
+            Some(pool) => pool.return_buffer(self.size_in_bytes, self.buffer.clone()),
+            None => self.bind_groups.evict(&self.buffer),
         }
     }
 }
@@ -350,7 +386,11 @@ impl UnifiedTensor {
     }
 
     /// Copies the tensor back to the CPU, waiting for queued GPU work.
-    pub async fn to_vec(&self, context: &WgpuContext) -> Vec<f32> {
+    ///
+    /// # Errors
+    /// [`ReadbackError`] when wgpu cannot map the staging buffer, which
+    /// happens when the GPU device was lost.
+    pub async fn to_vec(&self, context: &WgpuContext) -> Result<Vec<f32>, ReadbackError> {
         let start = Instant::now();
         let size = self.size_in_bytes();
         context.counters.readbacks.fetch_add(1, Ordering::Relaxed);
@@ -373,30 +413,29 @@ impl UnifiedTensor {
         context.flush();
 
         let slice = staging.slice(..);
-        let mapped = Arc::new(AtomicBool::new(false));
-        let flag = mapped.clone();
-        slice.map_async(wgpu::MapMode::Read, move |_| {
-            flag.store(true, Ordering::Release)
-        });
-        context.poll_until(|| mapped.load(Ordering::Acquire));
-
-        let data = slice.get_mapped_range();
+        let data = map_for_read(context, &slice)?;
         let res = bytemuck::cast_slice(&data).to_vec();
         drop(data);
         staging.unmap();
         GpuCounters::add_elapsed(&context.counters.readback_nanos, start);
-        res
+        Ok(res)
     }
 
     /// Reads the f32 values of every tensor in `tensors` back to the host
     /// with one copy into one staging buffer, so the queue drains once
     /// however many tensors there are.
-    pub async fn read_many(context: &WgpuContext, tensors: &[&UnifiedTensor]) -> Vec<Vec<f32>> {
+    ///
+    /// # Errors
+    /// As [`to_vec`](Self::to_vec).
+    pub async fn read_many(
+        context: &WgpuContext,
+        tensors: &[&UnifiedTensor],
+    ) -> Result<Vec<Vec<f32>>, ReadbackError> {
         let start = Instant::now();
         let sizes: Vec<u64> = tensors.iter().map(|t| t.size_in_bytes()).collect();
         let size: u64 = sizes.iter().sum();
         if size == 0 {
-            return tensors.iter().map(|_| Vec::new()).collect();
+            return Ok(tensors.iter().map(|_| Vec::new()).collect());
         }
         context.counters.readbacks.fetch_add(1, Ordering::Relaxed);
         context
@@ -422,14 +461,7 @@ impl UnifiedTensor {
         context.flush();
 
         let slice = staging.slice(..);
-        let mapped = Arc::new(AtomicBool::new(false));
-        let flag = mapped.clone();
-        slice.map_async(wgpu::MapMode::Read, move |_| {
-            flag.store(true, Ordering::Release)
-        });
-        context.poll_until(|| mapped.load(Ordering::Acquire));
-
-        let data = slice.get_mapped_range();
+        let data = map_for_read(context, &slice)?;
         let all: &[f32] = bytemuck::cast_slice(&data);
         let mut res = Vec::with_capacity(tensors.len());
         let mut at = 0;
@@ -441,15 +473,15 @@ impl UnifiedTensor {
         drop(data);
         staging.unmap();
         GpuCounters::add_elapsed(&context.counters.readback_nanos, start);
-        res
+        Ok(res)
     }
 }
 
 impl UnifiedTensor {
     /// Uploads the transpose of the row-major `[rows, cols]` matrix `data`
     /// as a `[cols, rows]` tensor of `dtype`, converting each value while it
-    /// is written into the buffer's mapped memory, so no transposed or
-    /// converted copy is made on the host.
+    /// is written into the upload bytes, so no transposed f32 copy is made on
+    /// the host.
     ///
     /// The buffer holds the same bytes as transposing `data` and passing the
     /// result to [`new`](Self::new) ([`DType::FP32`]) or
@@ -482,7 +514,7 @@ impl UnifiedTensor {
     }
 
     /// A tensor of `dtype` whose first `size_in_bytes` bytes `fill` writes
-    /// straight into the buffer's mapped memory (zeroed beforehand). The
+    /// (into zeroed memory). The
     /// buffer is laid out as by `create_buffer_init`, which
     /// [`from_bytes_with_dtype`](Self::from_bytes_with_dtype) uses: its
     /// size is rounded up to whole 32-bit words, at least one, with zeros
@@ -494,35 +526,19 @@ impl UnifiedTensor {
         dtype: DType,
         fill: impl FnOnce(&mut [u8]),
     ) -> Self {
-        let usage = wgpu::BufferUsages::STORAGE
-            | wgpu::BufferUsages::COPY_DST
-            | wgpu::BufferUsages::COPY_SRC;
-        let buffer = if size_in_bytes == 0 {
-            let empty: &mut [u8] = &mut [];
-            fill(empty);
-            context.device.create_buffer(&wgpu::BufferDescriptor {
+        // wgpu hands out mapped memory write-only, so `fill` writes into host
+        // memory that `create_buffer_init` then copies in.
+        let mut host = vec![0u8; size_in_bytes];
+        fill(&mut host);
+        let buffer = context
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("Byte Tensor"),
-                size: 0,
-                usage,
-                mapped_at_creation: false,
-            })
-        } else {
-            let align_mask = wgpu::COPY_BUFFER_ALIGNMENT - 1;
-            let padded = ((size_in_bytes as u64 + align_mask) & !align_mask)
-                .max(wgpu::COPY_BUFFER_ALIGNMENT);
-            let buffer = context.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Byte Tensor"),
-                size: padded,
-                usage,
-                mapped_at_creation: true,
+                contents: &host,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
             });
-            {
-                let mut mapped = buffer.slice(..).get_mapped_range_mut();
-                fill(&mut mapped[..size_in_bytes]);
-            }
-            buffer.unmap();
-            buffer
-        };
         context.note_upload(size_in_bytes as u64);
         Self {
             data: Arc::new(TensorData::new(
@@ -557,8 +573,7 @@ fn upload_len(n: usize, dtype: DType) -> usize {
 /// `bytemuck` casts them for [`UnifiedTensor::new`]) or little-endian f16
 /// rounded by `half::f16::from_f32` (as in
 /// [`UnifiedTensor::from_f32_as_f16`]). Bytes past the values are left as
-/// they are. `out` is filled front to back, so writes to mapped GPU memory
-/// stay sequential.
+/// they are. `out` is filled front to back.
 #[expect(
     clippy::expect_used,
     reason = "out holds one slot per value, see the length contract above"
@@ -587,6 +602,33 @@ fn write_transposed(src: &[f32], rows: usize, cols: usize, dtype: DType, out: &m
         }
         DType::Q4 => unreachable!("from_f32_transposed rejects DType::Q4"),
     }
+}
+
+/// Maps `slice` of a `MAP_READ` staging buffer and returns its bytes,
+/// polling the device until wgpu reports the mapping.
+///
+/// # Errors
+/// [`ReadbackError`] when the mapping or the mapped range fails.
+fn map_for_read(
+    context: &WgpuContext,
+    slice: &wgpu::BufferSlice<'_>,
+) -> Result<wgpu::BufferView, ReadbackError> {
+    // 0 while the mapping is pending, then MAPPED or FAILED.
+    const MAPPED: u8 = 1;
+    const FAILED: u8 = 2;
+    let state = Arc::new(AtomicU8::new(0));
+    let flag = state.clone();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        flag.store(
+            if result.is_ok() { MAPPED } else { FAILED },
+            Ordering::Release,
+        )
+    });
+    context.poll_until(|| state.load(Ordering::Acquire) != 0);
+    if state.load(Ordering::Acquire) == FAILED {
+        return Err(ReadbackError::Map(wgpu::BufferAsyncError));
+    }
+    slice.get_mapped_range().map_err(ReadbackError::Range)
 }
 
 #[cfg(test)]

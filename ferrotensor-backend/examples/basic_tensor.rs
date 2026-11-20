@@ -12,6 +12,7 @@
 //! mul:  first values [0.0, 0.0009756088, 0.0019493103], max |gpu - cpu| = 0.00e0
 //! silu: first values [0.0, 0.00048851967, 0.0009775162], max |gpu - cpu| = 1.19e-7
 //! ```
+#![allow(clippy::expect_used)]
 
 use ferrotensor_backend::{ComputeEngine, UnifiedTensor, WgpuContext};
 
@@ -44,7 +45,7 @@ fn main() {
         }
         let out = UnifiedTensor::empty(&ctx, &[N, N]);
         engine.matmul(&ctx, &a, &b, &out);
-        let gpu = out.to_vec(&ctx).await;
+        let gpu = out.to_vec(&ctx).await.expect("GPU readback");
         println!(
             "matmul [{N}, {N}] x [{N}, {N}]: first values {:?}, max |gpu - cpu| = {:.2e}",
             &gpu[..3],
@@ -55,7 +56,7 @@ fn main() {
         let cpu_add: Vec<f32> = a_data.iter().zip(&b_data).map(|(x, y)| x + y).collect();
         let out = UnifiedTensor::empty(&ctx, &[N, N]);
         engine.add(&ctx, &a, &b, &out);
-        let gpu = out.to_vec(&ctx).await;
+        let gpu = out.to_vec(&ctx).await.expect("GPU readback");
         println!(
             "add:  first values {:?}, max |gpu - cpu| = {:.2e}",
             &gpu[..3],
@@ -66,7 +67,7 @@ fn main() {
         let cpu_mul: Vec<f32> = a_data.iter().zip(&b_data).map(|(x, y)| x * y).collect();
         let out = UnifiedTensor::empty(&ctx, &[N, N]);
         engine.mul(&ctx, &a, &b, &out);
-        let gpu = out.to_vec(&ctx).await;
+        let gpu = out.to_vec(&ctx).await.expect("GPU readback");
         println!(
             "mul:  first values {:?}, max |gpu - cpu| = {:.2e}",
             &gpu[..3],
@@ -77,7 +78,7 @@ fn main() {
         let cpu_silu: Vec<f32> = a_data.iter().map(|x| x / (1.0 + (-x).exp())).collect();
         let out = UnifiedTensor::empty(&ctx, &[N, N]);
         engine.silu(&ctx, &a, &out);
-        let gpu = out.to_vec(&ctx).await;
+        let gpu = out.to_vec(&ctx).await.expect("GPU readback");
         println!(
             "silu: first values {:?}, max |gpu - cpu| = {:.2e}",
             &gpu[..3],
