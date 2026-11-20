@@ -126,6 +126,9 @@ pub(crate) struct Dispatch {
     pub(crate) bind_group: BindGroup,
     pub(crate) groups: (u32, u32, u32),
     pub(crate) label: KernelLabel,
+    /// The autotuner's sample this dispatch is part of: its GPU time is
+    /// read back for the tuner (see `engine::coop::autotune`).
+    pub(crate) tune: Option<u64>,
     /// The kernel's parameters, when they go through immediates.
     pub(crate) immediates: Option<Vec<u8>>,
 }
@@ -283,9 +286,14 @@ impl WgpuContext {
                 force_fallback_adapter,
             })?;
 
+        // The autotuner times the dispatches it tags, so it needs timestamps
+        // even when kernel timing is off.
+        let tuning = crate::engine::autotune_requested();
         let timing_mode = match timing {
-            KernelTiming::Off => None,
-            KernelTiming::On => KernelTimingMode::for_features(adapter.features()),
+            KernelTiming::Off if !tuning => None,
+            KernelTiming::Off | KernelTiming::On => {
+                KernelTimingMode::for_features(adapter.features())
+            }
         };
         let required_features = timing_mode
             .map_or(wgpu::Features::empty(), KernelTimingMode::features)
@@ -321,7 +329,9 @@ impl WgpuContext {
             limit_from_env_value(env(PENDING_OPS_ENV).as_deref(), MAX_PENDING_OPS);
         let max_pass_dispatches =
             limit_from_env_value(env(PASS_DISPATCHES_ENV).as_deref(), MAX_PASS_DISPATCHES);
-        let timer = timing_mode.map(|mode| KernelTimer::new(mode, &queue, max_pending_ops));
+        let timer = timing_mode.map(|mode| {
+            KernelTimer::new(mode, &queue, max_pending_ops, timing == KernelTiming::On)
+        });
         let immediates = device.features().contains(wgpu::Features::IMMEDIATES)
             && device.limits().max_immediate_size >= crate::engine::IMMEDIATE_BYTES
             && !env(UNIFORM_PARAMS_ENV).is_some_and(|v| v.trim() == "1");
@@ -416,7 +426,8 @@ impl WgpuContext {
         if dispatches.is_empty() {
             return encoder;
         }
-        if let Some(timer) = &self.timer {
+        let timer = self.timer.as_ref().filter(|t| t.times_any(dispatches));
+        if let Some(timer) = timer {
             let passes = timer.encode(&self.device, encoder, dispatches, times);
             self.counters
                 .compute_passes
@@ -611,7 +622,25 @@ impl WgpuContext {
     /// opened without [`KernelTiming::On`] or the adapter has no timestamp
     /// queries.
     pub fn kernel_timing_mode(&self) -> Option<KernelTimingMode> {
-        self.timer.as_ref().map(|timer| timer.mode)
+        self.timer
+            .as_ref()
+            .filter(|timer| timer.all)
+            .map(|timer| timer.mode)
+    }
+
+    /// Whether the context can time the dispatches the autotuner tags.
+    pub(crate) fn has_timestamps(&self) -> bool {
+        self.timer.is_some()
+    }
+
+    /// The GPU times of the autotuner's tagged dispatches that the GPU has
+    /// finished, each as its sample id and duration (`None`: unusable
+    /// timestamps); never waits.
+    pub(crate) fn take_tune_samples(&self) -> Vec<(u64, Option<Duration>)> {
+        self.timer.as_ref().map_or_else(Vec::new, |timer| {
+            timer.collect();
+            timer.take_samples()
+        })
     }
 
     /// GPU time by kernel, of the work the GPU finished before the last
@@ -619,6 +648,7 @@ impl WgpuContext {
     pub fn kernel_times(&self) -> KernelTimes {
         self.timer
             .as_ref()
+            .filter(|timer| timer.all)
             .map_or_else(KernelTimes::default, |timer| {
                 timer.collect();
                 timer.totals()

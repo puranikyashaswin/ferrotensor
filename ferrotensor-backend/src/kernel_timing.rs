@@ -11,6 +11,11 @@
 //! stream, so a kernel's time includes the barrier before it, and the sum
 //! over kernels leaves out time the GPU spent idle between them. The table
 //! attributes GPU time to kernels; it is not an exact budget.
+//!
+//! A context can also time only the dispatches that carry a tuning tag (see
+//! `engine::coop::autotune`): the same timestamp pairs, resolved and read back
+//! the same way, but nothing for the other dispatches, and the totals above
+//! stay empty. The tagged times go to the tuner, never into the table.
 
 use crate::context::Dispatch;
 use std::collections::{BTreeMap, HashMap};
@@ -143,6 +148,29 @@ impl KernelTimes {
     }
 }
 
+/// The tagged dispatches' times: for each pair of `ticks` whose index in
+/// `tunes` holds a sample id, that id and the pair's duration, or `None` for
+/// a pair that runs backwards (a counter that wrapped), which no timing can
+/// use.
+fn tagged_samples(
+    tunes: &[Option<u64>],
+    ticks: &[u64],
+    period_ns: f32,
+) -> Vec<(u64, Option<Duration>)> {
+    tunes
+        .iter()
+        .zip(ticks.as_chunks::<2>().0)
+        .filter_map(|(tune, pair)| {
+            let id = (*tune)?;
+            let time = (pair[1] > pair[0]).then(|| {
+                let nanos = (pair[1] - pair[0]) as f64 * f64::from(period_ns);
+                Duration::from_nanos(nanos as u64)
+            });
+            Some((id, time))
+        })
+        .collect()
+}
+
 /// Adds the time between each pair of `ticks` to the kernel of the same
 /// index in `labels`. A pair that runs backwards (a counter that wrapped)
 /// adds a dispatch with no time.
@@ -178,6 +206,7 @@ pub(crate) struct TimingSlot {
 struct InFlight {
     slot: TimingSlot,
     labels: Vec<KernelLabel>,
+    tunes: Vec<Option<u64>>,
     state: Arc<AtomicU8>,
 }
 
@@ -187,6 +216,8 @@ struct InFlight {
 pub(crate) struct PendingTimes {
     slot: Option<TimingSlot>,
     labels: Vec<KernelLabel>,
+    /// The tuning sample of each timed dispatch, if it has one.
+    tunes: Vec<Option<u64>>,
 }
 
 #[derive(Debug, Default)]
@@ -194,12 +225,17 @@ struct TimerState {
     free: Vec<TimingSlot>,
     in_flight: Vec<InFlight>,
     totals: HashMap<KernelLabel, KernelTime>,
+    /// Times of tagged dispatches read back and not yet taken.
+    samples: Vec<(u64, Option<Duration>)>,
 }
 
 /// Timestamp queries of one context.
 #[derive(Debug)]
 pub(crate) struct KernelTimer {
     pub(crate) mode: KernelTimingMode,
+    /// Whether every dispatch is timed (`KernelTiming::On`), or only those
+    /// with a tuning tag.
+    pub(crate) all: bool,
     /// Nanoseconds per timestamp tick.
     period_ns: f32,
     /// Timestamps one submission can hold: two per dispatch.
@@ -213,9 +249,11 @@ impl KernelTimer {
         mode: KernelTimingMode,
         queue: &wgpu::Queue,
         dispatches_per_submit: u32,
+        all: bool,
     ) -> Self {
         Self {
             mode,
+            all,
             period_ns: queue.get_timestamp_period(),
             queries_per_submit: 2 * dispatches_per_submit,
             state: Mutex::default(),
@@ -254,8 +292,18 @@ impl KernelTimer {
         self.state.lock().unwrap()
     }
 
-    /// Encodes `dispatches` with a timestamp pair each, and returns how many
-    /// compute passes that took.
+    /// Whether `dispatch` gets a timestamp pair.
+    fn times(&self, dispatch: &Dispatch) -> bool {
+        self.all || dispatch.tune.is_some()
+    }
+
+    /// Whether any of `dispatches` gets a timestamp pair.
+    pub(crate) fn times_any(&self, dispatches: &[Dispatch]) -> bool {
+        self.all || dispatches.iter().any(|d| d.tune.is_some())
+    }
+
+    /// Encodes `dispatches`, a timestamp pair for each that gets one, and
+    /// returns how many compute passes that took.
     pub(crate) fn encode(
         &self,
         device: &Device,
@@ -263,7 +311,11 @@ impl KernelTimer {
         dispatches: &[Dispatch],
         times: &mut PendingTimes,
     ) -> u64 {
-        let PendingTimes { slot, labels } = times;
+        let PendingTimes {
+            slot,
+            labels,
+            tunes,
+        } = times;
         let queries = &slot.get_or_insert_with(|| self.slot(device)).queries;
         debug_assert!(
             2 * (labels.len() + dispatches.len()) <= self.queries_per_submit as usize,
@@ -272,35 +324,56 @@ impl KernelTimer {
         let mut next_pair = |dispatch: &Dispatch| {
             let first = 2 * labels.len() as u32;
             labels.push(dispatch.label);
+            tunes.push(dispatch.tune);
             first
         };
         match self.mode {
             KernelTimingMode::InsidePasses => {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
                 for dispatch in dispatches {
-                    let first = next_pair(dispatch);
                     pass.set_pipeline(&dispatch.pipeline);
-                    pass.write_timestamp(queries, first);
-                    dispatch.encode(&mut pass);
-                    pass.write_timestamp(queries, first + 1);
+                    if self.times(dispatch) {
+                        let first = next_pair(dispatch);
+                        pass.write_timestamp(queries, first);
+                        dispatch.encode(&mut pass);
+                        pass.write_timestamp(queries, first + 1);
+                    } else {
+                        dispatch.encode(&mut pass);
+                    }
                 }
                 1
             }
             KernelTimingMode::PassBoundaries => {
-                for dispatch in dispatches {
-                    let first = next_pair(dispatch);
-                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: None,
-                        timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
-                            query_set: queries,
-                            beginning_of_pass_write_index: Some(first),
-                            end_of_pass_write_index: Some(first + 1),
-                        }),
-                    });
-                    pass.set_pipeline(&dispatch.pipeline);
-                    dispatch.encode(&mut pass);
+                let mut passes = 0;
+                let mut i = 0;
+                while i < dispatches.len() {
+                    if self.times(&dispatches[i]) {
+                        let dispatch = &dispatches[i];
+                        let first = next_pair(dispatch);
+                        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: None,
+                            timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                                query_set: queries,
+                                beginning_of_pass_write_index: Some(first),
+                                end_of_pass_write_index: Some(first + 1),
+                            }),
+                        });
+                        pass.set_pipeline(&dispatch.pipeline);
+                        dispatch.encode(&mut pass);
+                        i += 1;
+                    } else {
+                        // Untimed dispatches share a pass, as without timing.
+                        let mut pass =
+                            encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+                        while i < dispatches.len() && !self.times(&dispatches[i]) {
+                            pass.set_pipeline(&dispatches[i].pipeline);
+                            dispatches[i].encode(&mut pass);
+                            i += 1;
+                        }
+                    }
+                    passes += 1;
                 }
-                dispatches.len() as u64
+                passes
             }
         }
     }
@@ -332,6 +405,7 @@ impl KernelTimer {
         self.lock().in_flight.push(InFlight {
             slot,
             labels: std::mem::take(&mut times.labels),
+            tunes: std::mem::take(&mut times.tunes),
             state,
         });
     }
@@ -344,6 +418,7 @@ impl KernelTimer {
             free,
             in_flight,
             totals,
+            samples,
         } = &mut *state;
         let mut i = 0;
         while i < in_flight.len() {
@@ -361,7 +436,10 @@ impl KernelTimer {
                             .map(|bytes| u64::from_le_bytes(*bytes))
                             .collect();
                         drop(view);
-                        add_timestamp_pairs(totals, &done.labels, &ticks, self.period_ns);
+                        if self.all {
+                            add_timestamp_pairs(totals, &done.labels, &ticks, self.period_ns);
+                        }
+                        samples.extend(tagged_samples(&done.tunes, &ticks, self.period_ns));
                         done.slot.readback.unmap();
                         free.push(done.slot);
                     }
@@ -373,6 +451,13 @@ impl KernelTimer {
                 }
             }
         }
+    }
+
+    /// The tagged dispatches' times collected so far, each as its sample id
+    /// and its duration (`None` when the timestamps were unusable); they are
+    /// forgotten once taken.
+    pub(crate) fn take_samples(&self) -> Vec<(u64, Option<Duration>)> {
+        std::mem::take(&mut self.lock().samples)
     }
 
     /// Totals of every timestamp collected so far.
@@ -424,6 +509,19 @@ mod tests {
                 gpu_time: Duration::from_nanos(14),
             }
         );
+    }
+
+    #[test]
+    fn tagged_pairs_give_their_sample_and_skip_the_rest() {
+        // Ticks of 2 ns: pairs of 100, 7 and 5 ticks; the middle one has no
+        // sample, the last runs backwards.
+        let tunes = [Some(4), None, Some(9)];
+        let ticks = [1_000, 1_100, 1_100, 1_107, 2_000, 1_990];
+        assert_eq!(
+            tagged_samples(&tunes, &ticks, 2.0),
+            vec![(4, Some(Duration::from_nanos(200))), (9, None)]
+        );
+        assert!(tagged_samples(&[], &[], 2.0).is_empty());
     }
 
     #[test]

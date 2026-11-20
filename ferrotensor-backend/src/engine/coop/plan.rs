@@ -213,13 +213,20 @@ pub(super) fn plan(
         }
     }
     let tile = *tiles.last()?;
+    Some(CoopConfig {
+        tile,
+        split: split_to_fill(tile, (m, k, n), target),
+    })
+}
+
+/// How many slices of K `tile` needs over `m x k x n` for its grid to reach
+/// `target` workgroups: at most one slice per [`MIN_STEPS_PER_SPLIT`] steps
+/// of K, and 1 when the grid already reaches it.
+pub(super) fn split_to_fill(tile: CoopTile, (m, k, n): (u32, u32, u32), target: u32) -> u32 {
     let (gx, gy) = tile.groups(m, n);
     let most = (k.div_ceil(tile.bk) / MIN_STEPS_PER_SPLIT).max(1);
     let wanted = target.div_ceil(gx * gy).clamp(1, most);
-    Some(CoopConfig {
-        tile,
-        split: split_k(k, tile.bk, wanted).0,
-    })
+    split_k(k, tile.bk, wanted).0
 }
 
 #[cfg(test)]

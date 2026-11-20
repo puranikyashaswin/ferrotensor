@@ -361,6 +361,7 @@ mod tests {
                 adapter: Some("runs/a/lora_adapters.safetensors".into()),
                 q4_weights: None,
                 loss_scaler: None,
+                autotune: None,
             },
         };
         assert_eq!(
