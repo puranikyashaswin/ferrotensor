@@ -1,7 +1,7 @@
 //! The K loop: the 16x16 fragment multiplies of each staged step, and the
 //! order of loads, multiplies and barriers around them.
 
-use super::loader::{load_step, LoaderKind};
+use super::loader::{load_step, source_spans, LoaderKind};
 use super::CoopKey;
 
 /// The 16x16 fragments of one K substep `kk` from the staged tiles `sa` and
@@ -58,10 +58,9 @@ fn compute_step(key: CoopKey, bufs: (&str, &str)) -> String {
 /// step loads, waits, multiplies and waits. With two, the loads of step
 /// `t + 1` go to the other pair before step `t`'s multiplies, and one
 /// barrier per step separates a pair's reads from its next writes. A tile
-/// with `prefetch` (and the plain loader, the only one that has a register
-/// form) runs [`pipelined_loop`] instead.
+/// with `prefetch` runs [`pipelined_loop`] instead, with any loader.
 pub(super) fn main_loop(key: CoopKey) -> String {
-    if key.tile.prefetch && key.loader == LoaderKind::Plain {
+    if key.tile.prefetch {
         return pipelined_loop(key);
     }
     let p0 = ("sa0", "sb0");
@@ -129,6 +128,14 @@ fn prefetch_decls(key: CoopKey) -> String {
         } else {
             format!("  var pa{i} = 0.0;\n")
         });
+        // The SwiGlu loader reads two values of `a` per staged element.
+        if key.loader == LoaderKind::SwiGlu {
+            s.push_str(&if key.a_vec4 {
+                format!("  var pu{i} = vec4<f32>(0.0);\n")
+            } else {
+                format!("  var pu{i} = 0.0;\n")
+            });
+        }
     }
     for i in 0..nb {
         s.push_str(&if key.b_vec8 {
@@ -140,27 +147,24 @@ fn prefetch_decls(key: CoopKey) -> String {
     s
 }
 
-/// The global loads of the K step that starts at `k0` into the prefetch
-/// registers. Nothing here waits for them: the first use is the store of
-/// [`prefetch_store`], after the multiplies. Out-of-range elements load as
-/// zero, as in the plain loader.
-fn prefetch_load(key: CoopKey, k0: &str) -> String {
+/// One thread's loads of `a` for the step at `k0` (in scope) into its
+/// registers, `assign(i)` being the statements that set register `i` from
+/// the row `gr` and column `gk` in scope.
+fn a_register_loads(key: CoopKey, assign: &dyn Fn(u32) -> String) -> String {
     let nt = key.tile.threads();
-    let (bn, bk) = (key.tile.bn, key.tile.bk);
-    let (na, nb) = prefetch_counts(key);
-    let mut s = format!("    {{\n    let k0 = {k0};\n");
+    let (na, _) = prefetch_counts(key);
+    let mut s = String::new();
     for i in 0..na {
         let off = i * nt;
+        let body = assign(i);
         s.push_str(&if key.a_vec4 {
-            let q = bk / 4;
+            let q = key.tile.bk / 4;
             format!(
                 "    {{
       let idx = li + {off}u;
       let gr = m0 + idx / {q}u;
       let gk = k0 + (idx % {q}u) * 4u;
-      pa{i} = vec4<f32>(0.0);
-      if (gr < m && gk < k) {{ pa{i} = a[(gr * k + gk) / 4u]; }}
-    }}
+{body}    }}
 "
             )
         } else {
@@ -169,13 +173,92 @@ fn prefetch_load(key: CoopKey, k0: &str) -> String {
       let idx = li + {off}u;
       let gr = m0 + idx / BK;
       let gk = k0 + idx % BK;
-      pa{i} = 0.0;
-      if (gr < m && gk < k) {{ pa{i} = a[gr * k + gk]; }}
-    }}
+{body}    }}
 "
             )
         });
     }
+    s
+}
+
+/// The statements that set register `pa{i}` to `read` when the element is in
+/// range and to zero when it is not, as in the plain loader.
+fn guarded_a(key: CoopKey, i: u32, read: &str) -> String {
+    let zero = if key.a_vec4 { "vec4<f32>(0.0)" } else { "0.0" };
+    format!("      pa{i} = {zero};\n      if (gr < m && gk < k) {{ pa{i} = {read}; }}\n")
+}
+
+/// The global loads of `a` for the step at `k0` into `pa0..` (and `pu0..`
+/// with the SwiGlu loader), in the form of the key's loader.
+///
+/// Sources picks the matrix once per K step: the step lies inside one source,
+/// so every register reads the same binding with the plain vec4 load. A step
+/// that straddles a source boundary (a boundary that is no multiple of `BK`)
+/// reads through `a_load` per element, as the unpipelined loop does.
+fn prefetch_load_a(key: CoopKey) -> String {
+    let (div, index) = if key.a_vec4 {
+        (" / 4u", "(gr * k + gk) / 4u")
+    } else {
+        ("", "gr * k + gk")
+    };
+    match key.loader {
+        LoaderKind::Plain => a_register_loads(key, &|i| guarded_a(key, i, &format!("a[{index}]"))),
+        LoaderKind::SwiGlu => a_register_loads(key, &|i| {
+            let zero = if key.a_vec4 { "vec4<f32>(0.0)" } else { "0.0" };
+            format!(
+                "      pa{i} = {zero};
+      pu{i} = {zero};
+      if (gr < m && gk < k) {{
+        let row = gr * 2u * k + gk;
+        pa{i} = a[row{div}];
+        pu{i} = a[(row + k){div}];
+      }}
+"
+            )
+        }),
+        LoaderKind::Sources { count } => {
+            let spans = source_spans(count);
+            let last = spans.len().saturating_sub(1);
+            let mut chain = String::new();
+            for (s, (name, lo, hi)) in spans.iter().enumerate() {
+                let mut conds = Vec::new();
+                if s > 0 {
+                    conds.push(format!("k0 >= {lo}"));
+                }
+                if s < last {
+                    conds.push(format!("k0 + BK <= {hi}"));
+                }
+                let cond = if conds.is_empty() {
+                    "true".to_string()
+                } else {
+                    conds.join(" && ")
+                };
+                let read = format!("{name}[(gr * ({hi} - {lo}) + gk - {lo}){div}]");
+                chain.push_str(&format!(
+                    "{}if ({cond}) {{\n{}    }}",
+                    if s == 0 { "    " } else { " else " },
+                    a_register_loads(key, &|i| guarded_a(key, i, &read))
+                ));
+            }
+            chain.push_str(&format!(
+                " else {{\n{}    }}\n",
+                a_register_loads(key, &|i| guarded_a(key, i, "a_load(gr, gk)"))
+            ));
+            chain
+        }
+    }
+}
+
+/// The global loads of the K step that starts at `k0` into the prefetch
+/// registers. Nothing here waits for them: the first use is the store of
+/// [`prefetch_store`], after the multiplies. Out-of-range elements load as
+/// zero, as in the plain loader.
+fn prefetch_load(key: CoopKey, k0: &str) -> String {
+    let nt = key.tile.threads();
+    let (bn, bk) = (key.tile.bn, key.tile.bk);
+    let (_, nb) = prefetch_counts(key);
+    let mut s = format!("    {{\n    let k0 = {k0};\n");
+    s.push_str(&prefetch_load_a(key));
     for i in 0..nb {
         let off = i * nt;
         s.push_str(&match (key.b_vec8, key.transposed_b) {
@@ -241,11 +324,19 @@ fn prefetch_store(key: CoopKey, k0: &str, (sa, sb): (&str, &str)) -> String {
     let mut s = format!("    {{\n    let k0 = {k0};\n");
     for i in 0..na {
         let off = i * nt;
+        // The value staged: the register, or for SwiGlu silu(gate) * up.
+        let value = match (key.loader, key.a_vec4) {
+            (LoaderKind::SwiGlu, true) => {
+                format!("pa{i} / (vec4<f32>(1.0) + exp(-pa{i})) * pu{i}")
+            }
+            (LoaderKind::SwiGlu, false) => format!("pa{i} / (1.0 + exp(-pa{i})) * pu{i}"),
+            _ => format!("pa{i}"),
+        };
         s.push_str(&if key.a_vec4 {
             let q = bk / 4;
             format!(
                 "    {{
-      let v = pa{i};
+      let v = {value};
       let idx = li + {off}u;
       let o = (idx / {q}u) * AP + (idx % {q}u) * 4u;
       if (any(!(abs(v) <= vec4<f32>(F16_MAX)))) {{ overflow = true; }}
@@ -260,7 +351,7 @@ fn prefetch_store(key: CoopKey, k0: &str, (sa, sb): (&str, &str)) -> String {
         } else {
             format!(
                 "    {{
-      let v = pa{i};
+      let v = {value};
       let idx = li + {off}u;
       if (!(abs(v) <= F16_MAX)) {{ overflow = true; }}
       {sa}[(idx / BK) * AP + idx % BK] = f16(clamp(v, -F16_MAX, F16_MAX));
@@ -502,5 +593,103 @@ mod tests {
         let loop_end = body.find("if (odd == 1u)").expect("the odd step");
         // Two steps per iteration, one barrier each.
         assert_eq!(body[..loop_end].matches("workgroupBarrier()").count(), 2);
+    }
+
+    /// Every pipelined tile with every fused loader, in each layout and
+    /// staging-load variant, under the plain epilogue.
+    fn fused_keys() -> Vec<CoopKey> {
+        let loaders = [
+            LoaderKind::Sources { count: 2 },
+            LoaderKind::Sources { count: 3 },
+            LoaderKind::Sources { count: 4 },
+            LoaderKind::SwiGlu,
+        ];
+        let mut keys = Vec::new();
+        for loader in loaders {
+            for tile in CoopTile::PIPELINED {
+                for transposed_b in [false, true] {
+                    for a_vec4 in [false, true] {
+                        for b_vec8 in [false, true] {
+                            keys.push(CoopKey {
+                                tile,
+                                transposed_b,
+                                a_vec4,
+                                b_vec8,
+                                loader,
+                                epilogue: EpilogueKind::AlphaBeta,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        keys
+    }
+
+    #[test]
+    fn every_fused_pipelined_kernel_validates() {
+        for key in fused_keys() {
+            let src = source(key);
+            validate(key, &src, naga::valid::Capabilities::empty());
+            validate(
+                key,
+                &immediate_source(&src),
+                naga::valid::Capabilities::IMMEDIATES,
+            );
+        }
+    }
+
+    #[test]
+    fn fused_loaders_run_the_register_prefetch_loop() {
+        for key in fused_keys() {
+            let src = source(key);
+            let start = src
+                .find("for (var p")
+                .or_else(|| src.find("for (var t"))
+                .expect("a K loop");
+            let body = &src[start..];
+            let load = body.find("pa0 = ").expect("a load into pa0");
+            let mul = body.find("coopMultiplyAdd").expect("a multiply");
+            let store = body.find("let v = pa0").expect("a store of pa0");
+            assert!(load < mul && mul < store, "{key:?}");
+            let (na, _) = super::prefetch_counts(key);
+            let swiglu = key.loader == LoaderKind::SwiGlu;
+            assert_eq!(src.contains("var pu0 "), swiglu, "{key:?}");
+            assert_eq!(
+                src.contains(&format!("var pu{} ", na - 1)),
+                swiglu,
+                "{key:?}"
+            );
+            assert!(!src.contains(&format!("var pu{na} ")), "{key:?}");
+        }
+    }
+
+    #[test]
+    fn a_sources_step_reads_one_binding_and_falls_back_across_a_boundary() {
+        let key = |count| CoopKey {
+            tile: CoopTile::T64X64_W32X32_K32_PF,
+            transposed_b: true,
+            a_vec4: true,
+            b_vec8: true,
+            loader: LoaderKind::Sources { count },
+            epilogue: EpilogueKind::AlphaBeta,
+        };
+        let src = source(key(3));
+        let body = &src[src.find("for (var p").expect("the pair loop")..];
+        // One chain over the three sources, then the per-element fallback.
+        assert!(body.contains("if (k0 + BK <= params[2].x) {"));
+        assert!(body.contains("else if (k0 >= params[2].x && k0 + BK <= params[2].y) {"));
+        assert!(body.contains("else if (k0 >= params[2].y) {"));
+        assert!(body.contains("a_load(gr, gk)"));
+        // The loop reads each binding with the plain vec4 index form.
+        for name in ["a", "a1", "a2"] {
+            assert!(body.contains(&format!("= {name}[(gr * (")), "{name}");
+        }
+        // Plain and SwiGlu kernels carry no source chain.
+        let plain = CoopKey {
+            loader: LoaderKind::Plain,
+            ..key(3)
+        };
+        assert!(!source(plain).contains("params[2]"));
     }
 }
