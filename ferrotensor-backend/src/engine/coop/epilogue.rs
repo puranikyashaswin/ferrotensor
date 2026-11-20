@@ -3,9 +3,10 @@
 //! Every epilogue but [`EpilogueKind::AlphaBeta`] is one WGSL function
 //! `ep_store(r, col, acc)` that the fragment loop calls for each element
 //! inside the matrix; the barriers around that loop stay in uniform control
-//! flow, outside the guard, as in the first epilogue. None of them runs with
-//! K split: a split product's slices are plain partial sums that the
-//! reduction pass adds.
+//! flow, outside the guard, as in the first epilogue. With K split none of
+//! them runs in the kernel: its slices are plain partial sums, and the
+//! reduction pass of `fused.rs` adds them and then calls the same `ep_store`
+//! once per element.
 
 /// The epilogue a kernel ends with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

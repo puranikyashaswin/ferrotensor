@@ -16,10 +16,11 @@ use wgpu::{Adapter, BindGroup, CommandEncoder, ComputePipeline, Device, Instance
 /// starts on long sequences without waiting for a sync point.
 const MAX_PENDING_OPS: u32 = 128;
 
-/// Queued dispatches are encoded into a pass once this many are waiting. A
-/// long pass delays GPU work: on an A10G (16 Nov 2026) passes of up to 32
-/// dispatches made SmolLM2-1.7B steps slower than one pass per dispatch.
-const MAX_PASS_DISPATCHES: usize = 8;
+/// Queued dispatches are encoded into a pass once this many are waiting. On
+/// an A10G (20 Nov 2026) a step of SmolLM2-135M ran faster the longer the
+/// pass, up to this many, which is the pending-ops cap: each pass costs host
+/// time in the driver, and a longer pass gave 1.7B no GPU slowdown.
+const MAX_PASS_DISPATCHES: usize = 128;
 
 /// Environment variable that replaces `MAX_PENDING_OPS` when the context is
 /// created (a positive integer), to tune submission on a given GPU.

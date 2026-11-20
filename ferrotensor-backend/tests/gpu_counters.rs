@@ -102,7 +102,7 @@ fn dispatches_sharing_a_pass_see_each_others_writes() {
     // (1 * 2^10 + 3) * 0.5
     assert_eq!(values, vec![513.5; N]);
     assert_eq!(ops.dispatches, 12);
-    assert_eq!(ops.compute_passes, 2, "12 dispatches, at most 8 per pass");
+    assert_eq!(ops.compute_passes, 1, "12 dispatches, at most 128 per pass");
     assert_eq!(ops.submits, 1);
 }
 
@@ -406,4 +406,75 @@ fn bind_group_cache_follows_reused_and_freed_buffers() {
     engine.add(&ctx, &z, &b, &sum);
     assert_eq!(bind_counts(&ctx, &before), (1, 0, 1));
     assert_eq!(read(&ctx, &sum), vec![30.0, 60.0, 90.0, 120.0], "z's data");
+}
+
+/// 100 and 101 rows of 10 floats are 4000 and 4040 bytes, which are the same
+/// size class, so the pool hands a buffer of one to the other.
+const ROWS_A: usize = 100;
+const ROWS_B: usize = 101;
+const COLS: usize = 10;
+
+/// A kernel that takes its sizes from its parameters binds a whole pooled
+/// buffer, so a tensor of another length in the same size class reuses the
+/// group cached for the buffer.
+#[test]
+#[ignore = "needs a GPU"]
+fn whole_buffer_groups_serve_tensors_of_other_lengths() {
+    let ctx = pollster::block_on(WgpuContext::new());
+    let engine = ComputeEngine::new(&ctx);
+    let weight = UnifiedTensor::new(&ctx, &[1.0; COLS], &[COLS]);
+    let src_a = UnifiedTensor::new(&ctx, &[2.0; ROWS_A * COLS], &[ROWS_A * COLS]);
+    let src_b = UnifiedTensor::new(&ctx, &[2.0; ROWS_B * COLS], &[ROWS_B * COLS]);
+
+    let x = UnifiedTensor::empty(&ctx, &[ROWS_A, COLS]);
+    let y = UnifiedTensor::empty(&ctx, &[ROWS_A, COLS]);
+    engine.copy_tensor(&ctx, &src_a, &x, 0);
+    let before = ctx.gpu_counters();
+    engine.rms_norm(&ctx, &x, &weight, &y);
+    assert_eq!(bind_counts(&ctx, &before), (1, 0, 1));
+    let (x_buffer, y_buffer) = (x.buffer().clone(), y.buffer().clone());
+    // The pool gives back the most recently returned buffer first.
+    drop(y);
+    drop(x);
+
+    let x = UnifiedTensor::empty(&ctx, &[ROWS_B, COLS]);
+    let y = UnifiedTensor::empty(&ctx, &[ROWS_B, COLS]);
+    assert!(*x.buffer() == x_buffer && *y.buffer() == y_buffer);
+    engine.copy_tensor(&ctx, &src_b, &x, 0);
+    let before = ctx.gpu_counters();
+    engine.rms_norm(&ctx, &x, &weight, &y);
+    assert_eq!(bind_counts(&ctx, &before), (0, 1, 0), "the cached group");
+    let out = read(&ctx, &y);
+    // 2 / sqrt(mean(2 * 2) + 1e-5), for each of the 101 rows.
+    let want = 2.0 / (4.0f32 + 1e-5).sqrt();
+    for (i, v) in out.iter().take(ROWS_B * COLS).enumerate() {
+        assert!((v - want).abs() < 1e-5, "element {i}: {v} against {want}");
+    }
+}
+
+/// A kernel that bounds its loops by `arrayLength` is bound to its tensors'
+/// own bytes, so the same buffers at another length need a new group, and
+/// the same buffers at the same length reuse theirs.
+#[test]
+#[ignore = "needs a GPU"]
+fn exact_size_groups_follow_the_tensor_length() {
+    let ctx = pollster::block_on(WgpuContext::new());
+    let engine = ComputeEngine::new(&ctx);
+    let [a, b, out] = [(); 3].map(|()| UnifiedTensor::empty(&ctx, &[ROWS_A, COLS]));
+    let before = ctx.gpu_counters();
+    engine.add(&ctx, &a, &b, &out);
+    assert_eq!(bind_counts(&ctx, &before), (1, 0, 1));
+    let buffers = [a.buffer().clone(), b.buffer().clone(), out.buffer().clone()];
+    drop(out);
+    drop(b);
+    drop(a);
+
+    let [a, b, out] = [(); 3].map(|()| UnifiedTensor::empty(&ctx, &[ROWS_B, COLS]));
+    assert!(*a.buffer() == buffers[0] && *b.buffer() == buffers[1] && *out.buffer() == buffers[2]);
+    let before = ctx.gpu_counters();
+    engine.add(&ctx, &a, &b, &out);
+    assert_eq!(bind_counts(&ctx, &before), (1, 0, 1), "a new length");
+    let before = ctx.gpu_counters();
+    engine.add(&ctx, &a, &b, &out);
+    assert_eq!(bind_counts(&ctx, &before), (0, 1, 0), "the same length");
 }
