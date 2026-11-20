@@ -489,7 +489,7 @@ kernel dispatch on the GPU and prints, after the totals, a table of the
 median step sorted by GPU time:
 
 ```text
-profile: kernel timestamps before and after each dispatch, inside passes of up to 8 dispatches
+profile: kernel timestamps before and after each dispatch, inside passes of up to 128 dispatches
 profile: GPU time by kernel in that step
   kernel                                       dispatches       GPU ms   share
   <kernel>                                          <n>         <ms>     <%>
@@ -522,7 +522,7 @@ with `--json` adds a `profile` object: `kernel_timing`, `prefill`
 
 `kernel_timing` says how the timestamps were taken. `inside_passes`
 writes one before and one after each dispatch, inside the usual passes of
-up to 8 dispatches. `pass_boundaries` is for adapters that cannot write
+up to 128 dispatches. `pass_boundaries` is for adapters that cannot write
 timestamps inside a pass (Apple GPUs among them): each dispatch then gets
 its own pass, timed at its start and end, so compute passes and wall
 times differ from a run without `--profile`. It is `null`, with one line

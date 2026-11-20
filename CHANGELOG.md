@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Up to 128 dispatches share a compute pass, up from 8: on an A10G a SmolLM2-135M step at batch 1 × 8 takes 124.6 ms instead of 143.6 ms and 360M takes 143.6 ms instead of 163.7 ms, with 1 to 3% less on the other four cases and the same losses ([measurements](benchmarks/RESULTS.md#passes-of-up-to-128-dispatches-20-november-2026)). `FERROTENSOR_PASS_DISPATCHES` still sets another value.
+
 ## [0.7.0] - 2026-11-19
 
 Two behaviour changes to know before upgrading: `--train-modules layers.N` now matches layer `N` exactly, and `train --resume` with `--max-steps` at or below the saved step now trains nothing (both under Changed). `--q4-weights` is experimental and still fails its quality gate (under Added).
