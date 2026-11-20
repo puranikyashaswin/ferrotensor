@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- A kernel that takes its sizes from its parameters binds the whole of a pooled buffer, so its bind group is reused when the pool hands the buffer to a tensor of another length in the same size class; only the kernels of kernels.wgsl that call `arrayLength` still bind a tensor's exact bytes. The bind group cache keeps 32,768 groups (was 4,096) and drops the oldest when full instead of emptying itself. Results are unchanged.
+
 ## [0.7.0] - 2026-11-19
 
 Two behaviour changes to know before upgrading: `--train-modules layers.N` now matches layer `N` exactly, and `train --resume` with `--max-steps` at or below the saved step now trains nothing (both under Changed). `--q4-weights` is experimental and still fails its quality gate (under Added).
