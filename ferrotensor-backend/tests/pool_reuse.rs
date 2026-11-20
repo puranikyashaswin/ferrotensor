@@ -9,6 +9,7 @@
 
 use ferrotensor_backend::memory::wgpu_buffer_size;
 use ferrotensor_backend::{wgpu, ComputeEngine, UnifiedTensor, WgpuContext};
+use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -150,4 +151,85 @@ fn waiting_for_a_submission_trims_the_idle_buffers_it_used() {
     let mark = ctx.submission_mark();
     ctx.wait_for_submission(mark);
     assert_eq!(ctx.pool.pooled_bytes(), 0);
+}
+
+/// Copies `n` ones into a new pooled tensor of `n` elements.
+fn ones(ctx: &WgpuContext, engine: &ComputeEngine, n: usize) -> UnifiedTensor {
+    let src = UnifiedTensor::new(ctx, &vec![1.0; n], &[n]);
+    let out = UnifiedTensor::empty(ctx, &[n]);
+    engine.copy_tensor(ctx, &src, &out, 0);
+    out
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn a_buffer_larger_than_its_tensor_is_bound_to_the_tensors_bytes() {
+    let ctx = pollster::block_on(WgpuContext::new());
+    let engine = ComputeEngine::new(&ctx);
+
+    // 1,024 and 1,000 elements are 4,096 and 4,000 bytes, one size class.
+    drop(ones(&ctx, &engine, 1024));
+    let created = ctx.pool.buffers_created();
+    let small = ones(&ctx, &engine, 1000);
+    assert_eq!(ctx.pool.buffers_created(), created, "the class's buffer");
+    assert_eq!(small.size_in_bytes(), 4000);
+
+    // The kernel runs 1,024 threads (16 groups of 64) and stops at
+    // `arrayLength`: with the whole buffer bound it would scale the 24
+    // elements past the tensor too.
+    engine.gradient_scale(&ctx, &small, 2.0);
+    drop(small);
+    let whole = UnifiedTensor::empty(&ctx, &[1024]);
+    assert_eq!(ctx.pool.buffers_created(), created, "the same buffer again");
+    let values = pollster::block_on(whole.to_vec(&ctx)).expect("GPU readback");
+    assert_eq!(values.len(), 1024);
+    assert!(values[..1000].iter().all(|&v| v == 2.0), "scaled");
+    assert!(values[1000..].iter().all(|&v| v == 1.0), "past the tensor");
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn buffer_creations_stay_flat_when_the_length_changes_every_step() {
+    let ctx = pollster::block_on(WgpuContext::new());
+    let engine = ComputeEngine::new(&ctx);
+
+    // One step holds a few activations of `len` rows at once, as a forward
+    // pass does, then frees them.
+    let step = |len: usize| {
+        let live = [
+            ones(&ctx, &engine, len * 64),
+            ones(&ctx, &engine, len * 64),
+            ones(&ctx, &engine, len * 256),
+            ones(&ctx, &engine, len * len),
+        ];
+        for tensor in &live {
+            engine.gradient_scale(&ctx, tensor, 1.0);
+        }
+    };
+    let created_over = |lengths: &[usize]| {
+        let before = ctx.pool.buffers_created();
+        for &len in lengths {
+            step(len);
+        }
+        ctx.pool.buffers_created() - before
+    };
+
+    // Warm up on every second length (a class spans about 4% of a length or
+    // more at these sizes), then run every length from 100 to 200 in an
+    // order that changes the size on every step.
+    let warm: Vec<usize> = (100..=200).step_by(2).collect();
+    let created_warm = created_over(&warm);
+    let all: Vec<usize> = (0..=100).map(|i| 100 + (i * 37) % 101).collect();
+    assert_eq!(all.len(), 101);
+    let created_all = created_over(&all);
+    let created_again = created_over(&all);
+    let _ = writeln!(
+        std::io::stderr(),
+        "buffers created: {created_warm} over {} warm-up steps, {created_all} over {} steps \
+         of new lengths, {created_again} over the same steps again",
+        warm.len(),
+        all.len(),
+    );
+    assert_eq!(created_all, 0, "every new length is in a class seen before");
+    assert_eq!(created_again, 0);
 }

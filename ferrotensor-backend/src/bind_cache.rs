@@ -19,16 +19,18 @@ use wgpu::{BindGroup, Buffer, ComputePipeline};
 /// never let go.
 const MAX_GROUPS: usize = 4096;
 
-/// What a cached group binds: a pipeline, and the buffer at each binding.
+/// What a cached group binds: a pipeline, and the buffer at each binding with
+/// the bytes of it that are bound (0 for the whole buffer).
 #[derive(Clone)]
 pub(crate) struct BindKey {
     pipeline: Arc<ComputePipeline>,
-    buffers: Vec<(u32, Buffer)>,
+    buffers: Vec<(u32, Buffer, u64)>,
 }
 
 impl BindKey {
-    /// The key for binding `buffers` (binding index, buffer) to `pipeline`.
-    pub(crate) fn new(pipeline: &Arc<ComputePipeline>, buffers: Vec<(u32, Buffer)>) -> Self {
+    /// The key for binding `buffers` (binding index, buffer, bound bytes) to
+    /// `pipeline`.
+    pub(crate) fn new(pipeline: &Arc<ComputePipeline>, buffers: Vec<(u32, Buffer, u64)>) -> Self {
         Self {
             pipeline: Arc::clone(pipeline),
             buffers,
@@ -36,7 +38,7 @@ impl BindKey {
     }
 
     fn binds(&self, buffer: &Buffer) -> bool {
-        self.buffers.iter().any(|(_, b)| b == buffer)
+        self.buffers.iter().any(|(_, b, _)| b == buffer)
     }
 }
 
@@ -86,7 +88,7 @@ impl CacheState {
                 self.groups.remove(&hash);
             }
         }
-        for (_, buffer) in &key.buffers {
+        for (_, buffer, _) in &key.buffers {
             if buffer == skip {
                 continue;
             }
@@ -144,7 +146,7 @@ impl BindGroupCache {
             *state = CacheState::default();
         }
         let group = make();
-        for (_, buffer) in &key.buffers {
+        for (_, buffer, _) in &key.buffers {
             let keys = state.by_buffer.entry(hash_of(buffer)).or_default();
             if !keys.contains(&key) {
                 keys.push(key.clone());

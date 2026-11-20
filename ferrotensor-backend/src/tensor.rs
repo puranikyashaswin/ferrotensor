@@ -124,10 +124,12 @@ impl TensorData {
         };
         // A buffer without a pool is dropped with the tensor; a pooled one
         // is kept or dropped by the pool, which counts it either way.
+        // The allocation is the buffer's own size, which a pooled buffer can
+        // have rounded up to its size class.
         let memory =
             context
                 .memory()
-                .allocate(dtype, shape, logical, size_in_bytes, pool.is_none());
+                .allocate(dtype, shape, logical, buffer.size(), pool.is_none());
         Self {
             buffer,
             size_in_bytes,
@@ -144,7 +146,7 @@ impl Drop for TensorData {
         // (or, past its cap, as awaiting GPU).
         drop(self.memory.take());
         match &self.pool {
-            Some(pool) => pool.return_buffer(self.size_in_bytes, self.buffer.clone()),
+            Some(pool) => pool.return_buffer(self.buffer.size(), self.buffer.clone()),
             None => self.bind_groups.evict(&self.buffer),
         }
     }

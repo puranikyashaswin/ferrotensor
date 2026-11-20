@@ -538,29 +538,39 @@ impl ComputeEngine {
         let mut cacheable = true;
         let mut bound = Vec::with_capacity(entries.len());
         for &(binding, arg) in entries {
-            let buffer = match arg.arg() {
-                ArgRef::Buffer(buffer) => buffer,
+            // A pooled buffer larger than its tensor is bound to the tensor's
+            // bytes only, as kernels bound their loops by `arrayLength`;
+            // size 0 binds the whole buffer.
+            let (buffer, size) = match arg.arg() {
+                ArgRef::Buffer(buffer) => (buffer, ctx.pool.bound_size(buffer).unwrap_or(0)),
                 ArgRef::Params(params) if self.immediates => {
                     immediates = Some(params.bytes.clone());
                     continue;
                 }
                 ArgRef::Params(params) => {
                     cacheable = false;
-                    params.buffer(ctx)
+                    (params.buffer(ctx), 0)
                 }
                 ArgRef::Scratch(buffer) => {
                     cacheable = false;
-                    buffer
+                    (buffer, 0)
                 }
             };
-            bound.push((binding, buffer));
+            bound.push((binding, buffer, size));
         }
         let create = || {
             let entries: Vec<wgpu::BindGroupEntry<'_>> = bound
                 .iter()
-                .map(|&(binding, buffer)| wgpu::BindGroupEntry {
+                .map(|&(binding, buffer, size)| wgpu::BindGroupEntry {
                     binding,
-                    resource: buffer.as_entire_binding(),
+                    resource: match wgpu::BufferSize::new(size) {
+                        Some(size) => wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer,
+                            offset: 0,
+                            size: Some(size),
+                        }),
+                        None => buffer.as_entire_binding(),
+                    },
                 })
                 .collect();
             ctx.counters.bind_groups.fetch_add(1, Relaxed);
@@ -571,7 +581,9 @@ impl ComputeEngine {
             })
         };
         let bind_group = if cacheable {
-            let buffers = bound.iter().map(|&(b, buffer)| (b, buffer.clone()));
+            let buffers = bound
+                .iter()
+                .map(|&(b, buffer, size)| (b, buffer.clone(), size));
             let key = BindKey::new(&kernel.pipeline, buffers.collect());
             let (group, hit) = ctx.pool.bind_groups().get_or_create(key, create);
             let counter = if hit {
