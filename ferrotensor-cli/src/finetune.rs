@@ -1,10 +1,11 @@
 //! `ferrotensor finetune`: `train` with the memory settings `plan` picks for
 //! this machine, for each setting not given on the command line.
 
-use crate::plan::{self, BudgetArgs, Checkpointing, Pinned, Precision, TrainConfig};
+use crate::plan::{self, BudgetArgs, Checkpointing, LengthProfile, Pinned, Precision, TrainConfig};
 use crate::{unmet, Result, TrainArgs, TrainSummary};
 use clap::parser::ValueSource;
 use clap::{ArgMatches, Args};
+use ferrotensor_loader::Tokenizer;
 use serde::Serialize;
 use serde_json::Value;
 use std::num::NonZeroUsize;
@@ -102,6 +103,27 @@ fn apply_plan(args: &mut TrainArgs, user_set: UserSet, config: &TrainConfig) -> 
     ]
 }
 
+/// Token counts of the examples `train` will load, for the memory estimate;
+/// `None` when the data is empty.
+///
+/// # Errors
+///
+/// When the model has no readable tokenizer or the dataset does not load.
+fn measure_lengths(args: &TrainArgs) -> Result<Option<LengthProfile>> {
+    let dir = crate::resolve_model(&args.model.model)?;
+    let tok_path = dir.join("tokenizer.json");
+    let tokenizer = Tokenizer::from_file(&tok_path)
+        .map_err(|e| format!("cannot load {}: {e}", tok_path.display()))?;
+    let dataset = crate::load_dataset(&args.data, &tokenizer)?;
+    Ok(LengthProfile::new(
+        dataset
+            .examples()
+            .iter()
+            .map(|example| example.input_ids.len())
+            .collect(),
+    ))
+}
+
 /// What `finetune --json` prints: the plan, then the `train` summary.
 #[derive(Serialize, Debug)]
 struct FinetuneSummary {
@@ -138,12 +160,25 @@ pub fn run(args: FinetuneArgs, user_set: UserSet) -> Result<()> {
             (_, true) => (Precision::F32, "user"),
             _ => (Precision::F16, "default"),
         };
+    // Training pads each micro-batch to its longest sequence, so the memory
+    // follows the data, not --seq-len. A dataset that cannot be read here is
+    // reported by `train` below; the plan then assumes full-length rows.
+    let lengths = match measure_lengths(&train_args) {
+        Ok(profile) => profile,
+        Err(e) => {
+            eprintln!(
+                "finetune: cannot measure the dataset lengths ({e}); planning for --seq-len rows"
+            );
+            None
+        }
+    };
     let planned = plan::plan_training(
         &budget,
         &train_args.model.model,
         precision,
         train_args.lora_rank,
         pinned(&train_args, user_set)?,
+        lengths.as_ref(),
     )?;
     for line in &planned.lines {
         eprintln!("{line}");
@@ -227,6 +262,7 @@ mod tests {
             batch_size,
             grad_accum: plan::grad_accum_for(batch_size),
             seq_len,
+            padded_len: seq_len,
             lora_rank: 8,
             precision: Precision::F16,
             checkpointing,
