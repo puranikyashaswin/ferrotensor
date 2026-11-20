@@ -14,7 +14,8 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
 use ferrotensor_backend::{
-    AdamParams, AttentionOptions, ComputeEngine, DType, Epilogue, UnifiedTensor, WgpuContext,
+    AdamParams, AttentionOptions, ComputeEngine, DType, Epilogue, FlatLayout, UnifiedTensor,
+    WgpuContext,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -846,6 +847,32 @@ impl AutogradNode for EmbeddingNode {
     }
 }
 
+/// Backward node of [`Tensor::embedding_gpu`].
+pub struct GpuEmbeddingNode {
+    /// Table `[vocab, hidden]`.
+    pub table: Tensor,
+    /// The looked-up id of each output row, in order.
+    pub ids: Vec<u32>,
+}
+impl AutogradNode for GpuEmbeddingNode {
+    fn inputs(&self) -> Vec<Tensor> {
+        vec![self.table.clone()]
+    }
+    /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
+    fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
+        let ctx = &self.table.ctx;
+        // The ids are known on the host, so the index of which positions
+        // feed which row is built here and the gradient never comes back.
+        let (index, slots) =
+            ComputeEngine::embedding_scatter_index(&self.ids, self.table.data.shape[0]);
+        let index_bytes: Vec<u8> = index.iter().flat_map(|i| i.to_le_bytes()).collect();
+        let index_buf = UnifiedTensor::from_bytes(ctx, &index_bytes, &[index.len()]);
+        let table_grad = UnifiedTensor::empty(ctx, &self.table.data.shape);
+        engine.embedding_scatter(ctx, grad, &index_buf, slots, &table_grad);
+        vec![table_grad]
+    }
+}
+
 /// Backward node of [`Tensor::mse_loss`].
 pub struct MSELossNode {
     /// Predictions.
@@ -1415,6 +1442,39 @@ impl Tensor {
         Tensor::with_creator(table.ctx.clone(), out_data, node)
     }
 
+    /// [`embedding`](Self::embedding) gathered on the GPU from `table`
+    /// itself, for a table that trains: it needs no host copy, so no lookup
+    /// waits for the GPU to read the table back, and the gradient is summed
+    /// on the GPU too. Same values as [`embedding`](Self::embedding); a table
+    /// that is not `f32` or an empty lookup takes the host path.
+    #[expect(
+        clippy::expect_used,
+        reason = "a readback fails only on device loss, and the caller has no error path"
+    )]
+    pub fn embedding_gpu(table: &Tensor, rows: &[&[u32]], engine: &ComputeEngine) -> Tensor {
+        let ids: Vec<u32> = rows.iter().flat_map(|r| r.iter().copied()).collect();
+        let seq_len = rows.first().map_or(0, |r| r.len());
+        let (vocab, hidden) = (table.data.shape[0], table.data.shape[1]);
+        if table.data.dtype != DType::FP32 || ids.is_empty() || vocab * hidden == 0 {
+            let host = pollster::block_on(table.data.to_vec(&table.ctx))
+                .expect("GPU device lost during readback");
+            return Self::embedding(table, &host, rows);
+        }
+        let ctx = &table.ctx;
+        let id_bytes: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
+        let id_buf = UnifiedTensor::from_bytes(ctx, &id_bytes, &[ids.len()]);
+        let out_data = UnifiedTensor::empty(ctx, &[rows.len(), seq_len, hidden]);
+        engine.embedding_gather(ctx, &table.data, &id_buf, &out_data);
+        if !table.requires_grad {
+            return Tensor::frozen(ctx.clone(), out_data);
+        }
+        let node = Arc::new(GpuEmbeddingNode {
+            table: table.clone(),
+            ids,
+        });
+        Tensor::with_creator(ctx.clone(), out_data, node)
+    }
+
     /// Row `token_index` of `[seq, vocab]` logits.
     #[expect(
         clippy::expect_used,
@@ -1633,6 +1693,17 @@ pub trait Optimizer: Send + Sync {
     fn step(&mut self, params: &[Tensor]);
     /// Clear the gradients of `params`.
     fn zero_grad(&mut self, params: &[Tensor]);
+    /// Whether [`step_flat`](Optimizer::step_flat) works for this optimizer.
+    fn supports_flat_step(&self) -> bool {
+        false
+    }
+    /// Update `params` from `grads`, their gradients packed into one buffer
+    /// in the order of the parameters that hold a gradient. The step reads
+    /// `grads`, not the gradients the parameters hold. The default says the
+    /// optimizer has no flat step.
+    fn step_flat(&mut self, _params: &[Tensor], _grads: &FlatGrads) -> Result<(), String> {
+        Err("this optimizer has no flat step".to_string())
+    }
     /// Set the learning rate used by the next [`step`](Optimizer::step)
     /// (for schedules). The default ignores it.
     fn set_lr(&mut self, _lr: f32) {}
@@ -1658,6 +1729,51 @@ pub trait Optimizer: Send + Sync {
         _state: &OptimizerCheckpoint,
     ) -> Result<OptimizerLoad, String> {
         Err("this optimizer cannot restore saved state".to_string())
+    }
+}
+
+/// The gradients of a parameter list packed into one buffer, so the norm, the
+/// clip and the optimizer step each run as one dispatch over all of them.
+pub struct FlatGrads {
+    /// Where each gradient starts in [`data`](Self::data).
+    pub layout: FlatLayout,
+    /// The packed gradients. The gaps between them stay zero.
+    pub data: UnifiedTensor,
+}
+
+impl FlatGrads {
+    /// A zeroed buffer for gradients of `sizes` elements, or `None` when they
+    /// would not fit one buffer.
+    pub fn new(ctx: &WgpuContext, sizes: &[usize]) -> Option<Self> {
+        let layout = FlatLayout::new(sizes)?;
+        let data = UnifiedTensor::zeros_on_gpu(ctx, &[layout.total()]);
+        Some(Self { layout, data })
+    }
+
+    /// Copies `grads` into the buffer, one copy each.
+    ///
+    /// # Errors
+    ///
+    /// When `grads` do not have the sizes the buffer was made for.
+    pub fn pack(
+        &self,
+        ctx: &WgpuContext,
+        engine: &ComputeEngine,
+        grads: &[UnifiedTensor],
+    ) -> Result<(), String> {
+        let sizes: Vec<usize> = grads.iter().map(|g| g.shape.iter().product()).collect();
+        if sizes != self.layout.sizes() {
+            return Err("the gradients do not match the flat layout".to_string());
+        }
+        for (i, grad) in grads.iter().enumerate() {
+            if grad.dtype != DType::FP32 {
+                return Err("flat gradients must be f32".to_string());
+            }
+            if sizes[i] > 0 {
+                engine.copy_into_flat(ctx, grad, &self.data, self.layout.offset(i));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1734,6 +1850,21 @@ pub struct AdamW {
     pub t: f32,
     m_states: HashMap<usize, UnifiedTensor>,
     v_states: HashMap<usize, UnifiedTensor>,
+    /// While [`step_flat`](Optimizer::step_flat) is in use, the moments of
+    /// the parameters it covers live here and not in the maps above.
+    flat: Option<FlatState>,
+}
+
+/// The moments of a parameter list packed into flat buffers, and a flat
+/// buffer for the weights the update runs on.
+struct FlatState {
+    ctx: Arc<WgpuContext>,
+    /// Address of each parameter's data, in order.
+    ptrs: Vec<usize>,
+    shapes: Vec<Vec<usize>>,
+    layout: FlatLayout,
+    m: UnifiedTensor,
+    v: UnifiedTensor,
 }
 
 impl AdamW {
@@ -1749,6 +1880,7 @@ impl AdamW {
             t: 0.0,
             m_states: HashMap::new(),
             v_states: HashMap::new(),
+            flat: None,
         }
     }
 
@@ -1758,6 +1890,7 @@ impl AdamW {
     }
 
     fn apply_step(&mut self, params: &[Tensor]) {
+        self.spill_flat();
         self.t += 1.0;
         let p = AdamParams {
             lr: self.lr,
@@ -1789,6 +1922,109 @@ impl AdamW {
         }
     }
 
+    /// Moves the moments out of the flat buffers into one tensor per
+    /// parameter, which is where the per-tensor step and the checkpoint
+    /// code expect them.
+    fn spill_flat(&mut self) {
+        let Some(flat) = self.flat.take() else {
+            return;
+        };
+        for (i, key) in flat.ptrs.iter().enumerate() {
+            let offset = flat.layout.offset(i);
+            let Some(shape) = flat.shapes.get(i) else {
+                continue;
+            };
+            let m = UnifiedTensor::empty(&flat.ctx, shape);
+            let v = UnifiedTensor::empty(&flat.ctx, shape);
+            self.engine.copy_from_flat(&flat.ctx, &flat.m, offset, &m);
+            self.engine.copy_from_flat(&flat.ctx, &flat.v, offset, &v);
+            self.m_states.insert(*key, m);
+            self.v_states.insert(*key, v);
+        }
+    }
+
+    /// Makes `self.flat` cover `ts` in `layout`, moving in the moments the
+    /// per-tensor maps hold for them.
+    fn ensure_flat(&mut self, ts: &[&Tensor], layout: &FlatLayout, ctx: &Arc<WgpuContext>) {
+        let ptrs: Vec<usize> = ts.iter().map(|p| Arc::as_ptr(&p.data) as usize).collect();
+        if self
+            .flat
+            .as_ref()
+            .is_some_and(|f| f.ptrs == ptrs && f.layout == *layout)
+        {
+            return;
+        }
+        self.spill_flat();
+        let total = [layout.total()];
+        let m = UnifiedTensor::zeros_on_gpu(ctx, &total);
+        let v = UnifiedTensor::zeros_on_gpu(ctx, &total);
+        for (i, key) in ptrs.iter().enumerate() {
+            if let Some(old) = self.m_states.remove(key) {
+                self.engine.copy_into_flat(ctx, &old, &m, layout.offset(i));
+            }
+            if let Some(old) = self.v_states.remove(key) {
+                self.engine.copy_into_flat(ctx, &old, &v, layout.offset(i));
+            }
+        }
+        self.flat = Some(FlatState {
+            ctx: Arc::clone(ctx),
+            ptrs,
+            shapes: ts.iter().map(|p| p.data.shape.clone()).collect(),
+            layout: layout.clone(),
+            m,
+            v,
+        });
+    }
+
+    /// One AdamW step over every parameter at once: the weights are copied
+    /// into a temporary buffer, updated by one dispatch against `grads` and the
+    /// flat moments, and copied back.
+    fn apply_flat_step(&mut self, params: &[Tensor], grads: &FlatGrads) -> Result<(), String> {
+        let ts: Vec<&Tensor> = params
+            .iter()
+            .filter(|p| p.grad.borrow().is_some())
+            .collect();
+        let sizes: Vec<usize> = ts.iter().map(|p| p.data.shape.iter().product()).collect();
+        if sizes != grads.layout.sizes() {
+            return Err("the flat gradients do not match the parameters".to_string());
+        }
+        if ts.iter().any(|p| p.data.dtype != DType::FP32) {
+            return Err("a flat step needs f32 parameters".to_string());
+        }
+        let Some(first) = ts.first() else {
+            return Ok(());
+        };
+        let ctx = Arc::clone(&first.ctx);
+        self.t += 1.0;
+        let p = AdamParams {
+            lr: self.lr,
+            beta1: self.beta1,
+            beta2: self.beta2,
+            eps: self.eps,
+            weight_decay: self.weight_decay,
+            t: self.t,
+            _pad: [0.0; 2],
+        };
+        self.ensure_flat(&ts, &grads.layout, &ctx);
+        let Some(flat) = self.flat.as_ref() else {
+            return Err("the flat optimizer state is missing".to_string());
+        };
+        // The weights only need the buffer for this step, so it is made
+        // here and freed after, and does not stay live between steps.
+        let weights = UnifiedTensor::zeros_on_gpu(&ctx, &[grads.layout.total()]);
+        for (i, param) in ts.iter().enumerate() {
+            self.engine
+                .copy_into_flat(&ctx, &param.data, &weights, grads.layout.offset(i));
+        }
+        self.engine
+            .adamw_update(&ctx, &weights, &grads.data, &flat.m, &flat.v, &p);
+        for (i, param) in ts.iter().enumerate() {
+            self.engine
+                .copy_from_flat(&ctx, &weights, grads.layout.offset(i), &param.data);
+        }
+        Ok(())
+    }
+
     /// Clear the gradients of `params`.
     pub fn zero_grad(&mut self, params: &[Tensor]) {
         self.clear_grads(params);
@@ -1804,6 +2040,12 @@ impl AdamW {
 impl Optimizer for AdamW {
     fn step(&mut self, params: &[Tensor]) {
         self.apply_step(params);
+    }
+    fn supports_flat_step(&self) -> bool {
+        true
+    }
+    fn step_flat(&mut self, params: &[Tensor], grads: &FlatGrads) -> Result<(), String> {
+        self.apply_flat_step(params, grads)
     }
     fn set_lr(&mut self, lr: f32) {
         self.lr = lr;
@@ -1826,30 +2068,57 @@ impl Optimizer for AdamW {
             .map(|(name, tensor)| (Arc::as_ptr(&tensor.data) as usize, name.clone()))
             .collect();
 
-        let mut m_states = HashMap::new();
-        let mut v_states = HashMap::new();
-        for (ptr, state) in &self.m_states {
-            if let Some(name) = names_by_ptr.get(ptr) {
-                m_states.insert(
-                    name.clone(),
-                    OptimizerTensorState {
-                        shape: state.shape.clone(),
-                        data: pollster::block_on(state.to_vec(ctx))
-                            .expect("GPU device lost during readback"),
-                    },
-                );
+        let mut m_host: Vec<(usize, Vec<usize>, Vec<f32>)> = self
+            .m_states
+            .iter()
+            .map(|(ptr, s)| {
+                (
+                    *ptr,
+                    s.shape.clone(),
+                    pollster::block_on(s.to_vec(ctx)).expect("GPU device lost during readback"),
+                )
+            })
+            .collect();
+        let mut v_host: Vec<(usize, Vec<usize>, Vec<f32>)> = self
+            .v_states
+            .iter()
+            .map(|(ptr, s)| {
+                (
+                    *ptr,
+                    s.shape.clone(),
+                    pollster::block_on(s.to_vec(ctx)).expect("GPU device lost during readback"),
+                )
+            })
+            .collect();
+        if let Some(flat) = &self.flat {
+            let m_all =
+                pollster::block_on(flat.m.to_vec(ctx)).expect("GPU device lost during readback");
+            let v_all =
+                pollster::block_on(flat.v.to_vec(ctx)).expect("GPU device lost during readback");
+            for (i, ptr) in flat.ptrs.iter().enumerate() {
+                let start = flat.layout.offset(i);
+                let end = start + flat.layout.sizes().get(i).copied().unwrap_or(0);
+                if let (Some(shape), Some(m), Some(v)) = (
+                    flat.shapes.get(i),
+                    m_all.get(start..end),
+                    v_all.get(start..end),
+                ) {
+                    m_host.push((*ptr, shape.clone(), m.to_vec()));
+                    v_host.push((*ptr, shape.clone(), v.to_vec()));
+                }
             }
         }
-        for (ptr, state) in &self.v_states {
-            if let Some(name) = names_by_ptr.get(ptr) {
-                v_states.insert(
-                    name.clone(),
-                    OptimizerTensorState {
-                        shape: state.shape.clone(),
-                        data: pollster::block_on(state.to_vec(ctx))
-                            .expect("GPU device lost during readback"),
-                    },
-                );
+
+        let mut m_states = HashMap::new();
+        let mut v_states = HashMap::new();
+        for (ptr, shape, data) in m_host {
+            if let Some(name) = names_by_ptr.get(&ptr) {
+                m_states.insert(name.clone(), OptimizerTensorState { shape, data });
+            }
+        }
+        for (ptr, shape, data) in v_host {
+            if let Some(name) = names_by_ptr.get(&ptr) {
+                v_states.insert(name.clone(), OptimizerTensorState { shape, data });
             }
         }
 
@@ -1894,6 +2163,7 @@ impl Optimizer for AdamW {
         self.t = state.t;
         self.m_states.clear();
         self.v_states.clear();
+        self.flat = None;
         for name in matched {
             let key = Arc::as_ptr(&named_params[name].data) as usize;
             let (m, v) = (&state.m_states[name], &state.v_states[name]);
