@@ -14,9 +14,10 @@
 //! weights as a Hugging Face checkpoint, and [`classify`] fine-tunes a decoder with LoRA as a sequence
 //! classifier ([`ClassifierTrainer`]).
 
-use ferrotensor_autograd::{AutogradNode, LRScheduler, Optimizer, Tensor};
+use ferrotensor_autograd::{AutogradNode, FlatGrads, LRScheduler, Optimizer, Tensor};
 use ferrotensor_backend::{
-    ComputeEngine, MemoryCategory, UnifiedTensor, WgpuContext, MASKED_CE_SKIP, SUM_SQUARES_CHUNK,
+    ComputeEngine, DType, MemoryCategory, UnifiedTensor, WgpuContext, MASKED_CE_SKIP,
+    SUM_SQUARES_CHUNK,
 };
 use ferrotensor_graph::lfm::Lfm2Model;
 use std::sync::Arc;
@@ -443,6 +444,22 @@ impl Trainer {
         self.deferred.drain(..read).map(|d| d.stats).collect()
     }
 
+    /// Packs `grads` into one buffer when the optimizer can step from one and
+    /// they fit in one; the buffer lives for one step.
+    fn pack_flat_grads(&self, grads: &[UnifiedTensor]) -> Option<FlatGrads> {
+        if grads.len() < 2
+            || !self.optimizer.supports_flat_step()
+            || grads.iter().any(|g| g.dtype != DType::FP32)
+        {
+            return None;
+        }
+        let sizes: Vec<usize> = grads.iter().map(|g| g.shape.iter().product()).collect();
+        let _tag = self.ctx.memory().scope(MemoryCategory::OptimizerState);
+        let packed = FlatGrads::new(&self.ctx, &sizes)?;
+        packed.pack(&self.ctx, &self.engine, grads).ok()?;
+        Some(packed)
+    }
+
     /// Sync, unscale, clip and apply the accumulated gradients.
     fn apply_gradients(
         &mut self,
@@ -471,7 +488,11 @@ impl Trainer {
 
         // One readback serves the scaler and the clip: the scaled norm tells
         // whether anything overflowed, and the norm over S is the true norm.
-        let scaled_norm = global_grad_norm(&grads, &self.ctx, &self.engine);
+        let packed = self.pack_flat_grads(&grads);
+        let scaled_norm = match &packed {
+            Some(packed) => flat_grad_norm(packed, &self.ctx, &self.engine),
+            None => global_grad_norm(&grads, &self.ctx, &self.engine),
+        };
         let unscale = match self.scaler.as_mut() {
             Some(scaler) => scaler.unscale_factor(scaled_norm),
             None => scaled_norm.is_finite().then_some(1.0),
@@ -488,8 +509,16 @@ impl Trainer {
         };
         let factor = unscale * clip;
         if factor != 1.0 {
-            for grad in &grads {
-                self.engine.clip_grad_by_norm(&self.ctx, grad, factor);
+            match &packed {
+                Some(packed) => {
+                    self.engine
+                        .clip_grad_by_norm(&self.ctx, &packed.data, factor);
+                }
+                None => {
+                    for grad in &grads {
+                        self.engine.clip_grad_by_norm(&self.ctx, grad, factor);
+                    }
+                }
             }
         }
 
@@ -503,7 +532,14 @@ impl Trainer {
         }
         {
             let _tag = self.ctx.memory().scope(MemoryCategory::OptimizerState);
-            self.optimizer.step(train_params);
+            let stepped = match &packed {
+                Some(packed) => self.optimizer.step_flat(train_params, packed),
+                None => {
+                    self.optimizer.step(train_params);
+                    Ok(())
+                }
+            };
+            stepped.map_err(TrainError)?;
         }
         self.optimizer_step_count += 1;
         stats.optimizer_step = true;
@@ -636,6 +672,27 @@ pub(crate) fn global_grad_norm(
     }
     let sum_sq: f64 = pollster::block_on(partials.to_vec(ctx))
         .expect("GPU device lost during readback")
+        .iter()
+        .map(|&x| x as f64)
+        .sum();
+    sum_sq.sqrt() as f32
+}
+
+/// [`global_grad_norm`] over gradients packed into one buffer: one dispatch.
+/// Each gradient starts on a chunk boundary, so the partial sums are the same
+/// as the per-tensor ones and so is the norm.
+pub(crate) fn flat_grad_norm(
+    packed_grads: &FlatGrads,
+    ctx: &WgpuContext,
+    engine: &ComputeEngine,
+) -> f32 {
+    let chunks = packed_grads.layout.total() / SUM_SQUARES_CHUNK;
+    if chunks == 0 {
+        return 0.0;
+    }
+    let partials = UnifiedTensor::empty(ctx, &[chunks]);
+    engine.sum_squares_partial(ctx, &packed_grads.data, &partials, 0);
+    let sum_sq: f64 = pollster::block_on(partials.to_vec(ctx))
         .iter()
         .map(|&x| x as f64)
         .sum();

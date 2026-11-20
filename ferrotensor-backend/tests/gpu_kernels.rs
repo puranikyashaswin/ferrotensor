@@ -2933,3 +2933,65 @@ fn transposed_a_matmul_accumulates_into_out() {
         assert_eq!(bits(&got), bits(&read(&sum)), "aT@b {m}x{k}x{n}");
     }
 }
+
+/// The GPU embedding lookup and its gradient against the host: rows copied
+/// exactly, zeros for ids outside the table, and each table row's gradient
+/// summed in position order, so both match bit for bit. 300 x 70 spans many
+/// workgroups, and 70 does not divide 64.
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn embedding_gather_and_scatter_match_the_host_bit_for_bit() {
+    let g = gpu();
+    let (vocab, hidden) = (300usize, 70usize);
+    let table = rand_vec(vocab * hidden, 51);
+    // Repeated ids, so rows sum several positions, and ids past the table.
+    let ids: Vec<u32> = (0..192u32).map(|p| (p * 37 + p / 5) % 330).collect();
+    let n = ids.len();
+    let id_buf = UnifiedTensor::from_bytes(&g.ctx, bytemuck::cast_slice(&ids), &[n]);
+    let out = UnifiedTensor::empty(&g.ctx, &[n, hidden]);
+    g.engine
+        .embedding_gather(&g.ctx, &upload(&table, &[vocab, hidden]), &id_buf, &out);
+    let mut want = Vec::with_capacity(n * hidden);
+    for &id in &ids {
+        let start = id as usize * hidden;
+        match table.get(start..start + hidden) {
+            Some(row) => want.extend_from_slice(row),
+            None => want.extend(std::iter::repeat_n(0.0, hidden)),
+        }
+    }
+    assert!(ids.iter().any(|&id| id as usize >= vocab));
+    assert_eq!(bits(&read(&out)), bits(&want), "gather");
+
+    let grad = rand_vec(n * hidden, 52);
+    let mut want = vec![0.0f32; vocab * hidden];
+    for (&id, row_grad) in ids.iter().zip(grad.chunks_exact(hidden)) {
+        let start = id as usize * hidden;
+        if let Some(row) = want.get_mut(start..start + hidden) {
+            for (sum, g) in row.iter_mut().zip(row_grad) {
+                *sum += g;
+            }
+        }
+    }
+    let (index, slots) = ComputeEngine::embedding_scatter_index(&ids, vocab);
+    let index_buf = UnifiedTensor::from_bytes(&g.ctx, bytemuck::cast_slice(&index), &[index.len()]);
+    let table_grad = UnifiedTensor::empty(&g.ctx, &[vocab, hidden]);
+    g.engine.embedding_scatter(
+        &g.ctx,
+        &upload(&grad, &[n, hidden]),
+        &index_buf,
+        slots,
+        &table_grad,
+    );
+    assert_eq!(bits(&read(&table_grad)), bits(&want), "scatter");
+}
+
+/// The scatter index of ids [2, 0, 2, 9, 0, 2] in a 4-row table: row 2 is
+/// slot 0 (positions 0, 2, 5), row 0 slot 1 (positions 1, 4), rows 1 and 3
+/// and the id 9 have no slot.
+#[test]
+fn embedding_scatter_index_groups_positions_by_row() {
+    let (index, slots) = ComputeEngine::embedding_scatter_index(&[2, 0, 2, 9, 0, 2], 4);
+    let none = u32::MAX;
+    assert_eq!(slots, 2);
+    assert_eq!(index, [1, none, 0, none, 0, 3, 5, 0, 2, 5, 1, 4]);
+}
