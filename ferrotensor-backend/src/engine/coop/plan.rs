@@ -183,9 +183,54 @@ pub(super) fn grid_fits(tile: CoopTile, m: u32, n: u32, split: u32) -> bool {
 /// [`MIN_STEPS_PER_SPLIT`] steps). The first kernel's tiles stand in on a
 /// device that fits none of the list.
 pub(super) fn plan(
+    dims: (u32, u32, u32),
+    transposed_b: bool,
+    target: (u32, bool),
+    fits: impl Fn(CoopTile) -> bool,
+) -> Option<CoopConfig> {
+    let (_, k, n) = dims;
+    let in_step_rule = target.1 && STEP_RULE.contains(&(transposed_b, k, n));
+    let small: &[CoopTile] = if in_step_rule {
+        &STEP_TILES
+    } else {
+        &SMALL_M_TILES
+    };
+    plan_with(dims, transposed_b, target, small, fits)
+}
+
+/// Weight elements (`k * n`) from which a fused product of up to 256 rows
+/// runs [`STEP_TILES`], the tiles of the 1.7B base products (2048 x 2048 and
+/// up). Its fused N holds the LoRA `A` columns, so it is in no [`STEP_RULE`]
+/// row.
+const FUSED_STEP_WEIGHTS: u64 = 2048 * 2048;
+
+/// The configuration a fused product runs with: as [`plan`], but a product
+/// of up to 256 rows on a weight of [`FUSED_STEP_WEIGHTS`] elements or more
+/// takes [`STEP_TILES`], which no [`STEP_RULE`] row names for it, and its K
+/// split stands (the fused kernels run the split with the epilogue in the
+/// reduction).
+pub(super) fn plan_fused(
+    dims: (u32, u32, u32),
+    transposed_b: bool,
+    target: (u32, bool),
+    fits: impl Fn(CoopTile) -> bool,
+) -> Option<CoopConfig> {
+    let (_, k, n) = dims;
+    let large_weight = u64::from(k) * u64::from(n) >= FUSED_STEP_WEIGHTS;
+    let small: &[CoopTile] = if large_weight {
+        &STEP_TILES
+    } else {
+        &SMALL_M_TILES
+    };
+    plan_with(dims, transposed_b, target, small, fits)
+}
+
+/// [`plan`] with `small` as the tile list of products of up to 256 rows.
+fn plan_with(
     (m, k, n): (u32, u32, u32),
     transposed_b: bool,
     (target, use_tuned): (u32, bool),
+    small: &[CoopTile],
     fits: impl Fn(CoopTile) -> bool,
 ) -> Option<CoopConfig> {
     let measured = tuned(m, transposed_b, k, n)
@@ -193,14 +238,7 @@ pub(super) fn plan(
     if measured.is_some() {
         return measured;
     }
-    let in_step_rule = use_tuned && STEP_RULE.contains(&(transposed_b, k, n));
-    let list: &[CoopTile] = if m > 256 {
-        &LARGE_M_TILES
-    } else if in_step_rule {
-        &STEP_TILES
-    } else {
-        &SMALL_M_TILES
-    };
+    let list: &[CoopTile] = if m > 256 { &LARGE_M_TILES } else { small };
     let usable = |tile: &CoopTile| fits(*tile) && grid_fits(*tile, m, n, 1);
     let mut tiles: Vec<CoopTile> = list.iter().copied().filter(usable).collect();
     if tiles.is_empty() {
@@ -232,7 +270,9 @@ pub(super) fn split_to_fill(tile: CoopTile, (m, k, n): (u32, u32, u32), target: 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use super::{plan, split_k, CoopTile, LARGE_M_TILES, SMALL_M_TILES, STEP_TILES, TUNED};
+    use super::{
+        plan, plan_fused, split_k, CoopTile, LARGE_M_TILES, SMALL_M_TILES, STEP_TILES, TUNED,
+    };
 
     #[test]
     fn split_k_keeps_whole_steps_and_no_empty_slice() {
@@ -273,6 +313,31 @@ mod tests {
         let got = plan((256, 576, 576), false, untuned, single).map(|c| (c.tile, c.split));
         assert_eq!(got, Some((CoopTile::ALL[2], 2)));
         assert!(plan((256, 576, 576), false, untuned, |_: CoopTile| false).is_none());
+    }
+
+    #[test]
+    fn fused_products_keep_the_split_and_take_step_tiles_on_large_weights() {
+        let all = |_: CoopTile| true;
+        let untuned = (160, false);
+        let pick = |c: Option<super::CoopConfig>| c.map(|c| (c.tile, c.split));
+        let rule = |dims, transposed_b| pick(plan(dims, transposed_b, untuned, all));
+        let fused = |dims, transposed_b| pick(plan_fused(dims, transposed_b, untuned, all));
+        // 1.7B QKV forward at 80 rows (N holds 3 x 16 LoRA columns): the
+        // 64x64 step tile has 97 x 2 = 194 workgroups, past the target. The
+        // plain rule would run the 32x64 tile there.
+        assert_eq!(fused((80, 2048, 6192), true), Some((STEP_TILES[1], 1)));
+        assert_eq!(rule((80, 2048, 6192), true), Some((SMALL_M_TILES[0], 1)));
+        // 1.7B QKV dX: 32 x 2 = 64 workgroups, so K = 6192 splits in 3 slices
+        // of 2,080.
+        assert_eq!(fused((80, 6192, 2048), false), Some((STEP_TILES[1], 3)));
+        // 135M QKV forward: the small weight keeps the small-M tiles, and
+        // 16 x 2 = 32 workgroups split K = 576 in 5 slices of 128.
+        assert_eq!(fused((78, 576, 1008), true), Some((SMALL_M_TILES[1], 5)));
+        // Above 256 rows both rules agree.
+        assert_eq!(
+            fused((1024, 2048, 6192), true),
+            rule((1024, 2048, 6192), true)
+        );
     }
 
     /// The fastest configuration `matmul-tune` found on an NVIDIA A10G for

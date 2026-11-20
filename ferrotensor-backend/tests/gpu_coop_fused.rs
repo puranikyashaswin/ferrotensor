@@ -1,10 +1,13 @@
 //! The fused loaders and epilogues of the matmul against CPU references.
 //!
-//! Every case runs twice when the device allows it: on the plain reference
-//! kernel, which needs only a GPU, and on the cooperative-matrix kernel, which
-//! needs a GPU with f16 cooperative matrices (16x16x16, f32 accumulation),
-//! subgroups of 32 threads and `FERROTENSOR_EXPERIMENTAL=1`. Without those the
-//! second half is skipped with a message. Run them with:
+//! Every case runs on the plain reference kernel, which needs only a GPU, and
+//! when the device allows it on the cooperative-matrix kernel, which needs a
+//! GPU with f16 cooperative matrices (16x16x16, f32 accumulation), subgroups
+//! of 32 threads and `FERROTENSOR_EXPERIMENTAL=1`: with the router's
+//! configuration and with each of `SPLITS`, tiles that run K in 2 to 4
+//! slices, whose partial sums a reduction pass adds before the epilogue runs.
+//! Without cooperative matrices the second half is skipped with a message.
+//! Run them with:
 //!
 //! ```text
 //! FERROTENSOR_EXPERIMENTAL=1 cargo test -p ferrotensor-backend --test gpu_coop_fused -- --ignored --test-threads=1
@@ -18,7 +21,8 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::too_many_arguments)]
 
 use ferrotensor_backend::{
-    ComputeEngine, Epilogue, FusedA, FusedOut, FusedSpec, UnifiedTensor, WgpuContext,
+    ComputeEngine, CoopConfig, CoopTile, Epilogue, FusedA, FusedOut, FusedSpec, UnifiedTensor,
+    WgpuContext,
 };
 use std::sync::OnceLock;
 
@@ -39,7 +43,29 @@ fn gpu() -> &'static Gpu {
 #[derive(Clone, Copy, Debug)]
 enum Mode {
     Reference,
+    /// The cooperative kernel with the configuration the router picks.
     Coop,
+    /// The cooperative kernel with this tile and K split.
+    CoopWith(CoopConfig),
+}
+
+/// Tiles and the K splits the split cases run: a single-buffered and a
+/// double-buffered tile, K steps of 32 and 64, and 2, 3 and 4 slices.
+fn splits() -> [CoopConfig; 3] {
+    [
+        CoopConfig {
+            tile: CoopTile::ALL[2],
+            split: 3,
+        },
+        CoopConfig {
+            tile: CoopTile::ALL[12],
+            split: 2,
+        },
+        CoopConfig {
+            tile: CoopTile::ALL[4],
+            split: 4,
+        },
+    ]
 }
 
 /// The kernels to run: the reference always, the cooperative one when the
@@ -48,6 +74,7 @@ fn modes(g: &Gpu, test: &str) -> Vec<Mode> {
     let mut modes = vec![Mode::Reference];
     if g.engine.coop_matmul_available() {
         modes.push(Mode::Coop);
+        modes.extend(splits().map(Mode::CoopWith));
     } else {
         eprintln!(
             "{test}: the cooperative kernel is skipped, {} has no f16 cooperative matrices \
@@ -62,6 +89,10 @@ fn exec(g: &Gpu, mode: Mode, spec: &FusedSpec<'_>) {
     let ran = match mode {
         Mode::Reference => g.engine.matmul_fused_reference_into(&g.ctx, spec),
         Mode::Coop => g.engine.matmul_fused_coop_into(&g.ctx, spec),
+        Mode::CoopWith(config) => g
+            .engine
+            .matmul_fused_coop_config_into(&g.ctx, spec, Some(config))
+            .map(|_| ()),
     };
     ran.unwrap_or_else(|e| panic!("{mode:?}: {e}"));
 }
@@ -730,7 +761,24 @@ fn fused_coop_counts_f16_overflow_and_poisons_its_tile() {
     let k: usize = widths.iter().sum();
     let b = weight(g, &f16_round(&rand_vec(k * n, 51)), k, n, false);
     let overflows = || pollster::block_on(g.engine.coop_f16_overflows(&g.ctx)).unwrap();
-    for big_source in [0usize, 1] {
+    // K = 64 is two steps of 32: with 2 slices the large value sits in one
+    // slice's staging, and its partial sums carry the NaN through the
+    // reduction into the output.
+    let configs = [
+        None,
+        Some(CoopConfig {
+            tile: CoopTile::ALL[2],
+            split: 2,
+        }),
+        Some(CoopConfig {
+            tile: CoopTile::ALL[4],
+            split: 2,
+        }),
+    ];
+    for (big_source, config) in [0usize, 1]
+        .into_iter()
+        .flat_map(|source| configs.map(|config| (source, config)))
+    {
         let mut parts: Vec<Vec<f32>> = widths
             .iter()
             .enumerate()
@@ -756,7 +804,9 @@ fn fused_coop_counts_f16_overflow_and_poisons_its_tile() {
             },
         };
         let before = overflows();
-        g.engine.matmul_fused_coop_into(&g.ctx, &spec).unwrap();
+        g.engine
+            .matmul_fused_coop_config_into(&g.ctx, &spec, config)
+            .unwrap();
         assert!(read(g, &out).iter().all(|v| v.is_finite()));
         assert_eq!(overflows(), before);
         parts[big_source][3 * widths[big_source] + 5] = 70_000.0;
@@ -770,9 +820,76 @@ fn fused_coop_counts_f16_overflow_and_poisons_its_tile() {
             a: FusedA::Sources(&big_refs),
             ..spec
         };
-        g.engine.matmul_fused_coop_into(&g.ctx, &spec).unwrap();
-        assert_eq!(overflows(), before + 1, "source {big_source}");
+        g.engine
+            .matmul_fused_coop_config_into(&g.ctx, &spec, config)
+            .unwrap();
+        assert_eq!(overflows(), before + 1, "source {big_source} {config:?}");
         let got = read(g, &out);
-        assert!(got[0].is_nan(), "the tile's first element is poisoned");
+        assert!(
+            got[0].is_nan(),
+            "{config:?}: the tile's first element is poisoned"
+        );
+    }
+}
+
+/// A split request runs as that many slices (no slice empty), the epilogue
+/// of an accumulate runs once on the sum, and the unsplit and split results
+/// agree.
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn split_fused_product_adds_the_slices_then_runs_the_epilogue_once() {
+    let g = gpu();
+    if !g.engine.coop_matmul_available() {
+        eprintln!(
+            "split_fused_product_adds_the_slices_then_runs_the_epilogue_once: skipped, no cooperative matrices"
+        );
+        return;
+    }
+    let (m, k, n) = (80usize, 576usize, 200usize);
+    let a = f16_round(&rand_vec(m * k, 61));
+    let b = f16_round(&rand_vec(k * n, 62));
+    let a_t = tensor(g, &a, &[m, k]);
+    let b_t = weight(g, &b, k, n, false);
+    let prod = cpu_matmul(&a, &b, (m, k, n));
+    let base = rand_vec(m * n, 63);
+    // K = 576 is 18 steps of 32: 3 slices take 6 steps each, 6 slices 3 each
+    // and 4 slices 5 each (the last one 3), since slices are whole steps.
+    for (tile, asked, ran) in [
+        (CoopTile::ALL[2], 1u32, 1u32),
+        (CoopTile::ALL[2], 3, 3),
+        (CoopTile::ALL[2], 6, 6),
+        (CoopTile::ALL[4], 4, 4),
+    ] {
+        let out = tensor(g, &base, &[m, n]);
+        let spec = FusedSpec {
+            a: FusedA::Plain(&a_t),
+            b: &b_t,
+            transposed_b: false,
+            out: FusedOut::AlphaBeta {
+                out: &out,
+                epilogue: Epilogue {
+                    alpha: 0.5,
+                    beta: 1.0,
+                },
+            },
+        };
+        let config = CoopConfig { tile, split: asked };
+        let got = g
+            .engine
+            .matmul_fused_coop_config_into(&g.ctx, &spec, Some(config))
+            .unwrap();
+        assert_eq!(got.split, ran, "{tile:?} asked {asked}");
+        // `base` is added once, not once per slice.
+        let want: Vec<f64> = prod
+            .iter()
+            .zip(&base)
+            .map(|(&p, &o)| 0.5 * p + f64::from(o))
+            .collect();
+        check(
+            &format!("{tile:?} split {asked}"),
+            &read(g, &out),
+            &want,
+            EXACT,
+        );
     }
 }
