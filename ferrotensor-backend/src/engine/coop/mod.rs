@@ -860,8 +860,10 @@ mod tests {
     /// [`KN`] x [`ROWS`] on four device descriptions, taken before the split
     /// and retaken (it was 3834093253146709999) when the 1024-row rows joined
     /// the tuned table, which can only move products of 257 to 1024 rows on a
-    /// tuned device.
-    const PLAN_HASH: u64 = 17442595157898385172;
+    /// tuned device, and retaken again (it was 17442595157898385172) when the
+    /// 64 to 256-row rows replaced the 256-row ones, which moves products of up
+    /// to 256 rows on a tuned device.
+    const PLAN_HASH: u64 = 1620736337270207953;
 
     #[test]
     fn selector_picks_what_it_picked_before_the_split() {
