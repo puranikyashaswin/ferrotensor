@@ -171,6 +171,13 @@ and single-pass peaks; 30-step runs that accumulate passes have not reached
 their peak, and it is up to 35% above those. Other GPUs, f32 and 4-bit weights
 and LFM2 models are not calibrated.
 
+`finetune` and `plan --data` estimate for the rows the data pads to, not for
+`--seq-len`: the 99th percentile of the tokenized lengths sets the margin
+check, and a batch of the longest sequences must fit the budget without the
+margin. On the A10G, SmolLM2-1.7B at batch 8 x 1 on a 2,000-example Alpaca
+split (longest sequence 214 tokens) peaked at 19,296 MiB, and the estimate for
+8 x 214 rows is 20,409 MiB, 5.8% above it.
+
 ## 4-bit weights (experimental)
 
 `--q4-weights` still fails its quality gate: the untouched base model has a
