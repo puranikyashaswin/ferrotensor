@@ -11,10 +11,10 @@ use std::sync::{Arc, Mutex};
 use wgpu::{util::DeviceExt, Buffer};
 
 mod attention;
+mod coop;
 mod elementwise;
 mod flash_coop;
 mod matmul;
-mod matmul_coop;
 mod misc;
 mod norm;
 mod quant;
@@ -23,9 +23,9 @@ mod small_m;
 mod training;
 
 pub use attention::AttentionOptions;
+pub use coop::{CoopConfig, CoopTile};
 pub use flash_coop::FLASH_COOP_ENV;
 pub use matmul::{Epilogue, MatmulPath};
-pub use matmul_coop::{CoopConfig, CoopTile};
 pub use skinny::SkinnyTile;
 pub use small_m::{SmallMLaunch, SmallMTile};
 pub use training::{AdamParams, FlatLayout, FLAT_MAX_ELEMS, MASKED_CE_SKIP, SUM_SQUARES_CHUNK};
@@ -380,7 +380,7 @@ pub struct ComputeEngine {
     /// Workgroups a small-M matmul's K split aims for on this device.
     split_target: u32,
     /// Cooperative-matrix matmul kernels, when the device has them.
-    coop: Option<matmul_coop::Coop>,
+    coop: Option<coop::Coop>,
     /// Skinny matmul kernels, compiled the first time a tile and layout run.
     skinny: Mutex<HashMap<skinny::SkinnyKey, Arc<Kernel>>>,
     /// Whether the kernels read their parameters from immediates.
@@ -464,7 +464,7 @@ impl ComputeEngine {
                 .max_compute_invocations_per_workgroup
                 .min(limits.max_compute_workgroup_size_x),
             split_target: small_m::split_target(ctx.adapter.get_info().device_type),
-            coop: matmul_coop::Coop::new(
+            coop: coop::Coop::new(
                 ctx,
                 small_m::split_target(ctx.adapter.get_info().device_type),
             ),
