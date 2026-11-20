@@ -1204,6 +1204,74 @@ fn rms_norm_backward_matches_cpu() {
 
 #[test]
 #[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn rms_norm_backward_beta_accumulates_into_grad_input() {
+    let g = gpu();
+    let e = &g.engine;
+    for &(rows, len, eps) in &[(1, 1, 1e-5), (5, 37, 1e-5), (3, 64, 0.1), (130, 576, 1e-5)] {
+        let x = rand_vec(rows * len, 80 + len as u64);
+        let w = rand_vec(len, 81 + len as u64);
+        let go = rand_vec(rows * len, 82 + len as u64);
+        let old = rand_vec(rows * len, 83 + len as u64);
+        let (tx, tw, tgo) = (
+            upload(&x, &[rows, len]),
+            upload(&w, &[len]),
+            upload(&go, &[rows, len]),
+        );
+        let (want_x, want_w) = cpu_rms_norm_backward(&x, &go, &w, len, eps);
+        // The unfused path: the plain kernel into a scratch buffer, then `add`.
+        let scratch = zeros(&[rows, len]);
+        e.rms_norm_backward(&g.ctx, &tx, &tw, &tgo, &scratch, None, eps);
+        let summed = zeros(&[rows, len]);
+        e.add(&g.ctx, &upload(&old, &[rows, len]), &scratch, &summed);
+        let unfused = read(&summed);
+
+        for beta in [1.0f32, 0.5, -2.0] {
+            for with_weight in [true, false] {
+                let name = format!("rms_norm_backward_beta {rows}x{len} beta {beta}");
+                let gx = upload(&old, &[rows, len]);
+                let gw = zeros(&[len]);
+                let grad_w = with_weight.then_some(&gw);
+                e.rms_norm_backward_beta(&g.ctx, &tx, &tw, &tgo, (&gx, beta), grad_w, eps);
+                let want: Vec<f32> = want_x.iter().zip(&old).map(|(n, o)| n + beta * o).collect();
+                assert_close(&format!("{name} grad_x"), &read(&gx), &want, 1e-4, 1e-3);
+                if beta == 1.0 {
+                    assert_close(&format!("{name} vs add"), &read(&gx), &unfused, 1e-6, 1e-6);
+                }
+                if with_weight {
+                    assert_close(&format!("{name} grad_w"), &read(&gw), &want_w, 1e-4, 1e-3);
+                }
+            }
+        }
+
+        // With beta = 0 the old contents are never read: NaN there is gone.
+        let nan = upload(&vec![f32::NAN; rows * len], &[rows, len]);
+        e.rms_norm_backward_beta(&g.ctx, &tx, &tw, &tgo, (&nan, 0.0), None, eps);
+        assert_close("rms_norm_backward_beta 0", &read(&nan), &want_x, 1e-4, 1e-3);
+    }
+}
+
+/// One row of two values, `eps = 0`, worked by hand: `x = [3, 4]`, `w = [1, 1]`,
+/// `g = [1, 0]`, so `inv = 1 / sqrt(12.5)`, `dot = 3`, `grad_x = [0.181019,
+/// -0.135764]` and `grad_w = [0.848528, 0]`; with `beta = 1` onto `[10, 20]`.
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn rms_norm_backward_beta_worked_row() {
+    let g = gpu();
+    let (tx, tw, tgo) = (
+        upload(&[3.0, 4.0], &[1, 2]),
+        upload(&[1.0, 1.0], &[2]),
+        upload(&[1.0, 0.0], &[1, 2]),
+    );
+    let gx = upload(&[10.0, 20.0], &[1, 2]);
+    let gw = zeros(&[2]);
+    g.engine
+        .rms_norm_backward_beta(&g.ctx, &tx, &tw, &tgo, (&gx, 1.0), Some(&gw), 0.0);
+    assert_close("grad_x", &read(&gx), &[10.181019, 19.864235], 1e-5, 1e-5);
+    assert_close("grad_w", &read(&gw), &[0.848528, 0.0], 1e-5, 1e-5);
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
 fn rms_norm_residual_matches_cpu() {
     let g = gpu();
     let len = 777;
