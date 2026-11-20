@@ -206,7 +206,7 @@ fn print_mode(mode: Option<KernelTimingMode>) -> bool {
     match mode {
         None => eprintln!("profile: the adapter has no timestamp queries; kernel times are not measured"),
         Some(KernelTimingMode::InsidePasses) => eprintln!(
-            "profile: kernel timestamps before and after each dispatch, inside passes of up to 8 dispatches"
+            "profile: kernel timestamps before and after each dispatch, inside passes of up to 128 dispatches"
         ),
         Some(KernelTimingMode::PassBoundaries) => eprintln!(
             "profile: kernel timestamps at the start and end of passes of one dispatch each \

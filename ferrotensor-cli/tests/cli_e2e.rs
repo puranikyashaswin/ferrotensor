@@ -199,7 +199,7 @@ fn train_writes_adapter_state_and_metrics() {
     } else {
         assert!(
             passes > 0 && passes * 4 <= dispatches,
-            "up to 8 dispatches share a compute pass: {profile}"
+            "up to 128 dispatches share a compute pass: {profile}"
         );
     }
     assert!(

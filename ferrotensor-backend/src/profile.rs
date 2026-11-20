@@ -67,7 +67,7 @@ pub struct GpuCounterSnapshot {
     /// Compute kernel dispatches recorded (buffer copies are not counted).
     pub dispatches: u64,
     /// Compute passes the dispatches were encoded in: one per run of at most
-    /// 8 dispatches between copies and submissions.
+    /// 128 dispatches between copies and submissions.
     pub compute_passes: u64,
     /// Bind groups created: one per dispatch the bind group cache did not
     /// serve.

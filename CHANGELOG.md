@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - A kernel that takes its sizes from its parameters binds the whole of a pooled buffer, so its bind group is reused when the pool hands the buffer to a tensor of another length in the same size class; only the kernels of kernels.wgsl that call `arrayLength` still bind a tensor's exact bytes. The bind group cache keeps 32,768 groups (was 4,096) and drops the oldest when full instead of emptying itself. Results are unchanged (the same held-out loss to every printed digit). On an A10G a SmolLM2-135M step at batch 1 × 8 takes 123.1 ms instead of 143.6 ms and 360M takes 146.3 ms instead of 163.7 ms; the 8 × 1 cases and 1.7B change by 1% or less. Bind groups reused per 135M step rise from 574 to 1,629 and the misses fall from 7,085 to 6,003.
+- Up to 128 dispatches share a compute pass, up from 8: on an A10G a SmolLM2-135M step at batch 1 × 8 takes 124.6 ms instead of 143.6 ms and 360M takes 143.6 ms instead of 163.7 ms, with 1 to 3% less on the other four cases and the same losses ([measurements](benchmarks/RESULTS.md#passes-of-up-to-128-dispatches-20-november-2026)). `FERROTENSOR_PASS_DISPATCHES` still sets another value.
 
 ## [0.7.0] - 2026-11-19
 
