@@ -1577,7 +1577,7 @@ struct LossScalerRecord {
     scale: f32,
     /// Optimizer steps skipped because a gradient overflowed.
     skipped_steps: u64,
-    /// Workgroups that clamped an input past the f16 range.
+    /// Staging threads (per workgroup) that met an input past the f16 range.
     f16_overflows: u64,
 }
 

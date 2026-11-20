@@ -29,6 +29,11 @@ name = "tensor-api"
 path = "src/bin/tensor_api.rs"
 bench = false
 
+[[bin]]
+name = "matmul-tune"
+path = "src/bin/matmul_tune.rs"
+bench = false
+
 [[bench]]
 name = "gpu"
 path = "benches/gpu.rs"

@@ -1,5 +1,6 @@
 //! Matrix multiplication kernels.
 
+use super::skinny::SkinnyTile;
 use super::small_m::{self, SmallMLaunch, SmallMTile};
 use super::{grid, uniform, ComputeEngine, Kernel};
 use crate::kernel_timing::KernelLabel;
@@ -365,11 +366,12 @@ impl ComputeEngine {
     }
 
     /// Runs `out[M, N] = alpha * op(a) @ op(b) + beta * out` with the kernel
-    /// that suits the shape and `b`'s storage: the small-M kernel when
-    /// [`small_m::routes`] takes the shape and a tile fits the device, else
-    /// [`matmul_previous`](Self::matmul_previous). With the cooperative-matrix
-    /// kernel turned on, products against f16 weights go to it first. Returns the small-M tile
-    /// and split when that kernel ran.
+    /// that suits the shape and `b`'s storage, trying in order: the
+    /// cooperative-matrix kernel for f16 weights when it is turned on, the
+    /// skinny kernel for f32 products with at most 64 columns, the small-M
+    /// kernel when [`small_m::routes`] takes the shape and a tile fits the
+    /// device, else [`matmul_previous`](Self::matmul_previous). Returns the
+    /// small-M tile and split when that kernel ran.
     fn matmul_run(
         &self,
         ctx: &WgpuContext,
@@ -388,6 +390,10 @@ impl ComputeEngine {
                 return None;
             }
         }
+        if let Some((transposed_b, tile)) = self.skinny_route(layout, b.dtype, (m, n)) {
+            self.matmul_skinny(ctx, transposed_b, (m, k, n), [a, b, out], tile, ep);
+            return None;
+        }
         if let Some((transposed_b, tile)) = self.small_m_route(layout, b.dtype, (m, k, n)) {
             return Some(self.matmul_small_m(
                 ctx,
@@ -400,6 +406,27 @@ impl ComputeEngine {
         }
         self.matmul_previous(ctx, layout, (m, k, n), [a, b, out], ep);
         None
+    }
+
+    /// Whether `b` is stored `[N, K]` and the tile, when the router sends an
+    /// `[M, N]` product of `layout` with a `dtype` weight to the skinny
+    /// kernel: f32 `b`, `a` stored `[M, K]`, and N the short side of at most
+    /// 64 columns, where the thin kernel would run the transposed product.
+    fn skinny_route(
+        &self,
+        layout: Layout,
+        dtype: DType,
+        (m, n): (u32, u32),
+    ) -> Option<(bool, SkinnyTile)> {
+        let transposed_b = match layout {
+            Layout::Plain => false,
+            Layout::TransposedB => true,
+            Layout::TransposedA => return None,
+        };
+        if dtype != DType::FP32 || thin_side(dtype, m, n) != Some(Thin::B) {
+            return None;
+        }
+        self.skinny_tile(m, n).map(|tile| (transposed_b, tile))
     }
 
     /// Whether `b` is stored `[N, K]` and the default tile, when the router

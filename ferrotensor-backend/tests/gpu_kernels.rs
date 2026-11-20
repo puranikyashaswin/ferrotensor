@@ -13,7 +13,7 @@
 
 use ferrotensor_backend::{
     q4, AdamParams, AttentionOptions, ComputeEngine, DType, Epilogue, MatmulPath, MemoryCategory,
-    SmallMTile, UnifiedTensor, WgpuContext, MASKED_CE_SKIP, SUM_SQUARES_CHUNK,
+    SkinnyTile, SmallMTile, UnifiedTensor, WgpuContext, MASKED_CE_SKIP, SUM_SQUARES_CHUNK,
 };
 use q4::Q4Group;
 use std::io::Write as _;
@@ -271,6 +271,16 @@ fn f16_round(x: &[f32]) -> Vec<f32> {
     x.iter().map(|&v| half::f16::from_f32(v).to_f32()).collect()
 }
 
+/// `x` as the f16-weight matmuls see it: with the cooperative-matrix kernel
+/// routed, `a` is converted to f16, so tests feed values f16 holds exactly.
+fn maybe_f16(x: Vec<f32>) -> Vec<f32> {
+    if gpu().engine.coop_matmul_active() {
+        f16_round(&x)
+    } else {
+        x
+    }
+}
+
 #[test]
 #[ignore = "needs a GPU; run with --ignored --test-threads=1"]
 fn matmul_with_f16_b_matches_cpu() {
@@ -282,7 +292,7 @@ fn matmul_with_f16_b_matches_cpu() {
         .chain(&[(3, 5, 7), (65, 33, 129)])
         .enumerate()
     {
-        let a = rand_vec(m * k, 300 + seed as u64);
+        let a = maybe_f16(rand_vec(m * k, 300 + seed as u64));
         let b = rand_vec(k * n, 400 + seed as u64);
         let b_h = UnifiedTensor::from_f32_as_f16(&g.ctx, &b, &[k, n]);
         assert!(b_h.size_in_bytes() <= ((k * n * 2).div_ceil(4) * 4).max(4) as u64);
@@ -577,7 +587,7 @@ fn thin_matmul_matches_cpu_in_every_layout() {
     // product); f16 `b` with few columns takes the tile kernel.
     let g = gpu();
     for (seed, &(m, k, n)) in THIN_SHAPES.iter().enumerate() {
-        let a = rand_vec(m * k, 3000 + seed as u64);
+        let a = maybe_f16(rand_vec(m * k, 3000 + seed as u64));
         let b: Vec<f32> = rand_vec(k * n, 3100 + seed as u64)
             .iter()
             .map(|v| v * 0.1)
@@ -617,6 +627,60 @@ fn thin_matmul_matches_cpu_in_every_layout() {
     }
 }
 
+/// `(m, k, n)` for the skinny kernel: the LoRA `x @ A` of rank 8 at 256 and
+/// 2048 rows and at the 1.7B MLP's K of 8192, then M, K and N off every
+/// tile's multiple, one column, and the widest N it takes.
+const SKINNY_SHAPES: &[(usize, usize, usize)] = &[
+    (256, 576, 8),
+    (2048, 576, 8),
+    (256, 8192, 8),
+    (200, 40, 8),
+    (77, 37, 5),
+    (300, 64, 1),
+    (130, 1000, 64),
+];
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn every_skinny_tile_matches_cpu_in_both_layouts() {
+    let g = gpu();
+    for (seed, &(m, k, n)) in SKINNY_SHAPES.iter().enumerate() {
+        let a = rand_vec(m * k, 3400 + seed as u64);
+        let b: Vec<f32> = rand_vec(k * n, 3500 + seed as u64)
+            .iter()
+            .map(|v| v * 0.1)
+            .collect();
+        let old = rand_vec(m * n, 3600 + seed as u64);
+        let product = cpu_matmul(&a, &b, m, k, n);
+        let a_up = upload(&a, &[m, k]);
+        let layouts = [
+            (false, upload(&b, &[k, n])),
+            (true, upload(&transpose(&b, k, n), &[n, k])),
+        ];
+        for (transposed_b, b_up) in &layouts {
+            for tile in SkinnyTile::ALL {
+                for (alpha, beta) in [(1.0f32, 0.0f32), (-0.5, 1.0)] {
+                    let out = upload(&old, &[m, n]);
+                    let ep = Epilogue { alpha, beta };
+                    let tensors = [&a_up, b_up, &out];
+                    let ran =
+                        g.engine
+                            .matmul_skinny_into(&g.ctx, *transposed_b, tensors, Some(tile), ep);
+                    assert_eq!(ran, Ok(tile));
+                    let want: Vec<f32> = product
+                        .iter()
+                        .zip(&old)
+                        .map(|(&p, &o)| alpha * p + beta * o)
+                        .collect();
+                    // Names the tile, shape, layout, alpha and beta.
+                    let name = format!("{tile:?} {m}x{k}x{n} {transposed_b} {alpha} {beta}");
+                    assert_close(&name, &read(&out), &want, 1e-4, 1e-4);
+                }
+            }
+        }
+    }
+}
+
 /// `(m, k, n)` of products whose `b` is stored along k: `a @ b^T` in f32 and
 /// f16, and `x @ W` with 4-bit `W`. K is off the 16 the tile kernel stages
 /// at a time and N off its 64 columns. M and N above 64 (for f16 and 4-bit
@@ -638,7 +702,7 @@ const ALONG_K_SHAPES: &[(usize, usize, usize)] = &[
 fn matmul_with_b_along_k_matches_cpu_at_odd_shapes() {
     let g = gpu();
     for (seed, &(m, k, n)) in ALONG_K_SHAPES.iter().enumerate() {
-        let a = rand_vec(m * k, 3200 + seed as u64);
+        let a = maybe_f16(rand_vec(m * k, 3200 + seed as u64));
         // Weight-sized values keep the k = 2048 sums near 1, so the
         // tolerance below measures the kernel, not f32 rounding.
         let b: Vec<f32> = rand_vec(k * n, 3300 + seed as u64)
@@ -884,6 +948,8 @@ fn matmul_routes_few_rows_against_wide_weights_to_small_m() {
     // Vulkan have 32); the router takes no smaller step, so with 16 KiB
     // (DX12 on WARP) the previous kernels run.
     let bytes = g.ctx.device.limits().max_compute_workgroup_storage_size;
+    // With the cooperative-matrix kernel routed, f16 weights with 64 or more rows go there first.
+    let coop = g.engine.coop_matmul_active();
     let tile = |bk| SmallMTile {
         tm: 8,
         tn: 4,
@@ -899,11 +965,15 @@ fn matmul_routes_few_rows_against_wide_weights_to_small_m() {
         None
     };
     assert_eq!(route((64, 512, 256), true, DType::FP32), want, "{bytes} B");
-    assert_eq!(route((64, 512, 256), false, DType::FP16), want, "{bytes} B");
+    assert_eq!(
+        route((64, 512, 256), false, DType::FP16),
+        if coop { None } else { want },
+        "{bytes} B"
+    );
     // 160 rows: two row blocks of 80, with K steps of 16 in 22.5 KiB.
     assert_eq!(
         route((160, 256, 300), true, DType::FP16).map(SmallMTile::bm),
-        (bytes >= 23_040).then_some(80),
+        (bytes >= 23_040 && !coop).then_some(80),
         "{bytes} B"
     );
     // Too narrow, too shallow, too few or too many rows: the previous kernels.
@@ -2820,7 +2890,8 @@ fn matmul_epilogue_matches_cpu_on_every_path() {
     let g = gpu();
     // One shape per kernel: one row (the matrix-vector kernel for a@b, the
     // thin kernel for a@bT), a thin a, a thin b (64x64 tiles with an f16 b),
-    // 64x64 tiles, and the small-M kernel with one slice of K and with three.
+    // the router's skinny kernel for a thin f32 b, 64x64 tiles, and the
+    // small-M kernel with one slice of K and with three.
     let small_m = |split| MatmulPath::SmallM {
         tile: None,
         split: Some(split),
@@ -2829,6 +2900,7 @@ fn matmul_epilogue_matches_cpu_on_every_path() {
         ("one row", (1, 96, 80), MatmulPath::Previous),
         ("thin a", (8, 96, 200), MatmulPath::Previous),
         ("thin b", (200, 40, 8), MatmulPath::Previous),
+        ("skinny", (200, 576, 8), MatmulPath::Auto),
         ("tiles", (100, 72, 130), MatmulPath::Previous),
         ("small-M, 1 slice", (64, 512, 256), small_m(1)),
         ("small-M, 3 slices", (64, 512, 256), small_m(3)),
