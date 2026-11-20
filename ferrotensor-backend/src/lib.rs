@@ -38,6 +38,7 @@ pub mod memory;
 pub mod pool;
 mod profile;
 pub mod q4;
+mod shader_checks;
 mod tensor;
 
 pub use context::{
@@ -53,4 +54,5 @@ pub use engine::{MatmulPath, SmallMLaunch, SmallMTile};
 pub use kernel_timing::{KernelTime, KernelTimes, KernelTiming, KernelTimingMode};
 pub use memory::{MemoryCategory, MemorySnapshot, MemoryTracker};
 pub use profile::GpuCounterSnapshot;
+pub use shader_checks::{ShaderChecks, SHADER_CHECKS_ENV};
 pub use tensor::{DType, ReadbackError, UnifiedTensor};
