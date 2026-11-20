@@ -8,7 +8,7 @@
 //! clamped, counted in the matmul's overflow counter, and the workgroup
 //! writes NaN into its first output element).
 
-use super::matmul_coop::immediate_source;
+use super::coop::immediate_source;
 use super::{attention::AttentionOptions, Arg, ComputeEngine, Kernel, Params};
 use crate::{UnifiedTensor, WgpuContext};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
