@@ -26,7 +26,7 @@
 //! rejected.
 
 use crate::lfm::{Lfm2Block, Lfm2Conv, Lfm2LayerOp, Lfm2Model};
-use crate::{Attention, Linear, LoRAAdapter, RMSNorm, MLP};
+use crate::{Attention, FusedSlot, Linear, LoRAAdapter, RMSNorm, MLP};
 use ferrotensor_autograd::Tensor;
 use ferrotensor_backend::q4::Q4Group;
 use ferrotensor_backend::{ComputeEngine, DType, UnifiedTensor, WgpuContext};
@@ -500,6 +500,7 @@ impl<'a> Lfm2ModelBuilder<'a> {
             gate_proj: self.build_linear(&format!("{prefix}.{gate}"), gate, seed)?,
             up_proj: self.build_linear(&format!("{prefix}.{up}"), up, seed)?,
             down_proj: self.build_linear(&format!("{prefix}.{down}"), down, seed)?,
+            fused: FusedSlot::default(),
         })
     }
 
@@ -546,6 +547,7 @@ impl<'a> Lfm2ModelBuilder<'a> {
                 .unwrap_or(10000.0) as f32,
             q_norm: self.build_head_norm(&format!("{prefix}.q_norm"), head_dim)?,
             k_norm: self.build_head_norm(&format!("{prefix}.k_norm"), head_dim)?,
+            fused: FusedSlot::default(),
         })
     }
 

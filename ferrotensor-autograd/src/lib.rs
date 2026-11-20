@@ -21,6 +21,11 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+mod fused;
+pub use fused::{
+    AttentionGeometry, FusedAttentionNode, FusedGateUpNode, FusedLora, FusedProjections,
+};
+
 thread_local! {
     static GRAD_ENABLED: Cell<bool> = const { Cell::new(true) };
 }
@@ -772,6 +777,37 @@ impl AutogradNode for RMSNormNode {
             self.eps,
         );
         vec![grad_x, grad_w]
+    }
+    /// The same gradients as [`backward`](AutogradNode::backward), with the
+    /// input gradient added into the input's slot by the norm kernel itself.
+    ///
+    /// A residual stream's tensor already holds the skip connection's
+    /// gradient when its norm runs, so this removes the `add` that would sum
+    /// the two. A frozen input has no slot, so that case keeps the default.
+    fn backward_accumulate(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> bool {
+        if !self.input.requires_grad {
+            return false;
+        }
+        let ctx = &self.input.ctx;
+        let grad_w = self
+            .weight
+            .requires_grad
+            .then(|| UnifiedTensor::empty(ctx, &self.weight.data.shape));
+        self.input.accumulate_grad_with(engine, |out, ep| {
+            engine.rms_norm_backward_beta(
+                ctx,
+                &self.input.data,
+                &self.weight.data,
+                grad,
+                (out, ep.beta),
+                grad_w.as_ref(),
+                self.eps,
+            );
+        });
+        if let Some(grad_w) = &grad_w {
+            self.weight.accumulate_grad(engine, grad_w);
+        }
+        true
     }
 }
 

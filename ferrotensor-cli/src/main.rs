@@ -39,7 +39,7 @@ use ferrotensor_graph::lfm::{legacy_llama_name, Lfm2Model};
 use ferrotensor_graph::model_builder::{
     check_supported, module_matches, Lfm2ModelBuilder, LoRaConfig, Q4Selection,
 };
-use ferrotensor_graph::{KVCache, KVCacheLayer};
+use ferrotensor_graph::{FusedMode, KVCache, KVCacheLayer};
 use ferrotensor_loader::{Lfm2Config, ModelLoader, Sampler, Tokenizer, WeightsContext};
 use ferrotensor_trainer::checkpoint::{
     apply_checkpoint, load_lora_checkpoint, save_lora_checkpoint, upgrade_optimizer_names,
@@ -847,6 +847,10 @@ fn restore_checkpoint(
         // The lookup of a frozen table reads a host copy made at build time.
         model.clear_host_embeddings();
     }
+    // A fused projection reads an f16 copy of each LoRA `A`.
+    model
+        .refresh_lora_mirrors(&base.engine)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(restored)
 }
 
@@ -1568,6 +1572,44 @@ struct TrainSummary {
     /// cooperative matrices.
     #[serde(skip_serializing_if = "Option::is_none")]
     loss_scaler: Option<LossScalerRecord>,
+    /// What the matmul autotuner did; left out unless `FERROTENSOR_AUTOTUNE`
+    /// turned it on for this run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    autotune: Option<AutotuneRecord>,
+}
+
+/// What the cooperative-matrix autotuner did during a run.
+#[derive(serde::Serialize, Debug, Clone, PartialEq)]
+struct AutotuneRecord {
+    /// `"on"` or `"retune"`.
+    mode: &'static str,
+    /// Time spent on trials: the host time compiling their kernels plus the
+    /// GPU time of their dispatches, which also did the step's work.
+    seconds: f64,
+    /// Products timed and settled in this run.
+    shapes_tuned: usize,
+    /// Products that took their choice from the cache file.
+    shapes_cached: usize,
+    /// Products whose trial had not settled by the end of the run.
+    shapes_open: usize,
+    /// Whether the time budget stopped a product from starting a trial.
+    budget_exhausted: bool,
+    /// The cache file; null when no location is known.
+    cache_file: Option<PathBuf>,
+}
+
+impl From<ferrotensor_backend::AutotuneReport> for AutotuneRecord {
+    fn from(report: ferrotensor_backend::AutotuneReport) -> Self {
+        Self {
+            mode: report.mode,
+            seconds: report.seconds,
+            shapes_tuned: report.shapes_tuned,
+            shapes_cached: report.shapes_cached,
+            shapes_open: report.shapes_open,
+            budget_exhausted: report.budget_exhausted,
+            cache_file: report.cache_file,
+        }
+    }
 }
 
 /// Where dynamic loss scaling ended up at the end of a run.
@@ -1699,6 +1741,12 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
     let model = model.with_block_checkpointing(args.checkpoint_blocks);
     if args.checkpoint_blocks {
         eprintln!("block checkpointing: on");
+    }
+    if lora_on {
+        let groups = model.enable_fused_projections(&base.engine, FusedMode::Auto)?;
+        if groups > 0 {
+            eprintln!("fused projections: {groups} groups");
+        }
     }
     let mut optimizer = AdamW::new(base.engine.clone(), args.lr);
     optimizer.weight_decay = args.weight_decay;
@@ -2068,6 +2116,17 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
             f16_overflows: base.engine.coop_f16_overflows(&base.ctx).await?,
         });
     }
+    // The loss readbacks above waited for the GPU, so the last timings are in.
+    let autotune = base
+        .engine
+        .autotune_finish(&base.ctx)
+        .map(AutotuneRecord::from);
+    if let Some(record) = &autotune {
+        eprintln!(
+            "autotune: {} shapes tuned, {} from the cache, {:.2} s spent tuning",
+            record.shapes_tuned, record.shapes_cached, record.seconds
+        );
+    }
     Ok(TrainSummary {
         steps: step,
         first_loss,
@@ -2080,6 +2139,7 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
         adapter: is_root.then_some(adapter_path),
         q4_weights,
         loss_scaler,
+        autotune,
     })
 }
 
@@ -2652,6 +2712,7 @@ mod tests {
             adapter: Some(PathBuf::from("runs/a/lora_adapters.safetensors")),
             q4_weights: None,
             loss_scaler: None,
+            autotune: None,
         };
         assert_eq!(
             serde_json::to_value(&summary).unwrap(),
@@ -2678,6 +2739,25 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&scaled).unwrap()["loss_scaler"],
             serde_json::json!({ "scale": 32768.0, "skipped_steps": 1, "f16_overflows": 4 })
+        );
+        let tuned = TrainSummary {
+            autotune: Some(AutotuneRecord {
+                mode: "on",
+                seconds: 1.25,
+                shapes_tuned: 7,
+                shapes_cached: 2,
+                shapes_open: 1,
+                budget_exhausted: false,
+                cache_file: Some(PathBuf::from("cache/autotune.txt")),
+            }),
+            ..scaled
+        };
+        assert_eq!(
+            serde_json::to_value(&tuned).unwrap()["autotune"],
+            serde_json::json!({
+                "mode": "on", "seconds": 1.25, "shapes_tuned": 7, "shapes_cached": 2,
+                "shapes_open": 1, "budget_exhausted": false, "cache_file": "cache/autotune.txt",
+            })
         );
     }
 

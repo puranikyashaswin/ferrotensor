@@ -11,10 +11,12 @@ use std::sync::{Arc, Mutex};
 use wgpu::{util::DeviceExt, Buffer};
 
 mod attention;
+mod coop;
 mod elementwise;
 mod flash_coop;
+mod lora_group;
 mod matmul;
-mod matmul_coop;
+mod matmul_fused;
 mod misc;
 mod norm;
 mod quant;
@@ -23,9 +25,12 @@ mod small_m;
 mod training;
 
 pub use attention::AttentionOptions;
+pub(crate) use coop::autotune_requested;
+pub use coop::{AutotuneReport, CoopConfig, CoopTile, AUTOTUNE_ENV};
 pub use flash_coop::FLASH_COOP_ENV;
+pub use lora_group::{LoraGrad, LoraMirror, LoraProj, LORA_GROUP_MAX, LORA_GROUP_MAX_RANK};
 pub use matmul::{Epilogue, MatmulPath};
-pub use matmul_coop::{CoopConfig, CoopTile};
+pub use matmul_fused::{FusedA, FusedOut, FusedSpec};
 pub use skinny::SkinnyTile;
 pub use small_m::{SmallMLaunch, SmallMTile};
 pub use training::{AdamParams, FlatLayout, FLAT_MAX_ELEMS, MASKED_CE_SKIP, SUM_SQUARES_CHUNK};
@@ -380,9 +385,14 @@ pub struct ComputeEngine {
     /// Workgroups a small-M matmul's K split aims for on this device.
     split_target: u32,
     /// Cooperative-matrix matmul kernels, when the device has them.
-    coop: Option<matmul_coop::Coop>,
+    coop: Option<coop::Coop>,
     /// Skinny matmul kernels, compiled the first time a tile and layout run.
     skinny: Mutex<HashMap<skinny::SkinnyKey, Arc<Kernel>>>,
+    /// The reference kernels of the fused products, compiled the first time they run.
+    fused_ref: matmul_fused::ReferenceKernels,
+    /// Grouped LoRA kernels, compiled the first time a kernel, group size and
+    /// rank run.
+    lora_group: Mutex<HashMap<lora_group::Key, Arc<Kernel>>>,
     /// Whether the kernels read their parameters from immediates.
     immediates: bool,
 }
@@ -464,11 +474,13 @@ impl ComputeEngine {
                 .max_compute_invocations_per_workgroup
                 .min(limits.max_compute_workgroup_size_x),
             split_target: small_m::split_target(ctx.adapter.get_info().device_type),
-            coop: matmul_coop::Coop::new(
+            coop: coop::Coop::new(
                 ctx,
                 small_m::split_target(ctx.adapter.get_info().device_type),
             ),
             skinny: Mutex::new(HashMap::new()),
+            fused_ref: Mutex::new(HashMap::new()),
+            lora_group: Mutex::new(HashMap::new()),
             immediates,
         }
     }
@@ -505,6 +517,20 @@ impl ComputeEngine {
         label: KernelLabel,
         entries: &[(u32, &dyn Arg)],
         groups: (u32, u32, u32),
+    ) {
+        self.run_tagged(ctx, kernel, label, entries, groups, None);
+    }
+
+    /// [`run_labeled`](Self::run_labeled), for a dispatch that is part of
+    /// the autotuner's sample `tune`, whose GPU time is read back for it.
+    fn run_tagged(
+        &self,
+        ctx: &WgpuContext,
+        kernel: &Kernel,
+        label: KernelLabel,
+        entries: &[(u32, &dyn Arg)],
+        groups: (u32, u32, u32),
+        tune: Option<u64>,
     ) {
         let mut immediates = None;
         // A group that binds a buffer made for this dispatch alone is not
@@ -564,6 +590,7 @@ impl ComputeEngine {
             bind_group,
             groups,
             label,
+            tune,
             immediates,
         });
     }
