@@ -23,21 +23,28 @@
 //! The module is split by what a later change touches: `tiles` holds the tile
 //! shapes, `plan` the router that picks a tile and a K split, `loader` the
 //! staging of the operands, `mainloop` the K loop and `epilogue` the writes
-//! back. This file holds the kernel template, the cache of compiled kernels
-//! and the engine methods.
+//! back, and `autotune` (with its cache file in `autotune_cache`) times the
+//! candidates where they run, when `FERROTENSOR_AUTOTUNE=1`. This file holds
+//! the kernel template, the cache of compiled kernels and the engine methods.
 
 use super::{grid, immediate_params, uniform, ComputeEngine, Epilogue, Kernel};
 use crate::kernel_timing::KernelLabel;
 use crate::{DType, ReadbackError, UnifiedTensor, WgpuContext};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Instant;
 
+mod autotune;
+mod autotune_cache;
 mod epilogue;
 mod loader;
 mod mainloop;
 mod plan;
 mod tiles;
 
+pub(crate) use autotune::autotune_requested;
+use autotune::{candidates, TuneKey, Tuner};
+pub use autotune::{AutotuneReport, AUTOTUNE_ENV};
 use epilogue::{store_fragment, EpilogueKind};
 use loader::LoaderKind;
 use mainloop::main_loop;
@@ -84,6 +91,34 @@ pub(super) struct Coop {
     max_threads: u32,
     /// Whether the kernel reads its parameters from immediates.
     immediates: bool,
+    /// The autotuner; `None` unless `FERROTENSOR_AUTOTUNE` asks for it on a
+    /// device that routes matmuls here and times dispatches.
+    tuner: Option<Mutex<Tuner>>,
+}
+
+/// The adapter line of the autotune cache file for `ctx`: what a cached
+/// choice depends on besides the shape.
+fn adapter_header(ctx: &WgpuContext) -> String {
+    let info = ctx.adapter.get_info();
+    autotune_cache::header_text(
+        (&info.name, info.vendor, info.device),
+        (&info.driver, &info.driver_info),
+        &format!("{:?}", info.backend),
+    )
+}
+
+/// The kernel `tile` runs a product with `b` stored as `transposed_b` says
+/// and a K and N of `(k, n)`.
+fn coop_key(tile: CoopTile, transposed_b: bool, (k, n): (u32, u32)) -> CoopKey {
+    let b_row = if transposed_b { k } else { n };
+    CoopKey {
+        tile,
+        transposed_b,
+        a_vec4: k.is_multiple_of(4),
+        b_vec8: b_row.is_multiple_of(8),
+        loader: LoaderKind::Plain,
+        epilogue: EpilogueKind::AlphaBeta,
+    }
 }
 
 /// `src` with its parameters moved to immediates. The `enable` directives
@@ -116,11 +151,17 @@ impl Coop {
             return None;
         }
         let limits = ctx.device.limits();
+        let routed = crate::adapters::experimental_opt_in();
+        let tuner = Tuner::from_env(
+            &|name| std::env::var(name).ok(),
+            (routed, ctx.has_timestamps()),
+            || adapter_header(ctx),
+        );
         Some(Self {
             kernels: Mutex::new(HashMap::new()),
             overflows: UnifiedTensor::zeros(ctx, &[1]),
             flash: Some(super::flash_coop::FlashCoop::new()),
-            routed: crate::adapters::experimental_opt_in(),
+            routed,
             target,
             tuned: ctx.adapter.get_info().device_type == wgpu::DeviceType::DiscreteGpu,
             max_bytes: limits.max_compute_workgroup_storage_size,
@@ -128,7 +169,47 @@ impl Coop {
                 .max_compute_invocations_per_workgroup
                 .min(limits.max_compute_workgroup_size_x),
             immediates: ctx.uses_immediates(),
+            tuner: tuner.map(Mutex::new),
         })
+    }
+
+    fn tuner(&self) -> Option<MutexGuard<'_, Tuner>> {
+        self.tuner
+            .as_ref()
+            .map(|t| t.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// The configuration and sample id to run an `m x k x n` product with when
+    /// the static rules pick `static_cfg`: the tuner's pick, and the sample
+    /// to tag the run with when it is a timing. Without a tuner, the static
+    /// pick and no sample.
+    fn autotuned(
+        &self,
+        ctx: &WgpuContext,
+        transposed_b: bool,
+        dims: (u32, u32, u32),
+        static_cfg: CoopConfig,
+    ) -> (CoopConfig, Option<u64>) {
+        let Some(mut tuner) = self.tuner() else {
+            return (static_cfg, None);
+        };
+        if tuner.wants_samples() {
+            for (sample, time) in ctx.take_tune_samples() {
+                tuner.record(sample, time);
+            }
+        }
+        let (m, k, n) = dims;
+        let probe = coop_key(static_cfg.tile, transposed_b, (k, n));
+        let key = TuneKey::new(transposed_b, (probe.loader, probe.epilogue), dims);
+        let usable =
+            |c: CoopConfig| self.fits(c.tile, transposed_b) && grid_fits(c.tile, m, n, c.split);
+        let list = || {
+            candidates(dims, key.m_bucket(), self.target, &|t| {
+                self.fits(t, transposed_b)
+            })
+        };
+        let pick = tuner.pick(key, static_cfg, &usable, &list);
+        (pick.config, pick.sample)
     }
 
     fn fits(&self, tile: CoopTile, transposed_b: bool) -> bool {
@@ -286,7 +367,7 @@ impl ComputeEngine {
                 "matmul_coop_into: no tile fits {m} x {n} on this device"
             ));
         };
-        self.matmul_coop_run(ctx, transposed_b, dims, [a, b, out], config, ep)
+        self.matmul_coop_run(ctx, transposed_b, dims, [a, b, out], (config, None), ep)
             .ok_or_else(|| "matmul_coop_into: no cooperative-matrix kernel".into())
     }
 
@@ -307,36 +388,50 @@ impl ComputeEngine {
         let Some(config) = plan(dims, transposed_b, target, |t| coop.fits(t, transposed_b)) else {
             return false;
         };
-        self.matmul_coop_run(ctx, transposed_b, dims, tensors, config, ep)
+        let (config, tune) = coop.autotuned(ctx, transposed_b, dims, config);
+        self.matmul_coop_run(ctx, transposed_b, dims, tensors, (config, tune), ep)
             .is_some()
+    }
+
+    /// Reads the autotuner's timings that have arrived, saves its cache file
+    /// and reports what it did; `None` when autotuning is off (or the
+    /// device has no cooperative matrices). The GPU work should have been
+    /// waited for, or its last timings are missed.
+    pub fn autotune_finish(&self, ctx: &WgpuContext) -> Option<AutotuneReport> {
+        let mut tuner = self.coop.as_ref()?.tuner()?;
+        for (sample, time) in ctx.take_tune_samples() {
+            tuner.record(sample, time);
+        }
+        tuner.save();
+        Some(tuner.report())
     }
 
     /// Records `config` for the product: one pass that applies `ep`, or with
     /// K split, one pass of partial sums and the reduction that adds them in
-    /// slice order and applies `ep`. Returns the configuration that ran, or
-    /// `None` (recording nothing) without the kernel.
+    /// slice order and applies `ep`. The dispatches carry the autotuner's
+    /// sample id `tune` when the run is a timing. Returns the configuration
+    /// that ran, or `None` (recording nothing) without the kernel.
     fn matmul_coop_run(
         &self,
         ctx: &WgpuContext,
         transposed_b: bool,
         (m, k, n): (u32, u32, u32),
         [a, b, out]: [&UnifiedTensor; 3],
-        config: CoopConfig,
+        (config, tune): (CoopConfig, Option<u64>),
         ep: Epilogue,
     ) -> Option<CoopConfig> {
         let coop = self.coop.as_ref()?;
         let tile = config.tile;
         let (split, kps) = split_k(k, tile.bk, config.split);
-        let b_row = if transposed_b { k } else { n };
-        let key = CoopKey {
-            tile,
-            transposed_b,
-            a_vec4: k.is_multiple_of(4),
-            b_vec8: b_row.is_multiple_of(8),
-            loader: LoaderKind::Plain,
-            epilogue: EpilogueKind::AlphaBeta,
-        };
+        let key = coop_key(tile, transposed_b, (k, n));
+        let compiling = Instant::now();
         let kernel = coop.kernel(ctx, key);
+        if tune.is_some() {
+            // A trial's compile time is part of what tuning costs.
+            if let Some(mut tuner) = coop.tuner() {
+                tuner.charge(compiling.elapsed());
+            }
+        }
         // With K split the kernel stores plain partial sums; the reduction
         // applies the epilogue once.
         let kernel_ep = if split == 1 { ep } else { Epilogue::STORE };
@@ -350,7 +445,7 @@ impl ComputeEngine {
         };
         let (gx, gy) = tile.groups(m, n);
         if split == 1 {
-            self.run_labeled(
+            self.run_tagged(
                 ctx,
                 &kernel,
                 label,
@@ -362,10 +457,11 @@ impl ComputeEngine {
                     (4, coop.overflows.buffer()),
                 ],
                 (gx, gy, 1),
+                tune,
             );
         } else {
             let parts = UnifiedTensor::empty(ctx, &[split as usize, m as usize, n as usize]);
-            self.run_labeled(
+            self.run_tagged(
                 ctx,
                 &kernel,
                 label,
@@ -377,17 +473,25 @@ impl ComputeEngine {
                     (4, coop.overflows.buffer()),
                 ],
                 (gx, gy, split),
+                tune,
             );
             let len = m * n;
             let params = uniform(
                 ctx,
                 bytemuck::cast_slice(&[len, split, ep.alpha.to_bits(), ep.beta.to_bits()]),
             );
-            self.run(
+            let reduce = KernelLabel {
+                entry: self.split_reduce.entry_point,
+                layout: "",
+                size_class: "",
+            };
+            self.run_tagged(
                 ctx,
                 &self.split_reduce,
+                reduce,
                 &[(0, parts.buffer()), (1, out.buffer()), (2, &params)],
                 grid(len.div_ceil(256)),
+                tune,
             );
         }
         Some(CoopConfig { tile, split })
