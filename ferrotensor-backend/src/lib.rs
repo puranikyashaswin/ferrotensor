@@ -49,7 +49,9 @@ pub use engine::{
     MASKED_CE_SKIP, SUM_SQUARES_CHUNK,
 };
 #[doc(hidden)]
-pub use engine::{CoopConfig, CoopTile, MatmulPath, SkinnyTile, SmallMLaunch, SmallMTile};
+pub use engine::{
+    CoopConfig, CoopTile, MatmulPath, SkinnyTile, SmallMLaunch, SmallMTile, FLASH_COOP_ENV,
+};
 pub use kernel_timing::{KernelTime, KernelTimes, KernelTiming, KernelTimingMode};
 pub use memory::{MemoryCategory, MemorySnapshot, MemoryTracker};
 pub use profile::GpuCounterSnapshot;

@@ -13,6 +13,7 @@ use wgpu::{util::DeviceExt, Buffer, Device};
 
 mod attention;
 mod elementwise;
+mod flash_coop;
 mod matmul;
 mod matmul_coop;
 mod misc;
@@ -23,6 +24,7 @@ mod small_m;
 mod training;
 
 pub use attention::AttentionOptions;
+pub use flash_coop::FLASH_COOP_ENV;
 pub use matmul::{Epilogue, MatmulPath};
 pub use matmul_coop::{CoopConfig, CoopTile};
 pub use skinny::SkinnyTile;
@@ -366,6 +368,7 @@ pub struct ComputeEngine {
     flash_attn_decode: Kernel,
     flash_attn_v2_bw_dq: Kernel,
     flash_attn_v2_bw_dkdv: Kernel,
+    flash_group_sum: Kernel,
     split_reduce: Kernel,
     /// Small-M matmul kernels, compiled the first time a tile and layout run.
     small_m: Mutex<HashMap<small_m::SmallMKey, Arc<Kernel>>>,
@@ -455,6 +458,7 @@ impl ComputeEngine {
             flash_attn_decode: k("flash_attention_decode"),
             flash_attn_v2_bw_dq: k("flash_bwd_dq"),
             flash_attn_v2_bw_dkdv: k("flash_bwd_dk_dv"),
+            flash_group_sum: k("flash_group_sum"),
             split_reduce: k("matmul_split_reduce"),
             small_m: Mutex::new(HashMap::new()),
             small_m_max_bytes: limits.max_compute_workgroup_storage_size,

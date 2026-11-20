@@ -11,6 +11,9 @@
 
 #![allow(clippy::unwrap_used)]
 
+mod common;
+
+use common::attention::{causal_rule, cpu_attention, cpu_attention_backward, cpu_attention_lse};
 use ferrotensor_backend::{
     q4, AdamParams, AttentionOptions, ComputeEngine, DType, Epilogue, MatmulPath, MemoryCategory,
     SkinnyTile, SmallMTile, UnifiedTensor, WgpuContext, MASKED_CE_SKIP, SUM_SQUARES_CHUNK,
@@ -29,6 +32,8 @@ fn gpu() -> &'static Gpu {
     GPU.get_or_init(|| {
         let ctx = pollster::block_on(WgpuContext::new());
         let engine = ComputeEngine::new(&ctx);
+        // The f32 tolerances below are for the scalar attention kernels.
+        engine.set_flash_coop(false);
         Gpu { ctx, engine }
     })
 }
@@ -123,108 +128,6 @@ fn cpu_rms_norm(x: &[f32], w: &[f32], len: usize, eps: f32) -> Vec<f32> {
 
 fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
-}
-
-/// Reference attention for [batch, seq, heads, dim] tensors with GQA, an
-/// optional additive mask of shape [batch, heads, seq_q, seq_k] and a
-/// visibility rule `visible(i, j)` for query i and key j.
-#[allow(clippy::too_many_arguments)]
-fn cpu_attention(
-    q: &[f32],
-    k: &[f32],
-    v: &[f32],
-    mask: Option<&[f32]>,
-    (b, sq, sk, h, hkv, d): (usize, usize, usize, usize, usize, usize),
-    visible: impl Fn(usize, usize) -> bool,
-) -> (Vec<f32>, Vec<Vec<f32>>) {
-    let scale = 1.0 / (d as f32).sqrt();
-    let mut out = vec![0.0f32; b * sq * h * d];
-    // Attention probabilities per (b, h, i), used by the backward reference.
-    let mut probs = Vec::new();
-    for bi in 0..b {
-        for hi in 0..h {
-            let kh = hi / (h / hkv);
-            for i in 0..sq {
-                let qo = ((bi * sq + i) * h + hi) * d;
-                let mut s = vec![f32::NEG_INFINITY; sk];
-                for (j, sj) in s.iter_mut().enumerate() {
-                    if !visible(i, j) {
-                        continue;
-                    }
-                    let ko = ((bi * sk + j) * hkv + kh) * d;
-                    let mut dot = 0.0;
-                    for x in 0..d {
-                        dot += q[qo + x] * k[ko + x];
-                    }
-                    *sj = dot * scale;
-                    if let Some(m) = mask {
-                        *sj += m[((bi * h + hi) * sq + i) * sk + j];
-                    }
-                }
-                let max = s.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let e: Vec<f32> = s.iter().map(|x| (x - max).exp()).collect();
-                let sum: f32 = e.iter().sum();
-                let p: Vec<f32> = e.iter().map(|x| x / sum).collect();
-                for (j, pj) in p.iter().enumerate() {
-                    let vo = ((bi * sk + j) * hkv + kh) * d;
-                    for x in 0..d {
-                        out[qo + x] += pj * v[vo + x];
-                    }
-                }
-                probs.push(p);
-            }
-        }
-    }
-    (out, probs)
-}
-
-/// Reference gradients of attention (no dropout) given dO.
-#[allow(clippy::type_complexity)]
-fn cpu_attention_backward(
-    q: &[f32],
-    k: &[f32],
-    v: &[f32],
-    dout: &[f32],
-    probs: &[Vec<f32>],
-    (b, sq, sk, h, hkv, d): (usize, usize, usize, usize, usize, usize),
-) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
-    let scale = 1.0 / (d as f32).sqrt();
-    let mut dq = vec![0.0f32; q.len()];
-    let mut dk = vec![0.0f32; k.len()];
-    let mut dv = vec![0.0f32; v.len()];
-    let mut row = 0;
-    for bi in 0..b {
-        for hi in 0..h {
-            let kh = hi / (h / hkv);
-            for i in 0..sq {
-                let p = &probs[row];
-                row += 1;
-                let qo = ((bi * sq + i) * h + hi) * d;
-                // dP_ij = dO_i . V_j ; dS = P * (dP - sum_j P_ij dP_ij)
-                let dp: Vec<f32> = (0..sk)
-                    .map(|j| {
-                        let vo = ((bi * sk + j) * hkv + kh) * d;
-                        (0..d).map(|x| dout[qo + x] * v[vo + x]).sum()
-                    })
-                    .collect();
-                let rowsum: f32 = p.iter().zip(&dp).map(|(a, b)| a * b).sum();
-                for j in 0..sk {
-                    let ko = ((bi * sk + j) * hkv + kh) * d;
-                    let ds = p[j] * (dp[j] - rowsum) * scale;
-                    for x in 0..d {
-                        dv[ko + x] += p[j] * dout[qo + x];
-                        dq[qo + x] += ds * k[ko + x];
-                        dk[ko + x] += ds * q[qo + x];
-                    }
-                }
-            }
-        }
-    }
-    (dq, dk, dv)
-}
-
-fn causal_rule(causal: bool) -> impl Fn(usize, usize) -> bool {
-    move |i, j| !causal || j <= i
 }
 
 // ---------------------------------------------------------------------------
@@ -1780,6 +1683,54 @@ fn flash_attention_v2_backward_matches_cpu() {
     }
 }
 
+/// Backward with groups of 3 query heads per KV head (the 135M, 360M and
+/// 1.7B head counts, and a batch), where dK and dV go through per-head
+/// partials and the group sum.
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn flash_attention_v2_backward_sums_the_heads_of_a_group() {
+    let g = gpu();
+    // (batch, seq, heads, kv heads, head_dim)
+    let cases: &[(usize, usize, usize, usize, usize)] = &[
+        (1, 256, 9, 3, 64),
+        (1, 100, 15, 5, 64),
+        (2, 45, 6, 2, 64),
+        (1, 33, 4, 1, 128),
+        (1, 40, 8, 8, 64),
+    ];
+    for (n, &(b, s, h, hkv, d)) in cases.iter().enumerate() {
+        let dims = (b, s, s, h, hkv, d);
+        let seed = 200 + 4 * n as u64;
+        let q = rand_vec(b * s * h * d, seed);
+        let k = rand_vec(b * s * hkv * d, seed + 1);
+        let v = rand_vec(b * s * hkv * d, seed + 2);
+        let dout = rand_vec(b * s * h * d, seed + 3);
+        let (out, probs) = cpu_attention(&q, &k, &v, None, dims, causal_rule(true));
+        let (want_dq, want_dk, want_dv) = cpu_attention_backward(&q, &k, &v, &dout, &probs, dims);
+        let (gq, gk, gv) = (
+            zeros(&[b, s, h, d]),
+            zeros(&[b, s, hkv, d]),
+            zeros(&[b, s, hkv, d]),
+        );
+        g.engine.flash_attention_v2_backward(
+            &g.ctx,
+            &upload(&q, &[b, s, h, d]),
+            &upload(&k, &[b, s, hkv, d]),
+            &upload(&v, &[b, s, hkv, d]),
+            &upload(&out, &[b, s, h, d]),
+            &upload(&dout, &[b, s, h, d]),
+            &gq,
+            &gk,
+            &gv,
+            true,
+        );
+        let name = format!("b{b} s{s} h{h}/{hkv} d{d}");
+        assert_close(&format!("dq {name}"), &read(&gq), &want_dq, 1e-4, 1e-3);
+        assert_close(&format!("dk {name}"), &read(&gk), &want_dk, 1e-4, 1e-3);
+        assert_close(&format!("dv {name}"), &read(&gv), &want_dv, 1e-4, 1e-3);
+    }
+}
+
 #[test]
 #[ignore = "needs a GPU; run with --ignored --test-threads=1"]
 fn flash_attention_single_head_backward_matches_cpu() {
@@ -1808,40 +1759,6 @@ fn flash_attention_single_head_backward_matches_cpu() {
     assert_close("v1 dq", &read(&gq), &want_dq, 1e-4, 1e-3);
     assert_close("v1 dk", &read(&gk), &want_dk, 1e-4, 1e-3);
     assert_close("v1 dv", &read(&gv), &want_dv, 1e-4, 1e-3);
-}
-
-/// Log-sum-exp of the scaled (and masked) scores of every (batch, head,
-/// query) row, in the order of the attention stats.
-fn cpu_attention_lse(
-    q: &[f32],
-    k: &[f32],
-    mask: Option<&[f32]>,
-    (b, sq, sk, h, hkv, d): (usize, usize, usize, usize, usize, usize),
-    visible: impl Fn(usize, usize) -> bool,
-) -> Vec<f32> {
-    let scale = 1.0 / (d as f32).sqrt();
-    let mut lse = Vec::with_capacity(b * h * sq);
-    for bi in 0..b {
-        for hi in 0..h {
-            let kh = hi / (h / hkv);
-            for i in 0..sq {
-                let qo = ((bi * sq + i) * h + hi) * d;
-                let s: Vec<f64> = (0..sk)
-                    .filter(|&j| visible(i, j))
-                    .map(|j| {
-                        let ko = ((bi * sk + j) * hkv + kh) * d;
-                        let dot: f64 = (0..d).map(|x| (q[qo + x] * k[ko + x]) as f64).sum();
-                        let m = mask.map_or(0.0, |m| m[((bi * h + hi) * sq + i) * sk + j] as f64);
-                        dot * scale as f64 + m
-                    })
-                    .collect();
-                let max = s.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                let sum: f64 = s.iter().map(|x| (x - max).exp()).sum();
-                lse.push((max + sum.ln()) as f32);
-            }
-        }
-    }
-    lse
 }
 
 /// (batch, seq, heads, kv_heads, head_dim) for the saved-stats tests: every
