@@ -17,11 +17,12 @@ use common::*;
 use ferrotensor_autograd::{FusedProjections, Tensor};
 use ferrotensor_graph::lfm::{Lfm2LayerOp, Lfm2Model};
 use ferrotensor_graph::model_builder::{Lfm2ModelBuilder, LoRaConfig};
-use ferrotensor_graph::FusedMode;
+use ferrotensor_graph::{FuseChoice, FuseSwitch, FusedMode};
 use ferrotensor_loader::{ModelLoader, WeightsContext};
 use ferrotensor_trainer::checkpoint::{
-    apply_checkpoint, load_lora_checkpoint, save_lora_checkpoint,
+    apply_checkpoint, load_lora_checkpoint, save_lora_checkpoint, LoraMetadata,
 };
+use ferrotensor_trainer::merge::{merge_adapter, MERGED_WEIGHTS_FILE};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -144,7 +145,7 @@ fn fused_projections_match_the_unfused_layers() {
     write_tiny_llama(dir.path());
     let gpu = gpu();
     let off = build(&gpu, dir.path());
-    let on = build(&gpu, dir.path());
+    let mut on = build(&gpu, dir.path());
     set_lora_b(&gpu, &off);
     set_lora_b(&gpu, &on);
     let built = on
@@ -190,7 +191,7 @@ fn fused_projections_train_like_the_unfused_layers() {
     write_tiny_llama(dir.path());
     let gpu = gpu();
     let off = build(&gpu, dir.path());
-    let on = build(&gpu, dir.path());
+    let mut on = build(&gpu, dir.path());
     set_lora_b(&gpu, &off);
     set_lora_b(&gpu, &on);
     on.enable_fused_projections(&gpu.engine, FusedMode::Force)
@@ -226,7 +227,7 @@ fn the_f16_mirror_equals_f16_of_a_after_a_step_and_after_a_resume() {
     let dir = TempDir::new("fused-mirror");
     write_tiny_llama(dir.path());
     let gpu = gpu();
-    let model = build(&gpu, dir.path());
+    let mut model = build(&gpu, dir.path());
     set_lora_b(&gpu, &model);
     model
         .enable_fused_projections(&gpu.engine, FusedMode::Force)
@@ -254,7 +255,7 @@ fn the_f16_mirror_equals_f16_of_a_after_a_step_and_after_a_resume() {
     let named = trained.model.named_lora_params();
     pollster::block_on(save_lora_checkpoint(&gpu.ctx, &adapter, &named, None))
         .expect("save adapter");
-    let fresh = build(&gpu, dir.path());
+    let mut fresh = build(&gpu, dir.path());
     fresh
         .enable_fused_projections(&gpu.engine, FusedMode::Force)
         .expect("enable");
@@ -280,7 +281,7 @@ fn a_model_without_fused_projections_runs_exactly_as_before() {
     write_tiny_llama(dir.path());
     let gpu = gpu();
     let plain = build(&gpu, dir.path());
-    let auto = build(&gpu, dir.path());
+    let mut auto = build(&gpu, dir.path());
     set_lora_b(&gpu, &plain);
     set_lora_b(&gpu, &auto);
     let built = auto
@@ -300,4 +301,224 @@ fn a_model_without_fused_projections_runs_exactly_as_before() {
         let same = a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits());
         assert!(same, "{name}: gradient differs");
     }
+}
+
+/// The frozen weight of every q, k, v, gate and up projection of `model` as
+/// `(name, values)`, in layer order. A fused model's own layers hold a
+/// placeholder instead, so this is for a model that never fused.
+fn base_weights(gpu: &Gpu, model: &Lfm2Model) -> Vec<(String, Vec<f32>)> {
+    let mut out = Vec::new();
+    for (i, layer) in model.layers.iter().enumerate() {
+        if let Lfm2LayerOp::Attention(attn) = &layer.op {
+            for (n, l) in [
+                ("q", &attn.q_proj),
+                ("k", &attn.k_proj),
+                ("v", &attn.v_proj),
+            ] {
+                out.push((format!("{i}.{n}"), host(gpu, &l.weight)));
+            }
+        }
+        for (n, l) in [("gate", &layer.mlp.gate_proj), ("up", &layer.mlp.up_proj)] {
+            out.push((format!("{i}.{n}"), host(gpu, &l.weight)));
+        }
+    }
+    out
+}
+
+fn bits(values: &[f32]) -> Vec<u16> {
+    values
+        .iter()
+        .map(|&v| half::f16::from_f32(v).to_bits())
+        .collect()
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn switches_off_run_exactly_the_unfused_path() {
+    let dir = TempDir::new("fused-switch-off");
+    write_tiny_llama(dir.path());
+    let gpu = gpu();
+    let plain = build(&gpu, dir.path());
+    let mut off = build(&gpu, dir.path());
+    set_lora_b(&gpu, &plain);
+    set_lora_b(&gpu, &off);
+    let built = off
+        .enable_fused_projections_with(&gpu.engine, FusedMode::Force, FuseChoice::OFF, 64)
+        .expect("enable");
+    assert_eq!(built, (0, 0), "both switches off build no group");
+    assert!(groups(&off).is_empty());
+
+    let (loss_a, grads_a) = loss_and_grads(&gpu, &plain);
+    let (loss_b, grads_b) = loss_and_grads(&gpu, &off);
+    assert_eq!(loss_a.to_bits(), loss_b.to_bits(), "loss");
+    for ((name, a), (_, b)) in grads_a.iter().zip(&grads_b) {
+        let same = a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits());
+        assert!(same, "{name}: gradient differs");
+    }
+    let before = base_weights(&gpu, &plain);
+    let after = base_weights(&gpu, &off);
+    assert_eq!(before.len(), after.len());
+    for ((name, a), (_, b)) in before.iter().zip(&after) {
+        assert_eq!(a, b, "{name}: the weight changed with the switches off");
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn each_switch_builds_only_its_own_groups() {
+    let dir = TempDir::new("fused-switch-one");
+    write_tiny_llama(dir.path());
+    let gpu = gpu();
+    let mut qkv_only = build(&gpu, dir.path());
+    let choice = FuseChoice {
+        qkv: FuseSwitch::On,
+        gate_up: FuseSwitch::Off,
+    };
+    let built = qkv_only
+        .enable_fused_projections_with(&gpu.engine, FusedMode::Force, choice, 64)
+        .expect("enable");
+    assert_eq!(built, (LAYERS, 0));
+    let mut gate_up_only = build(&gpu, dir.path());
+    let choice = FuseChoice {
+        qkv: FuseSwitch::Off,
+        gate_up: FuseSwitch::On,
+    };
+    let built = gate_up_only
+        .enable_fused_projections_with(&gpu.engine, FusedMode::Force, choice, 64)
+        .expect("enable");
+    assert_eq!(built, (0, LAYERS));
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn the_fused_weight_equals_the_concatenation_of_the_originals() {
+    let dir = TempDir::new("fused-concat");
+    write_tiny_llama(dir.path());
+    let gpu = gpu();
+    let reference = build(&gpu, dir.path());
+    let mut fused = build(&gpu, dir.path());
+    set_lora_b(&gpu, &reference);
+    set_lora_b(&gpu, &fused);
+    fused
+        .enable_fused_projections(&gpu.engine, FusedMode::Force)
+        .expect("enable");
+    let originals = base_weights(&gpu, &reference);
+
+    let mut checked = 0;
+    for (i, layer) in fused.layers.iter().enumerate() {
+        let mut sets: Vec<(Arc<FusedProjections>, Vec<String>)> = Vec::new();
+        if let Lfm2LayerOp::Attention(attn) = &layer.op {
+            if let Some(g) = attn.fused.get() {
+                sets.push((g, ["q", "k", "v"].map(|n| format!("{i}.{n}")).to_vec()));
+            }
+        }
+        if let Some(g) = layer.mlp.fused.get() {
+            sets.push((g, ["gate", "up"].map(|n| format!("{i}.{n}")).to_vec()));
+        }
+        for (group, names) in sets {
+            let halves = group.weight_halves(&gpu.ctx).expect("weight readback");
+            let rows = group.input_size();
+            let total = halves.len() / rows;
+            assert_eq!(halves.len(), rows * total);
+            let mut offset = 0;
+            for (index, (name, width)) in names.iter().zip(group.widths()).enumerate() {
+                let (_, want) = originals
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .unwrap_or_else(|| panic!("no original {name}"));
+                assert_eq!(want.len(), rows * width, "{name}: original size");
+                let want = bits(want);
+                for r in 0..rows {
+                    let got = &halves[r * total + offset..r * total + offset + width];
+                    assert_eq!(got, &want[r * width..(r + 1) * width], "{name}, row {r}");
+                }
+                // The copy taken back out of the group is the original too.
+                let back = group.projection(&gpu.ctx, index).expect("projection");
+                assert_eq!(bits(&host(&gpu, &back)), want, "{name}: restored weight");
+                offset += width;
+                checked += 1;
+            }
+        }
+    }
+    assert_eq!(checked, LAYERS * 5, "q, k, v, gate and up of every block");
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn a_fused_model_decodes_with_a_cache_like_the_unfused_one() {
+    let dir = TempDir::new("fused-cache");
+    write_tiny_llama(dir.path());
+    let gpu = gpu();
+    let reference = build(&gpu, dir.path());
+    let mut fused = build(&gpu, dir.path());
+    set_lora_b(&gpu, &reference);
+    set_lora_b(&gpu, &fused);
+    fused
+        .enable_fused_projections(&gpu.engine, FusedMode::Force)
+        .expect("enable");
+    let seq = pattern_sequence();
+    let run = |model: &Lfm2Model| {
+        let mut cache = model
+            .new_kv_cache(seq.len())
+            .expect("an attention-only model");
+        let logits = model.forward(&gpu.engine, &seq[..8], 0, Some(&mut cache), None);
+        let first = host(&gpu, &logits);
+        let logits = model.forward(&gpu.engine, &seq[8..9], 8, Some(&mut cache), None);
+        (first, host(&gpu, &logits))
+    };
+    // A pass with a cache cannot use the group, so it runs the layers' own
+    // code on weights copied back out of it: the same values, bit for bit.
+    let (a1, a2) = run(&reference);
+    let (b1, b2) = run(&fused);
+    let same = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits());
+    assert!(same(&a1, &b1), "prefill logits differ");
+    assert!(same(&a2, &b2), "decode logits differ");
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn save_and_merge_write_the_original_layout_from_a_fused_model() {
+    let dir = TempDir::new("fused-merge");
+    write_tiny_llama(dir.path());
+    let gpu = gpu();
+    let reference = build(&gpu, dir.path());
+    let mut fused = build(&gpu, dir.path());
+    set_lora_b(&gpu, &reference);
+    set_lora_b(&gpu, &fused);
+    fused
+        .enable_fused_projections(&gpu.engine, FusedMode::Force)
+        .expect("enable");
+
+    let meta = LoraMetadata {
+        rank: 4,
+        alpha: 8.0,
+        target_modules: Vec::new(),
+        trained_modules: None,
+    };
+    let save = |model: &Lfm2Model, file: &str| {
+        let path = dir.path().join(file);
+        let named = model.named_lora_params();
+        pollster::block_on(save_lora_checkpoint(&gpu.ctx, &path, &named, Some(&meta)))
+            .expect("save adapter");
+        load_lora_checkpoint(&path).expect("load adapter")
+    };
+    let ckpt_ref = save(&reference, "ref.safetensors");
+    let ckpt_fused = save(&fused, "fused.safetensors");
+    assert_eq!(ckpt_ref.tensors.len(), LAYERS * 7 * 2);
+    assert_eq!(ckpt_fused.tensors.len(), ckpt_ref.tensors.len());
+    for (name, (shape, values)) in &ckpt_ref.tensors {
+        let (fshape, fvalues) = &ckpt_fused.tensors[name];
+        assert_eq!(shape, fshape, "{name}: shape");
+        assert_eq!(values, fvalues, "{name}: values");
+    }
+
+    let out_ref = TempDir::new("fused-merge-ref");
+    let out_fused = TempDir::new("fused-merge-fused");
+    let a = merge_adapter(dir.path(), &ckpt_ref, out_ref.path()).expect("merge reference");
+    let b = merge_adapter(dir.path(), &ckpt_fused, out_fused.path()).expect("merge fused");
+    assert_eq!((a.merged, a.copied), (b.merged, b.copied));
+    assert_eq!(a.merged, LAYERS * 7, "seven adapted projections per block");
+    let bytes_a = std::fs::read(out_ref.path().join(MERGED_WEIGHTS_FILE)).expect("read");
+    let bytes_b = std::fs::read(out_fused.path().join(MERGED_WEIGHTS_FILE)).expect("read");
+    assert!(bytes_a == bytes_b, "the merged files differ");
 }

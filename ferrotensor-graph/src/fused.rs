@@ -7,17 +7,138 @@
 //! forward and backward passes then run as the fused kernels of
 //! `ferrotensor-backend` instead of one op per projection.
 //!
-//! The group holds an f16 copy of the `A` matrices of the layer's LoRA
-//! adapters. [`Lfm2Model::refresh_lora_mirrors`](crate::Lfm2Model::refresh_lora_mirrors)
+//! The group owns the concatenated f16 weight of its projections, with room for
+//! an f16 copy of the `A` matrices of the layer's LoRA adapters. It is the
+//! only copy of those weights: the layer's own `Linear`s keep a placeholder,
+//! and a pass the group cannot serve (a KV cache, a mask) copies the weights
+//! back out of it once and keeps them.
+//!
+//! `FERROTENSOR_FUSE_QKV` and `FERROTENSOR_FUSE_GATEUP` (`on`, `off` or
+//! `auto`, read once) choose per kind of group whether a layer gets one. [`Lfm2Model::refresh_lora_mirrors`](crate::Lfm2Model::refresh_lora_mirrors)
 //! rewrites it, and must run after every optimizer step, adapter load and
 //! resume. A layer that is not eligible, or a model that was never enabled,
 //! runs the unfused code of before.
 
 use crate::{Attention, Linear, MLP};
 use ferrotensor_autograd::{AttentionGeometry, FusedLora, FusedProjections, Tensor};
-use ferrotensor_backend::{ComputeEngine, DType, WgpuContext, LORA_GROUP_MAX_RANK};
+use ferrotensor_backend::{ComputeEngine, DType, UnifiedTensor, WgpuContext, LORA_GROUP_MAX_RANK};
 use std::cell::RefCell;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+/// The environment variable that switches the fused q, k and v groups.
+pub const FUSE_QKV_ENV: &str = "FERROTENSOR_FUSE_QKV";
+/// The environment variable that switches the fused gate and up groups.
+pub const FUSE_GATEUP_ENV: &str = "FERROTENSOR_FUSE_GATEUP";
+
+/// Whether one kind of fused group is used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FuseSwitch {
+    /// Every eligible layer gets the group.
+    On,
+    /// No layer does: the unfused code of before runs.
+    Off,
+    /// A layer gets it where [`FuseKind::auto_fuses`] says it is faster.
+    Auto,
+}
+
+impl FuseSwitch {
+    /// The switch a variable value names; `None` (unset) is `auto`, and a
+    /// value that names none is `auto` with a warning.
+    fn parse(name: &str, value: Option<&str>) -> Self {
+        match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            None | Some("auto") => Self::Auto,
+            Some("on") => Self::On,
+            Some("off") => Self::Off,
+            Some(other) => {
+                log::warn!("{name}={other:?} is not on, off or auto; using auto");
+                Self::Auto
+            }
+        }
+    }
+}
+
+/// The two kinds of fused group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FuseKind {
+    /// The q, k and v projections of an attention layer.
+    Qkv,
+    /// The gate and up projections of a feed-forward.
+    GateUp,
+}
+
+/// The shape of one group, for the `auto` rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FuseShape {
+    /// Rows of one training pass (batch size times sequence length).
+    pub rows: usize,
+    /// The input width of the projections.
+    pub hidden: usize,
+    /// The summed output widths of the projections.
+    pub width: usize,
+}
+
+impl FuseKind {
+    /// Whether `auto` fuses a group of this kind and `shape`: the rule that
+    /// the end-to-end step times of `notes/stack2-2026-11-20.md` support.
+    pub fn auto_fuses(self, _shape: FuseShape) -> bool {
+        matches!(self, Self::Qkv | Self::GateUp)
+    }
+}
+
+/// Which fused groups [`Lfm2Model::enable_fused_projections_with`](crate::Lfm2Model::enable_fused_projections_with) builds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FuseChoice {
+    /// The q, k and v groups.
+    pub qkv: FuseSwitch,
+    /// The gate and up groups.
+    pub gate_up: FuseSwitch,
+}
+
+impl FuseChoice {
+    /// Both kinds on.
+    pub const ON: Self = Self {
+        qkv: FuseSwitch::On,
+        gate_up: FuseSwitch::On,
+    };
+    /// Both kinds off.
+    pub const OFF: Self = Self {
+        qkv: FuseSwitch::Off,
+        gate_up: FuseSwitch::Off,
+    };
+    /// Both kinds decided by the `auto` rule.
+    pub const AUTO: Self = Self {
+        qkv: FuseSwitch::Auto,
+        gate_up: FuseSwitch::Auto,
+    };
+
+    /// The choice [`FUSE_QKV_ENV`] and [`FUSE_GATEUP_ENV`] make, read from the
+    /// environment the first time and kept for the life of the process.
+    pub fn from_env() -> Self {
+        static CHOICE: OnceLock<FuseChoice> = OnceLock::new();
+        *CHOICE.get_or_init(|| Self::from_vars(&|name| std::env::var(name).ok()))
+    }
+
+    /// The choice `get`'s environment makes.
+    pub fn from_vars(get: &dyn Fn(&str) -> Option<String>) -> Self {
+        Self {
+            qkv: FuseSwitch::parse(FUSE_QKV_ENV, get(FUSE_QKV_ENV).as_deref()),
+            gate_up: FuseSwitch::parse(FUSE_GATEUP_ENV, get(FUSE_GATEUP_ENV).as_deref()),
+        }
+    }
+
+    /// Whether a group of `kind` and `shape` is built.
+    pub fn wants(self, kind: FuseKind, shape: FuseShape) -> bool {
+        let switch = match kind {
+            FuseKind::Qkv => self.qkv,
+            FuseKind::GateUp => self.gate_up,
+        };
+        match switch {
+            FuseSwitch::On => true,
+            FuseSwitch::Off => false,
+            FuseSwitch::Auto => kind.auto_fuses(shape),
+        }
+    }
+}
 
 /// When the fused projections are used.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,17 +159,59 @@ impl FusedMode {
 
 /// The fused group of one layer, empty until enabled.
 #[derive(Clone, Default)]
-pub struct FusedSlot(RefCell<Option<Arc<FusedProjections>>>);
+pub struct FusedSlot {
+    group: RefCell<Option<Arc<FusedProjections>>>,
+    /// The projections copied back out of the group, made the first time a
+    /// pass needs them.
+    restored: RefCell<Option<Vec<Tensor>>>,
+}
 
 impl FusedSlot {
     /// The group, when the layer has one.
     pub fn get(&self) -> Option<Arc<FusedProjections>> {
-        self.0.borrow().clone()
+        self.group.borrow().clone()
     }
 
     fn set(&self, group: Option<Arc<FusedProjections>>) {
-        *self.0.borrow_mut() = group;
+        *self.group.borrow_mut() = group;
+        *self.restored.borrow_mut() = None;
     }
+
+    /// The weights of the group's projections as separate frozen tensors, or
+    /// `None` when the layer has no group (its own weights are then the
+    /// real ones). They are copied out of the group the first time.
+    #[expect(
+        clippy::panic,
+        reason = "the unfused forward pass has no error path, and the group cannot be rebuilt without these weights"
+    )]
+    fn restored(&self, ctx: &Arc<WgpuContext>) -> Option<Vec<Tensor>> {
+        let group = self.get()?;
+        let mut cached = self.restored.borrow_mut();
+        if cached.is_none() {
+            let weights: Result<Vec<Tensor>, String> = (0..group.widths().len())
+                .map(|i| group.projection(ctx, i))
+                .collect();
+            match weights {
+                Ok(w) => *cached = Some(w),
+                Err(e) => panic!("copying the projections out of the fused group: {e}"),
+            }
+        }
+        cached.clone()
+    }
+}
+
+/// `lin` with `weight` in place of its own.
+fn with_weight(lin: &Linear, weight: &Tensor) -> Linear {
+    Linear {
+        weight: weight.clone(),
+        bias: lin.bias.clone(),
+        lora: lin.lora.clone(),
+    }
+}
+
+/// What stands in for a weight whose real copy lives in a fused group.
+fn placeholder(ctx: &Arc<WgpuContext>) -> Tensor {
+    Tensor::frozen(ctx.clone(), UnifiedTensor::new(ctx, &[0.0], &[1, 1]))
 }
 
 /// The adapters of `lins` as one group, `Ok(None)` without adapters, and
@@ -120,22 +283,46 @@ fn build(
 }
 
 impl Attention {
-    /// Gives the layer a fused q, k and v group, or none when `mode` or the
-    /// layer's shape does not allow one (a bias, a per-head norm, a weight
-    /// that is not frozen f16, adapters that differ). Returns whether the
-    /// layer now runs fused.
+    /// The input width and summed output width of the q, k and v projections.
+    fn qkv_shape(&self, rows: usize) -> FuseShape {
+        let widths = [&self.q_proj, &self.k_proj, &self.v_proj]
+            .map(|l| l.weight.data.shape.get(1).copied().unwrap_or(0));
+        FuseShape {
+            rows,
+            hidden: self.q_proj.weight.data.shape.first().copied().unwrap_or(0),
+            width: widths.iter().sum(),
+        }
+    }
+
+    /// Gives the layer a fused q, k and v group, or none when `mode`,
+    /// `choice` or the layer's shape does not allow one (a bias, a per-head
+    /// norm, a weight that is not frozen f16, adapters that differ). `rows`
+    /// is the row count of one pass, for the `auto` rule. Returns whether
+    /// the layer now runs fused.
+    ///
+    /// The group keeps the only copy of the three weights: the layer's own
+    /// are replaced by a placeholder, so a layer that has a group keeps it,
+    /// and calling this again returns `true` without changing anything.
     ///
     /// # Errors
     ///
     /// When building the group fails, such as a failed GPU readback.
     pub fn enable_fused(
-        &self,
-        ctx: &WgpuContext,
+        &mut self,
+        ctx: &Arc<WgpuContext>,
         engine: &ComputeEngine,
         mode: FusedMode,
+        choice: FuseChoice,
+        rows: usize,
     ) -> Result<bool, String> {
-        self.fused.set(None);
-        if !mode.allows(engine) || self.q_norm.is_some() || self.k_norm.is_some() {
+        if self.fused.get().is_some() {
+            return Ok(true);
+        }
+        if !mode.allows(engine)
+            || self.q_norm.is_some()
+            || self.k_norm.is_some()
+            || !choice.wants(FuseKind::Qkv, self.qkv_shape(rows))
+        {
             return Ok(false);
         }
         let kv = self.num_kv_heads * self.head_dim;
@@ -148,6 +335,12 @@ impl Attention {
         }
         let group = build(ctx, engine, &[&self.q_proj, &self.k_proj, &self.v_proj])?;
         let on = group.is_some();
+        if on {
+            let gone = placeholder(ctx);
+            self.q_proj.weight = gone.clone();
+            self.k_proj.weight = gone.clone();
+            self.v_proj.weight = gone;
+        }
         self.fused.set(group);
         Ok(on)
     }
@@ -161,6 +354,21 @@ impl Attention {
         self.fused
             .get()
             .map_or(Ok(()), |g| g.refresh_mirror(engine, ctx))
+    }
+
+    /// The q, k and v layers for a pass without the group: the layer's own,
+    /// or, when their weights live in the group, copies with the weights
+    /// taken back out of it.
+    pub(crate) fn unfused_qkv(&self, ctx: &Arc<WgpuContext>) -> Option<[Linear; 3]> {
+        let weights = self.fused.restored(ctx)?;
+        let [q, k, v] = weights.as_slice() else {
+            return None;
+        };
+        Some([
+            with_weight(&self.q_proj, q),
+            with_weight(&self.k_proj, k),
+            with_weight(&self.v_proj, v),
+        ])
     }
 
     /// The group, when it can serve a pass that has no KV cache, mask or
@@ -203,21 +411,46 @@ impl Attention {
 }
 
 impl MLP {
-    /// Gives the layer a fused gate and up group, or none when `mode` or the
-    /// layer's shape does not allow one. Returns whether the layer now runs
-    /// fused.
+    /// The input width and summed output width of the gate and up
+    /// projections.
+    fn gate_up_shape(&self, rows: usize) -> FuseShape {
+        let widths = [&self.gate_proj, &self.up_proj]
+            .map(|l| l.weight.data.shape.get(1).copied().unwrap_or(0));
+        FuseShape {
+            rows,
+            hidden: self
+                .gate_proj
+                .weight
+                .data
+                .shape
+                .first()
+                .copied()
+                .unwrap_or(0),
+            width: widths.iter().sum(),
+        }
+    }
+
+    /// Gives the layer a fused gate and up group, or none when `mode`,
+    /// `choice` or the layer's shape does not allow one. `rows` is the row
+    /// count of one pass, for the `auto` rule. Returns whether the layer now
+    /// runs fused. As for [`Attention::enable_fused`], the group keeps the
+    /// only copy of the two weights.
     ///
     /// # Errors
     ///
     /// When building the group fails, such as a failed GPU readback.
     pub fn enable_fused(
-        &self,
-        ctx: &WgpuContext,
+        &mut self,
+        ctx: &Arc<WgpuContext>,
         engine: &ComputeEngine,
         mode: FusedMode,
+        choice: FuseChoice,
+        rows: usize,
     ) -> Result<bool, String> {
-        self.fused.set(None);
-        if !mode.allows(engine) {
+        if self.fused.get().is_some() {
+            return Ok(true);
+        }
+        if !mode.allows(engine) || !choice.wants(FuseKind::GateUp, self.gate_up_shape(rows)) {
             return Ok(false);
         }
         let same_width = self.gate_proj.weight.data.shape == self.up_proj.weight.data.shape;
@@ -226,6 +459,11 @@ impl MLP {
         }
         let group = build(ctx, engine, &[&self.gate_proj, &self.up_proj])?;
         let on = group.is_some();
+        if on {
+            let gone = placeholder(ctx);
+            self.gate_proj.weight = gone.clone();
+            self.up_proj.weight = gone;
+        }
         self.fused.set(group);
         Ok(on)
     }
@@ -241,6 +479,20 @@ impl MLP {
             .map_or(Ok(()), |g| g.refresh_mirror(engine, ctx))
     }
 
+    /// The gate and up layers for a pass without the group: the layer's own,
+    /// or, when their weights live in the group, copies with the weights
+    /// taken back out of it.
+    pub(crate) fn unfused_gate_up(&self, ctx: &Arc<WgpuContext>) -> Option<[Linear; 2]> {
+        let weights = self.fused.restored(ctx)?;
+        let [gate, up] = weights.as_slice() else {
+            return None;
+        };
+        Some([
+            with_weight(&self.gate_proj, gate),
+            with_weight(&self.up_proj, up),
+        ])
+    }
+
     /// The group, when the weights are still frozen, the adapters still
     /// train and `input` has the group's input size.
     pub(crate) fn fused_for(&self, input: &Tensor) -> Option<Arc<FusedProjections>> {
@@ -249,5 +501,55 @@ impl MLP {
         let shape = &input.data.shape;
         let fits = (2..=3).contains(&shape.len()) && shape.last() == Some(&group.input_size());
         (frozen && fits && group.adapters_train()).then_some(group)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn choice(qkv: Option<&str>, gate_up: Option<&str>) -> FuseChoice {
+        FuseChoice::from_vars(&|name| match name {
+            FUSE_QKV_ENV => qkv.map(String::from),
+            FUSE_GATEUP_ENV => gate_up.map(String::from),
+            _ => None,
+        })
+    }
+
+    const SHAPE: FuseShape = FuseShape {
+        rows: 8,
+        hidden: 2048,
+        width: 4096,
+    };
+
+    #[test]
+    fn unset_variables_are_auto() {
+        assert_eq!(choice(None, None), FuseChoice::AUTO);
+    }
+
+    #[test]
+    fn each_variable_sets_its_own_switch() {
+        let c = choice(Some("on"), Some("off"));
+        assert_eq!(c.qkv, FuseSwitch::On);
+        assert_eq!(c.gate_up, FuseSwitch::Off);
+        let c = choice(Some(" OFF "), Some("Auto"));
+        assert_eq!(c.qkv, FuseSwitch::Off);
+        assert_eq!(c.gate_up, FuseSwitch::Auto);
+    }
+
+    #[test]
+    fn a_value_that_names_no_switch_is_auto() {
+        assert_eq!(choice(Some("yes"), Some("")), FuseChoice::AUTO);
+    }
+
+    #[test]
+    fn on_and_off_ignore_the_shape() {
+        for kind in [FuseKind::Qkv, FuseKind::GateUp] {
+            assert!(FuseChoice::ON.wants(kind, SHAPE));
+            assert!(!FuseChoice::OFF.wants(kind, SHAPE));
+        }
+        let only_qkv = choice(Some("on"), Some("off"));
+        assert!(only_qkv.wants(FuseKind::Qkv, SHAPE));
+        assert!(!only_qkv.wants(FuseKind::GateUp, SHAPE));
     }
 }

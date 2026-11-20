@@ -1,6 +1,6 @@
 use crate::model_builder::Architecture;
-use crate::{Attention, FusedMode, KVCacheLayer, Linear, RMSNorm, Tensor, MLP};
-use ferrotensor_backend::{ComputeEngine, UnifiedTensor};
+use crate::{Attention, FuseChoice, FusedMode, KVCacheLayer, Linear, RMSNorm, Tensor, MLP};
+use ferrotensor_backend::{ComputeEngine, MemoryCategory, UnifiedTensor};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -719,30 +719,56 @@ impl Lfm2Model {
     /// Gives every eligible layer its fused projections (see [`crate::fused`])
     /// for training and returns how many groups it built; a layer that does
     /// not qualify, or any layer when `mode` is [`FusedMode::Auto`] and the
-    /// engine has no cooperative matmul, keeps the unfused path.
+    /// engine has no cooperative matmul, keeps the unfused path. Every kind
+    /// of group is on; see
+    /// [`enable_fused_projections_with`](Self::enable_fused_projections_with)
+    /// to choose.
     ///
-    /// Call it after the adapters and the trainable set are final. The f16
-    /// mirror of each `A` is current on return; run
+    /// # Errors
+    ///
+    /// When building a group fails, such as a failed GPU readback.
+    pub fn enable_fused_projections(
+        &mut self,
+        engine: &ComputeEngine,
+        mode: FusedMode,
+    ) -> Result<usize, String> {
+        let (qkv, gate_up) = self.enable_fused_projections_with(engine, mode, FuseChoice::ON, 0)?;
+        Ok(qkv + gate_up)
+    }
+
+    /// [`enable_fused_projections`](Self::enable_fused_projections) for the
+    /// kinds of group `choice` allows, where `rows` is the row count of one
+    /// pass (batch size times sequence length) for its `auto` rule. Returns
+    /// the number of q, k and v groups and of gate and up groups built.
+    ///
+    /// Each group keeps the only copy of its projections' weights, so the
+    /// model holds them once. Call this after the adapters and the trainable
+    /// set are final. The f16 mirror of each `A` is current on return; run
     /// [`refresh_lora_mirrors`](Self::refresh_lora_mirrors) after every
     /// optimizer step, adapter load and resume.
     ///
     /// # Errors
     ///
     /// When building a group fails, such as a failed GPU readback.
-    pub fn enable_fused_projections(
-        &self,
+    pub fn enable_fused_projections_with(
+        &mut self,
         engine: &ComputeEngine,
         mode: FusedMode,
-    ) -> Result<usize, String> {
-        let ctx = &self.embed_tokens.ctx;
-        let mut groups = 0;
-        for layer in &self.layers {
-            if let Lfm2LayerOp::Attention(attn) = &layer.op {
-                groups += usize::from(attn.enable_fused(ctx, engine, mode)?);
+        choice: FuseChoice,
+        rows: usize,
+    ) -> Result<(usize, usize), String> {
+        let ctx = self.embed_tokens.ctx.clone();
+        // The groups hold the frozen weights now, so the memory report counts
+        // them with the base weights.
+        let _tag = ctx.memory().scope(MemoryCategory::BaseWeights);
+        let (mut qkv, mut gate_up) = (0, 0);
+        for layer in &mut self.layers {
+            if let Lfm2LayerOp::Attention(attn) = &mut layer.op {
+                qkv += usize::from(attn.enable_fused(&ctx, engine, mode, choice, rows)?);
             }
-            groups += usize::from(layer.mlp.enable_fused(ctx, engine, mode)?);
+            gate_up += usize::from(layer.mlp.enable_fused(&ctx, engine, mode, choice, rows)?);
         }
-        Ok(groups)
+        Ok((qkv, gate_up))
     }
 
     /// Rewrites the f16 mirror of every fused group's LoRA `A` matrices from
