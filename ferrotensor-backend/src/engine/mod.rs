@@ -23,7 +23,8 @@ mod small_m;
 mod training;
 
 pub use attention::AttentionOptions;
-pub use coop::{CoopConfig, CoopTile};
+pub(crate) use coop::autotune_requested;
+pub use coop::{AutotuneReport, CoopConfig, CoopTile, AUTOTUNE_ENV};
 pub use flash_coop::FLASH_COOP_ENV;
 pub use matmul::{Epilogue, MatmulPath};
 pub use skinny::SkinnyTile;
@@ -506,6 +507,20 @@ impl ComputeEngine {
         entries: &[(u32, &dyn Arg)],
         groups: (u32, u32, u32),
     ) {
+        self.run_tagged(ctx, kernel, label, entries, groups, None);
+    }
+
+    /// [`run_labeled`](Self::run_labeled), for a dispatch that is part of
+    /// the autotuner's sample `tune`, whose GPU time is read back for it.
+    fn run_tagged(
+        &self,
+        ctx: &WgpuContext,
+        kernel: &Kernel,
+        label: KernelLabel,
+        entries: &[(u32, &dyn Arg)],
+        groups: (u32, u32, u32),
+        tune: Option<u64>,
+    ) {
         let mut immediates = None;
         // A group that binds a buffer made for this dispatch alone is not
         // worth caching.
@@ -564,6 +579,7 @@ impl ComputeEngine {
             bind_group,
             groups,
             label,
+            tune,
             immediates,
         });
     }
