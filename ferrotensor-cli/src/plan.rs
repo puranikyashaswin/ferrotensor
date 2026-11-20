@@ -325,7 +325,8 @@ pub fn estimate_peak_mib(shape: &ModelShape, config: &TrainConfig) -> Estimate {
 
 /// Share of a dataset's sequences that fit the rows the estimate plans for.
 /// A micro-batch is padded to its longest sequence, so the longest ones set
-/// the peak; the rare longer batch is covered by [`SAFETY_MARGIN`].
+/// the peak. The margin is judged at this length; the longest sequence of
+/// the data must also fit the budget without the margin (see [`Plan::fits`]).
 const PLANNING_PERCENT: usize = 99;
 
 /// Token counts of a dataset's examples, as the planner needs them.
@@ -358,6 +359,12 @@ impl LengthProfile {
         let index = rank.clamp(1, self.lengths.len()) - 1;
         self.lengths[index].min(cap).max(1)
     }
+
+    /// Rows per sequence of the longest batch the data can make when examples
+    /// are cut at `cap` tokens, and at least 1.
+    pub fn longest_len(&self, cap: usize) -> usize {
+        self.lengths.last().copied().unwrap_or(1).min(cap).max(1)
+    }
 }
 
 /// Values the chooser keeps instead of trying its own; `None` tries them.
@@ -378,8 +385,13 @@ pub struct Plan {
     pub config: TrainConfig,
     /// Its estimated memory.
     pub estimate: Estimate,
-    /// Whether the estimate plus the safety margin fits the budget.
+    /// Whether the estimate plus the safety margin fits the budget, and the
+    /// estimate for a batch of the data's longest sequences fits it without
+    /// the margin.
     pub fits: bool,
+    /// The estimate for a batch whose sequences are all as long as the longest
+    /// one of the data (the same as `estimate` without data).
+    pub longest_peak_mib: u64,
 }
 
 /// The first configuration that fits `budget_mib` with the safety margin:
@@ -433,10 +445,21 @@ pub fn choose_for(
             checkpointing,
         };
         let estimate = estimate_peak_mib(shape, &config);
+        // The margin covers the rare batch that is longer than the planning
+        // length, but not a data set whose longest batch would overflow the
+        // GPU: that one has to fit the budget itself.
+        let longest = TrainConfig {
+            padded_len: lengths.map_or(seq_len, |profile| profile.longest_len(seq_len)),
+            ..config
+        };
+        let longest_peak_mib = estimate_peak_mib(shape, &longest)
+            .peak_mib
+            .max(estimate.peak_mib);
         Plan {
             config,
             estimate,
-            fits: estimate.peak_mib as f64 <= usable_mib,
+            fits: estimate.peak_mib as f64 <= usable_mib && longest_peak_mib <= budget_mib,
+            longest_peak_mib,
         }
     };
     for &seq_len in seq_lens {
@@ -767,7 +790,8 @@ pub fn plan_training(
     Ok(TrainingPlan {
         plan,
         budget_mib: budget.mib,
-        needed_budget_mib: (plan.estimate.peak_mib as f64 / (1.0 - SAFETY_MARGIN)).ceil() as u64,
+        needed_budget_mib: ((plan.estimate.peak_mib as f64 / (1.0 - SAFETY_MARGIN)).ceil() as u64)
+            .max(plan.longest_peak_mib),
         lines: human_lines(adapter.as_ref(), &budget, &report),
     })
 }
@@ -853,12 +877,14 @@ fn plan_model(
     if let Some(profile) = lengths.filter(|_| plan.config.padded_len < plan.config.seq_len) {
         notes.push(format!(
             "memory is estimated for {} rows per sequence, the {}th percentile of the \
-             {} tokenized examples, not for --seq-len {}; a batch with a longer sequence \
-             is covered by the margin",
+             {} tokenized examples, not for --seq-len {}; a batch of the longest sequences \
+             ({} rows each) is estimated at {} MiB and has to fit the budget without the margin",
             plan.config.padded_len,
             PLANNING_PERCENT,
             profile.examples(),
-            plan.config.seq_len
+            plan.config.seq_len,
+            profile.longest_len(plan.config.seq_len),
+            plan.longest_peak_mib
         ));
     }
     if plan.config.checkpointing == Checkpointing::Blocks {
@@ -1256,6 +1282,20 @@ mod tests {
                 with_data.fits
             ),
             (Checkpointing::Off, 8, 256, 160, 16596, true)
+        );
+        // A batch of the longest sequences, 8 x 224 rows, is 21,115 MiB and
+        // fits the 23,028 MiB budget itself.
+        assert_eq!(with_data.longest_peak_mib, 21115);
+        // On a 21,000 MiB budget 16,596 MiB is under the margin (17,850 MiB),
+        // but the longest batch does not fit, so the planner checkpoints.
+        let tight = choose_for(&shape, 21000, Precision::F16, 8, batch_8, Some(&lengths));
+        assert_eq!(
+            (
+                tight.config.checkpointing,
+                tight.longest_peak_mib < 21000,
+                tight.fits
+            ),
+            (Checkpointing::Blocks, true, true)
         );
         // 8 x 256 rows (23,375 MiB) do not fit, so without the data the
         // planner checkpoints.
