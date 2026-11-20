@@ -21,6 +21,11 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+mod fused;
+pub use fused::{
+    AttentionGeometry, FusedAttentionNode, FusedGateUpNode, FusedLora, FusedProjections,
+};
+
 thread_local! {
     static GRAD_ENABLED: Cell<bool> = const { Cell::new(true) };
 }

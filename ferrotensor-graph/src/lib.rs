@@ -11,6 +11,7 @@ use std::sync::Arc;
 pub mod classifier;
 pub mod dropout;
 pub mod flash_attention;
+pub mod fused;
 /// LFM2 (Liquid foundation model) blocks.
 pub mod lfm;
 pub mod model_builder;
@@ -20,6 +21,7 @@ pub use flash_attention::{
     AttentionMask, FlashAttention, FlashAttentionGrads, GroupedQueryAttention,
     KVCache as FlashKVCache, MultiQueryAttention, SlidingWindowAttention,
 };
+pub use fused::{FusedMode, FusedSlot};
 pub use lfm::Lfm2Model;
 
 // --- LoRA Adapter ---
@@ -319,6 +321,9 @@ pub struct Attention {
     pub q_norm: Option<RMSNorm>,
     /// The same for every key head (Qwen3 `k_norm`).
     pub k_norm: Option<RMSNorm>,
+    /// The fused q, k and v group of a training run, empty unless
+    /// [`Lfm2Model::enable_fused_projections`] gave the layer one.
+    pub fused: FusedSlot,
 }
 
 /// Applies `norm` to each `head_dim`-wide head vector of `x`
@@ -376,6 +381,11 @@ impl Attention {
         mask: Option<&UnifiedTensor>,
         dropout_seed: Option<u64>,
     ) -> Tensor {
+        if cache.is_none() && mask.is_none() {
+            if let Some(group) = self.fused_for(x) {
+                return self.forward_fused(engine, &group, x, pos, dropout_seed);
+            }
+        }
         let q = self.q_proj.forward(engine, x);
         let k = self.k_proj.forward(engine, x);
         let v = self.v_proj.forward(engine, x);
@@ -500,11 +510,18 @@ pub struct MLP {
     pub up_proj: Linear,
     /// Down projection back to the hidden size.
     pub down_proj: Linear,
+    /// The fused gate and up group of a training run, empty unless
+    /// [`Lfm2Model::enable_fused_projections`] gave the layer one.
+    pub fused: FusedSlot,
 }
 
 impl MLP {
     /// Applies the feed-forward to `[tokens, hidden]` or `[batch, seq, hidden]`.
     pub fn forward(&self, engine: &ComputeEngine, input: &Tensor) -> Tensor {
+        if let Some(group) = self.fused_for(input) {
+            let fused = Tensor::fused_gate_up_silu(input, &group, engine);
+            return self.down_proj.forward(engine, &fused);
+        }
         let up = self.up_proj.forward(engine, input);
         let gate = self.gate_proj.forward(engine, input);
         // silu_gate_fused(a, b) = silu(a) * b; SwiGLU applies SiLU to the gate.

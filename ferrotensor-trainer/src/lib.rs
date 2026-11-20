@@ -541,6 +541,11 @@ impl Trainer {
             };
             stepped.map_err(TrainError)?;
         }
+        // A fused projection reads an f16 copy of each LoRA `A`; it must
+        // follow the step. A model without fused groups does nothing here.
+        self.model
+            .refresh_lora_mirrors(&self.engine)
+            .map_err(TrainError)?;
         self.optimizer_step_count += 1;
         stats.optimizer_step = true;
         Ok(())

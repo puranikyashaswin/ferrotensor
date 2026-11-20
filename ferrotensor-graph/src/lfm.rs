@@ -1,5 +1,5 @@
 use crate::model_builder::Architecture;
-use crate::{Attention, KVCacheLayer, Linear, RMSNorm, Tensor, MLP};
+use crate::{Attention, FusedMode, KVCacheLayer, Linear, RMSNorm, Tensor, MLP};
 use ferrotensor_backend::{ComputeEngine, UnifiedTensor};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -714,6 +714,52 @@ impl Lfm2Model {
     #[cfg(test)]
     pub(crate) fn host_embeddings(&self) -> Option<Vec<f32>> {
         self.embed_host.borrow().clone()
+    }
+
+    /// Gives every eligible layer its fused projections (see [`crate::fused`])
+    /// for training and returns how many groups it built; a layer that does
+    /// not qualify, or any layer when `mode` is [`FusedMode::Auto`] and the
+    /// engine has no cooperative matmul, keeps the unfused path.
+    ///
+    /// Call it after the adapters and the trainable set are final. The f16
+    /// mirror of each `A` is current on return; run
+    /// [`refresh_lora_mirrors`](Self::refresh_lora_mirrors) after every
+    /// optimizer step, adapter load and resume.
+    ///
+    /// # Errors
+    ///
+    /// When building a group fails, such as a failed GPU readback.
+    pub fn enable_fused_projections(
+        &self,
+        engine: &ComputeEngine,
+        mode: FusedMode,
+    ) -> Result<usize, String> {
+        let ctx = &self.embed_tokens.ctx;
+        let mut groups = 0;
+        for layer in &self.layers {
+            if let Lfm2LayerOp::Attention(attn) = &layer.op {
+                groups += usize::from(attn.enable_fused(ctx, engine, mode)?);
+            }
+            groups += usize::from(layer.mlp.enable_fused(ctx, engine, mode)?);
+        }
+        Ok(groups)
+    }
+
+    /// Rewrites the f16 mirror of every fused group's LoRA `A` matrices from
+    /// the f32 tensors. A model without fused groups does nothing.
+    ///
+    /// # Errors
+    ///
+    /// When a kernel refuses the call.
+    pub fn refresh_lora_mirrors(&self, engine: &ComputeEngine) -> Result<(), String> {
+        let ctx = &self.embed_tokens.ctx;
+        for layer in &self.layers {
+            if let Lfm2LayerOp::Attention(attn) = &layer.op {
+                attn.refresh_fused(ctx, engine)?;
+            }
+            layer.mlp.refresh_fused(ctx, engine)?;
+        }
+        Ok(())
     }
 
     /// Only the LoRA adapter tensors (what LoRA fine-tuning updates).

@@ -39,7 +39,7 @@ use ferrotensor_graph::lfm::{legacy_llama_name, Lfm2Model};
 use ferrotensor_graph::model_builder::{
     check_supported, module_matches, Lfm2ModelBuilder, LoRaConfig, Q4Selection,
 };
-use ferrotensor_graph::{KVCache, KVCacheLayer};
+use ferrotensor_graph::{FusedMode, KVCache, KVCacheLayer};
 use ferrotensor_loader::{Lfm2Config, ModelLoader, Sampler, Tokenizer, WeightsContext};
 use ferrotensor_trainer::checkpoint::{
     apply_checkpoint, load_lora_checkpoint, save_lora_checkpoint, upgrade_optimizer_names,
@@ -847,6 +847,10 @@ fn restore_checkpoint(
         // The lookup of a frozen table reads a host copy made at build time.
         model.clear_host_embeddings();
     }
+    // A fused projection reads an f16 copy of each LoRA `A`.
+    model
+        .refresh_lora_mirrors(&base.engine)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(restored)
 }
 
@@ -1737,6 +1741,12 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
     let model = model.with_block_checkpointing(args.checkpoint_blocks);
     if args.checkpoint_blocks {
         eprintln!("block checkpointing: on");
+    }
+    if lora_on {
+        let groups = model.enable_fused_projections(&base.engine, FusedMode::Auto)?;
+        if groups > 0 {
+            eprintln!("fused projections: {groups} groups");
+        }
     }
     let mut optimizer = AdamW::new(base.engine.clone(), args.lr);
     optimizer.weight_decay = args.weight_decay;
