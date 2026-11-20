@@ -680,6 +680,10 @@ pub(crate) fn global_grad_norm(
 /// [`global_grad_norm`] over gradients packed into one buffer: one dispatch.
 /// Each gradient starts on a chunk boundary, so the partial sums are the same
 /// as the per-tensor ones and so is the norm.
+#[expect(
+    clippy::expect_used,
+    reason = "a readback fails only on device loss, and the caller has no error path"
+)]
 pub(crate) fn flat_grad_norm(
     packed_grads: &FlatGrads,
     ctx: &WgpuContext,
@@ -692,6 +696,7 @@ pub(crate) fn flat_grad_norm(
     let partials = UnifiedTensor::empty(ctx, &[chunks]);
     engine.sum_squares_partial(ctx, &packed_grads.data, &partials, 0);
     let sum_sq: f64 = pollster::block_on(partials.to_vec(ctx))
+        .expect("GPU device lost during readback")
         .iter()
         .map(|&x| x as f64)
         .sum();
