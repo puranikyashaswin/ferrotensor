@@ -3,11 +3,121 @@
 use super::CoopKey;
 
 /// How a kernel reads its operands from global memory into the staging tiles.
+///
+/// Only `a` has more than one way: `b` is always one f16 buffer, so a LoRA
+/// `A` matrix folded into the weight is just more columns of `b`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(super) enum LoaderKind {
+pub(in crate::engine) enum LoaderKind {
     /// `a` as f32, converted to f16 with the overflow check, and `b` as f16,
     /// each read straight from its own buffer.
     Plain,
+    /// `a` is `count` (2 to 4) f32 matrices side by side along K, each its
+    /// own binding with its own row length: `[dQ | dK | dV | dU]` against the
+    /// fused weight. Source `s` covers the columns from bound `s` to bound
+    /// `s + 1`, the bounds being 0, `params[2].xyz` and K.
+    Sources {
+        /// How many matrices.
+        count: u8,
+    },
+    /// `a` is `[M, 2K]` f32, a gate half then an up half, and the value
+    /// staged for column `k` is `silu(a[r, k]) * a[r, K + k]`: the down
+    /// projection reads the gate/up output with no product buffer between.
+    SwiGlu,
+}
+
+/// Most matrices a [`LoaderKind::Sources`] loader reads.
+pub(in crate::engine) const MAX_SOURCES: usize = 4;
+
+/// First binding of the extra sources `a1`, `a2` and `a3`.
+pub(in crate::engine) const SOURCE_BINDING: u32 = 5;
+
+/// Vec4s of `params` the loader reads: 2 for the sizes, 3 with the source bounds.
+pub(in crate::engine) fn params_vec4s(kind: LoaderKind) -> u32 {
+    match kind {
+        LoaderKind::Sources { .. } => 3,
+        LoaderKind::Plain | LoaderKind::SwiGlu => 2,
+    }
+}
+
+/// The binding declarations the loader adds to the kernel: the sources after
+/// the first, typed as the first (`a_vec4`).
+pub(in crate::engine) fn bindings(kind: LoaderKind, a_vec4: bool) -> String {
+    let LoaderKind::Sources { count } = kind else {
+        return String::new();
+    };
+    let ty = if a_vec4 { "vec4<f32>" } else { "f32" };
+    (1..u32::from(count))
+        .map(|s| {
+            format!(
+                "@group(0) @binding({}) var<storage, read> a{s}: array<{ty}>;\n",
+                SOURCE_BINDING + s - 1
+            )
+        })
+        .collect()
+}
+
+/// The WGSL function `a_load` that reads `a` at row `gr`, column `gk` (four
+/// elements as a `vec4<f32>` with `a_vec4`) for every loader but
+/// [`LoaderKind::Plain`], which indexes `a` itself in the staging loop.
+pub(in crate::engine) fn helpers(kind: LoaderKind, a_vec4: bool) -> String {
+    match kind {
+        LoaderKind::Plain => String::new(),
+        _ => element_fn(kind, a_vec4),
+    }
+}
+
+/// `a_load` for every loader, `Plain` included: the reference kernel reads
+/// `a` through it.
+pub(in crate::engine) fn element_fn(kind: LoaderKind, a_vec4: bool) -> String {
+    let (ty, div) = if a_vec4 {
+        ("vec4<f32>", " / 4u")
+    } else {
+        ("f32", "")
+    };
+    let mut body = String::new();
+    match kind {
+        LoaderKind::Plain => {
+            body.push_str(&format!("  return a[(gr * params[0].y + gk){div}];\n"));
+        }
+        LoaderKind::Sources { count } => {
+            const NAMES: [&str; MAX_SOURCES] = ["a", "a1", "a2", "a3"];
+            const LO: [&str; MAX_SOURCES] = ["0u", "params[2].x", "params[2].y", "params[2].z"];
+            let count = usize::from(count).clamp(1, MAX_SOURCES);
+            for (s, (name, lo)) in NAMES.iter().zip(LO).enumerate().take(count) {
+                let hi = if s + 1 < count {
+                    LO[s + 1]
+                } else {
+                    "params[0].y"
+                };
+                let read = format!("{name}[(gr * ({hi} - {lo}) + gk - {lo}){div}]");
+                if s + 1 < count {
+                    body.push_str(&format!("  if (gk < {hi}) {{ return {read}; }}\n"));
+                } else {
+                    body.push_str(&format!("  return {read};\n"));
+                }
+            }
+        }
+        LoaderKind::SwiGlu => {
+            let one = if a_vec4 { "vec4<f32>(1.0)" } else { "1.0" };
+            body.push_str(&format!(
+                "  let row = gr * 2u * params[0].y + gk;
+  let g = a[row{div}];
+  let u = a[(row + params[0].y){div}];
+  return g / ({one} + exp(-g)) * u;
+"
+            ));
+        }
+    }
+    format!("fn a_load(gr: u32, gk: u32) -> {ty} {{\n{body}}}\n")
+}
+
+/// The expression that reads `a` at `(gr, gk)` in the staging loop.
+fn read_a(key: CoopKey) -> &'static str {
+    match (key.loader, key.a_vec4) {
+        (LoaderKind::Plain, true) => "a[(gr * k + gk) / 4u]",
+        (LoaderKind::Plain, false) => "a[gr * k + gk]",
+        _ => "a_load(gr, gk)",
+    }
 }
 
 /// Staging `a[m0.., k0..]` into `sa` as f16, flagging values f16 cannot hold.
@@ -24,7 +134,7 @@ fn load_a(key: CoopKey, sa: &str) -> String {
       let gr = m0 + r;
       let gk = k0 + q * 4u;
       var v = vec4<f32>(0.0);
-      if (gr < m && gk < k) {{ v = a[(gr * k + gk) / 4u]; }}
+      if (gr < m && gk < k) {{ v = {read}; }}
       if (any(!(abs(v) <= vec4<f32>(F16_MAX)))) {{ overflow = true; }}
       let h = vec4<f16>(clamp(v, vec4<f32>(-F16_MAX), vec4<f32>(F16_MAX)));
       let o = r * AP + q * 4u;
@@ -34,7 +144,8 @@ fn load_a(key: CoopKey, sa: &str) -> String {
       {sa}[o + 3u] = h.w;
     }}
 ",
-            q = bk / 4
+            q = bk / 4,
+            read = read_a(key)
         )
     } else {
         let count = key.tile.bm * bk / nt;
@@ -46,11 +157,12 @@ fn load_a(key: CoopKey, sa: &str) -> String {
       let gr = m0 + r;
       let gk = k0 + q;
       var v = 0.0;
-      if (gr < m && gk < k) {{ v = a[gr * k + gk]; }}
+      if (gr < m && gk < k) {{ v = {read}; }}
       if (!(abs(v) <= F16_MAX)) {{ overflow = true; }}
       {sa}[r * AP + q] = f16(clamp(v, -F16_MAX, F16_MAX));
     }}
-"
+",
+            read = read_a(key)
         )
     }
 }
@@ -120,11 +232,15 @@ fn load_b(key: CoopKey, sb: &str) -> String {
 /// `(sa, sb)`.
 pub(super) fn load_step(key: CoopKey, k0: &str, bufs: (&str, &str)) -> String {
     match key.loader {
-        LoaderKind::Plain => plain_step(key, k0, bufs),
+        // The loaders differ in how `a` is read (`read_a`), not in the shape
+        // of a step.
+        LoaderKind::Plain | LoaderKind::Sources { .. } | LoaderKind::SwiGlu => {
+            plain_step(key, k0, bufs)
+        }
     }
 }
 
-/// [`LoaderKind::Plain`]'s loads of one K step.
+/// One K step's loads: `a` through the key's loader, then `b`.
 fn plain_step(key: CoopKey, k0: &str, (sa, sb): (&str, &str)) -> String {
     format!(
         "    {{\n    let k0 = {k0};\n{}{}    }}\n",
