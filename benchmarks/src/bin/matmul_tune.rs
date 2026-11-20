@@ -15,8 +15,10 @@
 //! difference from the previous kernel's result.
 //!
 //! Flags: `--models 135m,360m,1.7b`, `--rows 256,2048`, `--only coop|skinny`,
-//! `--calls N` (default 10), `--reps N` (default 3), `--quick` (135M at 256
-//! rows, one rep of two calls).
+//! `--tiles old|new|both` (the coop tiles to try: `old` is `CoopTile::ALL`,
+//! the default; `new` is the register-prefetch tiles of
+//! `CoopTile::PIPELINED`), `--calls N` (default 10), `--reps N` (default 3),
+//! `--quick` (135M at 256 rows, one rep of two calls).
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
@@ -69,6 +71,7 @@ struct Options {
     models: Vec<String>,
     rows: Vec<usize>,
     only: Option<String>,
+    tiles: String,
     calls: usize,
     reps: usize,
 }
@@ -78,6 +81,7 @@ fn options() -> Options {
         models: MODELS.iter().map(|m| m.name.to_string()).collect(),
         rows: vec![256, 2048],
         only: None,
+        tiles: "old".to_string(),
         calls: 10,
         reps: 3,
     };
@@ -93,6 +97,7 @@ fn options() -> Options {
                     .collect();
             }
             "--only" => o.only = Some(value()),
+            "--tiles" => o.tiles = value(),
             "--calls" => o.calls = value().parse().expect("--calls takes a number"),
             "--reps" => o.reps = value().parse().expect("--reps takes a number"),
             "--quick" => {
@@ -104,6 +109,10 @@ fn options() -> Options {
             other => panic!("unknown flag {other}"),
         }
     }
+    assert!(
+        ["old", "new", "both"].contains(&o.tiles.as_str()),
+        "--tiles takes old, new or both"
+    );
     assert!(
         o.calls > 0 && o.reps > 0,
         "--calls and --reps must be positive"
@@ -215,6 +224,8 @@ struct Bench<'a> {
     engine: &'a ComputeEngine,
     calls: usize,
     reps: usize,
+    /// The coop tiles to try, from `--tiles`.
+    tiles: Vec<CoopTile>,
 }
 
 impl Bench<'_> {
@@ -339,12 +350,17 @@ fn bench_coop(b: &Bench<'_>, model: &str, s: Shape) {
         name: name(picked),
         us,
     };
-    let mut all = vec![Timing {
-        name: router.name.clone(),
-        us,
-    }];
+    // With `--tiles new` the best column is the best of the new tiles alone.
+    let mut all = if b.tiles.iter().any(|t| CoopTile::ALL.contains(t)) {
+        vec![Timing {
+            name: router.name.clone(),
+            us,
+        }]
+    } else {
+        Vec::new()
+    };
     let mut seen = vec![picked];
-    for tile in CoopTile::ALL {
+    for &tile in &b.tiles {
         let groups = (s.n as u32).div_ceil(tile.bn) * (s.m as u32).div_ceil(tile.bm);
         let splits: &[u32] = if groups < SPLIT_BELOW {
             &[1, 2, 3, 4, 6, 8]
@@ -379,6 +395,10 @@ fn bench_coop(b: &Bench<'_>, model: &str, s: Shape) {
                 us,
             });
         }
+    }
+    if all.is_empty() {
+        eprintln!("  no new tile runs {}x{}x{}", s.m, s.k, s.n);
+        return;
     }
     report(model, s, previous, &router, &all);
 }
@@ -461,11 +481,20 @@ fn main() {
         ctx.kernel_timing_mode().map_or("off", |m| m.name()),
         engine.coop_matmul_available(),
     );
+    let tiles: Vec<CoopTile> = match o.tiles.as_str() {
+        "old" => CoopTile::ALL.to_vec(),
+        "new" => CoopTile::PIPELINED.to_vec(),
+        _ => CoopTile::ALL
+            .into_iter()
+            .chain(CoopTile::PIPELINED)
+            .collect(),
+    };
     let bench = Bench {
         ctx: &ctx,
         engine: &engine,
         calls: o.calls,
         reps: o.reps,
+        tiles,
     };
     println!(
         "| model | M | op | layout | K | N | previous us | router | router us | best | best us | best TFLOPS |"

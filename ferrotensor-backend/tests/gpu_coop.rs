@@ -142,10 +142,12 @@ fn run_coop_config(
     Ok((pollster::block_on(out.to_vec(&g.ctx)).unwrap(), ran))
 }
 
-/// Every tile with K whole and split in 3 (fewer when K has fewer steps).
+/// Every tile, the register-prefetch ones included, with K whole and split
+/// in 3 (fewer when K has fewer steps).
 fn configs() -> Vec<CoopConfig> {
     CoopTile::ALL
         .iter()
+        .chain(&CoopTile::PIPELINED)
         .flat_map(|&tile| [1, 3].map(|split| CoopConfig { tile, split }))
         .collect()
 }
@@ -1009,4 +1011,146 @@ fn flash_attention_keeps_the_scalar_kernels_for_what_the_coop_kernels_do_not_cov
         }
     }
     g.engine.set_flash_coop(true);
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn pipelined_tiles_match_cpu_at_large_m() {
+    let Some(g) = coop_gpu("pipelined_tiles_match_cpu_at_large_m") else {
+        return;
+    };
+    // M just under and at a multiple of 128 and 256 and well past 256, N not
+    // a multiple of 128 (or 8 or 16), K not a multiple of 32 or 64.
+    for (seed, &(m, k, n)) in [
+        (2047, 288, 200),
+        (1000, 1000, 520),
+        (2048, 256, 384),
+        (513, 100, 129),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let a = f16_round(&rand_vec(m * k, 400 + seed as u64));
+        let b = f16_round(&rand_vec(k * n, 500 + seed as u64));
+        let want = cpu_matmul(&a, &b, (m, k, n));
+        let zeros = vec![0.0; m * n];
+        for tile in CoopTile::PIPELINED {
+            for split in [1, 3] {
+                for transposed_b in [false, true] {
+                    let config = CoopConfig { tile, split };
+                    let ep = (Epilogue::STORE, zeros.as_slice());
+                    let Some(got) = run_or_skip(g, (m, k, n), (&a, &b), transposed_b, ep, config)
+                    else {
+                        continue;
+                    };
+                    let e = max_rel_error(&got, &want);
+                    assert!(
+                        e < 2e-5,
+                        "{} split {split} {m}x{k}x{n} transposed_b {transposed_b}: {e:e}",
+                        tile.name()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn pipelined_tiles_times_identity_return_a_at_large_m() {
+    let Some(g) = coop_gpu("pipelined_tiles_times_identity_return_a_at_large_m") else {
+        return;
+    };
+    // Integers below 2048 are exact in f16 and so are their sums: `a @ I`
+    // must equal `a` element for element, at a K of 9 steps of 32 (5 of 64)
+    // and an M that is no multiple of any tile.
+    let (m, k, n) = (2047, 288, 288);
+    let a: Vec<f32> = (0..m * k).map(|i| (i % 1000) as f32).collect();
+    let mut eye = vec![0.0f32; k * n];
+    for i in 0..k {
+        eye[i * n + i] = 1.0;
+    }
+    let zeros = vec![0.0; m * n];
+    for tile in CoopTile::PIPELINED {
+        for split in [1, 2] {
+            for transposed_b in [false, true] {
+                let config = CoopConfig { tile, split };
+                let ep = (Epilogue::STORE, zeros.as_slice());
+                let Some(got) = run_or_skip(g, (m, k, n), (&a, &eye), transposed_b, ep, config)
+                else {
+                    continue;
+                };
+                assert_eq!(
+                    got,
+                    a,
+                    "{} split {split} transposed_b {transposed_b}",
+                    tile.name()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn pipelined_tiles_apply_alpha_beta_and_count_overflow() {
+    let Some(g) = coop_gpu("pipelined_tiles_apply_alpha_beta_and_count_overflow") else {
+        return;
+    };
+    let (m, k, n) = (300, 96, 136);
+    let a = f16_round(&rand_vec(m * k, 600));
+    let b = f16_round(&rand_vec(k * n, 601));
+    let old = rand_vec(m * n, 602);
+    let product = cpu_matmul(&a, &b, (m, k, n));
+    let want: Vec<f64> = product
+        .iter()
+        .zip(&old)
+        .map(|(&p, &o)| -2.0 * p + 0.25 * f64::from(o))
+        .collect();
+    let ep = Epilogue {
+        alpha: -2.0,
+        beta: 0.25,
+    };
+    for tile in CoopTile::PIPELINED {
+        for transposed_b in [false, true] {
+            let config = CoopConfig { tile, split: 1 };
+            let Some(got) = run_or_skip(g, (m, k, n), (&a, &b), transposed_b, (ep, &old), config)
+            else {
+                continue;
+            };
+            let e = max_rel_error(&got, &want);
+            assert!(
+                e < 2e-5,
+                "{} transposed_b {transposed_b}: {e:e}",
+                tile.name()
+            );
+        }
+    }
+    // One value of `a` past the f16 range is counted once, by the one thread
+    // that stages it, and poisons its output tile: N = 16 is one column of
+    // workgroups whatever the tile.
+    let (m, k, n) = (256, 64, 16);
+    let b = rand_vec(k * n, 603);
+    let mut big = rand_vec(m * k, 604);
+    big[3 * k + 5] = 70_000.0;
+    let zeros = vec![0.0; m * n];
+    for tile in CoopTile::PIPELINED {
+        let before = pollster::block_on(g.engine.coop_f16_overflows(&g.ctx)).unwrap();
+        let config = CoopConfig { tile, split: 1 };
+        let ep = (Epilogue::STORE, zeros.as_slice());
+        let Some(got) = run_or_skip(g, (m, k, n), (&big, &b), false, ep, config) else {
+            continue;
+        };
+        assert_eq!(
+            pollster::block_on(g.engine.coop_f16_overflows(&g.ctx)).unwrap(),
+            before + 1,
+            "{}",
+            tile.name()
+        );
+        assert!(
+            got[0].is_nan(),
+            "{}: the tile's first element is poisoned",
+            tile.name()
+        );
+    }
 }
