@@ -29,6 +29,9 @@ pub fn kernel_timing(profile: bool) -> KernelTiming {
 pub struct GpuMark {
     counters: GpuCounterSnapshot,
     kernels: KernelTimes,
+    /// Buffers the pool created, and requests it served from an idle buffer.
+    pool_created: u64,
+    pool_reused: u64,
 }
 
 impl GpuMark {
@@ -37,6 +40,8 @@ impl GpuMark {
         Self {
             counters: ctx.gpu_counters(),
             kernels: ctx.kernel_times(),
+            pool_created: ctx.pool.buffers_created(),
+            pool_reused: ctx.pool.buffers_reused(),
         }
     }
 
@@ -44,7 +49,17 @@ impl GpuMark {
         Self {
             counters: self.counters.since(&earlier.counters),
             kernels: self.kernels.since(&earlier.kernels),
+            pool_created: self.pool_created.saturating_sub(earlier.pool_created),
+            pool_reused: self.pool_reused.saturating_sub(earlier.pool_reused),
         }
+    }
+
+    /// The pool counts with their report names.
+    fn pool_counts(&self) -> [(&'static str, u64); 2] {
+        [
+            ("pool_buffers_created", self.pool_created),
+            ("pool_buffers_reused", self.pool_reused),
+        ]
     }
 }
 
@@ -104,7 +119,8 @@ impl ProfileRun {
                 median.work.counters.readback_time,
             ),
         ];
-        let counts = median.work.counters.counts();
+        let mut counts = median.work.counters.counts().to_vec();
+        counts.extend(median.work.pool_counts());
 
         eprintln!(
             "profile: median of {} optimizer steps by wall time",
@@ -330,9 +346,15 @@ mod tests {
             )]
             .into_iter()
             .collect(),
+            pool_created: 5,
+            pool_reused: 7,
         };
         let work = later.since(&earlier);
         assert_eq!(work.counters.dispatches, 3);
+        assert_eq!(
+            work.pool_counts(),
+            [("pool_buffers_created", 5), ("pool_buffers_reused", 7)]
+        );
         assert_eq!(work.kernels, later.kernels);
         assert_eq!(later.since(&later).kernels, KernelTimes::default());
     }

@@ -424,6 +424,10 @@ struct TrainArgs {
     /// measured runs.
     #[arg(long)]
     checkpoint_blocks: bool,
+    /// Pad each micro-batch to a multiple of this many tokens (the padding is
+    /// left out of the loss) [default: the trainer's own rule].
+    #[arg(long, value_name = "TOKENS", value_parser = clap::value_parser!(u64).range(1..))]
+    length_bucket: Option<u64>,
     /// Number of processes in file-based data-parallel training (prototype).
     #[arg(long, default_value_t = 1)]
     world_size: usize,
@@ -1761,6 +1765,9 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
     .with_clip_grad_norm(args.grad_clip)
     .with_lr_scheduler(Box::new(scheduler))
     .with_deferred_loss_readback();
+    if let Some(tokens) = args.length_bucket {
+        trainer = trainer.with_length_bucket(usize::try_from(tokens).unwrap_or(usize::MAX));
+    }
     if base.engine.coop_matmul_active() {
         // The matmuls round activations and gradients to f16, so small
         // gradients need the loss scaled up to stay representable.
@@ -2225,6 +2232,21 @@ mod tests {
         };
         assert!(checkpoint_blocks(&["--checkpoint-blocks"]));
         assert!(!checkpoint_blocks(&[]));
+    }
+
+    #[test]
+    fn train_parses_length_bucket() {
+        let bucket = |extra: &[&str]| {
+            let mut args = vec!["train", "--model", "m", "--data", "d.jsonl"];
+            args.extend_from_slice(extra);
+            parse(&args).map(|cli| match cli.command {
+                Command::Train(t) => t.length_bucket,
+                _ => panic!("expected train"),
+            })
+        };
+        assert_eq!(bucket(&[]).expect("parse"), None);
+        assert_eq!(bucket(&["--length-bucket", "16"]).expect("parse"), Some(16));
+        assert!(bucket(&["--length-bucket", "0"]).is_err());
     }
 
     #[test]
