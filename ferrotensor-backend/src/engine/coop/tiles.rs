@@ -74,6 +74,9 @@ impl CoopTile {
     /// The 64x64 tile of 16x32 per subgroup, K 32, two staging buffers.
     pub(super) const T64X64_W16X32_K32_DB: Self = Self::new(64, 64, (16, 32), 32, true);
 
+    /// The 64x128 tile of 32x64 per subgroup, K 32, two staging buffers.
+    pub(super) const T64X128_W32X64_K32_DB: Self = Self::new(64, 128, (32, 64), 32, true);
+
     /// The 32x64 tile of 16x16 per subgroup, K 64, two staging buffers.
     pub(super) const T32X64_W16X16_K64_DB: Self = Self::new(32, 64, (16, 16), 64, true);
 
@@ -145,7 +148,7 @@ impl CoopTile {
         Self::T64X64_W32X32_K32_DB,
         Self::new(128, 128, (64, 64), 32, true),
         Self::T128X64_W32X32_K32_DB,
-        Self::new(64, 128, (32, 64), 32, true),
+        Self::T64X128_W32X64_K32_DB,
         Self::new(64, 64, (32, 32), 64, true),
         Self::new(64, 32, (32, 16), 32, true),
         Self::new(32, 64, (16, 32), 32, true),

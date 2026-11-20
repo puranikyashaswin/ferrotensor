@@ -857,8 +857,11 @@ mod tests {
     ];
 
     /// FNV-1a 64 of the configuration the selector picks for every product of
-    /// [`KN`] x [`ROWS`] on four device descriptions, taken before the split.
-    const PLAN_HASH: u64 = 3834093253146709999;
+    /// [`KN`] x [`ROWS`] on four device descriptions, taken before the split
+    /// and retaken (it was 3834093253146709999) when the 1024-row rows joined
+    /// the tuned table, which can only move products of 257 to 1024 rows on a
+    /// tuned device.
+    const PLAN_HASH: u64 = 17442595157898385172;
 
     #[test]
     fn selector_picks_what_it_picked_before_the_split() {
