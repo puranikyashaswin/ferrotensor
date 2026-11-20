@@ -47,7 +47,8 @@ pub use context::{
 };
 pub use engine::{
     AdamParams, AttentionOptions, AutotuneReport, ComputeEngine, Epilogue, FlatLayout, FusedA,
-    FusedOut, FusedSpec, AUTOTUNE_ENV, FLAT_MAX_ELEMS, MASKED_CE_SKIP, SUM_SQUARES_CHUNK,
+    FusedOut, FusedSpec, LoraGrad, LoraMirror, LoraProj, AUTOTUNE_ENV, FLAT_MAX_ELEMS,
+    LORA_GROUP_MAX, LORA_GROUP_MAX_RANK, MASKED_CE_SKIP, SUM_SQUARES_CHUNK,
 };
 #[doc(hidden)]
 pub use engine::{
