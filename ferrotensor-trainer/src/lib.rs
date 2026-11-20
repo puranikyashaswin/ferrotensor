@@ -477,7 +477,8 @@ impl Trainer {
             self.read_pending_losses();
             let mut stats = self.deferred.pop().map_or(EMPTY_STATS, |d| d.stats);
             let applied = {
-                let _span = self.ctx.host_span(HostSpan::Optimizer);
+                let ctx = Arc::clone(&self.ctx);
+                let _span = ctx.host_span(HostSpan::Optimizer);
                 let applied = self.apply_gradients(train_params, &mut stats);
                 self.optimizer.zero_grad(train_params);
                 applied
@@ -704,7 +705,8 @@ impl Trainer {
         chunk: &[(&[u32], &[u32], &[u8])],
         train_params: &[Tensor],
     ) -> Result<(), TrainError> {
-        let data_span = self.ctx.host_span(HostSpan::Data);
+        let ctx = Arc::clone(&self.ctx);
+        let data_span = ctx.host_span(HostSpan::Data);
         let longest = chunk
             .iter()
             .map(|s| s.0.len().min(s.1.len()))
