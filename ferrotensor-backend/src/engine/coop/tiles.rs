@@ -80,6 +80,15 @@ impl CoopTile {
     /// The 32x64 tile of 16x16 per subgroup, K 64, two staging buffers.
     pub(super) const T32X64_W16X16_K64_DB: Self = Self::new(32, 64, (16, 16), 64, true);
 
+    /// The 64x32 tile of 32x16 per subgroup, K 32, two staging buffers.
+    pub(super) const T64X32_W32X16_K32_DB: Self = Self::new(64, 32, (32, 16), 32, true);
+
+    /// The 32x64 tile of 16x32 per subgroup, K 32, two staging buffers.
+    pub(super) const T32X64_W16X32_K32_DB: Self = Self::new(32, 64, (16, 32), 32, true);
+
+    /// The 32x32 tile of 16x16 per subgroup, K 64, two staging buffers.
+    pub(super) const T32X32_W16X16_K64_DB: Self = Self::new(32, 32, (16, 16), 64, true);
+
     /// The 64x64 tile of 32x32 per subgroup, K 32, two staging buffers, register prefetch.
     pub(super) const T64X64_W32X32_K32_PF: Self = Self::prefetching(64, 64, (32, 32), 32, true);
 
@@ -150,11 +159,11 @@ impl CoopTile {
         Self::T128X64_W32X32_K32_DB,
         Self::T64X128_W32X64_K32_DB,
         Self::new(64, 64, (32, 32), 64, true),
-        Self::new(64, 32, (32, 16), 32, true),
-        Self::new(32, 64, (16, 32), 32, true),
+        Self::T64X32_W32X16_K32_DB,
+        Self::T32X64_W16X32_K32_DB,
         Self::T64X64_W16X32_K32_DB,
         Self::T32X64_W16X16_K64_DB,
-        Self::new(32, 32, (16, 16), 64, true),
+        Self::T32X32_W16X16_K64_DB,
     ];
 
     /// A short name such as `128x64/w64x32/k32/db`.
