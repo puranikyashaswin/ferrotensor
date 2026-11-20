@@ -129,7 +129,7 @@ impl ProfileRun {
         for (_, label, time) in times {
             eprintln!("  {label:<26} {:>12.3} ms", time.as_secs_f64() * 1e3);
         }
-        for (name, count) in counts {
+        for &(name, count) in &counts {
             eprintln!("  {:<26} {count:>12} /step", name.replace('_', " "));
         }
         let mode = self.ctx.kernel_timing_mode();
@@ -144,7 +144,7 @@ impl ProfileRun {
             for (key, _, time) in times {
                 report.insert(key.into(), time.as_secs_f64().into());
             }
-            for (name, count) in counts {
+            for &(name, count) in &counts {
                 report.insert(format!("{name}_per_step"), count.into());
             }
             report.insert(
