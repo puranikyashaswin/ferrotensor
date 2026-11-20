@@ -16,7 +16,9 @@ pub const FILE_NAME: &str = "profile.json";
 
 /// The kernel timing a command with `--profile` opens its context with.
 pub fn kernel_timing(profile: bool) -> KernelTiming {
-    if profile {
+    // Measurement build only: host spans without the per-dispatch timestamps.
+    let kernels_off = std::env::var("FERROTENSOR_PROFILE_KERNELS").is_ok_and(|v| v == "0");
+    if profile && !kernels_off {
         KernelTiming::On
     } else {
         KernelTiming::Off

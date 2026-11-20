@@ -608,6 +608,7 @@ impl ComputeEngine {
             bound.push((binding, buffer, size));
         }
         let create = || {
+            let _span = ctx.host_span(crate::HostSpan::BindMake);
             let entries: Vec<wgpu::BindGroupEntry<'_>> = bound
                 .iter()
                 .map(|&(binding, buffer, size)| wgpu::BindGroupEntry {

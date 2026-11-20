@@ -42,11 +42,13 @@ pub enum HostSpan {
     /// The optimizer step on the host: packing gradients, clipping and
     /// encoding the update, outside its readbacks and waits.
     Optimizer,
+    /// `Device::create_bind_group`, on a bind group cache miss.
+    BindMake,
 }
 
 impl HostSpan {
     /// How many spans there are.
-    pub const COUNT: usize = 10;
+    pub const COUNT: usize = 11;
 
     /// Every span, in report order.
     pub const ALL: [Self; Self::COUNT] = [
@@ -60,6 +62,7 @@ impl HostSpan {
         Self::MapCopy,
         Self::Data,
         Self::Optimizer,
+        Self::BindMake,
     ];
 
     /// The span's snake-case name in the report.
@@ -76,6 +79,7 @@ impl HostSpan {
             Self::MapCopy => "map_copy",
             Self::Data => "data",
             Self::Optimizer => "optimizer",
+            Self::BindMake => "bind_make",
         }
     }
 
