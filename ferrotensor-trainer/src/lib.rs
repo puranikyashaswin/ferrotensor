@@ -16,7 +16,7 @@
 
 use ferrotensor_autograd::{AutogradNode, FlatGrads, LRScheduler, Optimizer, Tensor};
 use ferrotensor_backend::{
-    ComputeEngine, DType, MemoryCategory, UnifiedTensor, WgpuContext, MASKED_CE_SKIP,
+    ComputeEngine, DType, HostSpan, MemoryCategory, UnifiedTensor, WgpuContext, MASKED_CE_SKIP,
     SUM_SQUARES_CHUNK,
 };
 use ferrotensor_graph::lfm::Lfm2Model;
@@ -476,8 +476,12 @@ impl Trainer {
             self.step_in_accum = 0;
             self.read_pending_losses();
             let mut stats = self.deferred.pop().map_or(EMPTY_STATS, |d| d.stats);
-            let applied = self.apply_gradients(train_params, &mut stats);
-            self.optimizer.zero_grad(train_params);
+            let applied = {
+                let _span = self.ctx.host_span(HostSpan::Optimizer);
+                let applied = self.apply_gradients(train_params, &mut stats);
+                self.optimizer.zero_grad(train_params);
+                applied
+            };
             self.deferred.push(DeferredStats { stats, rows: None });
             applied?;
         }
@@ -700,6 +704,7 @@ impl Trainer {
         chunk: &[(&[u32], &[u32], &[u8])],
         train_params: &[Tensor],
     ) -> Result<(), TrainError> {
+        let data_span = self.ctx.host_span(HostSpan::Data);
         let longest = chunk
             .iter()
             .map(|s| s.0.len().min(s.1.len()))
@@ -723,6 +728,7 @@ impl Trainer {
         let rows: Vec<&[u32]> = inputs.iter().map(Vec::as_slice).collect();
         let dropout_seed = Some(self.attention_dropout_seed());
         let head = self.supervised_head_rows(&targets, &masks, chunk.len());
+        drop(data_span);
         let logits = {
             let _tag = self.ctx.memory().scope(MemoryCategory::Activations);
             match &head {

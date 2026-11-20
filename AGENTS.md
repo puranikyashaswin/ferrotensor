@@ -84,7 +84,12 @@ stdout line by line. An error ends the session with a one-line
 timestamp queries, `kernel_timing` (`"inside_passes"`, `"pass_boundaries"`
 or null when the adapter has none), `kernel_gpu_seconds_per_step` and
 `kernels`: one object per kernel, longest GPU time first, with `name`,
-`dispatches_per_step` and `gpu_seconds_per_step`. `generate --profile
+`dispatches_per_step` and `gpu_seconds_per_step`. It also writes
+`host_ms_per_step`: `step`, `readback`, `spans` and `spans_in_readback` in
+milliseconds, with the host time split into `record`, `encode`, `finish`,
+`submit`, `release`, `wait`, `reclaim`, `map_copy`, `data`, `optimizer` and
+`other` (the rest of the step; in `spans_in_readback`, the rest of the time in
+readbacks). The spans do not overlap. `generate --profile
 --json` adds `profile` with `kernel_timing`, `prefill` (`gpu_wait_seconds`,
 `kernel_gpu_seconds`, `kernels` of `name`, `dispatches`, `gpu_seconds`) and
 `decode` (`tokens`, `gpu_wait_seconds_per_token`,

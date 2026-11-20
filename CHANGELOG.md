@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Host time by span in `train --profile`: `profile.json` gains `host_ms_per_step` and the stderr report a table that splits the step's host time into dispatch recording, encoding, `finish`, `Queue::submit`, freeing idle buffers, the fence wait, reclaim after a wait, the staging map and copy of readbacks, data preparation and the optimizer step, with the part of each that ran inside readbacks. Library: `HostSpan`, `SpanGuard`, `WgpuContext::host_span`, and `spans` and `readback_spans` on `GpuCounterSnapshot`.
+
 ## [0.7.0] - 2026-11-19
 
 Two behaviour changes to know before upgrading: `--train-modules layers.N` now matches layer `N` exactly, and `train --resume` with `--max-steps` at or below the saved step now trains nothing (both under Changed). `--q4-weights` is experimental and still fails its quality gate (under Added).
