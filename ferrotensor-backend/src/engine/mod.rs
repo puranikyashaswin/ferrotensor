@@ -1,6 +1,5 @@
 //! The compute engine: compiles the WGSL kernels and dispatches them.
 
-use crate::bind_cache::BindKey;
 use crate::context::Dispatch;
 use crate::kernel_timing::KernelLabel;
 use crate::{UnifiedTensor, WgpuContext};
@@ -181,6 +180,49 @@ fn q4_b_matmul(src: &str) -> String {
     .replace("matmul_blocked", "matmul_blocked_q4")
     .replace("mmb_", "mmq_")
     .replace("MMB_", "MMQ_")
+}
+
+/// Entry points of kernels.wgsl that call `arrayLength`, so they must be
+/// bound to exactly their tensors' bytes (see [`needs_exact_size`]). A test
+/// checks this list against the shader source.
+const EXACT_SIZE_ENTRIES: [&str; 29] = [
+    "rope",
+    "rope_out",
+    "silu",
+    "add",
+    "mul",
+    "dequantize",
+    "top_k",
+    "add_backward",
+    "mul_backward",
+    "silu_backward_real",
+    "sgd_update",
+    "adamw_update",
+    "sub",
+    "sub_backward",
+    "mse_loss",
+    "mse_loss_backward",
+    "relu",
+    "relu_backward",
+    "affine_dequantize",
+    "gradient_norm_squared",
+    "clip_grad_by_norm",
+    "silu_gate_fused",
+    "silu_gate_backward",
+    "gradient_accumulate",
+    "gradient_scale",
+    "fp32_to_fp16",
+    "fp16_to_fp32",
+    "embedding_gather",
+    "embedding_scatter",
+];
+
+/// Whether the kernel at `entry_point` reads the length of a buffer with
+/// `arrayLength`. Only kernels.wgsl does, so every other kernel takes its
+/// sizes from its parameters and may be bound to the whole of a pooled
+/// buffer.
+fn needs_exact_size(entry_point: &str) -> bool {
+    EXACT_SIZE_ENTRIES.contains(&entry_point)
 }
 
 /// A compiled compute pipeline together with its bind group layout.
@@ -536,13 +578,19 @@ impl ComputeEngine {
         // A group that binds a buffer made for this dispatch alone is not
         // worth caching.
         let mut cacheable = true;
+        let exact_sizes = needs_exact_size(kernel.entry_point);
         let mut bound = Vec::with_capacity(entries.len());
         for &(binding, arg) in entries {
-            // A pooled buffer larger than its tensor is bound to the tensor's
-            // bytes only, as kernels bound their loops by `arrayLength`;
-            // size 0 binds the whole buffer.
+            // A kernel that bounds its loops by `arrayLength` sees a pooled
+            // buffer larger than its tensor as the tensor's bytes only; any
+            // other kernel takes its sizes from its parameters, so it binds
+            // the whole buffer (size 0), and one group serves every tensor
+            // size the buffer is reused for.
             let (buffer, size) = match arg.arg() {
-                ArgRef::Buffer(buffer) => (buffer, ctx.pool.bound_size(buffer).unwrap_or(0)),
+                ArgRef::Buffer(buffer) if exact_sizes => {
+                    (buffer, ctx.pool.bound_size(buffer).unwrap_or(0))
+                }
+                ArgRef::Buffer(buffer) => (buffer, 0),
                 ArgRef::Params(params) if self.immediates => {
                     immediates = Some(params.bytes.clone());
                     continue;
@@ -581,11 +629,10 @@ impl ComputeEngine {
             })
         };
         let bind_group = if cacheable {
-            let buffers = bound
-                .iter()
-                .map(|&(b, buffer, size)| (b, buffer.clone(), size));
-            let key = BindKey::new(&kernel.pipeline, buffers.collect());
-            let (group, hit) = ctx.pool.bind_groups().get_or_create(key, create);
+            let (group, hit) =
+                ctx.pool
+                    .bind_groups()
+                    .get_or_create(&kernel.pipeline, &bound, create);
             let counter = if hit {
                 &ctx.counters.bind_group_hits
             } else {
@@ -694,6 +741,56 @@ mod shader_tests {
             );
             if let Err(e) = validator.validate(&module) {
                 panic!("WGSL validation error:\n{}", e.emit_to_string(src));
+            }
+        }
+    }
+
+    /// The functions of `src` that call `arrayLength`, each a chunk that
+    /// starts at a line beginning `fn `.
+    fn array_length_functions(src: &str) -> Vec<String> {
+        let needle = ["array", "Length("].concat();
+        src.split("\nfn ")
+            .skip(1)
+            .filter(|chunk| chunk.contains(&needle))
+            .map(|chunk| chunk.split('(').next().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// The kernels bound to exact sizes are the ones that call `arrayLength`:
+    /// a kernel missing from the list would read the slack of a pooled
+    /// buffer as part of its tensor.
+    #[test]
+    fn exact_size_entries_are_the_kernels_that_call_array_length() {
+        let mut found = array_length_functions(&super::shader_source());
+        found.sort_unstable();
+        let mut listed: Vec<String> = super::EXACT_SIZE_ENTRIES
+            .iter()
+            .map(|&entry| entry.to_string())
+            .collect();
+        listed.sort_unstable();
+        assert_eq!(found, listed);
+        assert!(super::needs_exact_size("add"));
+        assert!(!super::needs_exact_size("rms_norm"));
+        assert!(!super::needs_exact_size("matmul_blocked"));
+    }
+
+    /// The kernels generated in Rust source never call `arrayLength`, so the
+    /// check above covers every kernel.
+    #[test]
+    fn generated_kernels_do_not_call_array_length() {
+        let needle = ["array", "Length("].concat();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/engine");
+        let mut dirs = vec![root];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("{dir:?}: {e}")) {
+                let path = entry.unwrap_or_else(|e| panic!("{dir:?}: {e}")).path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let text =
+                        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
+                    assert!(!text.contains(&needle), "{path:?} calls arrayLength");
+                }
             }
         }
     }
