@@ -1511,6 +1511,32 @@ impl Tensor {
         Tensor::with_creator(ctx.clone(), out_data, node)
     }
 
+    /// The rows `rows` of `input` (`[.., hidden]`, its leading dimensions
+    /// flattened) as `[rows.len(), hidden]`, gathered on the GPU. The
+    /// gradient puts each output row's gradient back at its source row and
+    /// leaves every other row at zero, so a loss on the gathered rows trains
+    /// the model as the same loss with zero gradient on the other rows would.
+    /// A row index past the end gives zeros and no gradient. `None` for an
+    /// input that is not `f32` or an empty `rows`.
+    pub fn gather_rows(input: &Tensor, rows: &[u32], engine: &ComputeEngine) -> Option<Tensor> {
+        let hidden = *input.data.shape.last()?;
+        let flat = input.data.shape.iter().product::<usize>() / hidden.max(1);
+        if input.data.dtype != DType::FP32 || rows.is_empty() || flat * hidden == 0 {
+            return None;
+        }
+        let table = Tensor::reshape(input, &[flat, hidden]);
+        let ctx = &table.ctx;
+        let id_bytes: Vec<u8> = rows.iter().flat_map(|id| id.to_le_bytes()).collect();
+        let id_buf = UnifiedTensor::from_bytes(ctx, &id_bytes, &[rows.len()]);
+        let out_data = UnifiedTensor::empty(ctx, &[rows.len(), hidden]);
+        engine.embedding_gather(ctx, &table.data, &id_buf, &out_data);
+        let node = Arc::new(GpuEmbeddingNode {
+            table: table.clone(),
+            ids: rows.to_vec(),
+        });
+        Some(Tensor::with_creator(ctx.clone(), out_data, node))
+    }
+
     /// Row `token_index` of `[seq, vocab]` logits.
     #[expect(
         clippy::expect_used,
