@@ -57,8 +57,11 @@ pub use tiles::{CoopConfig, CoopTile};
 use tiles::{PAD, SUBGROUP};
 
 /// Fewest output rows routed to the kernel: decode steps and thin products
-/// stay on the f32 kernels.
-const MIN_ROWS: u32 = 64;
+/// stay on the f32 kernels. At 32 to 63 rows the kernel with the planner's
+/// split beat the small-M kernel in 46 of 48 products of SmolLM2 135M, 360M
+/// and 1.7B on an A10G (`matmul_bench --fused`, 20 November 2026), so those
+/// rows run here too.
+const MIN_ROWS: u32 = 32;
 
 /// What one compiled kernel is specialised for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

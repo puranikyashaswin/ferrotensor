@@ -15,7 +15,8 @@ mod common;
 
 use common::attention::{cpu_attention, cpu_attention_backward, cpu_attention_lse};
 use ferrotensor_backend::{
-    AttentionOptions, ComputeEngine, CoopConfig, CoopTile, Epilogue, UnifiedTensor, WgpuContext,
+    AttentionOptions, ComputeEngine, CoopConfig, CoopTile, Epilogue, MatmulPath, UnifiedTensor,
+    WgpuContext,
 };
 use std::sync::OnceLock;
 
@@ -231,6 +232,46 @@ fn coop_matmul_matches_cpu_on_f16_rounded_inputs() {
                 e32 < 3e-3,
                 "{m}x{k}x{n} transposed_b {transposed_b}: {e32:e}"
             );
+        }
+    }
+}
+
+/// Products of 32 to 63 rows go to the cooperative kernel, not the small-M one.
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn products_of_32_to_63_rows_take_the_coop_kernel() {
+    let Some(g) = coop_gpu("products_of_32_to_63_rows_take_the_coop_kernel") else {
+        return;
+    };
+    if !g.engine.coop_matmul_active() {
+        eprintln!(
+            "products_of_32_to_63_rows_take_the_coop_kernel: skipped, the kernel is off here"
+        );
+        return;
+    }
+    let (k, n) = (576, 1536);
+    for (seed, m) in [32usize, 48, 63].into_iter().enumerate() {
+        let a = rand_vec(m * k, seed as u64);
+        let b = rand_vec(k * n, 100 + seed as u64);
+        // The kernel rounds a and b to f16; the small-M kernel keeps a in f32,
+        // so only the first meets this bound against f16-rounded inputs.
+        let want = cpu_matmul(&f16_round(&a), &f16_round(&b), (m, k, n));
+        for transposed_b in [false, true] {
+            let a_t = UnifiedTensor::new(&g.ctx, &a, &[m, k]);
+            let b_t = if transposed_b {
+                UnifiedTensor::from_f32_as_f16(&g.ctx, &transpose(&b, k, n), &[n, k])
+            } else {
+                UnifiedTensor::from_f32_as_f16(&g.ctx, &b, &[k, n])
+            };
+            let out = UnifiedTensor::zeros(&g.ctx, &[m, n]);
+            let launch = g
+                .engine
+                .matmul_with_path(&g.ctx, transposed_b, &a_t, &b_t, &out, MatmulPath::Auto)
+                .unwrap();
+            assert!(launch.is_none(), "{m} rows took the small-M kernel");
+            let got = pollster::block_on(out.to_vec(&g.ctx)).unwrap();
+            let e = max_rel_error(&got, &want);
+            assert!(e < 2e-5, "{m}x{k}x{n} transposed_b {transposed_b}: {e:e}");
         }
     }
 }
