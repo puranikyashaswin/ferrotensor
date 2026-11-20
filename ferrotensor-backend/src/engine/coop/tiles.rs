@@ -9,7 +9,10 @@ pub(super) const SUBGROUP: u32 = 32;
 /// A workgroup's output tile `bm x bn`, split into one `wm x wn` block per
 /// subgroup, stepping through K `bk` at a time with one staging buffer or
 /// two (`double`: the next step's loads overlap this step's multiplies, and
-/// each step needs one barrier instead of two).
+/// each step needs one barrier instead of two). With `prefetch` the loads of
+/// the next step go to registers before this step's multiplies and reach
+/// workgroup memory after them, so the multiplies hide the global-memory
+/// latency whatever the compiler does with the order of the code.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CoopTile {
@@ -25,6 +28,8 @@ pub struct CoopTile {
     pub bk: u32,
     /// Two staging buffers.
     pub double: bool,
+    /// Register prefetch of the next K step (see [`CoopTile`]).
+    pub prefetch: bool,
 }
 
 impl CoopTile {
@@ -36,6 +41,15 @@ impl CoopTile {
             wn,
             bk,
             double,
+            prefetch: false,
+        }
+    }
+
+    /// As [`new`](Self::new), with register prefetch.
+    const fn prefetching(bm: u32, bn: u32, (wm, wn): (u32, u32), bk: u32, double: bool) -> Self {
+        Self {
+            prefetch: true,
+            ..Self::new(bm, bn, (wm, wn), bk, double)
         }
     }
 
@@ -63,6 +77,64 @@ impl CoopTile {
     /// The 32x64 tile of 16x16 per subgroup, K 64, two staging buffers.
     pub(super) const T32X64_W16X16_K64_DB: Self = Self::new(32, 64, (16, 16), 64, true);
 
+    /// The 64x64 tile of 32x32 per subgroup, K 32, two staging buffers, register prefetch.
+    pub(super) const T64X64_W32X32_K32_PF: Self = Self::prefetching(64, 64, (32, 32), 32, true);
+
+    /// The 128x64 tile of 32x32 per subgroup, K 32, two staging buffers, register prefetch.
+    pub(super) const T128X64_W32X32_K32_PF: Self = Self::prefetching(128, 64, (32, 32), 32, true);
+
+    /// The 128x64 tile of 64x32 per subgroup, K 32, two staging buffers, register prefetch.
+    pub(super) const T128X64_W64X32_K32_PF: Self = Self::prefetching(128, 64, (64, 32), 32, true);
+
+    /// The 128x128 tile of 64x32 per subgroup (8 subgroups), K 32, two staging
+    /// buffers, register prefetch.
+    pub(super) const T128X128_W64X32_K32_PF: Self = Self::prefetching(128, 128, (64, 32), 32, true);
+
+    /// The 128x128 tile of 64x64 per subgroup (4 subgroups), K 32, two staging
+    /// buffers, register prefetch.
+    pub(super) const T128X128_W64X64_K32_PF: Self = Self::prefetching(128, 128, (64, 64), 32, true);
+
+    /// The 128x256 tile of 64x64 per subgroup (8 subgroups), K 32, one staging
+    /// buffer, register prefetch.
+    pub(super) const T128X256_W64X64_K32_PF1: Self =
+        Self::prefetching(128, 256, (64, 64), 32, false);
+
+    /// The 256x128 tile of 64x64 per subgroup (8 subgroups), K 32, one staging
+    /// buffer, register prefetch.
+    pub(super) const T256X128_W64X64_K32_PF1: Self =
+        Self::prefetching(256, 128, (64, 64), 32, false);
+
+    /// The 128x128 tile of 32x32 per subgroup (16 subgroups), K 32, one
+    /// staging buffer, register prefetch.
+    pub(super) const T128X128_W32X32_K32_PF1: Self =
+        Self::prefetching(128, 128, (32, 32), 32, false);
+
+    /// The 128x128 tile of 64x32 per subgroup (8 subgroups), K 64, one staging
+    /// buffer, register prefetch.
+    pub(super) const T128X128_W64X32_K64_PF1: Self =
+        Self::prefetching(128, 128, (64, 32), 64, false);
+
+    /// The 128x128 tile of 64x32 per subgroup (8 subgroups), K 32, one staging
+    /// buffer, register prefetch.
+    pub(super) const T128X128_W64X32_K32_PF1: Self =
+        Self::prefetching(128, 128, (64, 32), 32, false);
+
+    /// The tiles with register prefetch, for the tests, the tuning bench and
+    /// the router. They are kept apart from [`ALL`](Self::ALL), whose order
+    /// the older tests and table rows count on.
+    pub const PIPELINED: [Self; 10] = [
+        Self::T64X64_W32X32_K32_PF,
+        Self::T128X64_W32X32_K32_PF,
+        Self::T128X64_W64X32_K32_PF,
+        Self::T128X128_W64X32_K32_PF,
+        Self::T128X128_W64X64_K32_PF,
+        Self::T128X256_W64X64_K32_PF1,
+        Self::T256X128_W64X64_K32_PF1,
+        Self::T128X128_W32X32_K32_PF1,
+        Self::T128X128_W64X32_K64_PF1,
+        Self::T128X128_W64X32_K32_PF1,
+    ];
+
     /// Every tile the generator is tested with, for tests and the tuning
     /// bench. The first three are the tiles of the first coop kernel.
     pub const ALL: [Self; 14] = [
@@ -85,13 +157,14 @@ impl CoopTile {
     /// A short name such as `128x64/w64x32/k32/db`.
     pub fn name(self) -> String {
         format!(
-            "{}x{}/w{}x{}/k{}{}",
+            "{}x{}/w{}x{}/k{}{}{}",
             self.bm,
             self.bn,
             self.wm,
             self.wn,
             self.bk,
-            if self.double { "/db" } else { "" }
+            if self.double { "/db" } else { "" },
+            if self.prefetch { "/pf" } else { "" }
         )
     }
 
@@ -155,7 +228,7 @@ mod tests {
 
     #[test]
     fn tiles_split_evenly_over_their_threads() {
-        for t in CoopTile::ALL {
+        for t in CoopTile::ALL.into_iter().chain(CoopTile::PIPELINED) {
             let nt = t.threads();
             let bk = t.bk;
             assert!(bk == 32 || bk == 64, "{t:?}");
@@ -187,5 +260,25 @@ mod tests {
         assert_eq!(CoopTile::ALL[6].threads(), 256);
         assert_eq!(CoopTile::ALL[0].name(), "128x64/w64x32/k32");
         assert_eq!(CoopTile::ALL[3].name(), "128x64/w64x32/k32/db");
+        assert_eq!(
+            CoopTile::T128X128_W64X32_K32_PF.name(),
+            "128x128/w64x32/k32/db/pf"
+        );
+        assert_eq!(
+            CoopTile::T128X256_W64X64_K32_PF1.name(),
+            "128x256/w64x64/k32/pf"
+        );
+    }
+
+    #[test]
+    fn pipelined_tiles_are_new_and_distinct() {
+        for (i, t) in CoopTile::PIPELINED.iter().enumerate() {
+            assert!(t.prefetch, "{t:?}");
+            assert!(!CoopTile::ALL.contains(t), "{t:?}");
+            assert!(CoopTile::ALL.iter().all(|a| !a.prefetch));
+            for u in &CoopTile::PIPELINED[..i] {
+                assert_ne!(t.name(), u.name());
+            }
+        }
     }
 }
