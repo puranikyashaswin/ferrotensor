@@ -960,6 +960,129 @@ fn small_m_matmul_refuses_what_it_cannot_run() {
         .is_err());
 }
 
+/// Linear projections of the SmolLM2 models as (name, input width, output
+/// width): the shapes a fine-tune sends through the small-M kernel in a
+/// micro-batch of one padded sequence. 135M and 1.7B are controls for 360M.
+const SMOLLM2_PROJECTIONS: &[(&str, usize, usize)] = &[
+    ("135M q/o", 576, 576),
+    ("135M k/v", 576, 192),
+    ("135M fused qkv", 576, 960),
+    ("135M gate/up", 576, 1536),
+    ("135M down", 1536, 576),
+    ("135M lm_head", 576, 49152),
+    ("360M q/o", 960, 960),
+    ("360M k/v", 960, 320),
+    ("360M fused qkv", 960, 1600),
+    ("360M gate/up", 960, 2560),
+    ("360M down", 2560, 960),
+    ("360M lm_head", 960, 49152),
+    ("1.7B q/k/v/o", 2048, 2048),
+    ("1.7B gate/up", 2048, 8192),
+    ("1.7B down", 8192, 2048),
+];
+
+/// Row counts of the micro-batches under test: one token, a decode batch,
+/// the router's lower bound, and the rows around one 32-row padding step.
+const SMOLLM2_ROWS: &[usize] = &[1, 8, 16, 31, 32, 48, 63];
+
+/// `a[M, K] @ b` in f64 for `b` stored `[N, K]` (`transposed_b`) or `[K, N]`.
+fn f64_matmul(
+    a: &[f32],
+    b: &[f32],
+    (m, k, n): (usize, usize, usize),
+    transposed_b: bool,
+) -> Vec<f32> {
+    let mut out = vec![0.0f64; m * n];
+    for (a_row, out_row) in a.chunks(k).zip(out.chunks_mut(n)) {
+        if transposed_b {
+            for (o, b_row) in out_row.iter_mut().zip(b.chunks(k)) {
+                *o = a_row
+                    .iter()
+                    .zip(b_row)
+                    .map(|(&x, &y)| f64::from(x) * f64::from(y))
+                    .sum();
+            }
+        } else {
+            for (&x, b_row) in a_row.iter().zip(b.chunks(n)) {
+                for (o, &y) in out_row.iter_mut().zip(b_row) {
+                    *o += f64::from(x) * f64::from(y);
+                }
+            }
+        }
+    }
+    out.into_iter().map(|v| v as f32).collect()
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn small_m_matmul_matches_f64_at_smollm2_shapes() {
+    // One weight W[out, in] gives both products of a linear layer: the
+    // forward a[M, in] @ W^T (b stored [N, K]) and the input gradient
+    // dy[M, out] @ W (b stored [K, N]). Each runs on the default tile with
+    // the heuristic's split, with no split, with 7 slices of K (what an A10G
+    // picks for 360M's 960-deep k/v products), and as the router sends it.
+    // The reference is f64 on the f16-rounded weight, and the tolerance of
+    // 1e-3 + 1e-4 * |want| is far above f32 summation noise (about 1e-5 at
+    // K = 8192) and far below the 0.03 a single wrong product would move
+    // an output by.
+    let g = gpu();
+    let paths = [
+        MatmulPath::SmallM {
+            tile: None,
+            split: None,
+        },
+        MatmulPath::SmallM {
+            tile: None,
+            split: Some(1),
+        },
+        MatmulPath::SmallM {
+            tile: None,
+            split: Some(7),
+        },
+        MatmulPath::Auto,
+    ];
+    for (shape_seed, &(name, d_in, d_out)) in SMOLLM2_PROJECTIONS.iter().enumerate() {
+        let shape_seed = shape_seed as u64;
+        let w: Vec<f32> = rand_vec(d_in * d_out, 7000 + shape_seed)
+            .iter()
+            .map(|v| v * 0.1)
+            .collect();
+        let mut weights = vec![(
+            "f16",
+            UnifiedTensor::from_f32_as_f16(&g.ctx, &w, &[d_out, d_in]),
+            f16_round(&w),
+        )];
+        if d_in * d_out <= 4_000_000 {
+            weights.push(("f32", upload(&w, &[d_out, d_in]), w.clone()));
+        }
+        for &m in SMOLLM2_ROWS {
+            for (product, transposed_b, k, n) in
+                [("a@bT", true, d_in, d_out), ("a@b", false, d_out, d_in)]
+            {
+                let a = rand_vec(m * k, 7100 + 16 * shape_seed + m as u64);
+                let a_up = upload(&a, &[m, k]);
+                for (dtype, b, b_ref) in &weights {
+                    let want = f64_matmul(&a, b_ref, (m, k, n), transposed_b);
+                    for path in paths {
+                        let out = zeros(&[m, n]);
+                        let launch = g
+                            .engine
+                            .matmul_with_path(&g.ctx, transposed_b, &a_up, b, &out, path)
+                            .unwrap();
+                        assert_close(
+                            &format!("{name} {dtype} {product} {m}x{k}x{n} {path:?} -> {launch:?}"),
+                            &read(&out),
+                            &want,
+                            1e-3,
+                            1e-4,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Element-wise ops and their backward passes
 // ---------------------------------------------------------------------------
