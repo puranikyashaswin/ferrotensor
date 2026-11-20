@@ -252,6 +252,19 @@ impl UnifiedTensor {
         Self::new(context, &data, shape)
     }
 
+    /// A zero-filled `f32` tensor from the buffer pool, cleared on the GPU.
+    ///
+    /// Unlike [`zeros`](Self::zeros) it uploads nothing from the host, so a
+    /// large scratch buffer made every step costs no upload bandwidth.
+    pub fn zeros_on_gpu(context: &WgpuContext, shape: &[usize]) -> Self {
+        let tensor = Self::empty(context, shape);
+        let size = tensor.size_in_bytes();
+        if size > 0 {
+            context.record(|encoder| encoder.clear_buffer(tensor.buffer(), 0, Some(size)));
+        }
+        tensor
+    }
+
     /// Uploads raw bytes as an `f32`-typed tensor (e.g. packed quantised data).
     pub fn from_bytes(context: &WgpuContext, data: &[u8], shape: &[usize]) -> Self {
         Self::from_bytes_with_dtype(context, data, shape, DType::FP32)
