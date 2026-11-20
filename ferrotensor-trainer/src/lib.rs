@@ -99,8 +99,14 @@ pub struct Trainer {
     /// the padding excluded from the loss). Causal attention keeps real
     /// tokens from seeing the padding, so results are unchanged, but a
     /// coarser bucket makes GPU buffer sizes repeat and reuses them, at the
-    /// price of rows that carry nothing. The default, 1, pads to the longest
-    /// sequence of the micro-batch and no further.
+    /// price of rows that carry nothing. 1 pads to the longest sequence of
+    /// the micro-batch and no further. The default, 0, picks per micro-batch
+    /// (see [`padded_length`]): a micro-batch of up to
+    /// [`SMALL_BATCH_SEQUENCES`] sequences is padded to a multiple of
+    /// [`SMALL_BATCH_BUCKET`], because its kernels are cheap enough that
+    /// creating buffers of a new size and building their bind groups on
+    /// every micro-batch costs more than the padded rows, and a larger
+    /// micro-batch is padded to its longest sequence.
     pub length_bucket: usize,
     /// Run `lm_head` and the loss only on the supervised positions, so the
     /// vocab-sized matmul skips prompt and padding rows in forward and
@@ -139,6 +145,26 @@ struct DeferredStats {
     rows: Option<(usize, std::ops::Range<usize>)>,
 }
 
+/// The most sequences in a micro-batch that is padded to a multiple of
+/// [`SMALL_BATCH_BUCKET`] when [`Trainer::length_bucket`] is 0.
+pub const SMALL_BATCH_SEQUENCES: usize = 2;
+
+/// The bucket a micro-batch of up to [`SMALL_BATCH_SEQUENCES`] sequences is
+/// padded to when [`Trainer::length_bucket`] is 0.
+pub const SMALL_BATCH_BUCKET: usize = 32;
+
+/// The length a micro-batch whose longest sequence has `longest` tokens and
+/// that holds `sequences` sequences is padded to, for a
+/// [`Trainer::length_bucket`] of `length_bucket` (0 for the default rule).
+pub fn padded_length(longest: usize, sequences: usize, length_bucket: usize) -> usize {
+    let bucket = match length_bucket {
+        0 if sequences <= SMALL_BATCH_SEQUENCES => SMALL_BATCH_BUCKET,
+        0 => 1,
+        bucket => bucket,
+    };
+    longest.div_ceil(bucket) * bucket
+}
+
 /// Stats of a step with no supervised tokens.
 const EMPTY_STATS: StepStats = StepStats {
     loss: 0.0,
@@ -167,7 +193,7 @@ impl Trainer {
             scaler: None,
             distributed_grad_sync: None,
             lr_scheduler: None,
-            length_bucket: 1,
+            length_bucket: 0,
             head_on_supervised_rows: true,
             dropout_seed: 0,
             defer_loss_readback: false,
@@ -189,10 +215,11 @@ impl Trainer {
         self
     }
 
-    /// Pad sequences to a multiple of `tokens` (see
-    /// [`length_bucket`](Self::length_bucket)).
+    /// Pad every micro-batch to a multiple of `tokens`, whatever its size
+    /// (see [`length_bucket`](Self::length_bucket)); 0 restores the
+    /// per-micro-batch default.
     pub fn with_length_bucket(mut self, tokens: usize) -> Self {
-        self.length_bucket = tokens.max(1);
+        self.length_bucket = tokens;
         self
     }
 
@@ -318,7 +345,7 @@ impl Trainer {
         train_params: &[Tensor],
     ) -> Result<(), TrainError> {
         let len = input_ids.len().min(target_ids.len());
-        let padded_len = len.div_ceil(self.length_bucket) * self.length_bucket;
+        let padded_len = padded_length(len, 1, self.length_bucket);
         let mut inputs = input_ids[..len].to_vec();
         let mut targets = target_ids[..len].to_vec();
         let mut mask = match loss_mask {
@@ -678,7 +705,7 @@ impl Trainer {
             .map(|s| s.0.len().min(s.1.len()))
             .max()
             .unwrap_or(0);
-        let padded_len = longest.div_ceil(self.length_bucket) * self.length_bucket;
+        let padded_len = padded_length(longest, chunk.len(), self.length_bucket);
         let mut inputs = Vec::with_capacity(chunk.len());
         let mut targets = Vec::with_capacity(chunk.len() * padded_len);
         let mut masks = Vec::with_capacity(chunk.len() * padded_len);
@@ -1183,8 +1210,27 @@ pub fn masked_cross_entropy_from_logits(
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use super::masked_cross_entropy_from_logits;
+    use super::{masked_cross_entropy_from_logits, padded_length};
     use crate::data::TrainingExample;
+
+    #[test]
+    fn default_bucket_pads_up_to_two_sequences_to_32_and_more_to_the_longest() {
+        assert_eq!(padded_length(61, 1, 0), 64);
+        assert_eq!(padded_length(64, 1, 0), 64);
+        assert_eq!(padded_length(1, 1, 0), 32);
+        assert_eq!(padded_length(61, 2, 0), 64);
+        assert_eq!(padded_length(61, 3, 0), 61);
+        assert_eq!(padded_length(61, 4, 0), 61);
+        assert_eq!(padded_length(214, 8, 0), 214);
+    }
+
+    #[test]
+    fn explicit_bucket_applies_to_every_micro_batch_size() {
+        assert_eq!(padded_length(61, 1, 1), 61);
+        assert_eq!(padded_length(61, 8, 16), 64);
+        assert_eq!(padded_length(61, 1, 16), 64);
+        assert_eq!(padded_length(0, 4, 0), 0);
+    }
 
     #[test]
     fn sft_mask_excludes_prompt_from_host_loss() {

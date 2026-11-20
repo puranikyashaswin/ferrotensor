@@ -214,7 +214,7 @@ fn defaults_match_the_bucketed_full_head() {
     let mut trainer = trainer(&gpu, model, 1e-2)
         .with_grad_accum_steps(2)
         .with_clip_grad_norm(0.5);
-    assert_eq!(trainer.length_bucket, 1);
+    assert_eq!(trainer.length_bucket, 0);
     assert!(trainer.head_on_supervised_rows);
     let seqs = sequences();
     let batch = masked_batch(&seqs);

@@ -425,7 +425,8 @@ struct TrainArgs {
     #[arg(long)]
     checkpoint_blocks: bool,
     /// Pad each micro-batch to a multiple of this many tokens (the padding is
-    /// left out of the loss) [default: the trainer's own rule].
+    /// left out of the loss) [default: 32 for a micro-batch of up to two
+    /// sequences, the longest sequence for a larger one].
     #[arg(long, value_name = "TOKENS", value_parser = clap::value_parser!(u64).range(1..))]
     length_bucket: Option<u64>,
     /// Number of processes in file-based data-parallel training (prototype).
