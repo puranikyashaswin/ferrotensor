@@ -951,3 +951,55 @@ fn fp16_to_fp32(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_work
     
     cast_fp32_out[i] = f16_bits_to_f32(bits);
 }
+
+// Embedding lookup, the forward of Tensor::embedding_gpu:
+// emb_out[p * hidden + c] = emb_table[emb_ids[p] * hidden + c], and zero for
+// an id outside the table, as the host lookup does.
+@group(0) @binding(0) var<storage, read> emb_table: array<f32>;
+@group(0) @binding(1) var<storage, read> emb_ids: array<u32>;
+@group(0) @binding(2) var<storage, read_write> emb_out: array<f32>;
+@group(0) @binding(3) var<uniform> emb_params: vec4<u32>; // hidden, vocab, 0, 0
+
+@compute @workgroup_size(64)
+fn embedding_gather(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = gid.x + gid.y * nwg.x * 64u;
+    if (i >= arrayLength(&emb_out)) { return; }
+    let hidden = emb_params.x;
+    let id = emb_ids[i / hidden];
+    if (id >= emb_params.y) {
+        emb_out[i] = 0.0;
+        return;
+    }
+    emb_out[i] = emb_table[id * hidden + i % hidden];
+}
+
+// Gradient of embedding_gather without atomics: one thread per table
+// element sums the output-gradient rows of the positions that looked its row
+// up, in position order, so the result is the host scatter-add bit for bit.
+// embg_index holds, one after the other: per table row the slot of its
+// unique id or EMBG_NONE (vocab entries), the start of each slot's positions
+// (slots + 1 entries), and the positions grouped by slot.
+const EMBG_NONE: u32 = 0xFFFFFFFFu;
+@group(0) @binding(0) var<storage, read> embg_grad: array<f32>;
+@group(0) @binding(1) var<storage, read> embg_index: array<u32>;
+@group(0) @binding(2) var<storage, read_write> embg_out: array<f32>;
+@group(0) @binding(3) var<uniform> embg_params: vec4<u32>; // hidden, vocab, slots, 0
+
+@compute @workgroup_size(64)
+fn embedding_scatter(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = gid.x + gid.y * nwg.x * 64u;
+    if (i >= arrayLength(&embg_out)) { return; }
+    let hidden = embg_params.x;
+    let vocab = embg_params.y;
+    let slot = embg_index[i / hidden];
+    var sum = 0.0;
+    if (slot != EMBG_NONE) {
+        let col = i % hidden;
+        let positions = vocab + embg_params.z + 1u;
+        let end = embg_index[vocab + slot + 1u];
+        for (var k = embg_index[vocab + slot]; k < end; k = k + 1u) {
+            sum = sum + embg_grad[embg_index[positions + k] * hidden + col];
+        }
+    }
+    embg_out[i] = sum;
+}

@@ -23,7 +23,7 @@ mod training;
 pub use attention::AttentionOptions;
 pub use matmul::{Epilogue, MatmulPath};
 pub use small_m::{SmallMLaunch, SmallMTile};
-pub use training::{AdamParams, MASKED_CE_SKIP, SUM_SQUARES_CHUNK};
+pub use training::{AdamParams, FlatLayout, FLAT_MAX_ELEMS, MASKED_CE_SKIP, SUM_SQUARES_CHUNK};
 
 /// The full WGSL source compiled into the engine's shader module.
 fn shader_source() -> String {
@@ -320,6 +320,8 @@ pub struct ComputeEngine {
     matvec_q4: Kernel,
     rope: Kernel,
     rope_out: Kernel,
+    emb_gather: Kernel,
+    emb_scatter: Kernel,
     rms_norm: Kernel,
     rms_norm_bw: Kernel,
     rms_norm_bw_weight: Kernel,
@@ -403,6 +405,8 @@ impl ComputeEngine {
             matvec_q4: k("matvec_q4"),
             rope: k("rope"),
             rope_out: k("rope_out"),
+            emb_gather: k("embedding_gather"),
+            emb_scatter: k("embedding_scatter"),
             rms_norm: k("rms_norm"),
             rms_norm_bw: k("rms_norm_backward"),
             rms_norm_bw_weight: k("rms_norm_backward_weight"),

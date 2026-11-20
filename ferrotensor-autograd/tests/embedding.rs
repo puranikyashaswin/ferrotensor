@@ -1,5 +1,6 @@
-//! `Tensor::embedding`: the gathered rows, the scatter-add gradient against
-//! values worked out by hand, and when the lookup records a node.
+//! `Tensor::embedding` and `Tensor::embedding_gpu`: the gathered rows, the
+//! scatter-add gradient against values worked out by hand or against each
+//! other, and when the lookup records a node.
 //!
 //! These need a real GPU, so they are `#[ignore]`d by default. Run them with:
 //!
@@ -86,4 +87,58 @@ fn a_frozen_table_or_no_grad_records_nothing() {
     let out = no_grad(|| Tensor::embedding(&trainable, &TABLE, rows));
     assert!(out.creator.is_none() && !out.requires_grad);
     assert_eq!(host(&ctx, &out.data), [2.0, 0.25, 0.5, -1.0]);
+}
+
+/// `embedding_gpu` against `embedding` on the same table, ids and output
+/// gradient: the rows, the zeros for an id past the table and the summed
+/// table gradient are equal bit for bit, and a frozen table records nothing.
+#[test]
+#[ignore = "needs a GPU"]
+fn the_gpu_lookup_matches_the_host_lookup_bit_for_bit() {
+    let (ctx, engine) = setup();
+    let (vocab, hidden) = (7usize, 5usize);
+    // Values with many mantissa bits, so a different summation order shows.
+    let values: Vec<f32> = (0..vocab * hidden)
+        .map(|i| ((i * 7919 % 1013) as f32 / 1013.0 - 0.5) * 3.1)
+        .collect();
+    let rows: &[&[u32]] = &[&[3, 0, 3, 6, 9], &[1, 3, 3, 0, 2]];
+    let w: Vec<f32> = (0..rows.len() * 5 * hidden)
+        .map(|i| ((i * 4583 % 997) as f32 / 997.0 - 0.5) * 1.7)
+        .collect();
+
+    let mut got = Vec::new();
+    for on_gpu in [false, true] {
+        let table = Tensor::new(
+            ctx.clone(),
+            UnifiedTensor::new(&ctx, &values, &[vocab, hidden]),
+        );
+        let out = if on_gpu {
+            Tensor::embedding_gpu(&table, rows, &engine)
+        } else {
+            Tensor::embedding(&table, &values, rows)
+        };
+        assert_eq!(out.data.shape, [2, 5, hidden]);
+        assert!(out.requires_grad && out.creator.is_some());
+        out.accumulate_grad(&engine, &UnifiedTensor::new(&ctx, &w, &[2, 5, hidden]));
+        out.backward(&engine);
+        let grad = table
+            .grad
+            .borrow()
+            .clone()
+            .expect("the table has a gradient");
+        let bits =
+            |t: &UnifiedTensor| -> Vec<u32> { host(&ctx, t).iter().map(|v| v.to_bits()).collect() };
+        got.push((bits(&out.data), bits(&grad)));
+    }
+    assert_eq!(got[0].0, got[1].0, "rows");
+    assert_eq!(got[0].1, got[1].1, "table gradient");
+    // Row 3 is looked up four times, row 4 never.
+    assert!(got[1].1[4 * hidden..5 * hidden].iter().all(|&b| b == 0));
+
+    let frozen = Tensor::frozen(
+        ctx.clone(),
+        UnifiedTensor::new(&ctx, &values, &[vocab, hidden]),
+    );
+    let out = Tensor::embedding_gpu(&frozen, rows, &engine);
+    assert!(out.creator.is_none() && !out.requires_grad);
 }
