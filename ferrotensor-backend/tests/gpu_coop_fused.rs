@@ -50,8 +50,14 @@ enum Mode {
 }
 
 /// Tiles and the K splits the split cases run: a single-buffered and a
-/// double-buffered tile, K steps of 32 and 64, and 2, 3 and 4 slices.
-fn splits() -> [CoopConfig; 3] {
+/// double-buffered tile, K steps of 32 and 64, and 2, 3 and 4 slices; then
+/// the register-prefetch tiles (double and single buffered, K steps of 32
+/// and 64) whole and split.
+fn splits() -> [CoopConfig; 9] {
+    let pf = |i: usize, split: u32| CoopConfig {
+        tile: CoopTile::PIPELINED[i],
+        split,
+    };
     [
         CoopConfig {
             tile: CoopTile::ALL[2],
@@ -65,6 +71,12 @@ fn splits() -> [CoopConfig; 3] {
             tile: CoopTile::ALL[4],
             split: 4,
         },
+        pf(0, 1),
+        pf(0, 3),
+        pf(1, 2),
+        pf(3, 1),
+        pf(7, 4),
+        pf(8, 1),
     ]
 }
 
