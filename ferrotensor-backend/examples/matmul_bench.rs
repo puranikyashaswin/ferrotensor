@@ -32,11 +32,15 @@
 //! cooperative configuration, null for `router`), `us`, `tflops`, `gbs`
 //! (weight, `a` and output bytes over `us`), `gpu_us` and `reduce_us`. The
 //! fused products and `coop` need `FERROTENSOR_EXPERIMENTAL=1`.
+//!
+//! `--tiles` runs the same products on the cooperative kernel with every
+//! tile of `CoopTile::ALL` and `CoopTile::PIPELINED` forced (see
+//! `tiles_main`).
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use ferrotensor_backend::{
-    wgpu, ComputeEngine, CoopConfig, Epilogue, FusedA, FusedOut, FusedSpec, KernelTiming,
+    wgpu, ComputeEngine, CoopConfig, CoopTile, Epilogue, FusedA, FusedOut, FusedSpec, KernelTiming,
     MatmulPath, SmallMLaunch, SmallMTile, UnifiedTensor, WgpuContext,
 };
 use std::time::Instant;
@@ -45,6 +49,7 @@ struct Options {
     quick: bool,
     sweep: bool,
     fused: bool,
+    tiles: bool,
     model: Option<String>,
     rows: Vec<usize>,
     calls: usize,
@@ -56,6 +61,7 @@ fn options() -> Options {
         quick: false,
         sweep: false,
         fused: false,
+        tiles: false,
         model: None,
         rows: vec![32, 48, 64, 80, 96, 128, 1024],
         calls: 20,
@@ -67,6 +73,7 @@ fn options() -> Options {
             "--quick" => o.quick = true,
             "--sweep" => o.sweep = true,
             "--fused" => o.fused = true,
+            "--tiles" => o.tiles = true,
             "--model" => o.model = Some(args.next().expect("--model takes a size")),
             "--rows" => {
                 o.rows = args
@@ -244,6 +251,10 @@ fn json_f64(v: Option<f64>) -> String {
 fn main() {
     env_logger::init();
     let o = options();
+    if o.tiles {
+        tiles_main(&o);
+        return;
+    }
     if o.fused {
         fused_main(&o);
         return;
@@ -528,9 +539,10 @@ fn run_fused(
     engine: &ComputeEngine,
     ctx: &WgpuContext,
     spec: &FusedSpec<'_>,
+    forced: Option<CoopConfig>,
 ) -> Result<Option<CoopConfig>, String> {
     engine
-        .matmul_fused_coop_config_into(ctx, spec, None)
+        .matmul_fused_coop_config_into(ctx, spec, forced)
         .map(Some)
 }
 
@@ -546,7 +558,13 @@ struct Run {
     reduce_us: Option<f64>,
 }
 
-fn measure(rig: &Rig, c: &Case, m: usize, variant: Variant, o: &Options) -> Result<Run, String> {
+fn measure(
+    rig: &Rig,
+    c: &Case,
+    m: usize,
+    (variant, forced): (Variant, Option<CoopConfig>),
+    o: &Options,
+) -> Result<Run, String> {
     let (ctx, engine) = (&rig.ctx, &rig.engine);
     let (transposed_b, w_shape) = match &c.op {
         Op::Plain { transposed_b } => (
@@ -596,7 +614,7 @@ fn measure(rig: &Rig, c: &Case, m: usize, variant: Variant, o: &Options) -> Resu
                         alpha: 1.0,
                     },
                 };
-                run_fused(engine, ctx, &spec).map(|config| ("fused", config))
+                run_fused(engine, ctx, &spec, forced).map(|config| ("fused", config))
             }
             (Variant::Fused, Op::Sources { .. }) => {
                 let spec = FusedSpec {
@@ -612,7 +630,7 @@ fn measure(rig: &Rig, c: &Case, m: usize, variant: Variant, o: &Options) -> Resu
                         },
                     },
                 };
-                run_fused(engine, ctx, &spec).map(|config| ("fused", config))
+                run_fused(engine, ctx, &spec, forced).map(|config| ("fused", config))
             }
             (Variant::Router, Op::Plain { .. }) => engine
                 .matmul_with_path(
@@ -638,7 +656,7 @@ fn measure(rig: &Rig, c: &Case, m: usize, variant: Variant, o: &Options) -> Resu
                     ctx,
                     transposed_b,
                     [&a_parts[0], &w, &outs[0]],
-                    None,
+                    forced,
                     Epilogue::STORE,
                 )
                 .map(|config| ("coop", Some(config))),
@@ -713,14 +731,14 @@ fn fused_main(o: &Options) {
                     c.k,
                     c.n
                 );
-                let run = match measure(&wall, &c, m, variant, o) {
+                let run = match measure(&wall, &c, m, (variant, None), o) {
                     Ok(run) => run,
                     Err(e) => {
                         println!("{{{head},\"error\":\"{}\"}}", e.replace('"', "'"));
                         continue;
                     }
                 };
-                let counted = measure(&timed, &c, m, variant, o).ok();
+                let counted = measure(&timed, &c, m, (variant, None), o).ok();
                 let flops = 2.0 * m as f64 * c.n as f64 * c.k as f64;
                 // Weight halves, `a` and the output in f32.
                 let bytes =
@@ -738,6 +756,74 @@ fn fused_main(o: &Options) {
                     json_f64(counted.as_ref().and_then(|r| r.gpu_us)),
                     json_f64(counted.as_ref().and_then(|r| r.reduce_us)),
                 );
+            }
+        }
+    }
+}
+
+/// The `--tiles` mode: every base-weight product at every row count on the
+/// cooperative kernel with each tile of `CoopTile::ALL` and
+/// `CoopTile::PIPELINED`, K whole and (when the grid is under 160
+/// workgroups) split in 2 and 4, then with the router's own pick (`pick`).
+/// Wall time per product only. One JSON object per line: `path` (`fused` or
+/// `coop`), `pick` (true for the router's configuration), the product's
+/// fields as in `--fused`, `tile`, `split`, `us`, `tflops` and `gbs`.
+fn tiles_main(o: &Options) {
+    let wall = rig(KernelTiming::Off);
+    eprintln!("adapter: {}", wall.ctx.adapter_info());
+    for c in cases(o.model.as_deref()) {
+        let variant = match c.op {
+            Op::Plain { .. } => Variant::Coop,
+            _ => Variant::Fused,
+        };
+        for &m in &o.rows {
+            let head = format!(
+                "\"model\":\"{}\",\"op\":\"{}\",\"layout\":\"{}\",\"m\":{m},\"k\":{},\"n\":{}",
+                c.model,
+                c.name,
+                match &c.op {
+                    Op::Plain {
+                        transposed_b: false,
+                    }
+                    | Op::Split { .. } => "a@b",
+                    _ => "a@bT",
+                },
+                c.k,
+                c.n
+            );
+            let flops = 2.0 * m as f64 * c.n as f64 * c.k as f64;
+            let bytes = 2.0 * (c.n * c.k) as f64 + 4.0 * (m * c.k) as f64 + 4.0 * (m * c.n) as f64;
+            let mut configs: Vec<(bool, Option<CoopConfig>)> = vec![(true, None)];
+            for tile in CoopTile::ALL.into_iter().chain(CoopTile::PIPELINED) {
+                let groups = c.n.div_ceil(tile.bn as usize) * m.div_ceil(tile.bm as usize);
+                let splits: &[u32] = if groups < 160 { &[1, 2, 4] } else { &[1] };
+                for &split in splits {
+                    configs.push((false, Some(CoopConfig { tile, split })));
+                }
+            }
+            for (pick, forced) in configs {
+                match measure(&wall, &c, m, (variant, forced), o) {
+                    Ok(run) => {
+                        let (tile, split) = run.config.map_or_else(
+                            || ("null".to_string(), "null".to_string()),
+                            |cfg| (format!("\"{}\"", cfg.tile.name()), cfg.split.to_string()),
+                        );
+                        println!(
+                            "{{\"path\":\"{}\",\"pick\":{pick},{head},\"tile\":{tile},\"split\":{split},\"us\":{},\"tflops\":{},\"gbs\":{}}}",
+                            run.path,
+                            json_f64(Some(run.us)),
+                            json_f64(Some(flops / (run.us * 1e-6) / 1e12)),
+                            json_f64(Some(bytes / (run.us * 1e-6) / 1e9)),
+                        );
+                    }
+                    Err(e) => {
+                        let t = forced.map_or_else(String::new, |f| f.tile.name());
+                        println!(
+                            "{{\"pick\":{pick},{head},\"tile\":\"{t}\",\"error\":\"{}\"}}",
+                            e.replace('"', "'")
+                        );
+                    }
+                }
             }
         }
     }
