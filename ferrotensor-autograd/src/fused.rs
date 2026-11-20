@@ -224,7 +224,7 @@ impl FusedProjections {
         let base: usize = self.widths.iter().sum();
         let half_at = |i: usize| -> u16 {
             let word = words[i / 2].to_bits();
-            (if i % 2 == 0 {
+            (if i.is_multiple_of(2) {
                 word & 0xffff
             } else {
                 word >> 16

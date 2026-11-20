@@ -340,7 +340,7 @@ mod tests {
             let text = format!("{good}{line}\n");
             let err = parse(&text, &header()).expect_err(line);
             assert!(
-                matches!(err, CacheError::Corrupt { line: 4, .. }),
+                matches!(err, CacheError::Corrupt { line: 5, .. }),
                 "{line}: {err:?}"
             );
         }
