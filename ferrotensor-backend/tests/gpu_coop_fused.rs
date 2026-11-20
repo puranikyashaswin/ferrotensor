@@ -583,61 +583,87 @@ fn invalid_specs_are_refused() {
     let b = weight(g, &f16_round(&rand_vec(k * n, 42)), k, n, false);
     let out = tensor(g, &vec![0.0; m * n], &[m, n]);
     let run = |spec: FusedSpec<'_>| g.engine.matmul_fused_reference_into(&g.ctx, &spec);
-    let plain = |out: FusedOut<'_>| FusedSpec {
-        a: FusedA::Plain(&a),
-        b: &b,
-        transposed_b: false,
-        out,
-    };
+    fn plain<'a>(
+        (a, b): (&'a UnifiedTensor, &'a UnifiedTensor),
+        out: FusedOut<'a>,
+    ) -> FusedSpec<'a> {
+        FusedSpec {
+            a: FusedA::Plain(a),
+            b,
+            transposed_b: false,
+            out,
+        }
+    }
     let store = Epilogue {
         alpha: 1.0,
         beta: 0.0,
     };
-    run(plain(FusedOut::AlphaBeta {
-        out: &out,
-        epilogue: store,
-    }))
+    run(plain(
+        (&a, &b),
+        FusedOut::AlphaBeta {
+            out: &out,
+            epilogue: store,
+        },
+    ))
     .unwrap();
     // A residual that is the output, an output that is the input.
-    assert!(run(plain(FusedOut::Residual {
-        out: &out,
-        residual: &out,
-        alpha: 1.0
-    }))
+    assert!(run(plain(
+        (&a, &b),
+        FusedOut::Residual {
+            out: &out,
+            residual: &out,
+            alpha: 1.0
+        }
+    ))
     .is_err());
-    assert!(run(plain(FusedOut::AlphaBeta {
-        out: &a,
-        epilogue: store
-    }))
+    assert!(run(plain(
+        (&a, &b),
+        FusedOut::AlphaBeta {
+            out: &a,
+            epilogue: store
+        }
+    ))
     .is_err());
     // A split whose widths do not add up to N, and two outputs on one buffer.
     let half = tensor(g, &vec![0.0; m * 4], &[m, 4]);
-    assert!(run(plain(FusedOut::Split {
-        outs: &[&half],
-        bias: None,
-        alpha: 1.0
-    }))
+    assert!(run(plain(
+        (&a, &b),
+        FusedOut::Split {
+            outs: &[&half],
+            bias: None,
+            alpha: 1.0
+        }
+    ))
     .is_err());
     let rest = tensor(g, &vec![0.0; m * 12], &[m, 12]);
-    assert!(run(plain(FusedOut::Split {
-        outs: &[&half, &rest],
-        bias: None,
-        alpha: 1.0
-    }))
+    assert!(run(plain(
+        (&a, &b),
+        FusedOut::Split {
+            outs: &[&half, &rest],
+            bias: None,
+            alpha: 1.0
+        }
+    ))
     .is_ok());
     let eighth = tensor(g, &vec![0.0; m * 8], &[m, 8]);
-    assert!(run(plain(FusedOut::Split {
-        outs: &[&eighth, &eighth],
-        bias: None,
-        alpha: 1.0
-    }))
+    assert!(run(plain(
+        (&a, &b),
+        FusedOut::Split {
+            outs: &[&eighth, &eighth],
+            bias: None,
+            alpha: 1.0
+        }
+    ))
     .is_err());
     // A bias of the wrong length.
-    assert!(run(plain(FusedOut::Split {
-        outs: &[&out],
-        bias: Some(&half),
-        alpha: 1.0
-    }))
+    assert!(run(plain(
+        (&a, &b),
+        FusedOut::Split {
+            outs: &[&out],
+            bias: Some(&half),
+            alpha: 1.0
+        }
+    ))
     .is_err());
     // K that does not match, one source, an odd gate/up width, and f32 weights.
     let long_b = weight(g, &f16_round(&rand_vec(8 * n, 43)), 8, n, false);
