@@ -1,5 +1,5 @@
 use crate::bind_cache::BindGroupCache;
-use crate::memory::MemoryTracker;
+use crate::memory::{wgpu_buffer_size, MemoryTracker};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
@@ -20,11 +20,39 @@ pub fn pool_overflow_from_env_value(value: Option<&str>) -> bool {
     !matches!(value.as_deref(), Some("0" | "false" | "off" | "no"))
 }
 
-/// Free lists of GPU buffers keyed by exact byte size.
+/// Smallest request, in bytes, that is rounded up to a size class; smaller
+/// ones keep their exact size, which is at most 64 distinct values.
+const MIN_CLASSED_BYTES: u64 = 256;
+
+/// log2 of the classes per power of two: 8, so a class is at most 12.5%
+/// above the sizes it serves.
+const CLASS_STEPS_LOG2: u32 = 3;
+
+/// The size in bytes of the buffer a request of `requested` bytes is served
+/// from.
 ///
-/// A tensor's buffer is returned when its last reference drops, and handed
-/// out again only to a tensor of exactly the same byte size: kernels bind
-/// whole buffers, so a larger one would change what they see.
+/// The request is rounded as wgpu does, then up to the next of 8 evenly
+/// spaced classes between two powers of two, so a class is at most 12.5%
+/// above the requests it serves. Below 256 bytes it stays exact. A sequence
+/// length that changes from one micro-batch to the next then lands on a few
+/// classes, not on a new size every time.
+pub fn size_class(requested: u64) -> u64 {
+    let size = wgpu_buffer_size(requested);
+    if size < MIN_CLASSED_BYTES {
+        return size;
+    }
+    let power = 1u64 << (63 - size.leading_zeros());
+    size.next_multiple_of(power >> CLASS_STEPS_LOG2)
+}
+
+/// Free lists of GPU buffers keyed by their size in bytes.
+///
+/// A tensor's buffer is returned when its last reference drops. A request is
+/// rounded up to its [`size_class`] and served by an idle buffer of exactly
+/// that size, so a buffer can be up to 12.5% larger than the tensor in it.
+/// Kernels still see the tensor's own size: the engine binds only the tensor's
+/// bytes of such a buffer, not the whole of it, since kernels bound their
+/// loops by `arrayLength`.
 ///
 /// Reusing a buffer that recorded or submitted GPU work still reads is safe:
 /// every op is recorded into one queue in program order, so the work of the
@@ -55,6 +83,9 @@ pub struct BufferPool {
     bind_groups: Arc<BindGroupCache>,
     created: AtomicU64,
     reused: AtomicU64,
+    /// Buffers in use that are larger than the tensor they hold, with the
+    /// tensor's bytes after wgpu's rounding.
+    bound: Mutex<HashMap<Buffer, u64>>,
 }
 
 struct PoolState {
@@ -172,6 +203,7 @@ impl BufferPool {
             bind_groups: Arc::new(BindGroupCache::default()),
             created: AtomicU64::new(0),
             reused: AtomicU64::new(0),
+            bound: Mutex::new(HashMap::new()),
         }
     }
 
@@ -260,35 +292,85 @@ impl BufferPool {
         self.reused.load(Relaxed)
     }
 
-    /// A free buffer of exactly `size` bytes, or a new one.
+    /// A free buffer for a tensor of `size` bytes: an idle one of the
+    /// [`size_class`] of `size`, or a new one of that size.
     #[expect(
         clippy::unwrap_used,
         reason = "lock poisoning means another thread panicked while holding the lock"
     )]
     pub fn get(&self, device: &Device, size: u64) -> Arc<Buffer> {
+        let exact = wgpu_buffer_size(size);
+        let class = size_class(size);
         let mut state = self.buffers.lock().unwrap();
-        if let Some(buffer) = state.lists.take(size) {
-            self.tracker.pool_take(size);
+        // The exact size is the second try: a class the device cannot
+        // allocate (see below) is created, and returned, at the exact size.
+        let mut idle = state.lists.take(class).map(|buffer| (class, buffer));
+        if idle.is_none() && class != exact {
+            idle = state.lists.take(exact).map(|buffer| (exact, buffer));
+        }
+        if let Some((taken, buffer)) = idle {
+            drop(state);
+            self.tracker.pool_take(taken);
             self.reused.fetch_add(1, Relaxed);
+            self.note_bound(&buffer, exact);
             return buffer;
         }
         drop(state);
 
         self.created.fetch_add(1, Relaxed);
-        Arc::new(device.create_buffer(&BufferDescriptor {
+        let created = if class <= device.limits().max_buffer_size {
+            class
+        } else {
+            exact
+        };
+        let buffer = Arc::new(device.create_buffer(&BufferDescriptor {
             label: Some("Pooled Buffer"),
-            size,
+            size: created,
             usage: self.usage,
             mapped_at_creation: false,
-        }))
+        }));
+        self.note_bound(&buffer, exact);
+        buffer
     }
 
-    /// Returns `buffer` (of `size` bytes) to the pool for reuse.
+    /// Records that `buffer` holds a tensor of `size` bytes, when it is
+    /// larger than that.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "lock poisoning means another thread panicked while holding the lock"
+    )]
+    fn note_bound(&self, buffer: &Buffer, size: u64) {
+        if buffer.size() != size {
+            self.bound.lock().unwrap().insert(buffer.clone(), size);
+        }
+    }
+
+    /// The bytes of `buffer` a kernel must see when the buffer is larger than
+    /// the tensor it holds; `None` for any other buffer, which is bound whole.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "lock poisoning means another thread panicked while holding the lock"
+    )]
+    pub(crate) fn bound_size(&self, buffer: &Buffer) -> Option<u64> {
+        self.bound.lock().unwrap().get(buffer).copied()
+    }
+
+    /// Forgets the tensor size of `buffer`, which is no longer in use.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "lock poisoning means another thread panicked while holding the lock"
+    )]
+    fn forget_bound(&self, buffer: &Buffer) {
+        self.bound.lock().unwrap().remove(buffer);
+    }
+
+    /// Returns `buffer` (of `size` bytes, its own size) to the pool for reuse.
     #[expect(
         clippy::unwrap_used,
         reason = "lock poisoning means another thread panicked while holding the lock"
     )]
     pub fn return_buffer(&self, size: u64, buffer: Arc<Buffer>) {
+        self.forget_bound(&buffer);
         let mut state = self.buffers.lock().unwrap();
         if !state.overflow && state.lists.pooled_bytes + size > state.max_pooled_bytes {
             // Dropping the last reference releases the GPU memory once the
@@ -391,6 +473,51 @@ mod tests {
         assert_eq!(b, a, "reused");
         let _ = get(&mut l, 8192);
         assert_eq!(created, 2);
+    }
+
+    #[test]
+    fn size_classes_round_up_by_at_most_an_eighth() {
+        // Small requests keep their exact (4-byte aligned) size.
+        assert_eq!(size_class(0), 4);
+        assert_eq!(size_class(1), 4);
+        assert_eq!(size_class(6), 8);
+        assert_eq!(size_class(252), 252);
+        // 8 classes per power of two from 256 bytes up.
+        assert_eq!(size_class(256), 256);
+        assert_eq!(size_class(257), 288);
+        assert_eq!(size_class(288), 288);
+        assert_eq!(size_class(300), 320);
+        assert_eq!(size_class(4000), 4096);
+        assert_eq!(size_class(4096), 4096);
+        assert_eq!(size_class(4097), 4608);
+        assert_eq!(size_class(5000), 5120);
+        assert_eq!(size_class(196_608_000), 201_326_592);
+        for requested in
+            (1..70_000u64).chain([1 << 20, (1 << 20) + 1, 3 << 28, u64::from(u32::MAX)])
+        {
+            let class = size_class(requested);
+            let exact = wgpu_buffer_size(requested);
+            assert!(class >= exact, "{requested}: class {class} below {exact}");
+            assert_eq!(class % 4, 0, "{requested}");
+            assert!(
+                class - exact <= exact / 8,
+                "{requested}: class {class} is more than an eighth above {exact}"
+            );
+            assert_eq!(size_class(class), class, "{requested}: classes are stable");
+        }
+    }
+
+    #[test]
+    fn lengths_that_differ_every_micro_batch_share_few_classes() {
+        // A [len, 64] f32 activation for every length from 64 to 255, as
+        // exact padding produces them.
+        let mut classes: Vec<u64> = (64..256u64).map(|len| size_class(len * 64 * 4)).collect();
+        classes.dedup();
+        classes.sort_unstable();
+        classes.dedup();
+        assert!(classes.len() <= 17, "{} classes", classes.len());
+        let exact = (64..256u64).count();
+        assert!(classes.len() * 10 < exact, "{} of {exact}", classes.len());
     }
 
     #[test]

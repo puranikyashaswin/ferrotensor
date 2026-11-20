@@ -39,7 +39,7 @@ use ferrotensor_graph::lfm::{legacy_llama_name, Lfm2Model};
 use ferrotensor_graph::model_builder::{
     check_supported, module_matches, Lfm2ModelBuilder, LoRaConfig, Q4Selection,
 };
-use ferrotensor_graph::{FusedMode, KVCache, KVCacheLayer};
+use ferrotensor_graph::{FuseChoice, FusedMode, KVCache, KVCacheLayer};
 use ferrotensor_loader::{Lfm2Config, ModelLoader, Sampler, Tokenizer, WeightsContext};
 use ferrotensor_trainer::checkpoint::{
     apply_checkpoint, load_lora_checkpoint, save_lora_checkpoint, upgrade_optimizer_names,
@@ -424,6 +424,11 @@ struct TrainArgs {
     /// measured runs.
     #[arg(long)]
     checkpoint_blocks: bool,
+    /// Pad each micro-batch to a multiple of this many tokens (the padding is
+    /// left out of the loss) [default: 32 for a micro-batch of up to two
+    /// sequences, the longest sequence for a larger one].
+    #[arg(long, value_name = "TOKENS", value_parser = clap::value_parser!(u64).range(1..))]
+    length_bucket: Option<u64>,
     /// Number of processes in file-based data-parallel training (prototype).
     #[arg(long, default_value_t = 1)]
     world_size: usize,
@@ -1738,14 +1743,24 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
         .max(1);
     let warmup = args.warmup_steps.min(total_steps.saturating_sub(1));
 
-    let model = model.with_block_checkpointing(args.checkpoint_blocks);
+    let mut model = model.with_block_checkpointing(args.checkpoint_blocks);
     if args.checkpoint_blocks {
         eprintln!("block checkpointing: on");
     }
     if lora_on {
-        let groups = model.enable_fused_projections(&base.engine, FusedMode::Auto)?;
-        if groups > 0 {
-            eprintln!("fused projections: {groups} groups");
+        // The switches are read here, once, for the whole run.
+        let rows = args.batch_size * args.data.seq_len;
+        let (qkv, gate_up) = model.enable_fused_projections_with(
+            &base.engine,
+            FusedMode::Auto,
+            FuseChoice::from_env(),
+            rows,
+        )?;
+        if qkv + gate_up > 0 {
+            eprintln!(
+                "fused projections: {} groups (q/k/v {qkv}, gate/up {gate_up})",
+                qkv + gate_up
+            );
         }
     }
     let mut optimizer = AdamW::new(base.engine.clone(), args.lr);
@@ -1761,6 +1776,9 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
     .with_clip_grad_norm(args.grad_clip)
     .with_lr_scheduler(Box::new(scheduler))
     .with_deferred_loss_readback();
+    if let Some(tokens) = args.length_bucket {
+        trainer = trainer.with_length_bucket(usize::try_from(tokens).unwrap_or(usize::MAX));
+    }
     if base.engine.coop_matmul_active() {
         // The matmuls round activations and gradients to f16, so small
         // gradients need the loss scaled up to stay representable.
@@ -2225,6 +2243,21 @@ mod tests {
         };
         assert!(checkpoint_blocks(&["--checkpoint-blocks"]));
         assert!(!checkpoint_blocks(&[]));
+    }
+
+    #[test]
+    fn train_parses_length_bucket() {
+        let bucket = |extra: &[&str]| {
+            let mut args = vec!["train", "--model", "m", "--data", "d.jsonl"];
+            args.extend_from_slice(extra);
+            parse(&args).map(|cli| match cli.command {
+                Command::Train(t) => t.length_bucket,
+                _ => panic!("expected train"),
+            })
+        };
+        assert_eq!(bucket(&[]).expect("parse"), None);
+        assert_eq!(bucket(&["--length-bucket", "16"]).expect("parse"), Some(16));
+        assert!(bucket(&["--length-bucket", "0"]).is_err());
     }
 
     #[test]

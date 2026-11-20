@@ -21,7 +21,10 @@ pub use flash_attention::{
     AttentionMask, FlashAttention, FlashAttentionGrads, GroupedQueryAttention,
     KVCache as FlashKVCache, MultiQueryAttention, SlidingWindowAttention,
 };
-pub use fused::{FusedMode, FusedSlot};
+pub use fused::{
+    FuseChoice, FuseKind, FuseShape, FuseSwitch, FusedMode, FusedSlot, FUSE_GATEUP_ENV,
+    FUSE_QKV_ENV,
+};
 pub use lfm::Lfm2Model;
 
 // --- LoRA Adapter ---
@@ -386,9 +389,15 @@ impl Attention {
                 return self.forward_fused(engine, &group, x, pos, dropout_seed);
             }
         }
-        let q = self.q_proj.forward(engine, x);
-        let k = self.k_proj.forward(engine, x);
-        let v = self.v_proj.forward(engine, x);
+        // A layer whose weights moved into a fused group gets them back here.
+        let restored = self.unfused_qkv(&x.ctx);
+        let [q_proj, k_proj, v_proj] = match &restored {
+            Some([q, k, v]) => [q, k, v],
+            None => [&self.q_proj, &self.k_proj, &self.v_proj],
+        };
+        let q = q_proj.forward(engine, x);
+        let k = k_proj.forward(engine, x);
+        let v = v_proj.forward(engine, x);
 
         // Before RoPE, as in Hugging Face Qwen3; every path below (training,
         // batched, KV-cache decoding) starts from these q and k.
@@ -522,8 +531,13 @@ impl MLP {
             let fused = Tensor::fused_gate_up_silu(input, &group, engine);
             return self.down_proj.forward(engine, &fused);
         }
-        let up = self.up_proj.forward(engine, input);
-        let gate = self.gate_proj.forward(engine, input);
+        let restored = self.unfused_gate_up(&input.ctx);
+        let [gate_proj, up_proj] = match &restored {
+            Some([gate, up]) => [gate, up],
+            None => [&self.gate_proj, &self.up_proj],
+        };
+        let up = up_proj.forward(engine, input);
+        let gate = gate_proj.forward(engine, input);
         // silu_gate_fused(a, b) = silu(a) * b; SwiGLU applies SiLU to the gate.
         let fused = Tensor::silu_gate_fused(&gate, &up, engine);
         self.down_proj.forward(engine, &fused)
