@@ -574,6 +574,7 @@ impl ComputeEngine {
         groups: (u32, u32, u32),
         tune: Option<u64>,
     ) {
+        let _span = ctx.host_span(crate::HostSpan::Record);
         let mut immediates = None;
         // A group that binds a buffer made for this dispatch alone is not
         // worth caching.

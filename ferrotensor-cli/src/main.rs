@@ -1974,7 +1974,7 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
         loader.set_epoch(epoch as u64);
         loader.reset();
         let mut any = false;
-        for batch in &mut loader {
+        while let Some(batch) = profile_report::timed_next(&base.ctx, &mut loader) {
             any = true;
             if micro_seen < skip_micro {
                 micro_seen += batch.batch_size;

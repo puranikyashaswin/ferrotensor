@@ -4,7 +4,7 @@
 //! the GPU time of each kernel when the adapter has timestamp queries.
 
 use ferrotensor_backend::{
-    GpuCounterSnapshot, KernelTimes, KernelTiming, KernelTimingMode, WgpuContext,
+    GpuCounterSnapshot, HostSpan, KernelTimes, KernelTiming, KernelTimingMode, WgpuContext,
 };
 use serde_json::{json, Map, Value};
 use std::path::Path;
@@ -21,6 +21,40 @@ pub fn kernel_timing(profile: bool) -> KernelTiming {
     } else {
         KernelTiming::Off
     }
+}
+
+/// The next item of `items`, with the time it took counted as the host's
+/// data preparation ([`HostSpan::Data`]).
+pub fn timed_next<I: Iterator>(ctx: &WgpuContext, items: &mut I) -> Option<I::Item> {
+    let _span = ctx.host_span(HostSpan::Data);
+    items.next()
+}
+
+/// The host spans of one step as milliseconds, with what the spans leave of
+/// the step (`other`), and the same inside readbacks, where `other` is what
+/// the spans leave of the time in readbacks.
+fn host_spans_ms(wall: Duration, work: &GpuCounterSnapshot) -> Value {
+    let ms = |d: Duration| d.as_secs_f64() * 1e3;
+    let mut spans = Map::new();
+    let mut inside = Map::new();
+    let (mut total, mut inside_total) = (Duration::ZERO, Duration::ZERO);
+    for span in HostSpan::ALL {
+        spans.insert(span.name().into(), ms(work.span(span)).into());
+        inside.insert(span.name().into(), ms(work.readback_span(span)).into());
+        total += work.span(span);
+        inside_total += work.readback_span(span);
+    }
+    spans.insert("other".into(), ms(wall.saturating_sub(total)).into());
+    inside.insert(
+        "other".into(),
+        ms(work.readback_time.saturating_sub(inside_total)).into(),
+    );
+    json!({
+        "step": ms(wall),
+        "readback": ms(work.readback_time),
+        "spans": spans,
+        "spans_in_readback": inside,
+    })
 }
 
 /// A context's GPU work counters and kernel times at one moment, or the
@@ -132,6 +166,15 @@ impl ProfileRun {
         for &(name, count) in &counts {
             eprintln!("  {:<26} {count:>12} /step", name.replace('_', " "));
         }
+        let host = host_spans_ms(median.wall, &median.work.counters);
+        eprintln!("profile: host time by span in that step, ms (in readbacks / total)");
+        for (name, ms) in host["spans"].as_object().into_iter().flatten() {
+            let inside = host["spans_in_readback"][name].as_f64().unwrap_or(0.0);
+            eprintln!(
+                "  {name:<26} {inside:>12.3} / {:>8.3}",
+                ms.as_f64().unwrap_or(0.0)
+            );
+        }
         let mode = self.ctx.kernel_timing_mode();
         if print_mode(mode) {
             eprintln!("profile: GPU time by kernel in that step");
@@ -147,6 +190,7 @@ impl ProfileRun {
             for &(name, count) in &counts {
                 report.insert(format!("{name}_per_step"), count.into());
             }
+            report.insert("host_ms_per_step".into(), host);
             report.insert(
                 "kernel_timing".into(),
                 mode.map(KernelTimingMode::name).into(),
@@ -317,6 +361,35 @@ mod tests {
                 ],
             })
         );
+    }
+
+    #[test]
+    fn host_spans_are_milliseconds_with_the_rest_as_other() {
+        let mut work = GpuCounterSnapshot {
+            readback_time: Duration::from_millis(30),
+            ..GpuCounterSnapshot::default()
+        };
+        let index = |span: HostSpan| HostSpan::ALL.iter().position(|&s| s == span).unwrap_or(0);
+        work.spans[index(HostSpan::Wait)] = Duration::from_millis(20);
+        work.spans[index(HostSpan::Encode)] = Duration::from_millis(5);
+        work.readback_spans[index(HostSpan::Wait)] = Duration::from_millis(20);
+        work.readback_spans[index(HostSpan::Release)] = Duration::from_millis(4);
+        work.spans[index(HostSpan::Release)] = Duration::from_millis(4);
+        let report = host_spans_ms(Duration::from_millis(100), &work);
+        let at = |value: &Value| value.as_f64().unwrap_or(f64::NAN);
+        for (value, expected) in [
+            (&report["step"], 100.0),
+            (&report["readback"], 30.0),
+            (&report["spans"]["wait"], 20.0),
+            (&report["spans"]["encode"], 5.0),
+            (&report["spans"]["release"], 4.0),
+            (&report["spans"]["other"], 71.0),
+            (&report["spans_in_readback"]["release"], 4.0),
+            (&report["spans_in_readback"]["encode"], 0.0),
+            (&report["spans_in_readback"]["other"], 6.0),
+        ] {
+            assert!((at(value) - expected).abs() < 1e-9, "{value} != {expected}");
+        }
     }
 
     #[test]
