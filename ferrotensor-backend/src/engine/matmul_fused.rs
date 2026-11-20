@@ -27,8 +27,11 @@
 //! device through a plain kernel with one thread per output element that
 //! shares the loaders' and epilogues' element code and rounds `a` to f16 like
 //! the staging does: slow, and the semantics the fast kernel is tested
-//! against. Neither splits K, and neither counts f16 overflows beyond what
-//! the cooperative kernel always does.
+//! against. The reference runs K whole and counts no f16 overflows. The
+//! cooperative kernel splits K as the planner or the autotuner say: each
+//! slice's partial sums go to a scratch buffer, and one reduction pass adds
+//! them in order and then runs the epilogue once, so a column split, a
+//! residual, a bias or an accumulate never sees a partial sum.
 
 use super::coop::{self, EpilogueKind, LoaderKind, MAX_SEGMENTS, MAX_SOURCES, SOURCE_BINDING};
 use super::{grid, immediate_params, uniform, Arg, ComputeEngine, Epilogue, Kernel, Params};
@@ -164,21 +167,59 @@ impl<'a> Resolved<'a> {
         v
     }
 
+    /// The bindings of the partial-sum pass of a split product: as
+    /// [`bind`](Self::bind), but the output (binding 2) is `parts` and the
+    /// epilogue's own buffers are left out, since that pass stores plain
+    /// sums.
+    pub(super) fn bind_partial<'s>(
+        &'s self,
+        params: &'s Params,
+        overflows: &'s wgpu::Buffer,
+        parts: &'s wgpu::Buffer,
+    ) -> Vec<(u32, &'s dyn Arg)> {
+        let mut v: Vec<(u32, &dyn Arg)> = vec![
+            (0, self.a0.buffer() as &dyn Arg),
+            (1, self.b.buffer() as &dyn Arg),
+            (2, parts as &dyn Arg),
+            (3, params as &dyn Arg),
+            (4, overflows as &dyn Arg),
+        ];
+        for (s, t) in (SOURCE_BINDING..).zip(&self.a_more) {
+            v.push((s, t.buffer() as &dyn Arg));
+        }
+        v
+    }
+
+    /// The bindings of the reduction pass: the partial sums (binding 0), the
+    /// output (2), `params` (3) and the epilogue's own buffers.
+    pub(super) fn bind_reduce<'s>(
+        &'s self,
+        params: &'s Params,
+        parts: &'s wgpu::Buffer,
+    ) -> Vec<(u32, &'s dyn Arg)> {
+        let mut v: Vec<(u32, &dyn Arg)> = vec![
+            (0, parts as &dyn Arg),
+            (2, self.out.buffer() as &dyn Arg),
+            (3, params as &dyn Arg),
+        ];
+        for &(binding, t) in &self.extras {
+            v.push((binding, t.buffer() as &dyn Arg));
+        }
+        v
+    }
+
     /// The words of `params`: sizes, scalars, then the bounds, `vec4s` of
     /// them in all. `kps` is K per slice, which is all of K rounded up to a
     /// step.
     pub(super) fn params_words(&self, kps: u32, vec4s: u32) -> Vec<u32> {
+        self.params_words_with(kps, vec4s, self.scalars)
+    }
+
+    /// [`params_words`](Self::params_words) with `scalars` as `(alpha, beta)`
+    /// instead of the product's own.
+    pub(super) fn params_words_with(&self, kps: u32, vec4s: u32, scalars: (f32, f32)) -> Vec<u32> {
         let (m, k, n) = self.dims;
-        let mut w = vec![
-            m,
-            k,
-            n,
-            kps,
-            self.scalars.0.to_bits(),
-            self.scalars.1.to_bits(),
-            0,
-            0,
-        ];
+        let mut w = vec![m, k, n, kps, scalars.0.to_bits(), scalars.1.to_bits(), 0, 0];
         w.extend(self.tail.iter().take(4 * vec4s.saturating_sub(2) as usize));
         w
     }
@@ -409,8 +450,9 @@ impl ComputeEngine {
     /// Runs `spec`: on the cooperative-matrix kernel when
     /// [`coop_matmul_active`](Self::coop_matmul_active) and a tile fits, else
     /// through [`matmul_fused_reference_into`](Self::matmul_fused_reference_into).
-    /// Any M is accepted, K is not split, and `a` values f16 cannot hold are
-    /// clamped and counted as in [`matmul_coop_into`](Self::matmul_coop_into).
+    /// Any M is accepted, K is split as the planner or the autotuner say, and
+    /// `a` values f16 cannot hold are clamped and counted as in
+    /// [`matmul_coop_into`](Self::matmul_coop_into).
     ///
     /// # Errors
     ///
@@ -439,6 +481,26 @@ impl ComputeEngine {
         spec: &FusedSpec<'_>,
     ) -> Result<(), String> {
         self.matmul_fused_coop(ctx, &resolve(spec)?)
+    }
+
+    /// Runs `spec` on the cooperative-matrix kernel with `config`, or with
+    /// the configuration the fused router picks when it is `None`, and
+    /// returns the configuration that ran (a split can come out smaller, so
+    /// that no slice of K is empty).
+    ///
+    /// # Errors
+    ///
+    /// As [`matmul_fused_coop_into`](Self::matmul_fused_coop_into), and when
+    /// `config`'s tile does not fit this device or its grid is past the
+    /// dispatch limit.
+    #[doc(hidden)]
+    pub fn matmul_fused_coop_config_into(
+        &self,
+        ctx: &WgpuContext,
+        spec: &FusedSpec<'_>,
+        config: Option<coop::CoopConfig>,
+    ) -> Result<coop::CoopConfig, String> {
+        self.matmul_fused_coop_with(ctx, &resolve(spec)?, config)
     }
 
     /// Runs `spec` on the plain reference kernel, on any device: one thread

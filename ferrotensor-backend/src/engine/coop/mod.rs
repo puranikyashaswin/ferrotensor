@@ -57,8 +57,11 @@ pub use tiles::{CoopConfig, CoopTile};
 use tiles::{PAD, SUBGROUP};
 
 /// Fewest output rows routed to the kernel: decode steps and thin products
-/// stay on the f32 kernels.
-const MIN_ROWS: u32 = 64;
+/// stay on the f32 kernels. At 32 to 63 rows the kernel with the planner's
+/// split beat the small-M kernel in 46 of 48 products of SmolLM2 135M, 360M
+/// and 1.7B on an A10G (`matmul_bench --fused`, 20 November 2026), so those
+/// rows run here too.
+const MIN_ROWS: u32 = 32;
 
 /// What one compiled kernel is specialised for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -80,6 +83,8 @@ pub(super) struct CoopKey {
 /// The cooperative-matrix kernels of a device that has them.
 pub(super) struct Coop {
     kernels: Mutex<HashMap<CoopKey, Arc<Kernel>>>,
+    /// The reduction passes of split fused products, by epilogue.
+    fused_reduce: Mutex<HashMap<EpilogueKind, Arc<Kernel>>>,
     /// One `u32` counter of staging threads that clamped an `a` value (or a
     /// value the attention kernels staged).
     pub(super) overflows: UnifiedTensor,
@@ -163,6 +168,7 @@ impl Coop {
         );
         Some(Self {
             kernels: Mutex::new(HashMap::new()),
+            fused_reduce: Mutex::new(HashMap::new()),
             overflows: UnifiedTensor::zeros(ctx, &[1]),
             flash: Some(super::flash_coop::FlashCoop::new()),
             routed,
@@ -183,14 +189,16 @@ impl Coop {
             .map(|t| t.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
-    /// The configuration and sample id to run an `m x k x n` product with when
-    /// the static rules pick `static_cfg`: the tuner's pick, and the sample
-    /// to tag the run with when it is a timing. Without a tuner, the static
-    /// pick and no sample.
+    /// The configuration and sample id to run an `m x k x n` product of the
+    /// kernel variant `kinds` (its loader and epilogue) with when the static
+    /// rules pick `static_cfg`: the tuner's pick, and the sample to tag the
+    /// run with when it is a timing. Without a tuner, the static pick and no
+    /// sample.
     fn autotuned(
         &self,
         ctx: &WgpuContext,
         transposed_b: bool,
+        kinds: (LoaderKind, EpilogueKind),
         dims: (u32, u32, u32),
         static_cfg: CoopConfig,
     ) -> (CoopConfig, Option<u64>) {
@@ -202,9 +210,8 @@ impl Coop {
                 tuner.record(sample, time);
             }
         }
-        let (m, k, n) = dims;
-        let probe = coop_key(static_cfg.tile, transposed_b, (k, n));
-        let key = TuneKey::new(transposed_b, (probe.loader, probe.epilogue), dims);
+        let (m, _, n) = dims;
+        let key = TuneKey::new(transposed_b, kinds, dims);
         let usable =
             |c: CoopConfig| self.fits(c.tile, transposed_b) && grid_fits(c.tile, m, n, c.split);
         let list = || {
@@ -392,7 +399,13 @@ impl ComputeEngine {
         let Some(config) = plan(dims, transposed_b, target, |t| coop.fits(t, transposed_b)) else {
             return false;
         };
-        let (config, tune) = coop.autotuned(ctx, transposed_b, dims, config);
+        let (config, tune) = coop.autotuned(
+            ctx,
+            transposed_b,
+            (LoaderKind::Plain, EpilogueKind::AlphaBeta),
+            dims,
+            config,
+        );
         self.matmul_coop_run(ctx, transposed_b, dims, tensors, (config, tune), ep)
             .is_some()
     }

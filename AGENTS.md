@@ -194,7 +194,7 @@ weight matrix on the host, without a GPU. See
 
 With `FERROTENSOR_EXPERIMENTAL=1`, on a GPU whose adapter offers 16x16x16 f16
 cooperative matrices with f32 accumulation and 32-thread subgroups, matmuls
-against f16 base weights (at least 64 rows) round their f32 input to f16 and
+against f16 base weights (at least 32 rows) round their f32 input to f16 and
 run on those matrices; LoRA's thin matmuls stay in f32. `train` then turns on
 dynamic loss scaling (start 65536, x2 after 2,000 good steps, x0.5 and a
 skipped step on overflow) and reports it as `loss_scaler`. Any other value of
