@@ -82,11 +82,12 @@ impl FuseKind {
     ///
     /// The q, k and v group was at least as fast as the three projections in
     /// every SmolLM2 size and batch shape measured on one A10G. The gate and
-    /// up group was within 3% of them at 135M, 17% slower at 360M with 256
-    /// rows and 12 to 37% slower at 1.7B: its backward product `[dG|dU] @
-    /// W^T` has a K of the summed widths and no K split, so past a few
-    /// thousand columns it fills too little of the GPU. Other GPUs are not
-    /// measured, so `on` and `off` stay available.
+    /// up group was within 3% of them at 135M. Its backward product `[dG|dU]
+    /// @ W^T` has a K of the summed widths; before that product ran with a K
+    /// split it was 17% slower at 360M and 12 to 37% slower at 1.7B. With
+    /// the split it is 3% to 6% faster at 360M (256 rows, batch 1 by 8 and 8
+    /// by 1) and still 5% slower at 1.7B. Other GPUs are not measured, so
+    /// `on` and `off` stay available.
     pub fn auto_fuses(self, shape: FuseShape) -> bool {
         match self {
             Self::Qkv => true,
@@ -96,8 +97,10 @@ impl FuseKind {
 }
 
 /// The widest gate and up group (summed output widths) that `auto` fuses:
-/// SmolLM2-135M's 3,072 does, SmolLM2-360M's 5,120 does not.
-const GATE_UP_AUTO_MAX_WIDTH: usize = 4096;
+/// SmolLM2-135M's 3,072 and SmolLM2-360M's 5,120 do, SmolLM2-1.7B's 16,384
+/// does not. Widths between 5,120 and 16,384 are not measured; the limit sits
+/// below the middle of that range.
+const GATE_UP_AUTO_MAX_WIDTH: usize = 8192;
 
 /// Which fused groups [`Lfm2Model::enable_fused_projections_with`](crate::Lfm2Model::enable_fused_projections_with) builds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -568,7 +571,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_fuses_gate_up_only_in_the_narrow_sizes_it_won_in() {
+    fn auto_fuses_gate_up_only_in_the_sizes_it_won_in() {
         let gate_up = |width| FuseShape {
             rows: 256,
             hidden: 576,
@@ -576,7 +579,9 @@ mod tests {
         };
         // SmolLM2-135M, 360M and 1.7B: twice the feed-forward width.
         assert!(FuseChoice::AUTO.wants(FuseKind::GateUp, gate_up(3072)));
-        assert!(!FuseChoice::AUTO.wants(FuseKind::GateUp, gate_up(5120)));
+        assert!(FuseChoice::AUTO.wants(FuseKind::GateUp, gate_up(5120)));
+        assert!(FuseChoice::AUTO.wants(FuseKind::GateUp, gate_up(8192)));
+        assert!(!FuseChoice::AUTO.wants(FuseKind::GateUp, gate_up(8193)));
         assert!(!FuseChoice::AUTO.wants(FuseKind::GateUp, gate_up(16384)));
         for width in [3072, 5120, 16384] {
             assert!(FuseChoice::AUTO.wants(FuseKind::Qkv, gate_up(width)));

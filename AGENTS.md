@@ -221,9 +221,9 @@ attention block, and the gate and up projections of a feed-forward, as one
 matmul each when every one is a bias-free frozen f16 weight with a LoRA
 adapter. `FERROTENSOR_FUSE_QKV` and `FERROTENSOR_FUSE_GATEUP` (`on`, `off` or
 `auto`, read once at start, default `auto`) choose per kind; `auto` fuses q, k
-and v always and gate and up only when their summed width is at most 4,096
-(SmolLM2-135M; on one A10G the gate and up group was slower than the separate
-projections at 360M with 256 rows and at 1.7B); `off` runs the
+and v always and gate and up only when their summed width is at most 8,192
+(SmolLM2-135M and 360M; on one A10G the gate and up group was 3% to 6% faster
+than the separate projections at 360M and 5% slower at 1.7B); `off` runs the
 unfused layers of before, bit for bit, and any other value is `auto` with a
 warning. A fused group keeps the only copy of its weights, so the model holds
 them once; the adapter file, `merge` and `export-gguf` still use the original
