@@ -768,6 +768,7 @@ mod tests {
                 consecutive_good_steps: 3,
                 found_overflow: false,
                 enabled: true,
+                skipped_steps: 2,
             }),
         };
         checkpoint.save(&path).expect("save checkpoint");

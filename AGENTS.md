@@ -62,7 +62,7 @@ is `null`. On an error stdout carries `{"error": "<message>"}` instead.
 |---|---|
 | `plan` | `adapter`, `backend`, `device_type`, `budget_mib`, `budget_source`, `model`, `parameters`, `chosen`, `estimated_peak_mib`, `margin`, `fits`, `train_command`, `notes`; without `--model` the per-model keys are in a `models` array |
 | `finetune` | `chosen` (`batch_size`, `seq_len`, `rank`, `precision`, `checkpoint_blocks`), `grad_accum`, `budget_mib`, `estimated_peak_mib`, `fits`, then every `train` key |
-| `train` | `steps`, `first_loss`, `final_loss`, `eval_loss_before`, `eval_loss_after` (null without `--eval-data`), `measured_peak_mib`, `seconds`, `out_dir`, `adapter` (null on ranks above 0, which save nothing), and with `--q4-weights` only, `q4_weights` (`modules`, `skip`, `group`, `tensors`: the 4-bit selection and how many tensors it stored at 4 bits) |
+| `train` | `steps`, `first_loss`, `final_loss`, `eval_loss_before`, `eval_loss_after` (null without `--eval-data`), `measured_peak_mib`, `seconds`, `out_dir`, `adapter` (null on ranks above 0, which save nothing), and with `--q4-weights` only, `q4_weights` (`modules`, `skip`, `group`, `tensors`: the 4-bit selection and how many tensors it stored at 4 bits), and with `FERROTENSOR_EXPERIMENTAL=1` on a GPU with f16 cooperative matrices only, `loss_scaler` (`scale`, `skipped_steps`, `f16_overflows`: the dynamic loss scale at the end, the optimizer steps it skipped on overflow, and the matmul workgroups that clamped an input past the f16 range) |
 | `eval` | `examples`, `tokens`, `loss`, `perplexity`, `seconds` |
 | `generate` | `text`, `prompt_tokens`, `new_tokens`, `tokens_per_second` (decode speed: one-token forward passes after the prompt per second, prompt time left out; null when none ran), `prefill_seconds` (time to run the prompt), `kv_cache`, and with `--profile` only, `profile` (`kernel_timing`, `prefill` and `decode`: see [GPU time by kernel](#gpu-time-by-kernel---profile)) |
 | `chat` | one object per reply, each on its own line: `reply`, `prompt_tokens` (the whole conversation), `cached_tokens` (prompt tokens taken from the KV cache of earlier turns, not run again), `new_tokens`, `tokens_per_second` and `prefill_seconds` (as for `generate`; with the kept cache the prefill runs only the uncached tokens) |
@@ -182,6 +182,16 @@ Use it only when nothing else fits. `--q4-modules KEYS`, `--q4-skip KEYS`
 `ferrotensor q4-report --model DIR --json` measures the 4-bit error of every
 weight matrix on the host, without a GPU. See
 [ferrotensor-cli/README.md](ferrotensor-cli/README.md#finding-where-the-4-bit-loss-comes-from).
+
+## Cooperative-matrix matmuls (experimental)
+
+With `FERROTENSOR_EXPERIMENTAL=1`, on a GPU whose adapter offers 16x16x16 f16
+cooperative matrices with f32 accumulation and 32-thread subgroups, matmuls
+against f16 base weights (at least 64 rows) round their f32 input to f16 and
+run on those matrices; LoRA's thin matmuls stay in f32. `train` then turns on
+dynamic loss scaling (start 65536, x2 after 2,000 good steps, x0.5 and a
+skipped step on overflow) and reports it as `loss_scaler`. Any other value of
+the variable, or another GPU, keeps the f32 path.
 
 ## Working on the code
 

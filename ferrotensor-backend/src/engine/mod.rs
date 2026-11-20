@@ -14,6 +14,7 @@ use wgpu::{util::DeviceExt, Buffer, Device};
 mod attention;
 mod elementwise;
 mod matmul;
+mod matmul_coop;
 mod misc;
 mod norm;
 mod quant;
@@ -371,6 +372,8 @@ pub struct ComputeEngine {
     small_m_max_threads: u32,
     /// Workgroups a small-M matmul's K split aims for on this device.
     split_target: u32,
+    /// Cooperative-matrix matmul kernels, when the device has them.
+    coop: Option<matmul_coop::Coop>,
     /// Whether the kernels read their parameters from immediates.
     immediates: bool,
 }
@@ -454,6 +457,10 @@ impl ComputeEngine {
                 .max_compute_invocations_per_workgroup
                 .min(limits.max_compute_workgroup_size_x),
             split_target: small_m::split_target(ctx.adapter.get_info().device_type),
+            coop: matmul_coop::Coop::new(
+                ctx,
+                small_m::split_target(ctx.adapter.get_info().device_type),
+            ),
             immediates,
         }
     }

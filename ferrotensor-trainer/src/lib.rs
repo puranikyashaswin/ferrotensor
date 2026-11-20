@@ -4,7 +4,7 @@
 //! ([`masked_cross_entropy`]), backward and an optimizer step on an
 //! [`Lfm2Model`] (Llama-style or LFM2), with gradient accumulation, global
 //! gradient-norm clipping, an optional learning-rate schedule, an optional loss
-//! scaler (not used by the CLI) and a prototype of file-based gradient
+//! scaler and a prototype of file-based gradient
 //! averaging. [`data`] builds SFT and
 //! pretraining datasets, [`checkpoint`] saves and restores LoRA adapters and
 //! optimizer state, [`peft`] converts adapters to and from the Hugging Face
@@ -87,7 +87,8 @@ pub struct Trainer {
     pub grad_accum_steps: usize,
     /// Micro-batches accumulated so far in the current window.
     pub step_in_accum: usize,
-    /// Optional dynamic loss scaler. Not set by the CLI.
+    /// Optional dynamic loss scaler; the CLI sets one when matmuls run on
+    /// cooperative matrices.
     pub scaler: Option<GradScaler>,
     /// Multi-process gradient averaging through a shared directory.
     pub distributed_grad_sync: Option<FileGradSyncConfig>,
@@ -473,15 +474,6 @@ impl Trainer {
             return Ok(());
         }
 
-        if let Some(scaler) = self.scaler.as_mut() {
-            let valid = scaler.unscale_and_check(&grads, &self.ctx, &self.engine);
-            scaler.update();
-            if !valid {
-                log::warn!("non-finite gradients; skipping optimizer step");
-                return Ok(());
-            }
-        }
-
         if let Some(cfg) = self.distributed_grad_sync.as_ref() {
             if cfg.world_size > 1 {
                 crate::distributed::average_grads_file_sync(
@@ -494,28 +486,37 @@ impl Trainer {
             }
         }
 
+        // One readback serves the scaler and the clip: the scaled norm tells
+        // whether anything overflowed, and the norm over S is the true norm.
         let packed = self.pack_flat_grads(&grads);
-        let norm = match &packed {
+        let scaled_norm = match &packed {
             Some(packed) => flat_grad_norm(packed, &self.ctx, &self.engine),
             None => global_grad_norm(&grads, &self.ctx, &self.engine),
         };
+        let unscale = match self.scaler.as_mut() {
+            Some(scaler) => scaler.unscale_factor(scaled_norm),
+            None => scaled_norm.is_finite().then_some(1.0),
+        };
+        let norm = scaled_norm * unscale.unwrap_or(1.0);
         stats.grad_norm = Some(norm);
-        if !norm.is_finite() {
-            log::warn!("gradient norm is {norm}; skipping optimizer step");
+        let Some(unscale) = unscale else {
+            log::warn!("gradient norm is {scaled_norm}; skipping optimizer step");
             return Ok(());
-        }
-        if let Some(max_norm) = self.clip_grad_norm {
-            if norm > max_norm {
-                let scale = max_norm / (norm + 1e-6);
-                match &packed {
-                    Some(packed) => {
-                        self.engine
-                            .clip_grad_by_norm(&self.ctx, &packed.data, scale);
-                    }
-                    None => {
-                        for grad in &grads {
-                            self.engine.clip_grad_by_norm(&self.ctx, grad, scale);
-                        }
+        };
+        let clip = match self.clip_grad_norm {
+            Some(max_norm) if norm > max_norm => max_norm / (norm + 1e-6),
+            _ => 1.0,
+        };
+        let factor = unscale * clip;
+        if factor != 1.0 {
+            match &packed {
+                Some(packed) => {
+                    self.engine
+                        .clip_grad_by_norm(&self.ctx, &packed.data, factor);
+                }
+                None => {
+                    for grad in &grads {
+                        self.engine.clip_grad_by_norm(&self.ctx, grad, factor);
                     }
                 }
             }
