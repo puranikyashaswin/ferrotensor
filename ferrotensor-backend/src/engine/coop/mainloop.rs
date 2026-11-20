@@ -248,9 +248,8 @@ fn prefetch_store(key: CoopKey, k0: &str, (sa, sb): (&str, &str)) -> String {
       let v = pa{i};
       let idx = li + {off}u;
       let o = (idx / {q}u) * AP + (idx % {q}u) * 4u;
-      let c = clamp(v, vec4<f32>(-F16_MAX), vec4<f32>(F16_MAX));
-      if (any(c != v)) {{ overflow = true; }}
-      let h = vec4<f16>(c);
+      if (any(!(abs(v) <= vec4<f32>(F16_MAX)))) {{ overflow = true; }}
+      let h = vec4<f16>(clamp(v, vec4<f32>(-F16_MAX), vec4<f32>(F16_MAX)));
       {sa}[o] = h.x;
       {sa}[o + 1u] = h.y;
       {sa}[o + 2u] = h.z;
@@ -263,9 +262,8 @@ fn prefetch_store(key: CoopKey, k0: &str, (sa, sb): (&str, &str)) -> String {
                 "    {{
       let v = pa{i};
       let idx = li + {off}u;
-      let c = clamp(v, -F16_MAX, F16_MAX);
-      if (c != v) {{ overflow = true; }}
-      {sa}[(idx / BK) * AP + idx % BK] = f16(c);
+      if (!(abs(v) <= F16_MAX)) {{ overflow = true; }}
+      {sa}[(idx / BK) * AP + idx % BK] = f16(clamp(v, -F16_MAX, F16_MAX));
     }}
 "
             )
