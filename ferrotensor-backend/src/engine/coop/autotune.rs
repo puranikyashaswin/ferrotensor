@@ -598,13 +598,11 @@ mod tests {
         nanos: &dyn Fn(CoopConfig) -> u64,
     ) -> (CoopConfig, usize) {
         let list = || others.to_vec();
-        let mut timed = 0;
-        for _ in 0..1000 {
+        for timed in 0..1000 {
             let pick = t.pick(key, static_cfg, &any, &list);
             let Some(sample) = pick.sample else {
                 return (pick.config, timed);
             };
-            timed += 1;
             // A product with K split reports its two dispatches separately.
             let parts = split_k(key.k, pick.config.tile.bk, pick.config.split)
                 .0
