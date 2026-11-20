@@ -8,7 +8,11 @@
 //! With `FERROTENSOR_AUTOTUNE=1`, each product (a [`TuneKey`]: layout, kernel
 //! variant, row bucket, N and K) starts a trial on its first occurrence. The
 //! candidates are the static pick and up to seven other tiles, each with K
-//! whole or split to fill the GPU. Every later occurrence runs the candidate
+//! whole or split to fill the GPU. Products of up to 256 rows (a batch of 1
+//! at 256 tokens, or a padded micro-batch) have six tiles per row bucket and
+//! K split into 1, 2, 3, 4, 6 or 8 slices or to fill the GPU, since a
+//! `matmul_bench --tiles` sweep on an A10G found the static rule 1.4 to 3
+//! times slower than the best of those at many of them. Every later occurrence runs the candidate
 //! with the fewest timings so far as the real dispatch, since all candidates
 //! compute the same product, and tags it so the context reads its GPU time
 //! back from timestamp queries (see `kernel_timing`), at the wait the trainer
@@ -22,8 +26,9 @@
 //! K split sums its slices in, so the first steps of a tuning run differ from
 //! an untuned run by rounding; with the cache they do not.
 //!
-//! The cost is bounded three ways: at most [`MAX_CANDIDATES`] kernels are
-//! compiled and [`TIMINGS`] times as many dispatches run per key; once the
+//! The cost is bounded three ways: at most [`MAX_CANDIDATES`] configurations
+//! (a K split shares its tile's kernel, so at most six kernels for a product
+//! of up to 256 rows) are timed [`TIMINGS`] times each per key; once the
 //! time spent on trials (the host time compiling their kernels plus the GPU
 //! time of their dispatches, which also did the step's work) reaches the
 //! budget, no new key starts a trial; and a key whose timings never arrive
@@ -56,8 +61,69 @@ const TIMINGS: usize = 3;
 /// How much faster than the static pick a candidate must be to replace it.
 const MARGIN: f64 = 0.03;
 
-/// Most candidates per key, the static pick included.
+/// Most candidates per key above 256 rows, the static pick included.
 const MAX_CANDIDATES: usize = 8;
+
+/// Most candidates per key of up to 256 rows: six tiles with up to seven
+/// splits each, and the static pick. A split reuses its tile's compiled
+/// kernel and adds only a reduction dispatch.
+const SMALL_MAX_CANDIDATES: usize = 48;
+
+/// Slices of K, besides one and the split that fills the GPU, that a product
+/// of up to 256 rows tries.
+const SMALL_SPLITS: [u32; 5] = [2, 3, 4, 6, 8];
+
+/// Most candidates the key's row bucket may time.
+fn max_candidates(bucket: u32) -> usize {
+    if bucket <= 256 {
+        SMALL_MAX_CANDIDATES
+    } else {
+        MAX_CANDIDATES
+    }
+}
+
+/// The tiles worth timing at a row bucket of up to 256 rows, chosen greedily
+/// from the `matmul_bench --tiles` sweep of the three SmolLM2 sizes on an
+/// A10G (rows 32 to 256): each next tile is the one that most lowers the
+/// geometric mean of the per-product best time of the tiles chosen so far.
+/// Empty above 256 rows.
+fn tune_tiles(bucket: u32) -> &'static [CoopTile] {
+    match bucket {
+        0..=64 => &[
+            CoopTile::T32X64_W16X16_K64_DB,
+            CoopTile::T64X64_W16X32_K32_DB,
+            CoopTile::T32X32_W16X16_K64_DB,
+            CoopTile::T32X32_W16X16_K32,
+            CoopTile::T64X64_W32X32_K32_PF,
+            CoopTile::T64X128_W32X64_K32_DB,
+        ],
+        65..=128 => &[
+            CoopTile::T128X64_W32X32_K32_PF,
+            CoopTile::T32X64_W16X16_K64_DB,
+            CoopTile::T64X64_W32X32_K32_PF,
+            CoopTile::T64X64_W16X32_K32_DB,
+            CoopTile::T128X128_W64X64_K32_PF,
+            CoopTile::T32X32_W16X16_K64_DB,
+        ],
+        129..=192 => &[
+            CoopTile::T64X64_W32X32_K32_PF,
+            CoopTile::T64X64_W16X32_K32_DB,
+            CoopTile::T128X128_W64X64_K32_PF,
+            CoopTile::T32X64_W16X16_K64_DB,
+            CoopTile::T64X128_W32X64_K32_DB,
+            CoopTile::T64X64_W32X32_K32,
+        ],
+        193..=256 => &[
+            CoopTile::T128X64_W32X32_K32_PF,
+            CoopTile::T64X64_W16X32_K32_DB,
+            CoopTile::T128X128_W64X64_K32_PF,
+            CoopTile::T32X64_W16X16_K64_DB,
+            CoopTile::T64X64_W32X32_K32,
+            CoopTile::T64X64_W32X32_K32_PF,
+        ],
+        _ => &[],
+    }
+}
 
 /// What `FERROTENSOR_AUTOTUNE` asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -209,9 +275,10 @@ fn fill(workgroups: u64, target: u32) -> f64 {
 /// The configurations worth timing for an `m x k x n` product, best first:
 /// every tile that fits the device and has at most twice the bucket's rows
 /// in a workgroup, each with K whole and, when its grid reaches under twice
-/// `target` workgroups, with K split to fill the GPU. They are ordered by how
-/// full the last wave of workgroups is, then by tile size, then by their
-/// order in [`CoopTile::ALL`] and then [`CoopTile::PIPELINED`].
+/// `target` workgroups, with K split to fill the GPU. Up to 256 rows only the
+/// bucket's [`tune_tiles`] are tried, each also with K split into
+/// [`SMALL_SPLITS`] slices. They are ordered by how full the last wave of
+/// workgroups is, then by tile size, then by their order in the tile list.
 pub(super) fn candidates(
     (m, k, n): (u32, u32, u32),
     bucket: u32,
@@ -219,7 +286,16 @@ pub(super) fn candidates(
     tile_fits: &dyn Fn(CoopTile) -> bool,
 ) -> Vec<CoopConfig> {
     let mut found: Vec<(CoopConfig, f64)> = Vec::new();
-    for tile in CoopTile::ALL.into_iter().chain(CoopTile::PIPELINED) {
+    let small = !tune_tiles(bucket).is_empty();
+    let tiles: Vec<CoopTile> = if small {
+        tune_tiles(bucket).to_vec()
+    } else {
+        CoopTile::ALL
+            .into_iter()
+            .chain(CoopTile::PIPELINED)
+            .collect()
+    };
+    for tile in tiles {
         if !tile_fits(tile) || tile.bm > 2 * bucket || !grid_fits(tile, m, n, 1) {
             continue;
         }
@@ -227,10 +303,17 @@ pub(super) fn candidates(
         let groups = u64::from(gx) * u64::from(gy);
         found.push((CoopConfig { tile, split: 1 }, fill(groups, target)));
         if groups < 2 * u64::from(target) {
-            let split = split_to_fill(tile, (m, k, n), target);
-            if split > 1 {
-                let filled = fill(groups * u64::from(split), target);
-                found.push((CoopConfig { tile, split }, filled));
+            let mut splits = vec![split_to_fill(tile, (m, k, n), target)];
+            if small {
+                splits.extend(SMALL_SPLITS.iter().map(|&s| split_k(k, tile.bk, s).0));
+            }
+            let mut seen = vec![1];
+            for split in splits {
+                if !seen.contains(&split) {
+                    seen.push(split);
+                    let filled = fill(groups * u64::from(split), target);
+                    found.push((CoopConfig { tile, split }, filled));
+                }
             }
         }
     }
@@ -414,7 +497,8 @@ impl Tuner {
             }
             let mut list = vec![static_cfg];
             for config in candidates() {
-                if list.len() < MAX_CANDIDATES && !list.contains(&config) && usable(config) {
+                let room = list.len() < max_candidates(key.m_bucket);
+                if room && !list.contains(&config) && usable(config) {
                     list.push(config);
                 }
             }
@@ -847,6 +931,83 @@ mod tests {
             let g = u64::from(gx) * u64::from(gy) * u64::from(c.split);
             assert!(fill(groups, 160) >= fill(g, 160) - 1e-12, "{c:?}");
         }
+    }
+
+    #[test]
+    fn small_buckets_try_their_six_tiles_with_the_extra_splits() {
+        let all = |_: CoopTile| true;
+        // 135M q/o projection at 128 rows: 576 x 576 under a 128x64 tile is
+        // 9 groups, so every split of K reaches the candidates.
+        let got = candidates((128, 576, 576), 128, 160, &all);
+        let tiles = tune_tiles(128);
+        assert_eq!(tiles.len(), 6);
+        for c in &got {
+            assert!(tiles.contains(&c.tile), "{c:?}");
+        }
+        for &tile in tiles {
+            let splits: Vec<u32> = got
+                .iter()
+                .filter(|c| c.tile == tile)
+                .map(|c| c.split)
+                .collect();
+            assert!(splits.contains(&1), "{tile:?} {splits:?}");
+            for s in [2, 3, 4] {
+                // 576 / bk is at least 9 steps, so 2, 3 and 4 slices are
+                // all distinct and whole.
+                assert!(splits.contains(&split_k(576, tile.bk, s).0), "{tile:?} {s}");
+            }
+        }
+        // No configuration twice, and the list fits the cap with the static pick.
+        for (i, c) in got.iter().enumerate() {
+            assert!(!got[..i].contains(c), "{c:?}");
+        }
+        assert!(got.len() < SMALL_MAX_CANDIDATES);
+        // A product whose grid already fills the GPU is timed unsplit only:
+        // 49152 columns under any of the 64-row tiles is 384 groups or more.
+        for c in candidates((64, 576, 49152), 64, 160, &all) {
+            assert_eq!(c.split, 1, "{c:?}");
+        }
+        // Every bucket of up to 256 rows has six distinct tiles that fit.
+        for bucket in [64, 128, 192, 256] {
+            let list = tune_tiles(bucket);
+            assert_eq!(list.len(), 6, "{bucket}");
+            for (i, t) in list.iter().enumerate() {
+                assert!(!list[..i].contains(t), "{bucket} {t:?}");
+            }
+        }
+        assert!(tune_tiles(512).is_empty());
+    }
+
+    #[test]
+    fn large_buckets_keep_the_old_candidates_and_cap() {
+        let all = |_: CoopTile| true;
+        assert_eq!(max_candidates(256), SMALL_MAX_CANDIDATES);
+        assert_eq!(max_candidates(512), MAX_CANDIDATES);
+        // At 1024 rows a tile has K whole or K split to fill: never 2, 3, 4
+        // slices unless that is the fill split.
+        for c in candidates((1024, 2048, 2048), 1024, 160, &all) {
+            let (gx, gy) = c.tile.groups(1024, 2048);
+            let groups = u64::from(gx) * u64::from(gy);
+            let fill_split = split_to_fill(c.tile, (1024, 2048, 2048), 160);
+            assert!(
+                c.split == 1 || (groups < 320 && c.split == fill_split),
+                "{c:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_small_bucket_times_more_than_eight_candidates() {
+        let mut t = tuner(BTreeMap::new(), DEFAULT_BUDGET);
+        let all = |_: CoopTile| true;
+        let others = candidates((128, 576, 576), 128, 160, &all);
+        let small_key = TuneKey::new(false, KEY, (128, 576, 576));
+        let (_, timed) = drive(&mut t, small_key, (A, &others), &time_of);
+        assert!(timed > 8 * TIMINGS, "{timed}");
+        let mut t = tuner(BTreeMap::new(), DEFAULT_BUDGET);
+        let large_key = TuneKey::new(false, KEY, (1024, 576, 576));
+        let (_, timed) = drive(&mut t, large_key, (A, &others), &time_of);
+        assert!(timed <= 8 * TIMINGS + 8, "{timed}");
     }
 
     #[test]

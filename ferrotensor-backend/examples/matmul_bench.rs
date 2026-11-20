@@ -558,6 +558,15 @@ struct Run {
     reduce_us: Option<f64>,
 }
 
+/// The tensors of one case at one row count, built once so that a sweep over
+/// tiles and splits does not rebuild the weight for every configuration.
+struct Prepared {
+    transposed_b: bool,
+    w: UnifiedTensor,
+    a_parts: Vec<UnifiedTensor>,
+    outs: Vec<UnifiedTensor>,
+}
+
 fn measure(
     rig: &Rig,
     c: &Case,
@@ -565,7 +574,11 @@ fn measure(
     (variant, forced): (Variant, Option<CoopConfig>),
     o: &Options,
 ) -> Result<Run, String> {
-    let (ctx, engine) = (&rig.ctx, &rig.engine);
+    measure_prepared(rig, c, &prepare(rig, c, m), (variant, forced), o)
+}
+
+fn prepare(rig: &Rig, c: &Case, m: usize) -> Prepared {
+    let ctx = &rig.ctx;
     let (transposed_b, w_shape) = match &c.op {
         Op::Plain { transposed_b } => (
             *transposed_b,
@@ -591,7 +604,6 @@ fn measure(
         .zip(1u64..)
         .map(|(&w, seed)| UnifiedTensor::new(ctx, &values(m * w, seed), &[m, w]))
         .collect();
-    let a_refs: Vec<&UnifiedTensor> = a_parts.iter().collect();
     let out_widths = match &c.op {
         Op::Split { widths } => widths.clone(),
         _ => vec![c.n],
@@ -600,13 +612,37 @@ fn measure(
         .iter()
         .map(|&w| UnifiedTensor::zeros(ctx, &[m, w]))
         .collect();
+    Prepared {
+        transposed_b,
+        w,
+        a_parts,
+        outs,
+    }
+}
+
+fn measure_prepared(
+    rig: &Rig,
+    c: &Case,
+    prepared: &Prepared,
+    (variant, forced): (Variant, Option<CoopConfig>),
+    o: &Options,
+) -> Result<Run, String> {
+    let (ctx, engine) = (&rig.ctx, &rig.engine);
+    let Prepared {
+        transposed_b,
+        w,
+        a_parts,
+        outs,
+    } = prepared;
+    let (transposed_b, w) = (*transposed_b, w);
+    let a_refs: Vec<&UnifiedTensor> = a_parts.iter().collect();
     let out_refs: Vec<&UnifiedTensor> = outs.iter().collect();
     let run = || -> Result<(&'static str, Option<CoopConfig>), String> {
         match (variant, &c.op) {
             (Variant::Fused, Op::Split { .. }) => {
                 let spec = FusedSpec {
                     a: FusedA::Plain(&a_parts[0]),
-                    b: &w,
+                    b: w,
                     transposed_b,
                     out: FusedOut::Split {
                         outs: &out_refs,
@@ -619,7 +655,7 @@ fn measure(
             (Variant::Fused, Op::Sources { .. }) => {
                 let spec = FusedSpec {
                     a: FusedA::Sources(&a_refs),
-                    b: &w,
+                    b: w,
                     transposed_b,
                     out: FusedOut::AlphaBeta {
                         out: &outs[0],
@@ -637,7 +673,7 @@ fn measure(
                     ctx,
                     transposed_b,
                     &a_parts[0],
-                    &w,
+                    w,
                     &outs[0],
                     MatmulPath::Auto,
                 )
@@ -655,7 +691,7 @@ fn measure(
                 .matmul_coop_config_into(
                     ctx,
                     transposed_b,
-                    [&a_parts[0], &w, &outs[0]],
+                    [&a_parts[0], w, &outs[0]],
                     forced,
                     Epilogue::STORE,
                 )
@@ -761,13 +797,49 @@ fn fused_main(o: &Options) {
     }
 }
 
+/// Largest K split `--tiles` asks for besides the fill split.
+const MAX_SPLIT: u32 = 8;
+/// Workgroups the router fills on an A10G (80 multiprocessors, two each).
+const FILL_TARGET: u32 = 160;
+
+/// The slices of K the kernel runs for `requested`: every slice a whole
+/// number of `bk` steps, none empty (as the router's own rule).
+fn effective_split(k: usize, bk: usize, requested: u32) -> u32 {
+    let per = k.div_ceil(bk).div_ceil(requested.max(1) as usize).max(1) * bk;
+    k.div_ceil(per).max(1) as u32
+}
+
+/// The K splits worth timing for `tile` on an `m x k x n` product: K whole
+/// and, when the grid is under twice [`FILL_TARGET`] workgroups, every split
+/// of 2 to [`MAX_SPLIT`] and the split that fills the GPU (at least two
+/// steps per slice), without repeats.
+fn splits_for(tile: CoopTile, (m, k, n): (usize, usize, usize)) -> Vec<u32> {
+    let groups = n.div_ceil(tile.bn as usize) * m.div_ceil(tile.bm as usize);
+    let mut splits = vec![1];
+    if groups < 2 * FILL_TARGET as usize {
+        let bk = tile.bk as usize;
+        let most = (k.div_ceil(bk) / 2).max(1);
+        let fill = (FILL_TARGET as usize).div_ceil(groups).clamp(1, most) as u32;
+        for requested in (2..=MAX_SPLIT).chain([fill]) {
+            let split = effective_split(k, bk, requested);
+            if !splits.contains(&split) {
+                splits.push(split);
+            }
+        }
+    }
+    splits.sort_unstable();
+    splits
+}
+
 /// The `--tiles` mode: every base-weight product at every row count on the
 /// cooperative kernel with each tile of `CoopTile::ALL` and
-/// `CoopTile::PIPELINED`, K whole and (when the grid is under 160
-/// workgroups) split in 2 and 4, then with the router's own pick (`pick`).
-/// Wall time per product only. One JSON object per line: `path` (`fused` or
-/// `coop`), `pick` (true for the router's configuration), the product's
-/// fields as in `--fused`, `tile`, `split`, `us`, `tflops` and `gbs`.
+/// `CoopTile::PIPELINED` that has at most twice the rows (rounded up to 32)
+/// in a workgroup, each with K whole and, when the grid is under 320
+/// workgroups, split 2 to 8 and by the fill split (see `splits_for`), then
+/// with the router's own pick (`pick`). Wall time per product only. One JSON
+/// object per line: `path` (`fused` or `coop`), `pick` (true for the router's
+/// configuration), the product's fields as in `--fused`, `tile`, `split`,
+/// `us`, `tflops` and `gbs`.
 fn tiles_main(o: &Options) {
     let wall = rig(KernelTiming::Off);
     eprintln!("adapter: {}", wall.ctx.adapter_info());
@@ -794,15 +866,18 @@ fn tiles_main(o: &Options) {
             let flops = 2.0 * m as f64 * c.n as f64 * c.k as f64;
             let bytes = 2.0 * (c.n * c.k) as f64 + 4.0 * (m * c.k) as f64 + 4.0 * (m * c.n) as f64;
             let mut configs: Vec<(bool, Option<CoopConfig>)> = vec![(true, None)];
+            let max_rows = 2 * m.div_ceil(32) * 32;
             for tile in CoopTile::ALL.into_iter().chain(CoopTile::PIPELINED) {
-                let groups = c.n.div_ceil(tile.bn as usize) * m.div_ceil(tile.bm as usize);
-                let splits: &[u32] = if groups < 160 { &[1, 2, 4] } else { &[1] };
-                for &split in splits {
+                if tile.bm as usize > max_rows {
+                    continue;
+                }
+                for split in splits_for(tile, (m, c.k, c.n)) {
                     configs.push((false, Some(CoopConfig { tile, split })));
                 }
             }
+            let prepared = prepare(&wall, &c, m);
             for (pick, forced) in configs {
-                match measure(&wall, &c, m, (variant, forced), o) {
+                match measure_prepared(&wall, &c, &prepared, (variant, forced), o) {
                     Ok(run) => {
                         let (tile, split) = run.config.map_or_else(
                             || ("null".to_string(), "null".to_string()),
