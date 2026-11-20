@@ -135,13 +135,15 @@ fn rms_norm(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wg
 
 // RMSNorm backward, one workgroup per row. With inv = 1 / rms(x):
 // grad_x = g * w * inv - x * inv^3 * sum(g * w * x) / size.
-// Each row's inv is kept for rms_norm_backward_weight.
+// Each row's inv is kept for rms_norm_backward_weight. With beta != 0 the result
+// is added to grad_x's earlier contents (beta * grad_x + the gradient); with
+// beta = 0 grad_x is never read.
 @group(0) @binding(0) var<storage, read> rmsb_x: array<f32>;
 @group(0) @binding(1) var<storage, read> rmsb_g: array<f32>;
 @group(0) @binding(2) var<storage, read> rmsb_w: array<f32>;
 @group(0) @binding(3) var<storage, read_write> rmsb_gx: array<f32>;
 @group(0) @binding(4) var<storage, read_write> rmsb_inv: array<f32>;
-@group(0) @binding(5) var<uniform> rmsb_params: vec4<u32>; // size, rows, eps bits, 0
+@group(0) @binding(5) var<uniform> rmsb_params: vec4<u32>; // size, rows, eps bits, beta bits
 
 @compute @workgroup_size(256)
 fn rms_norm_backward(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wg: vec3<u32>,
@@ -161,8 +163,14 @@ fn rms_norm_backward(@builtin(local_invocation_index) lid: u32, @builtin(workgro
     gwx = row_sum(lid, gwx);
     let inv = 1.0 / sqrt(ss / f32(size) + bitcast<f32>(rmsb_params.z));
     let coef = gwx * inv * inv * inv / f32(size);
+    let beta = bitcast<f32>(rmsb_params.w);
     for (var i = lid; i < size; i += ROW_WG) {
-        rmsb_gx[off + i] = rmsb_g[off + i] * rmsb_w[i] * inv - rmsb_x[off + i] * coef;
+        let gv = rmsb_g[off + i] * rmsb_w[i] * inv - rmsb_x[off + i] * coef;
+        if (beta == 0.0) {
+            rmsb_gx[off + i] = gv;
+        } else {
+            rmsb_gx[off + i] = beta * rmsb_gx[off + i] + gv;
+        }
     }
     if (lid == 0u) { rmsb_inv[row] = inv; }
 }
