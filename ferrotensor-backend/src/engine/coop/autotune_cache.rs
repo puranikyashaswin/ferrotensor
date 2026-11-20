@@ -140,8 +140,8 @@ pub(super) fn parse(text: &str, header: &str) -> Result<BTreeMap<String, Choice>
         let mut fields = value.split(';');
         let tile = fields.next().ok_or_else(|| corrupt("no tile"))?;
         let tile = CoopTile::ALL
-            .iter()
-            .copied()
+            .into_iter()
+            .chain(CoopTile::PIPELINED)
             .find(|t| t.name() == tile)
             .ok_or_else(|| corrupt("unknown tile"))?;
         let number = |field: Option<&str>, name: &str| {
@@ -246,6 +246,10 @@ mod tests {
                 "layout=a@b;variant=Plain/AlphaBeta;m=2048;n=576;k=576".to_owned(),
                 choice(CoopTile::T128X64_W64X32_K32, 1, 17.5),
             ),
+            (
+                "layout=a@b;variant=Plain/AlphaBeta;m=1024;n=1536;k=576".to_owned(),
+                choice(CoopTile::PIPELINED[3], 1, 9.25),
+            ),
         ]
         .into_iter()
         .collect()
@@ -277,7 +281,7 @@ mod tests {
         let text = render(&header(), &entries());
         let back = parse(&text, &header()).expect("parse what render wrote");
         // The time is written to three decimals.
-        assert_eq!(back.len(), 2);
+        assert_eq!(back.len(), 3);
         for (key, want) in entries() {
             let got = back[&key];
             assert_eq!(got.config, want.config, "{key}");
@@ -354,7 +358,7 @@ mod tests {
         let path = dir.join("autotune.txt");
         assert!(load(&path, &header()).is_empty());
         write_atomic(&path, &render(&header(), &entries())).expect("write");
-        assert_eq!(load(&path, &header()).len(), 2);
+        assert_eq!(load(&path, &header()).len(), 3);
         std::fs::write(&path, b"adapter=x\n\xff\xfe").expect("write garbage");
         assert!(load(&path, &header()).is_empty());
         std::fs::write(&path, "adapter=other\n").expect("write another header");

@@ -211,7 +211,7 @@ fn fill(workgroups: u64, target: u32) -> f64 {
 /// in a workgroup, each with K whole and, when its grid reaches under twice
 /// `target` workgroups, with K split to fill the GPU. They are ordered by how
 /// full the last wave of workgroups is, then by tile size, then by their
-/// order in [`CoopTile::ALL`].
+/// order in [`CoopTile::ALL`] and then [`CoopTile::PIPELINED`].
 pub(super) fn candidates(
     (m, k, n): (u32, u32, u32),
     bucket: u32,
@@ -219,7 +219,7 @@ pub(super) fn candidates(
     tile_fits: &dyn Fn(CoopTile) -> bool,
 ) -> Vec<CoopConfig> {
     let mut found: Vec<(CoopConfig, f64)> = Vec::new();
-    for tile in CoopTile::ALL {
+    for tile in CoopTile::ALL.into_iter().chain(CoopTile::PIPELINED) {
         if !tile_fits(tile) || tile.bm > 2 * bucket || !grid_fits(tile, m, n, 1) {
             continue;
         }
@@ -824,6 +824,8 @@ mod tests {
         for (i, c) in got.iter().enumerate() {
             assert!(!got[..i].contains(c), "{c:?}");
         }
+        // The register-prefetch tiles are candidates too.
+        assert!(got.iter().any(|c| c.tile.prefetch), "{got:?}");
         // 256 x 2048 under a 128x128 tile is 16 groups: split K to fill 160.
         assert!(got.iter().any(|c| c.split > 1));
         // At 64 rows no tile has more than 128 rows.
