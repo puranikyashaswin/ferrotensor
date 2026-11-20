@@ -198,8 +198,12 @@ fn expand(body: &str, count: u32) -> String {
 ///
 /// # Errors
 ///
-/// Returns an error when the template has no section for the kernel.
+/// Returns an error when the template has no section for the kernel, or for
+/// a mirror kernel with an odd rank, which cannot copy whole words.
 pub(super) fn source(key: Key) -> Result<String, String> {
+    if key.kind == Kind::Mirror && !key.rank.is_multiple_of(2) {
+        return Err(format!("lora_mirror needs an even rank, got {}", key.rank));
+    }
     // A Windows checkout with core.autocrlf has CRLF line ends.
     let template = include_str!("../shaders/lora_group.wgsl").replace("\r\n", "\n");
     let body = template
@@ -626,8 +630,14 @@ mod tests {
         let mut keys = Vec::new();
         for kind in [Kind::Ub, Kind::Du, Kind::Grads, Kind::Mirror] {
             for count in 1..=LORA_GROUP_MAX as u32 {
-                for rank in [1, 2, 4, 8, 12, LORA_GROUP_MAX_RANK as u32] {
-                    keys.push(Key { kind, count, rank });
+                for rank in [1, 2, 3, 4, 8, 12, LORA_GROUP_MAX_RANK as u32] {
+                    let key = Key { kind, count, rank };
+                    // The mirror copies whole words: an odd rank has no kernel.
+                    if kind == Kind::Mirror && !rank.is_multiple_of(2) {
+                        assert!(source(key).is_err(), "{key:?}");
+                    } else {
+                        keys.push(key);
+                    }
                 }
             }
         }
