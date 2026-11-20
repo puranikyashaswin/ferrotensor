@@ -209,6 +209,20 @@ slices in a different order, so the first steps of a tuning run differ from an
 untuned run by rounding; with a cache they do not. Any other value, no
 timestamp queries or no cooperative matrices keep the static rules exactly.
 
+Under the same setting, `train` runs the q, k and v projections of an
+attention block, and the gate and up projections of a feed-forward, as one
+matmul each when every one is a bias-free frozen f16 weight with a LoRA
+adapter. `FERROTENSOR_FUSE_QKV` and `FERROTENSOR_FUSE_GATEUP` (`on`, `off` or
+`auto`, read once at start, default `auto`) choose per kind; `auto` fuses q, k
+and v always and gate and up only when their summed width is at most 4,096
+(SmolLM2-135M; on one A10G the gate and up group was slower than the separate
+projections at 360M with 256 rows and at 1.7B); `off` runs the
+unfused layers of before, bit for bit, and any other value is `auto` with a
+warning. A fused group keeps the only copy of its weights, so the model holds
+them once; the adapter file, `merge` and `export-gguf` still use the original
+tensors and layout, and a pass with a KV cache copies the weights back out of
+the group once.
+
 ## Working on the code
 
 - GitHub CI is the reference build: `cargo fmt --all -- --check`,

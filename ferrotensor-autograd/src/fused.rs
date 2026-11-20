@@ -15,11 +15,13 @@
 //!   of `x`.
 //! - [`Tensor::fused_gate_up_silu`]: `x -> silu(x Wg) * (x Wu)` the same way.
 //!
-//! The base weights are frozen f16 matrices; [`FusedProjections`] keeps a
-//! concatenated copy of them with room for the LoRA `A` matrices, whose f16
-//! mirror [`FusedProjections::refresh_mirror`] rewrites. Run it after every
-//! optimizer step, adapter load and resume: a mirror that is not refreshed
-//! multiplies by the `A` of an earlier step, and nothing warns about it.
+//! The base weights are frozen f16 matrices; [`FusedProjections`] keeps them
+//! concatenated, with room for the LoRA `A` matrices, whose f16 mirror
+//! [`FusedProjections::refresh_mirror`] rewrites. Run it after every optimizer
+//! step, adapter load and resume: a mirror that is not refreshed multiplies by
+//! the `A` of an earlier step, and nothing warns about it. The concatenated
+//! buffer is the only copy a caller needs to keep: it can drop the separate
+//! weights and ask for one back with [`FusedProjections::projection`].
 
 use super::{AutogradNode, Tensor, GRAD_ENABLED};
 use ferrotensor_backend::{
@@ -39,6 +41,24 @@ fn must(result: Result<(), String>) {
     if let Err(e) = result {
         panic!("fused projection: {e}");
     }
+}
+
+/// Half `i` of an f16 tensor read back as 32-bit words: `to_vec` hands the
+/// words back as f32 bit patterns, two halves each, low half first.
+fn half_at(words: &[f32], i: usize) -> u16 {
+    let word = words[i / 2].to_bits();
+    (if i.is_multiple_of(2) {
+        word & 0xffff
+    } else {
+        word >> 16
+    }) as u16
+}
+
+/// The bytes of `halves` as an f16 tensor buffer, padded to whole words.
+fn half_bytes(halves: &[u16]) -> Vec<u8> {
+    let mut bytes: Vec<u8> = halves.iter().flat_map(|h| h.to_le_bytes()).collect();
+    bytes.resize(bytes.len().next_multiple_of(4).max(4), 0);
+    bytes
 }
 
 /// The LoRA adapters of a group of fused projections.
@@ -131,8 +151,6 @@ impl FusedProjections {
         if !total.is_multiple_of(2) {
             return Err(format!("the concatenated row of {total} is odd"));
         }
-        // The f16 weights are read as raw halves: `to_vec` hands back the
-        // 32-bit words as f32 bit patterns, two halves each, low half first.
         let mut halves = vec![0u16; rows * total];
         let mut col = 0;
         for (w, &width) in weights.iter().zip(&widths) {
@@ -140,21 +158,17 @@ impl FusedProjections {
                 .map_err(|e| format!("reading a weight failed: {e:?}"))?;
             for r in 0..rows {
                 for c in 0..width {
-                    let i = r * width + c;
-                    let word = words[i / 2].to_bits();
-                    let half = if i % 2 == 0 {
-                        word & 0xffff
-                    } else {
-                        word >> 16
-                    };
-                    halves[r * total + col + c] = half as u16;
+                    halves[r * total + col + c] = half_at(&words, r * width + c);
                 }
             }
             col += width;
         }
-        let mut bytes: Vec<u8> = halves.iter().flat_map(|h| h.to_le_bytes()).collect();
-        bytes.resize(bytes.len().next_multiple_of(4).max(4), 0);
-        let weight = UnifiedTensor::from_bytes_with_dtype(ctx, &bytes, &[rows, total], DType::FP16);
+        let weight = UnifiedTensor::from_bytes_with_dtype(
+            ctx,
+            &half_bytes(&halves),
+            &[rows, total],
+            DType::FP16,
+        );
         let fused = Self {
             weight,
             widths,
@@ -222,23 +236,57 @@ impl FusedProjections {
         let words = pollster::block_on(self.weight.to_vec(ctx))
             .map_err(|e| format!("reading the weight failed: {e:?}"))?;
         let base: usize = self.widths.iter().sum();
-        let half_at = |i: usize| -> u16 {
-            let word = words[i / 2].to_bits();
-            (if i.is_multiple_of(2) {
-                word & 0xffff
-            } else {
-                word >> 16
-            }) as u16
-        };
         Ok((0..l.a.len())
             .map(|g| {
                 let col0 = base + g * l.rank;
                 (0..rows)
                     .flat_map(|r| (0..l.rank).map(move |j| (r, j)))
-                    .map(|(r, j)| half_at(r * total + col0 + j))
+                    .map(|(r, j)| half_at(&words, r * total + col0 + j))
                     .collect()
             })
             .collect())
+    }
+
+    /// The concatenated weight as read back: `[in, sum of widths + count *
+    /// rank]` row-major raw halves, the base weights then the mirrors. For
+    /// tests.
+    ///
+    /// # Errors
+    ///
+    /// When the readback fails.
+    pub fn weight_halves(&self, ctx: &WgpuContext) -> Result<Vec<u16>, String> {
+        let words = pollster::block_on(self.weight.to_vec(ctx))
+            .map_err(|e| format!("reading the weight failed: {e:?}"))?;
+        let numel = self.weight.shape.iter().product::<usize>();
+        Ok((0..numel).map(|i| half_at(&words, i)).collect())
+    }
+
+    /// Projection `index` as a frozen f16 `[in, width]` tensor, copied out of
+    /// the concatenated buffer: what a caller that dropped its own copy needs
+    /// for a pass the group cannot serve.
+    ///
+    /// # Errors
+    ///
+    /// When `index` is out of range or the readback fails.
+    pub fn projection(&self, ctx: &Arc<WgpuContext>, index: usize) -> Result<Tensor, String> {
+        let Some(&width) = self.widths.get(index) else {
+            return Err(format!("projection {index} of {}", self.widths.len()));
+        };
+        let col0: usize = self.widths[..index].iter().sum();
+        let (rows, total) = (self.weight.shape[0], self.weight.shape[1]);
+        let words = pollster::block_on(self.weight.to_vec(ctx))
+            .map_err(|e| format!("reading the weight failed: {e:?}"))?;
+        let halves: Vec<u16> = (0..rows)
+            .flat_map(|r| (0..width).map(move |c| (r, c)))
+            .map(|(r, c)| half_at(&words, r * total + col0 + c))
+            .collect();
+        let data = UnifiedTensor::from_bytes_with_dtype(
+            ctx,
+            &half_bytes(&halves),
+            &[rows, width],
+            DType::FP16,
+        );
+        Ok(Tensor::frozen(ctx.clone(), data))
     }
 
     /// Writes the products of `x` (`[m, in]`) with every projection into
