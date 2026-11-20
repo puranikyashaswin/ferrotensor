@@ -425,6 +425,9 @@ pub(super) fn source(key: CoopKey) -> String {
             "var<workgroup> sa1: array<f16, {a_len}>;\nvar<workgroup> sb1: array<f16, {b_len}>;\n"
         ));
     }
+    let extra_bindings =
+        loader::bindings(key.loader, key.a_vec4) + &epilogue::bindings(key.epilogue);
+    let helpers = loader::helpers(key.loader, key.a_vec4) + &epilogue::helpers(key.epilogue);
     format!(
         "enable f16;
 enable wgpu_cooperative_matrix;
@@ -475,16 +478,6 @@ fn matmul_coop(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_i
 }}
 ",
         params_len = params_vec4s(key.loader, key.epilogue),
-        extra_bindings = format!(
-            "{}{}",
-            loader::bindings(key.loader, key.a_vec4),
-            epilogue::bindings(key.epilogue)
-        ),
-        helpers = format!(
-            "{}{}",
-            loader::helpers(key.loader, key.a_vec4),
-            epilogue::helpers(key.epilogue)
-        ),
         poison = poison(key.epilogue),
         a_ty = if key.a_vec4 { "vec4<f32>" } else { "f32" },
         b_ty = if key.b_vec8 { "vec4<u32>" } else { "u32" },
