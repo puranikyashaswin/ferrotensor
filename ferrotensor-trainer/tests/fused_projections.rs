@@ -325,10 +325,15 @@ fn base_weights(gpu: &Gpu, model: &Lfm2Model) -> Vec<(String, Vec<f32>)> {
     out
 }
 
-fn bits(values: &[f32]) -> Vec<u16> {
-    values
+/// The halves of an f16 tensor read back as 32-bit words: `to_vec` hands the
+/// words back as f32 bit patterns, two halves each, low half first.
+fn halves_of(words: &[f32]) -> Vec<u16> {
+    words
         .iter()
-        .map(|&v| half::f16::from_f32(v).to_bits())
+        .flat_map(|w| {
+            let bits = w.to_bits();
+            [(bits & 0xffff) as u16, (bits >> 16) as u16]
+        })
         .collect()
 }
 
@@ -426,15 +431,19 @@ fn the_fused_weight_equals_the_concatenation_of_the_originals() {
                     .iter()
                     .find(|(n, _)| n == name)
                     .unwrap_or_else(|| panic!("no original {name}"));
+                let want = halves_of(want);
                 assert_eq!(want.len(), rows * width, "{name}: original size");
-                let want = bits(want);
                 for r in 0..rows {
                     let got = &halves[r * total + offset..r * total + offset + width];
                     assert_eq!(got, &want[r * width..(r + 1) * width], "{name}, row {r}");
                 }
                 // The copy taken back out of the group is the original too.
                 let back = group.projection(&gpu.ctx, index).expect("projection");
-                assert_eq!(bits(&host(&gpu, &back)), want, "{name}: restored weight");
+                assert_eq!(
+                    halves_of(&host(&gpu, &back)),
+                    want,
+                    "{name}: restored weight"
+                );
                 offset += width;
                 checked += 1;
             }
@@ -453,8 +462,15 @@ fn a_fused_model_decodes_with_a_cache_like_the_unfused_one() {
     let mut fused = build(&gpu, dir.path());
     set_lora_b(&gpu, &reference);
     set_lora_b(&gpu, &fused);
+    // Only the q, k and v groups: the feed-forward has no cache path of its
+    // own, so a gate and up group would serve this pass fused and round
+    // differently.
+    let choice = FuseChoice {
+        qkv: FuseSwitch::On,
+        gate_up: FuseSwitch::Off,
+    };
     fused
-        .enable_fused_projections(&gpu.engine, FusedMode::Force)
+        .enable_fused_projections_with(&gpu.engine, FusedMode::Force, choice, 64)
         .expect("enable");
     let seq = pattern_sequence();
     let run = |model: &Lfm2Model| {
