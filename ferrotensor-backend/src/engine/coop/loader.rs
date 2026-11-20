@@ -56,6 +56,29 @@ pub(in crate::engine) fn bindings(kind: LoaderKind, a_vec4: bool) -> String {
         .collect()
 }
 
+/// The binding name, first column and end column of each of `count` sources of
+/// a [`LoaderKind::Sources`] loader, as WGSL expressions: source `s + 1` starts
+/// where source `s` ends, and the last one ends at K.
+pub(super) fn source_spans(count: u8) -> Vec<(&'static str, &'static str, &'static str)> {
+    const NAMES: [&str; MAX_SOURCES] = ["a", "a1", "a2", "a3"];
+    const LO: [&str; MAX_SOURCES] = ["0u", "params[2].x", "params[2].y", "params[2].z"];
+    let count = usize::from(count).clamp(1, MAX_SOURCES);
+    NAMES
+        .iter()
+        .zip(LO)
+        .enumerate()
+        .take(count)
+        .map(|(s, (name, lo))| {
+            let hi = if s + 1 < count {
+                LO[s + 1]
+            } else {
+                "params[0].y"
+            };
+            (*name, lo, hi)
+        })
+        .collect()
+}
+
 /// The WGSL function `a_load` that reads `a` at row `gr`, column `gk` (four
 /// elements as a `vec4<f32>` with `a_vec4`) for every loader but
 /// [`LoaderKind::Plain`], which indexes `a` itself in the staging loop.
@@ -80,17 +103,10 @@ pub(in crate::engine) fn element_fn(kind: LoaderKind, a_vec4: bool) -> String {
             body.push_str(&format!("  return a[(gr * params[0].y + gk){div}];\n"));
         }
         LoaderKind::Sources { count } => {
-            const NAMES: [&str; MAX_SOURCES] = ["a", "a1", "a2", "a3"];
-            const LO: [&str; MAX_SOURCES] = ["0u", "params[2].x", "params[2].y", "params[2].z"];
-            let count = usize::from(count).clamp(1, MAX_SOURCES);
-            for (s, (name, lo)) in NAMES.iter().zip(LO).enumerate().take(count) {
-                let hi = if s + 1 < count {
-                    LO[s + 1]
-                } else {
-                    "params[0].y"
-                };
+            let spans = source_spans(count);
+            for (s, (name, lo, hi)) in spans.iter().enumerate() {
                 let read = format!("{name}[(gr * ({hi} - {lo}) + gk - {lo}){div}]");
-                if s + 1 < count {
+                if s + 1 < spans.len() {
                     body.push_str(&format!("  if (gk < {hi}) {{ return {read}; }}\n"));
                 } else {
                     body.push_str(&format!("  return {read};\n"));
