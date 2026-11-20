@@ -516,6 +516,18 @@ impl Tuner {
         let Some(&config) = trial.candidates.get(best) else {
             return;
         };
+        if let Some((&first, times)) = trial.candidates.first().zip(trial.times.first()) {
+            let name = |c: CoopConfig| format!("{} split {}", c.tile.name(), c.split);
+            log::info!(
+                "autotune: {} chose {} ({} ns median) over the static {} ({} ns) from {} candidates",
+                key.line_key(),
+                name(config),
+                nanos,
+                name(first),
+                median(times),
+                trial.candidates.len()
+            );
+        }
         self.trials.remove(&key);
         self.settled.insert(key, config);
         self.tuned += 1;
