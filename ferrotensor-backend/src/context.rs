@@ -4,12 +4,12 @@ use crate::kernel_timing::{
     KernelLabel, KernelTimer, KernelTimes, KernelTiming, KernelTimingMode, PendingTimes,
 };
 use crate::pool::BufferPool;
-use crate::profile::{GpuCounterSnapshot, GpuCounters};
+use crate::profile::{GpuCounterSnapshot, GpuCounters, HostSpan, SpanGuard};
 use crate::shader_checks::ShaderChecks;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use wgpu::{Adapter, BindGroup, CommandEncoder, ComputePipeline, Device, Instance, Queue};
 
 /// Recorded GPU work is submitted once this many ops are pending, so the GPU
@@ -413,6 +413,7 @@ impl WgpuContext {
     /// usage per dispatch and puts a barrier between a write and a later
     /// access, so each dispatch sees the results of those before it.
     fn encoder<'p>(&self, pending: &'p mut Pending) -> &'p mut CommandEncoder {
+        let _span = self.counters.span(HostSpan::Encode);
         let Pending {
             encoder,
             dispatches,
@@ -505,9 +506,13 @@ impl WgpuContext {
         self.poll_until_done(done);
         // Callers wait for the last submitted work, so that poll let wgpu
         // destroy every buffer dropped before it.
-        self.memory().gpu_reclaimed();
+        {
+            let _span = self.counters.span(HostSpan::Reclaim);
+            self.memory().gpu_reclaimed();
+        }
         self.release_idle_buffers();
         if let Some(timer) = &self.timer {
+            let _span = self.counters.span(HostSpan::Reclaim);
             timer.collect();
         }
     }
@@ -515,12 +520,11 @@ impl WgpuContext {
     /// Polls the device until `done` returns true, counting the time as GPU
     /// wait; see [`poll_until`](Self::poll_until) for why it never blocks.
     fn poll_until_done(&self, done: impl Fn() -> bool) {
-        let start = Instant::now();
+        let _span = self.counters.span(HostSpan::Wait);
         let mut polls = 0u32;
         loop {
             self.poll();
             if done() {
-                GpuCounters::add_elapsed(&self.counters.gpu_wait_nanos, start);
                 return;
             }
             if polls < 100 {
@@ -562,21 +566,26 @@ impl WgpuContext {
             self.encoder(pending);
         }
         if let Some(mut encoder) = pending.encoder.take() {
+            let finish = self.counters.span(HostSpan::Finish);
             if let Some(timer) = &self.timer {
                 timer.resolve(&mut encoder, &pending.times);
             }
             let memory = self.memory();
             let serial = memory.begin_submission();
             self.counters.submits.fetch_add(1, Ordering::Relaxed);
+            let commands = encoder.finish();
+            drop(finish);
+            let submit = self.counters.span(HostSpan::Submit);
             // wgpu maintains the device here: it destroys buffers whose work
             // has finished and runs the callbacks of finished submissions.
-            self.queue.submit(Some(encoder.finish()));
+            self.queue.submit(Some(commands));
             if let Some(timer) = &self.timer {
                 timer.submitted(&mut pending.times);
             }
             let tracker = memory.clone();
             self.queue
                 .on_submitted_work_done(move || tracker.gpu_completed(serial));
+            drop(submit);
             self.release_idle_buffers();
         }
     }
@@ -585,6 +594,7 @@ impl WgpuContext {
     /// if any, polls once without blocking so wgpu destroys them now rather
     /// than at the next submission.
     fn release_idle_buffers(&self) {
+        let _span = self.counters.span(HostSpan::Release);
         if self.pool.trim() > 0 {
             self.poll();
         }
@@ -605,6 +615,12 @@ impl WgpuContext {
     /// pool, and by [`MemoryCategory`](crate::MemoryCategory).
     pub fn memory(&self) -> &Arc<crate::MemoryTracker> {
         self.pool.tracker()
+    }
+
+    /// Times the host work until the returned guard drops as `span`, less
+    /// any span nested inside it (see [`HostSpan`]).
+    pub fn host_span(&self, span: HostSpan) -> SpanGuard<'_> {
+        self.counters.span(span)
     }
 
     /// Totals of the GPU work recorded and waited for on this context.

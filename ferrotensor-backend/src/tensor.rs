@@ -3,7 +3,7 @@
 use crate::bind_cache::BindGroupCache;
 use crate::memory::{Allocation, MemoryCategory};
 use crate::pool::BufferPool;
-use crate::profile::GpuCounters;
+use crate::profile::{GpuCounters, HostSpan};
 use crate::q4::{Q4Error, Q4Group};
 use crate::WgpuContext;
 use std::fmt;
@@ -394,6 +394,8 @@ impl UnifiedTensor {
     /// happens when the GPU device was lost.
     pub async fn to_vec(&self, context: &WgpuContext) -> Result<Vec<f32>, ReadbackError> {
         let start = Instant::now();
+        let _in_readback = context.counters.readback_scope();
+        let _span = context.host_span(HostSpan::MapCopy);
         let size = self.size_in_bytes();
         context.counters.readbacks.fetch_add(1, Ordering::Relaxed);
         context
@@ -434,6 +436,8 @@ impl UnifiedTensor {
         tensors: &[&UnifiedTensor],
     ) -> Result<Vec<Vec<f32>>, ReadbackError> {
         let start = Instant::now();
+        let _in_readback = context.counters.readback_scope();
+        let _span = context.host_span(HostSpan::MapCopy);
         let sizes: Vec<u64> = tensors.iter().map(|t| t.size_in_bytes()).collect();
         let size: u64 = sizes.iter().sum();
         if size == 0 {
