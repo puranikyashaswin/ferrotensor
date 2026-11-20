@@ -9,7 +9,7 @@
 //! cargo test -p ferrotensor-trainer --test fused_projections -- --ignored --test-threads=1
 //! ```
 
-#![allow(clippy::expect_used)]
+#![allow(clippy::expect_used, clippy::panic)]
 
 mod common;
 

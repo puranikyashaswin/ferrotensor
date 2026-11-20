@@ -95,6 +95,10 @@ fn plain_frozen(l: &Linear) -> bool {
 }
 
 /// The group of `lins`, `Ok(None)` when they cannot be fused.
+#[expect(
+    clippy::arc_with_non_send_sync,
+    reason = "tensors are single-threaded handles (the autograd crate allows the same), the group never crosses a thread"
+)]
 fn build(
     ctx: &WgpuContext,
     engine: &ComputeEngine,
