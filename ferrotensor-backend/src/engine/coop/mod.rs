@@ -33,13 +33,17 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 mod epilogue;
+mod fused;
 mod loader;
 mod mainloop;
 mod plan;
 mod tiles;
 
-use epilogue::{store_fragment, EpilogueKind};
-use loader::LoaderKind;
+use epilogue::{poison, store_fragment};
+pub(super) use epilogue::{EpilogueKind, BIAS_BINDING, FIRST_BINDING, MAX_SEGMENTS};
+use fused::params_vec4s;
+pub(super) use fused::{params_vec4s as kind_params_vec4s, reference_source};
+pub(super) use loader::{LoaderKind, MAX_SOURCES, SOURCE_BINDING};
 use mainloop::main_loop;
 use plan::{grid_fits, plan, split_k};
 pub use tiles::{CoopConfig, CoopTile};
@@ -395,8 +399,9 @@ impl ComputeEngine {
 }
 
 /// The WGSL of the kernel for `key`, entry point `matmul_coop`. Params are
-/// `[M, K, N, K per slice]` and `[alpha bits, beta bits, 0, 0]`; workgroup z
-/// is the slice of K, whose sums go to `c[z * M * N ..]`.
+/// `[M, K, N, K per slice]` and `[alpha bits, beta bits, 0, 0]`, then, for a
+/// fused loader or epilogue, its column bounds; workgroup z is the slice of
+/// K, whose sums go to `c[z * M * N ..]`.
 pub(super) fn source(key: CoopKey) -> String {
     let t = key.tile;
     let (ti, tj) = (t.wm / 16, t.wn / 16);
@@ -427,9 +432,9 @@ enable wgpu_cooperative_matrix;
 @group(0) @binding(0) var<storage, read> a: array<{a_ty}>;
 @group(0) @binding(1) var<storage, read> b: array<{b_ty}>;
 @group(0) @binding(2) var<storage, read_write> c: array<f32>;
-@group(0) @binding(3) var<uniform> params: array<vec4<u32>, 2>;
+@group(0) @binding(3) var<uniform> params: array<vec4<u32>, {params_len}>;
 @group(0) @binding(4) var<storage, read_write> overflows: array<atomic<u32>>;
-
+{extra_bindings}
 const BM: u32 = {bm}u;
 const BN: u32 = {bn}u;
 const BK: u32 = {bk}u;
@@ -438,7 +443,7 @@ const BP: u32 = {bp}u;
 const F16_MAX: f32 = 65504.0;
 
 {arrays}var<workgroup> cs: array<f32, {cs_len}>;
-
+{helpers}
 @compute @workgroup_size({nt})
 fn matmul_coop(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {{
   let m = params[0].x;
@@ -465,10 +470,22 @@ fn matmul_coop(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_i
   storageBarrier();
   if (overflow) {{
     atomicAdd(&overflows[0], 1u);
-    c[base + m0 * n + n0] = bitcast<f32>(0x7fc00000u);
+    {poison}
   }}
 }}
 ",
+        params_len = params_vec4s(key.loader, key.epilogue),
+        extra_bindings = format!(
+            "{}{}",
+            loader::bindings(key.loader, key.a_vec4),
+            epilogue::bindings(key.epilogue)
+        ),
+        helpers = format!(
+            "{}{}",
+            loader::helpers(key.loader, key.a_vec4),
+            epilogue::helpers(key.epilogue)
+        ),
+        poison = poison(key.epilogue),
         a_ty = if key.a_vec4 { "vec4<f32>" } else { "f32" },
         b_ty = if key.b_vec8 { "vec4<u32>" } else { "u32" },
         bm = t.bm,
