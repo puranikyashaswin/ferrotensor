@@ -18,7 +18,8 @@ use std::sync::Arc;
 
 /// What the report counts, printed with every table and stored in the JSON.
 pub const MEMORY_REPORT_NOTE: &str = "Counts the buffers Ferrotensor allocated through wgpu \
-(sizes after wgpu's 4-byte rounding), including buffers it dropped that wgpu may not have \
+(sizes after wgpu's 4-byte rounding; the extra bytes of a pooled buffer larger than its tensor \
+are shown as pool slack), including buffers it dropped that wgpu may not have \
 destroyed yet. nvidia-smi and Activity Monitor show more: pipelines, shaders and bind \
 groups, wgpu's own upload staging copies, the driver's context, and its allocator's \
 blocks, alignment and slack are not counted.";
@@ -212,6 +213,7 @@ fn snapshot_json(s: &MemorySnapshot) -> Value {
     json!({
         "live_bytes": s.live_bytes,
         "logical_bytes": s.logical_bytes,
+        "pool_slack_bytes": s.pool_slack_bytes,
         "pool_idle_bytes": s.pool_idle_bytes,
         "awaiting_gpu_bytes": s.awaiting_gpu_bytes,
         "categories": categories,
@@ -225,6 +227,7 @@ fn record_json(r: &BufferRecord) -> Value {
         "dtype": dtype_name(r.dtype),
         "shape": r.shape,
         "allocated_bytes": r.allocated_bytes,
+        "pool_slack_bytes": r.pool_slack_bytes,
         "logical_bytes": r.logical_bytes,
     })
 }
@@ -282,6 +285,12 @@ impl MemoryReport {
                 );
             }
         }
+        row(
+            "pool slack (larger buffers)",
+            p.pool_slack_bytes,
+            o.pool_slack_bytes,
+            None,
+        );
         row("total (live tensors)", p.live_bytes, o.live_bytes, None);
         row(
             &format!("pool idle (cap {:.0} MiB)", mib(self.pool_cap_bytes)),
@@ -314,9 +323,10 @@ are the highest each reached, so they can come from other moments and need not a
         );
         let _ = writeln!(
             t,
-            "  live tensors at the phase peak need {:.2} MiB; wgpu's rounding adds {:.2} MiB",
+            "  live tensors at the phase peak need {:.2} MiB; wgpu's rounding adds {:.2} MiB and pool slack {:.2} MiB",
             mib(p.logical_bytes),
-            mib(p.live_bytes - p.logical_bytes),
+            mib(p.live_bytes - p.pool_slack_bytes - p.logical_bytes),
+            mib(p.pool_slack_bytes),
         );
         let _ = writeln!(
             t,

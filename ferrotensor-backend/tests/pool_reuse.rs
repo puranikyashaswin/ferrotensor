@@ -8,7 +8,7 @@
 #![allow(clippy::expect_used)]
 
 use ferrotensor_backend::memory::wgpu_buffer_size;
-use ferrotensor_backend::{wgpu, ComputeEngine, UnifiedTensor, WgpuContext};
+use ferrotensor_backend::{wgpu, ComputeEngine, MemoryCategory, UnifiedTensor, WgpuContext};
 use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -232,4 +232,79 @@ fn buffer_creations_stay_flat_when_the_length_changes_every_step() {
     );
     assert_eq!(created_all, 0, "every new length is in a class seen before");
     assert_eq!(created_again, 0);
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn a_larger_idle_buffer_serves_a_smaller_request_up_to_four_times_its_class() {
+    let ctx = pollster::block_on(WgpuContext::new());
+    let pool = &ctx.pool;
+
+    let big = pool.get(&ctx.device, 8192);
+    assert_eq!(big.size(), 8192);
+    pool.return_buffer(big.size(), big);
+    let created = pool.buffers_created();
+
+    // 3,000 bytes is class 3,072, and the idle 8,192 is within four times that.
+    let reused = pool.get(&ctx.device, 3000);
+    assert_eq!(reused.size(), 8192, "the idle buffer, not a new one");
+    assert_eq!(pool.buffers_created(), created);
+    pool.return_buffer(reused.size(), reused);
+
+    // 1,500 bytes is class 1,536; four times that is 6,144, below the idle 8,192.
+    let small = pool.get(&ctx.device, 1500);
+    assert_eq!(small.size(), 1536);
+    assert_eq!(pool.buffers_created(), created + 1);
+
+    // The exact class comes first: 1,536 is idle now, so 1,500 takes it, not 8,192.
+    pool.return_buffer(small.size(), small);
+    let again = pool.get(&ctx.device, 1500);
+    assert_eq!(again.size(), 1536);
+    assert_eq!(pool.buffers_created(), created + 1);
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn the_extra_bytes_of_a_reused_larger_buffer_are_pool_slack() {
+    let ctx = pollster::block_on(WgpuContext::new());
+    let mem = ctx.memory();
+
+    // 2,048 elements are 8,192 bytes; the buffer goes idle in the pool.
+    drop(UnifiedTensor::empty(&ctx, &[2048]));
+    ctx.synchronize();
+    let created = ctx.pool.buffers_created();
+    let (live, slack, idle) = (
+        mem.live_bytes(),
+        mem.pool_slack_bytes(),
+        mem.pool_idle_bytes(),
+    );
+    let other = mem
+        .current()
+        .category(MemoryCategory::Other)
+        .allocated_bytes;
+
+    // 1,792 elements are 7,168 bytes, class 7,168; the idle 8,192 serves it.
+    let grad = UnifiedTensor::empty(&ctx, &[1792]);
+    assert_eq!(ctx.pool.buffers_created(), created, "the idle buffer");
+    assert_eq!(grad.size_in_bytes(), 7168);
+    let now = mem.current();
+    assert_eq!(
+        now.category(MemoryCategory::Other).allocated_bytes,
+        other + 7168,
+        "the category counts the bytes the tensor asked for"
+    );
+    assert_eq!(now.pool_slack_bytes, slack + 1024);
+    assert_eq!(mem.live_bytes(), live + 8192, "the buffer's bytes");
+    assert_eq!(mem.pool_idle_bytes(), idle - 8192);
+    let sum: u64 = now.categories.iter().map(|c| c.allocated_bytes).sum();
+    assert_eq!(sum + now.pool_slack_bytes, now.live_bytes);
+
+    drop(grad);
+    assert_eq!(mem.pool_slack_bytes(), slack);
+    assert_eq!(mem.live_bytes(), live);
+    assert_eq!(
+        mem.pool_idle_bytes(),
+        idle,
+        "the 8,192 bytes are idle again"
+    );
 }
