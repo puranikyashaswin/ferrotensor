@@ -1,0 +1,53 @@
+{
+  "$schema": "https://fundingjson.org/schema/v1.1.0.json",
+  "version": "v1.1.0",
+  "entity": {
+    "type": "individual",
+    "role": "owner",
+    "name": "Yashaswin Sharma Puranik",
+    "email": "puranikyashaswinsharma@gmail.com",
+    "description": "I'm a third-year B.Tech student in computer science at Woxsen University in Hyderabad, India. I started Ferrotensor and I'm its maintainer. I also do machine learning research: I am the sole author of a pre-registered study on early warning of reward hacking in coding models, which is under review at TMLR (doi.org/10.5281/zenodo.24200118). I have merged pull requests in TransformerLens and SAELens, two open-source interpretability libraries.",
+    "webpageUrl": {
+      "url": "https://github.com/puranikyashaswin",
+      "wellKnown": "https://github.com/puranikyashaswin/ferrotensor/blob/main/.well-known/funding-manifest-urls"
+    }
+  },
+  "projects": [
+    {
+      "guid": "ferrotensor",
+      "name": "Ferrotensor",
+      "description": "Ferrotensor is a pure-Rust GPU machine learning framework. It runs tensors, autograd and LoRA fine-tuning of small language models on the GPU through wgpu and hand-written WGSL kernels, so the same code runs on Vulkan, Metal and DX12. There is no CUDA, cuDNN or libtorch to install. The Rust library and CLI need no Python at runtime, and cargo build is their whole toolchain. The Python wheel is a few megabytes. The aim is fine-tuning on the GPU a person already owns, including Macs, AMD and Intel cards that the usual CUDA stack serves poorly.\n\nCorrectness comes first. The LoRA training path is checked against PyTorch autograd in CI on every pull request: every element within 1e-4 + 1e-3 x |expected|, with the largest gradient difference below 1e-6. On one NVIDIA A10G, after 250 steps the held-out loss is within 0.005 of PyTorch + PEFT for SmolLM2-135M and SmolLM2-1.7B. Adapters export to standard PEFT format, and CI checks that PyTorch reproduces the logits within 1e-3. Merged main lowers peak GPU memory for SmolLM2-1.7B LoRA from 11,671 MiB to 8,142 MiB, and to 5,313 MiB with block checkpointing.\n\nReleased as 0.6.0 on crates.io and PyPI under MIT OR Apache-2.0. It has Rust and Python APIs, a CLI for train, eval, generate and adapter export, and CI on Linux and macOS. It is young and I am its one maintainer. It is slower than PyTorch on NVIDIA today (0.32x to 0.84x per step), and it has not been tested on AMD or Intel GPUs, or with DX12 on real hardware, yet.",
+      "webpageUrl": {
+        "url": "https://github.com/puranikyashaswin/ferrotensor",
+        "wellKnown": "https://github.com/puranikyashaswin/ferrotensor/blob/main/.well-known/funding-manifest-urls"
+      },
+      "repositoryUrl": {
+        "url": "https://github.com/puranikyashaswin/ferrotensor",
+        "wellKnown": "https://github.com/puranikyashaswin/ferrotensor/blob/main/.well-known/funding-manifest-urls"
+      },
+      "licenses": ["spdx:MIT", "spdx:Apache-2.0"],
+      "tags": ["machine-learning", "artificial-intelligence", "scientific-computing", "developer-tools", "rust", "gpu", "webgpu", "deep-learning", "llm"]
+    }
+  ],
+  "funding": {
+    "channels": [
+      {
+        "guid": "bank-india",
+        "type": "bank",
+        "description": "Bank transfer to my account in India. Account details go to the funder privately after a grant is approved."
+      }
+    ],
+    "plans": [
+      {
+        "guid": "ferrotensor-1-0",
+        "status": "active",
+        "name": "Ferrotensor 1.0: tested on every major GPU vendor, one-command fine-tuning",
+        "description": "This grant pays for my time as maintainer and for rented AMD and Intel GPUs to test on, since I own neither. I am asking for ₹3,07,000, one time. It is worked out like this:\n\n- Maintainer time at the CSIR JRF rate of ₹37,000 a month: half time (20 hours a week) for 9 months of term, ₹1,66,500, and full time for 3 months of semester break, ₹1,11,000.\n- AMD testing: 500 hours on a rented cloud machine with an AMD Radeon Pro V520, at $0.379 an hour, about ₹17,813.\n- Intel testing: 500 hours on a rented Intel Arc Pro B70, at $0.25 an hour, about ₹11,750.\n\nDollar prices are converted at ₹94 to the dollar. The total is ₹3,07,063, rounded down. Each milestone below has a stated check, and a stated next step if it fails.\n\n1. AMD, Intel and DX12. Run the kernel self-check (ferrotensor info --check) and the LoRA walkthrough on an AMD GPU, an Intel GPU and Windows DX12, and publish the results in benchmarks/RESULTS.md. If a backend fails, fix it, or list it as unsupported with the exact error.\n\n2. One-command fine-tuning. ferrotensor finetune runs with no flags on an 8 GB Mac and a 24 GB NVIDIA GPU, choosing settings from the machine, with predicted peak memory within 10% of measured. If the prediction misses, a short probe run measures the peak and the planner uses that.\n\n3. More model families. Qwen3, Gemma and Phi load from their configs and match reference logits. A family that needs missing ops stays out of the supported list until it matches.\n\n4. Speed and memory against PyTorch. Cut per-dispatch overhead (cached bind groups and pipelines, decode loop kept on the GPU), then publish matched speed and memory against PyTorch on the release build, whatever they show. If the gain is under 10%, profile the kernels and work on memory traffic inside them.\n\n5. Smaller base weights. 4-bit frozen weights pass the held-out loss check against f16 (today 1.6245 against 1.4560 on SmolLM2-1.7B). If 4-bit still fails, ship 8-bit if it passes and keep 4-bit experimental.\n\n6. Release. Tag 1.0.0 if every gate passes, otherwise 0.8.0 with the gates that passed, on crates.io and PyPI.\n\nAlongside: at least one community contribution each quarter (a talk, a blog post or a forum update), and clear good-first-issues for new contributors.",
+        "amount": 307000,
+        "currency": "INR",
+        "frequency": "one-time",
+        "channels": ["bank-india"]
+      }
+    ]
+  }
+}
