@@ -3063,3 +3063,180 @@ fn embedding_scatter_index_groups_positions_by_row() {
     assert_eq!(slots, 2);
     assert_eq!(index, [1, none, 0, none, 0, 3, 5, 0, 2, 5, 1, 4]);
 }
+
+/// Row widths the norm kernels meet: SmolLM2 hidden sizes (the vec4 path with
+/// one and two vec4 per thread), a width above the register limit, and widths
+/// that are not a multiple of four.
+const NORM_WIDTHS: &[usize] = &[576, 960, 2048, 3072, 2050, 1001];
+
+/// `x / sqrt(mean(x^2) + eps) * w` per row, in f64.
+fn f64_rms_norm(x: &[f32], w: &[f32], len: usize, eps: f64) -> Vec<f64> {
+    let mut out = Vec::with_capacity(x.len());
+    for row in x.chunks(len) {
+        let ms = row.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>() / len as f64;
+        let inv = 1.0 / (ms + eps).sqrt();
+        out.extend(
+            row.iter()
+                .zip(w)
+                .map(|(&v, &w)| f64::from(v) * inv * f64::from(w)),
+        );
+    }
+    out
+}
+
+/// Input gradient of `f64_rms_norm` per row, in f64.
+fn f64_rms_norm_grad_x(x: &[f32], g: &[f32], w: &[f32], len: usize, eps: f64) -> Vec<f64> {
+    let mut out = Vec::with_capacity(x.len());
+    for (xr, gr) in x.chunks(len).zip(g.chunks(len)) {
+        let ms = xr.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>() / len as f64;
+        let inv = 1.0 / (ms + eps).sqrt();
+        let dot: f64 = (0..len)
+            .map(|i| f64::from(gr[i]) * f64::from(w[i]) * f64::from(xr[i]))
+            .sum();
+        out.extend((0..len).map(|i| {
+            f64::from(gr[i]) * f64::from(w[i]) * inv
+                - f64::from(xr[i]) * dot * inv.powi(3) / len as f64
+        }));
+    }
+    out
+}
+
+fn to_f32(v: &[f64]) -> Vec<f32> {
+    v.iter().map(|&x| x as f32).collect()
+}
+
+/// The vec4 elementwise kernels at SmolLM2 MLP sizes and at lengths that are
+/// not a multiple of four (which take the scalar kernels), against f64.
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn vec4_elementwise_kernels_match_f64() {
+    let g = gpu();
+    // 880 rows of the 1.7B MLP width, a 135M-sized tensor, and odd lengths.
+    for &n in &[880 * 8192, 256 * 1536, 4, 1001, 8191 * 3] {
+        let up: Vec<f32> = rand_vec(n, 100 + n as u64)
+            .iter()
+            .map(|v| v * 6.0)
+            .collect();
+        let gate = rand_vec(n, 101 + n as u64);
+        let go = rand_vec(n, 102 + n as u64);
+        let (tup, tgate, tgo) = (upload(&up, &[n]), upload(&gate, &[n]), upload(&go, &[n]));
+        let name = format!("n {n}");
+
+        let out = zeros(&[n]);
+        g.engine.add(&g.ctx, &tup, &tgate, &out);
+        let want: Vec<f64> = up
+            .iter()
+            .zip(&gate)
+            .map(|(&a, &b)| f64::from(a) + f64::from(b))
+            .collect();
+        assert_close(
+            &format!("add {name}"),
+            &read(&out),
+            &to_f32(&want),
+            0.0,
+            1e-7,
+        );
+
+        g.engine.silu_gate_fused(&g.ctx, &tup, &tgate, &out);
+        let sig = |x: f32| 1.0 / (1.0 + (-f64::from(x)).exp());
+        let want: Vec<f64> = (0..n)
+            .map(|i| f64::from(up[i]) * sig(up[i]) * f64::from(gate[i]))
+            .collect();
+        assert_close(
+            &format!("silu_gate {name}"),
+            &read(&out),
+            &to_f32(&want),
+            1e-6,
+            1e-5,
+        );
+
+        let (gup, ggate) = (zeros(&[n]), zeros(&[n]));
+        g.engine
+            .silu_gate_backward(&g.ctx, &tup, &tgate, &tgo, &gup, &ggate);
+        let want_up: Vec<f64> = (0..n)
+            .map(|i| {
+                let s = sig(up[i]);
+                f64::from(go[i]) * f64::from(gate[i]) * s * (1.0 + f64::from(up[i]) * (1.0 - s))
+            })
+            .collect();
+        let want_gate: Vec<f64> = (0..n)
+            .map(|i| f64::from(go[i]) * f64::from(up[i]) * sig(up[i]))
+            .collect();
+        assert_close(
+            &format!("silu_gate_bw up {name}"),
+            &read(&gup),
+            &to_f32(&want_up),
+            1e-6,
+            1e-5,
+        );
+        assert_close(
+            &format!("silu_gate_bw gate {name}"),
+            &read(&ggate),
+            &to_f32(&want_gate),
+            1e-6,
+            1e-5,
+        );
+    }
+}
+
+/// RMSNorm forward and backward, with and without a residual gradient folded
+/// in through `beta`, at every width in [`NORM_WIDTHS`], against f64.
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn rms_norm_register_kernels_match_f64() {
+    let g = gpu();
+    let (rows, eps) = (37usize, 1e-5f32);
+    for &len in NORM_WIDTHS {
+        let x = rand_vec(rows * len, 110 + len as u64);
+        let w = rand_vec(len, 111 + len as u64);
+        let go = rand_vec(rows * len, 112 + len as u64);
+        let old = rand_vec(rows * len, 113 + len as u64);
+        let (tx, tw, tgo) = (
+            upload(&x, &[rows, len]),
+            upload(&w, &[len]),
+            upload(&go, &[rows, len]),
+        );
+        let name = format!("{rows}x{len}");
+
+        let out = zeros(&[rows, len]);
+        g.engine.rms_norm_eps(&g.ctx, &tx, &tw, &out, eps);
+        let want = f64_rms_norm(&x, &w, len, f64::from(eps));
+        assert_close(
+            &format!("rms_norm {name}"),
+            &read(&out),
+            &to_f32(&want),
+            1e-6,
+            1e-5,
+        );
+
+        let want_x = f64_rms_norm_grad_x(&x, &go, &w, len, f64::from(eps));
+        let gx = zeros(&[rows, len]);
+        g.engine
+            .rms_norm_backward(&g.ctx, &tx, &tw, &tgo, &gx, None, eps);
+        assert_close(
+            &format!("rms_norm_bw {name}"),
+            &read(&gx),
+            &to_f32(&want_x),
+            1e-5,
+            1e-4,
+        );
+
+        for beta in [1.0f32, -0.5] {
+            let acc = upload(&old, &[rows, len]);
+            g.engine
+                .rms_norm_backward_beta(&g.ctx, &tx, &tw, &tgo, (&acc, beta), None, eps);
+            let want: Vec<f64> = want_x
+                .iter()
+                .zip(&old)
+                .map(|(&n, &o)| n + f64::from(beta) * f64::from(o))
+                .collect();
+            assert_close(
+                &format!("rms_norm_bw beta {beta} {name}"),
+                &read(&acc),
+                &to_f32(&want),
+                1e-5,
+                1e-4,
+            );
+        }
+    }
+}

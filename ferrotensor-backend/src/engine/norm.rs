@@ -3,6 +3,12 @@
 use super::{grid, groups64, uniform, ComputeEngine};
 use crate::{UnifiedTensor, WgpuContext};
 
+/// Whether a norm row can run in the vec4 kernels, which keep the row in the
+/// registers of the 256 threads of one workgroup: two vec4 per thread.
+fn row_fits_registers(size: usize) -> bool {
+    size % 4 == 0 && size <= 2048
+}
+
 impl ComputeEngine {
     /// RMSNorm over the last dimension with eps = 1e-5:
     /// `out = x / sqrt(mean(x^2) + eps) * weight`.
@@ -31,9 +37,14 @@ impl ComputeEngine {
             ctx,
             bytemuck::cast_slice(&[size as u32, rows as u32, eps.to_bits(), 0]),
         );
+        let kernel = if row_fits_registers(size) {
+            &self.rms_norm_v4
+        } else {
+            &self.rms_norm
+        };
         self.run(
             ctx,
-            &self.rms_norm,
+            kernel,
             &[
                 (0, input.buffer()),
                 (1, weight.buffer()),
@@ -102,9 +113,14 @@ impl ComputeEngine {
             ctx,
             bytemuck::cast_slice(&[size as u32, rows as u32, eps.to_bits(), beta.to_bits()]),
         );
+        let kernel = if row_fits_registers(size) {
+            &self.rms_norm_bw_v4
+        } else {
+            &self.rms_norm_bw
+        };
         self.run(
             ctx,
-            &self.rms_norm_bw,
+            kernel,
             &[
                 (0, input.buffer()),
                 (1, grad_out.buffer()),

@@ -12,7 +12,17 @@ impl ComputeEngine {
         b: &UnifiedTensor,
         out: &UnifiedTensor,
     ) {
-        self.binary(ctx, &self.add, a, b, out);
+        let n: usize = a.shape.iter().product();
+        if n % 4 == 0 {
+            self.run(
+                ctx,
+                &self.add_v4,
+                &[(0, a.buffer()), (1, b.buffer()), (2, out.buffer())],
+                groups64(n / 4),
+            );
+        } else {
+            self.binary(ctx, &self.add, a, b, out);
+        }
     }
 
     /// `out = a * b`, element-wise.
@@ -187,7 +197,17 @@ impl ComputeEngine {
         gate: &UnifiedTensor,
         out: &UnifiedTensor,
     ) {
-        self.binary(ctx, &self.silu_gate, up, gate, out);
+        let n: usize = up.shape.iter().product();
+        if n % 4 == 0 {
+            self.run(
+                ctx,
+                &self.silu_gate_v4,
+                &[(0, up.buffer()), (1, gate.buffer()), (2, out.buffer())],
+                groups64(n / 4),
+            );
+        } else {
+            self.binary(ctx, &self.silu_gate, up, gate, out);
+        }
     }
 
     /// Fused SiLU-Gate backward: computes gradients for up and gate
@@ -200,9 +220,15 @@ impl ComputeEngine {
         grad_up: &UnifiedTensor,
         grad_gate: &UnifiedTensor,
     ) {
+        let n: usize = up.shape.iter().product();
+        let (kernel, threads) = if n % 4 == 0 {
+            (&self.silu_gate_bw_v4, n / 4)
+        } else {
+            (&self.silu_gate_bw, n)
+        };
         self.run(
             ctx,
-            &self.silu_gate_bw,
+            kernel,
             &[
                 (0, up.buffer()),
                 (1, gate.buffer()),
@@ -210,7 +236,7 @@ impl ComputeEngine {
                 (4, grad_up.buffer()),
                 (5, grad_gate.buffer()),
             ],
-            groups64(up.shape.iter().product()),
+            groups64(threads),
         );
     }
 }

@@ -27,6 +27,25 @@ fn row_sum(lid: u32, v: f32) -> f32 {
     return r;
 }
 
+// Two row sums in one reduction (half the barriers of two row_sum calls).
+var<workgroup> row_red_b: array<f32, 256>;
+
+fn row_sum2(lid: u32, a: f32, b: f32) -> vec2<f32> {
+    row_red[lid] = a;
+    row_red_b[lid] = b;
+    workgroupBarrier();
+    for (var s = ROW_WG / 2u; s > 0u; s = s >> 1u) {
+        if (lid < s) {
+            row_red[lid] += row_red[lid + s];
+            row_red_b[lid] += row_red_b[lid + s];
+        }
+        workgroupBarrier();
+    }
+    let r = vec2<f32>(row_red[0], row_red_b[0]);
+    workgroupBarrier();
+    return r;
+}
+
 fn row_max(lid: u32, v: f32) -> f32 {
     row_red[lid] = v;
     workgroupBarrier();
@@ -133,6 +152,32 @@ fn rms_norm(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wg
     }
 }
 
+// rms_norm for a row of at most 2048 floats, a multiple of four: each thread
+// holds its (at most two) vec4 of the row in registers, so the row is read once.
+@group(0) @binding(0) var<storage, read> rms4_input: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> rms4_weight: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> rms4_out: array<vec4<f32>>;
+@group(0) @binding(3) var<uniform> rms4_params: vec4<u32>; // size, rows, eps bits, 0
+
+@compute @workgroup_size(256)
+fn rms_norm_v4(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wg: vec3<u32>,
+               @builtin(num_workgroups) nwg: vec3<u32>) {
+    let row = row_index(wg, nwg);
+    let size = rms4_params.x;
+    if (row >= rms4_params.y) { return; } // uniform: whole workgroup exits
+    let size4 = size / 4u;
+    let off = row * size4;
+    let j1 = lid + ROW_WG;
+    var x0 = vec4<f32>(0.0);
+    var x1 = vec4<f32>(0.0);
+    if (lid < size4) { x0 = rms4_input[off + lid]; }
+    if (j1 < size4) { x1 = rms4_input[off + j1]; }
+    let ss = row_sum(lid, dot(x0, x0) + dot(x1, x1));
+    let inv_rms = 1.0 / sqrt(ss / f32(size) + bitcast<f32>(rms4_params.z));
+    if (lid < size4) { rms4_out[off + lid] = x0 * inv_rms * rms4_weight[lid]; }
+    if (j1 < size4) { rms4_out[off + j1] = x1 * inv_rms * rms4_weight[j1]; }
+}
+
 // RMSNorm backward, one workgroup per row. With inv = 1 / rms(x):
 // grad_x = g * w * inv - x * inv^3 * sum(g * w * x) / size.
 // Each row's inv is kept for rms_norm_backward_weight. With beta != 0 the result
@@ -173,6 +218,57 @@ fn rms_norm_backward(@builtin(local_invocation_index) lid: u32, @builtin(workgro
         }
     }
     if (lid == 0u) { rmsb_inv[row] = inv; }
+}
+
+// rms_norm_backward for a row of at most 2048 floats, a multiple of four: x and g
+// stay in registers between the two passes, so each is read once.
+@group(0) @binding(0) var<storage, read> rmsb4_x: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> rmsb4_g: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> rmsb4_w: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read_write> rmsb4_gx: array<vec4<f32>>;
+@group(0) @binding(4) var<storage, read_write> rmsb4_inv: array<f32>;
+@group(0) @binding(5) var<uniform> rmsb4_params: vec4<u32>; // size, rows, eps bits, beta bits
+
+@compute @workgroup_size(256)
+fn rms_norm_backward_v4(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wg: vec3<u32>,
+                        @builtin(num_workgroups) nwg: vec3<u32>) {
+    let row = row_index(wg, nwg);
+    let size = rmsb4_params.x;
+    if (row >= rmsb4_params.y) { return; } // uniform: whole workgroup exits
+    let size4 = size / 4u;
+    let off = row * size4;
+    let j1 = lid + ROW_WG;
+    var x0 = vec4<f32>(0.0);
+    var x1 = vec4<f32>(0.0);
+    var gw0 = vec4<f32>(0.0);
+    var gw1 = vec4<f32>(0.0);
+    var w0 = vec4<f32>(0.0);
+    var w1 = vec4<f32>(0.0);
+    if (lid < size4) {
+        x0 = rmsb4_x[off + lid];
+        w0 = rmsb4_w[lid];
+        gw0 = rmsb4_g[off + lid] * w0;
+    }
+    if (j1 < size4) {
+        x1 = rmsb4_x[off + j1];
+        w1 = rmsb4_w[j1];
+        gw1 = rmsb4_g[off + j1] * w1;
+    }
+    let sums = row_sum2(lid, dot(x0, x0) + dot(x1, x1), dot(gw0, x0) + dot(gw1, x1));
+    let inv = 1.0 / sqrt(sums.x / f32(size) + bitcast<f32>(rmsb4_params.z));
+    let coef = sums.y * inv * inv * inv / f32(size);
+    let beta = bitcast<f32>(rmsb4_params.w);
+    if (lid < size4) {
+        var gv = gw0 * inv - x0 * coef;
+        if (beta != 0.0) { gv += beta * rmsb4_gx[off + lid]; }
+        rmsb4_gx[off + lid] = gv;
+    }
+    if (j1 < size4) {
+        var gv = gw1 * inv - x1 * coef;
+        if (beta != 0.0) { gv += beta * rmsb4_gx[off + j1]; }
+        rmsb4_gx[off + j1] = gv;
+    }
+    if (lid == 0u) { rmsb4_inv[row] = inv; }
 }
 
 // grad_w[i] = sum over rows of g * x * inv, one thread per feature.
@@ -236,6 +332,18 @@ fn add(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) n
     let i = global_id.x;
     if (i >= arrayLength(&bin_out)) { return; }
     bin_out[i] = bin_a[i] + bin_b[i];
+}
+
+// add over four floats per thread; the length is a multiple of four.
+@group(0) @binding(0) var<storage, read> bin4_a: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> bin4_b: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> bin4_out: array<vec4<f32>>;
+
+@compute @workgroup_size(64)
+fn add_v4(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = gid.x + gid.y * nwg.x * 64u;
+    if (i >= arrayLength(&bin4_out)) { return; }
+    bin4_out[i] = bin4_a[i] + bin4_b[i];
 }
 
 @compute @workgroup_size(64)
@@ -821,6 +929,35 @@ fn silu_gate_backward(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(nu
     // d(silu)/d_up = s * (1 + up*(1-s))
     let dsilu = s * (1.0 + up * (1.0 - s));
     fused_grad_up[i] = g * gate * dsilu;
+}
+
+// The same two kernels over four floats per thread; the length is a multiple of four.
+@group(0) @binding(0) var<storage, read> fused4_up: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> fused4_gate: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> fused4_out: array<vec4<f32>>;
+
+@compute @workgroup_size(64)
+fn silu_gate_fused_v4(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = gid.x + gid.y * nwg.x * 64u;
+    if (i >= arrayLength(&fused4_out)) { return; }
+    let up = fused4_up[i];
+    fused4_out[i] = up * (1.0 / (1.0 + exp(-up))) * fused4_gate[i];
+}
+
+@group(0) @binding(3) var<storage, read> fused4_grad_out: array<vec4<f32>>;
+@group(0) @binding(4) var<storage, read_write> fused4_grad_up: array<vec4<f32>>;
+@group(0) @binding(5) var<storage, read_write> fused4_grad_gate: array<vec4<f32>>;
+
+@compute @workgroup_size(64)
+fn silu_gate_backward_v4(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = gid.x + gid.y * nwg.x * 64u;
+    if (i >= arrayLength(&fused4_grad_out)) { return; }
+    let up = fused4_up[i];
+    let gate = fused4_gate[i];
+    let g = fused4_grad_out[i];
+    let s = 1.0 / (1.0 + exp(-up));
+    fused4_grad_gate[i] = g * (up * s);
+    fused4_grad_up[i] = g * gate * (s * (1.0 + up * (1.0 - s)));
 }
 
 // --- 19. Fused RMSNorm + Residual Add ---

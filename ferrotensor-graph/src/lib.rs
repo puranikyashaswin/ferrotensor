@@ -536,11 +536,18 @@ impl MLP {
             Some([gate, up]) => [gate, up],
             None => [&self.gate_proj, &self.up_proj],
         };
-        let up = up_proj.forward(engine, input);
-        let gate = gate_proj.forward(engine, input);
+        // One flatten feeds both projections, so the backward pass meets one
+        // reshape node instead of two and skips a full-size gradient add.
+        let flat = Tensor::reshape_2d(input);
+        let up = up_proj.forward(engine, &flat);
+        let gate = gate_proj.forward(engine, &flat);
         // silu_gate_fused(a, b) = silu(a) * b; SwiGLU applies SiLU to the gate.
         let fused = Tensor::silu_gate_fused(&gate, &up, engine);
-        self.down_proj.forward(engine, &fused)
+        let out = self.down_proj.forward(engine, &fused);
+        match input.data.shape.as_slice() {
+            [batch, seq, _] => Tensor::unflatten_last(&out, *batch, *seq),
+            _ => out,
+        }
     }
 
     /// Trainable tensors (weights, then any LoRA adapters).
