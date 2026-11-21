@@ -66,32 +66,7 @@ impl Tokenizer {
         let hf_error = match tokenizers::Tokenizer::from_file(path) {
             Ok(hf_tokenizer) => {
                 drop(file);
-                let vocab = hf_tokenizer.get_vocab(true);
-                if vocab.is_empty() {
-                    return Err(format!("{}: tokenizer vocabulary is empty", path.display()));
-                }
-                let id_to_token: HashMap<u32, String> =
-                    vocab.iter().map(|(k, v)| (*v, k.clone())).collect();
-                let bos_token_id = declared_bos
-                    .as_deref()
-                    .and_then(|token| hf_tokenizer.token_to_id(token))
-                    .or_else(|| hf_tokenizer.token_to_id("<|im_start|>"))
-                    .or_else(|| hf_tokenizer.token_to_id("<s>"))
-                    .unwrap_or(1);
-                let eos_token_id = hf_tokenizer
-                    .token_to_id("<|im_end|>")
-                    .or_else(|| hf_tokenizer.token_to_id("</s>"))
-                    .unwrap_or(2);
-                let pad_token_id = hf_tokenizer.token_to_id("<pad>").unwrap_or(0);
-
-                return Ok(Self {
-                    vocab,
-                    id_to_token,
-                    bos_token_id,
-                    eos_token_id,
-                    pad_token_id,
-                    hf_tokenizer: Some(Arc::new(hf_tokenizer)),
-                });
+                return Self::from_hf_tokenizer(path, hf_tokenizer, declared_bos.as_deref());
             }
             Err(e) => e,
         };
@@ -99,6 +74,12 @@ impl Tokenizer {
         let mut content = String::new();
         std::io::Read::read_to_string(&mut std::io::BufReader::new(file), &mut content)
             .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+
+        // Newer files (Qwen3) store each merge as a `["left", "right"]` pair,
+        // which the pinned `tokenizers` reader refuses; read them as "left right".
+        if let Some(hf_tokenizer) = read_with_pair_merges(&content) {
+            return Self::from_hf_tokenizer(path, hf_tokenizer, declared_bos.as_deref());
+        }
 
         let parsed: TokenizerJson = serde_json::from_str(&content)
             .map_err(|e| format!("Failed to parse {}: {}", path.display(), e))?;
@@ -142,6 +123,40 @@ impl Tokenizer {
             eos_token_id,
             pad_token_id,
             hf_tokenizer: None,
+        })
+    }
+
+    /// The tokenizer around a parsed Hugging Face tokenizer, with the special
+    /// ids found by name.
+    fn from_hf_tokenizer(
+        path: &Path,
+        hf_tokenizer: tokenizers::Tokenizer,
+        declared_bos: Option<&str>,
+    ) -> Result<Self, String> {
+        let vocab = hf_tokenizer.get_vocab(true);
+        if vocab.is_empty() {
+            return Err(format!("{}: tokenizer vocabulary is empty", path.display()));
+        }
+        let id_to_token: HashMap<u32, String> =
+            vocab.iter().map(|(k, v)| (*v, k.clone())).collect();
+        let bos_token_id = declared_bos
+            .and_then(|token| hf_tokenizer.token_to_id(token))
+            .or_else(|| hf_tokenizer.token_to_id("<|im_start|>"))
+            .or_else(|| hf_tokenizer.token_to_id("<s>"))
+            .unwrap_or(1);
+        let eos_token_id = hf_tokenizer
+            .token_to_id("<|im_end|>")
+            .or_else(|| hf_tokenizer.token_to_id("</s>"))
+            .unwrap_or(2);
+        let pad_token_id = hf_tokenizer.token_to_id("<pad>").unwrap_or(0);
+
+        Ok(Self {
+            vocab,
+            id_to_token,
+            bos_token_id,
+            eos_token_id,
+            pad_token_id,
+            hf_tokenizer: Some(Arc::new(hf_tokenizer)),
         })
     }
 
@@ -474,6 +489,32 @@ fn byte_level_chars() -> [char; 256] {
         chars[usize::from(b)] = c;
     }
     chars
+}
+
+/// The Hugging Face tokenizer of `content` with each `["left", "right"]` merge
+/// rewritten as `"left right"`, or `None` when it has no pair merges or is still refused.
+///
+/// The `None` cases leave the caller to report the error of the first read.
+fn read_with_pair_merges(content: &str) -> Option<tokenizers::Tokenizer> {
+    let Ok(mut json) = serde_json::from_str::<serde_json::Value>(content) else {
+        return None;
+    };
+    let merges = json.get_mut("model")?.get_mut("merges")?.as_array_mut()?;
+    let mut rewrote = false;
+    for merge in merges.iter_mut() {
+        if let Some([left, right]) = merge.as_array().map(Vec::as_slice) {
+            let joined = format!("{} {}", left.as_str()?, right.as_str()?);
+            *merge = serde_json::Value::String(joined);
+            rewrote = true;
+        }
+    }
+    if !rewrote {
+        return None;
+    }
+    let Ok(tokenizer) = json.to_string().parse::<tokenizers::Tokenizer>() else {
+        return None;
+    };
+    Some(tokenizer)
 }
 
 /// The `bos_token` that the `tokenizer_config.json` beside `tokenizer_path`
@@ -966,6 +1007,154 @@ mod tests {
         assert!(
             err.as_deref().is_some_and(|e| e.contains("tokenizer.json")
                 && e.contains("cannot load the NoSuchModel tokenizer")),
+            "{err:?}"
+        );
+    }
+
+    /// A byte-level BPE `tokenizer.json` laid out as Qwen3's is: an NFC
+    /// normalizer, a regex split then `ByteLevel` pre-tokenizer, three added
+    /// special tokens outside `model.vocab`, and `merges` as `["left", "right"]`
+    /// pairs when `pairs` is set, else as "left right" strings (the Qwen2.5
+    /// layout). Ids: the 256 bytes 0..=255, `hi` 256, `Ġhi` 257, the first two
+    /// bytes of U+4E16 258, all three 259; `<|endoftext|>` 260,
+    /// `<|im_start|>` 261, `<|im_end|>` 262.
+    fn qwen3_style_json(pairs: bool) -> serde_json::Value {
+        let chars = byte_level_chars();
+        let byte = |b: usize| chars[b].to_string();
+        let first_two = format!("{}{}", byte(0xE4), byte(0xB8));
+        let all_three = format!("{first_two}{}", byte(0x96));
+        let merges = [
+            ("h".to_owned(), "i".to_owned()),
+            ("Ġ".to_owned(), "hi".to_owned()),
+            (byte(0xE4), byte(0xB8)),
+            (first_two.clone(), byte(0x96)),
+        ];
+        let merges: Vec<serde_json::Value> = merges
+            .iter()
+            .map(|(left, right)| {
+                if pairs {
+                    serde_json::json!([left, right])
+                } else {
+                    serde_json::json!(format!("{left} {right}"))
+                }
+            })
+            .collect();
+        let tokens: Vec<String> = chars
+            .iter()
+            .map(char::to_string)
+            .chain(["hi".to_owned(), "Ġhi".to_owned(), first_two, all_three])
+            .collect();
+        let vocab: serde_json::Map<String, serde_json::Value> = tokens
+            .into_iter()
+            .zip(0u32..)
+            .map(|(token, id)| (token, id.into()))
+            .collect();
+        let special = |id: u32, content: &str| {
+            serde_json::json!({
+                "id": id, "content": content, "single_word": false, "lstrip": false,
+                "rstrip": false, "normalized": false, "special": true
+            })
+        };
+        let byte_level = serde_json::json!({
+            "type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false,
+            "use_regex": false
+        });
+        let split = serde_json::json!({
+            "type": "Split",
+            "pattern": { "Regex": r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+" },
+            "behavior": "Isolated",
+            "invert": false
+        });
+        serde_json::json!({
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [
+                special(260, "<|endoftext|>"),
+                special(261, "<|im_start|>"),
+                special(262, "<|im_end|>")
+            ],
+            "normalizer": { "type": "NFC" },
+            "pre_tokenizer": { "type": "Sequence", "pretokenizers": [split, byte_level] },
+            "post_processor": byte_level,
+            "decoder": byte_level,
+            "model": {
+                "type": "BPE", "dropout": null, "unk_token": null,
+                "continuing_subword_prefix": "", "end_of_word_suffix": "",
+                "fuse_unk": false, "byte_fallback": false, "ignore_merges": false,
+                "vocab": vocab, "merges": merges
+            }
+        })
+    }
+
+    #[test]
+    fn merges_as_pairs_load_and_round_trip() -> TestResult {
+        let tok = load_with_config("pair-merges", &qwen3_style_json(true), None)?;
+        assert!(
+            tok.hf_tokenizer.is_some(),
+            "read by the Hugging Face reader"
+        );
+        assert_eq!(
+            tok.vocab.len(),
+            263,
+            "260 vocabulary entries, 3 added tokens"
+        );
+        assert_eq!((tok.bos_token_id, tok.eos_token_id), (261, 262));
+        // By hand: 'H' 72, 'i' 105, " hi" is one merged token, '世' is E4 B8 96
+        // and '界' is E7 95 8C, 'é' is C3 A9, '\n' 10.
+        assert_eq!(tok.encode("Hi hi")?, [72, 105, 257]);
+        assert_eq!(tok.encode("hi")?, [256]);
+        assert_eq!(tok.encode("世界")?, [259, 0xE7, 0x95, 0x8C]);
+        assert_eq!(tok.encode("é")?, [0xC3, 0xA9]);
+        assert_eq!(
+            tok.encode("<|im_start|>user\n")?,
+            [261, 117, 115, 101, 114, 10]
+        );
+        assert_eq!(tok.encode("a<|im_end|>")?, [97, 262]);
+        for text in [
+            "Hi hi",
+            "世界 hello 你好",
+            "héllo → 🦀\n\ttab",
+            "  two  spaces\r\n",
+        ] {
+            assert_eq!(tok.decode(&tok.encode(text)?)?, text);
+        }
+        // Special tokens are in the ids and dropped on decode.
+        let chat = tok.encode("<|im_start|>你好<|im_end|>")?;
+        assert_eq!((chat.first(), chat.last()), (Some(&261), Some(&262)));
+        assert_eq!(tok.decode(&chat)?, "你好");
+        Ok(())
+    }
+
+    #[test]
+    fn merges_as_strings_still_load_and_match_the_pair_form() -> TestResult {
+        let strings = load_with_config("string-merges", &qwen3_style_json(false), None)?;
+        let pairs = load_with_config("pair-merges-match", &qwen3_style_json(true), None)?;
+        assert!(strings.hf_tokenizer.is_some());
+        assert_eq!(strings.vocab, pairs.vocab);
+        assert_eq!(strings.encode("Hi hi")?, [72, 105, 257]);
+        for text in [
+            "Hi hi",
+            "世界 hello 你好",
+            "<|im_start|>user\n你好<|im_end|>",
+        ] {
+            let ids = strings.encode(text)?;
+            assert_eq!(ids, pairs.encode(text)?, "{text}");
+            assert_eq!(strings.decode(&ids)?, pairs.decode(&ids)?, "{text}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_merge_pair_that_is_not_two_strings_is_an_error() {
+        let mut json = qwen3_style_json(true);
+        json["model"]["merges"][0] = serde_json::json!(["h", "i", "x"]);
+        let err = load_with_config("bad-pair", &json, None)
+            .err()
+            .map(|e| e.to_string());
+        assert!(
+            err.as_deref()
+                .is_some_and(|e| e.contains("cannot load the BPE tokenizer")),
             "{err:?}"
         );
     }
