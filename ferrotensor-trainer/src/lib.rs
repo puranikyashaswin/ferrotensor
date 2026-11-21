@@ -457,7 +457,9 @@ impl Trainer {
                 self.ctx.wait_for_submission(mark);
             }
             let _tag = self.ctx.memory().scope(MemoryCategory::BackwardScratch);
+            ferrotensor_backend::trace::mark("bwd_begin");
             loss.backward(&self.engine);
+            ferrotensor_backend::trace::mark("bwd_end");
             if self.defer_loss_readback {
                 self.backward_mark = Some(self.ctx.submission_mark());
             }
@@ -475,6 +477,7 @@ impl Trainer {
         if self.step_in_accum >= self.grad_accum_steps {
             self.step_in_accum = 0;
             self.read_pending_losses();
+            ferrotensor_backend::trace::mark("losses_read");
             let mut stats = self.deferred.pop().map_or(EMPTY_STATS, |d| d.stats);
             let applied = self.apply_gradients(train_params, &mut stats);
             self.optimizer.zero_grad(train_params);
@@ -573,11 +576,14 @@ impl Trainer {
 
         // One readback serves the scaler and the clip: the scaled norm tells
         // whether anything overflowed, and the norm over S is the true norm.
+        ferrotensor_backend::trace::mark("pack_begin");
         let packed = self.pack_flat_grads(&grads);
+        ferrotensor_backend::trace::mark("pack_end");
         let scaled_norm = match &packed {
             Some(packed) => flat_grad_norm(packed, &self.ctx, &self.engine),
             None => global_grad_norm(&grads, &self.ctx, &self.engine),
         };
+        ferrotensor_backend::trace::mark("norm_read");
         let unscale = match self.scaler.as_mut() {
             Some(scaler) => scaler.unscale_factor(scaled_norm),
             None => scaled_norm.is_finite().then_some(1.0),
@@ -633,6 +639,7 @@ impl Trainer {
             .map_err(TrainError)?;
         self.optimizer_step_count += 1;
         stats.optimizer_step = true;
+        ferrotensor_backend::trace::mark("opt_done");
         Ok(())
     }
 
@@ -700,6 +707,7 @@ impl Trainer {
         chunk: &[(&[u32], &[u32], &[u8])],
         train_params: &[Tensor],
     ) -> Result<(), TrainError> {
+        ferrotensor_backend::trace::mark("chunk_begin");
         let longest = chunk
             .iter()
             .map(|s| s.0.len().min(s.1.len()))

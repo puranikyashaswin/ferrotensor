@@ -208,6 +208,7 @@ struct InFlight {
     labels: Vec<KernelLabel>,
     tunes: Vec<Option<u64>>,
     state: Arc<AtomicU8>,
+    serial: u64,
 }
 
 /// Dispatches encoded into the pending command encoder, and the slot their
@@ -390,7 +391,7 @@ impl KernelTimer {
     }
 
     /// Starts mapping the readback buffer of the submission just made.
-    pub(crate) fn submitted(&self, times: &mut PendingTimes) {
+    pub(crate) fn submitted(&self, times: &mut PendingTimes, serial: u64) {
         let Some(slot) = times.slot.take() else {
             return;
         };
@@ -407,6 +408,7 @@ impl KernelTimer {
             labels: std::mem::take(&mut times.labels),
             tunes: std::mem::take(&mut times.tunes),
             state,
+            serial,
         });
     }
 
@@ -436,6 +438,18 @@ impl KernelTimer {
                             .map(|bytes| u64::from_le_bytes(*bytes))
                             .collect();
                         drop(view);
+                        for (i, (label, pair)) in
+                            done.labels.iter().zip(ticks.as_chunks::<2>().0).enumerate()
+                        {
+                            crate::trace::gpu(
+                                done.serial,
+                                i,
+                                &label.name().replace(' ', "_"),
+                                pair[0] as f64 * f64::from(self.period_ns),
+                                pair[1] as f64 * f64::from(self.period_ns),
+                            );
+                        }
+                        crate::trace::flush();
                         if self.all {
                             add_timestamp_pairs(totals, &done.labels, &ticks, self.period_ns);
                         }

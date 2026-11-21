@@ -40,6 +40,7 @@ mod profile;
 pub mod q4;
 mod shader_checks;
 mod tensor;
+pub mod trace;
 
 pub use context::{
     ContextError, WgpuContext, PASS_DISPATCHES_ENV, PENDING_OPS_ENV, UNIFORM_PARAMS_ENV,

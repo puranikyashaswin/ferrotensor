@@ -400,6 +400,7 @@ impl WgpuContext {
     fn count_op(&self, pending: &mut Pending) {
         pending.ops += 1;
         if pending.ops >= self.max_pending_ops {
+            crate::trace::host("ops_limit", 0);
             self.submit(pending);
         }
     }
@@ -458,6 +459,7 @@ impl WgpuContext {
         reason = "lock poisoning means another thread panicked while holding the lock"
     )]
     pub fn flush(&self) {
+        crate::trace::host("flush", 0);
         let mut pending = self.pending.lock().unwrap();
         self.submit(&mut pending);
     }
@@ -508,9 +510,11 @@ impl WgpuContext {
         // destroy every buffer dropped before it.
         self.memory().gpu_reclaimed();
         self.release_idle_buffers();
+        crate::trace::host("reclaim_end", 0);
         if let Some(timer) = &self.timer {
             timer.collect();
         }
+        crate::trace::host("collect_end", 0);
     }
 
     /// Polls the device until `done` returns true, counting the time as GPU
@@ -518,9 +522,11 @@ impl WgpuContext {
     fn poll_until_done(&self, done: impl Fn() -> bool) {
         let start = Instant::now();
         let mut polls = 0u32;
+        crate::trace::host("wait_begin", 0);
         loop {
             self.poll();
             if done() {
+                crate::trace::host("wait_end", 0);
                 GpuCounters::add_elapsed(&self.counters.gpu_wait_nanos, start);
                 return;
             }
@@ -568,17 +574,22 @@ impl WgpuContext {
             }
             let memory = self.memory();
             let serial = memory.begin_submission();
+            crate::trace::host("submit_begin", serial);
             self.counters.submits.fetch_add(1, Ordering::Relaxed);
             // wgpu maintains the device here: it destroys buffers whose work
             // has finished and runs the callbacks of finished submissions.
-            self.queue.submit(Some(encoder.finish()));
+            let finished = encoder.finish();
+            crate::trace::host("finish_end", serial);
+            self.queue.submit(Some(finished));
+            crate::trace::host("submit_end", serial);
             if let Some(timer) = &self.timer {
-                timer.submitted(&mut pending.times);
+                timer.submitted(&mut pending.times, serial);
             }
             let tracker = memory.clone();
             self.queue
                 .on_submitted_work_done(move || tracker.gpu_completed(serial));
             self.release_idle_buffers();
+            crate::trace::host("release_end", serial);
         }
     }
 
