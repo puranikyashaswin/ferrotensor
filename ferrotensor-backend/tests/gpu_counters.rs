@@ -176,7 +176,7 @@ fn kernel_times_count_each_dispatch_under_its_kernel() {
     assert_eq!(
         dispatches,
         BTreeMap::from([
-            ("add", 1),
+            ("add_v4", 1),
             ("gradient_scale", 2),
             ("matmul_blocked (a@b, out<1M)", 1),
         ])
