@@ -225,6 +225,64 @@ fn needs_exact_size(entry_point: &str) -> bool {
     EXACT_SIZE_ENTRIES.contains(&entry_point)
 }
 
+/// Measurement only: bind group lookups by entry point.
+mod miss_stats {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    static STATS: Mutex<Option<HashMap<&'static str, [u64; 3]>>> = Mutex::new(None);
+
+    pub(super) fn note(entry: &'static str, hit: bool, spent: Duration) {
+        let mut guard = STATS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let row = guard
+            .get_or_insert_with(HashMap::new)
+            .entry(entry)
+            .or_default();
+        row[usize::from(!hit)] += 1;
+        row[2] += u64::try_from(spent.as_nanos()).unwrap_or(0);
+    }
+
+    /// Prints and clears the totals since the last call.
+    pub(super) fn dump(steps: usize) {
+        let mut guard = STATS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(map) = guard.take() else { return };
+        let mut rows: Vec<_> = map.into_iter().collect();
+        rows.sort_by_key(|(_, r)| std::cmp::Reverse(r[2]));
+        let n = steps.max(1) as f64;
+        let (mut h, mut m, mut ns) = (0, 0, 0);
+        for (_, r) in &rows {
+            h += r[0];
+            m += r[1];
+            ns += r[2];
+        }
+        eprintln!(
+            "bindstats per step: hits {:.1} misses {:.1} lookup ms {:.2}",
+            h as f64 / n,
+            m as f64 / n,
+            ns as f64 / n / 1e6
+        );
+        for (entry, r) in rows.iter().take(25) {
+            eprintln!(
+                "bindstats {entry:<28} hits {:>8.1} misses {:>8.1} ms {:>7.3}",
+                r[0] as f64 / n,
+                r[1] as f64 / n,
+                r[2] as f64 / n / 1e6
+            );
+        }
+    }
+}
+
+/// Prints and clears the bind group lookup totals (measurement build).
+#[doc(hidden)]
+pub fn bind_stats_dump(steps: usize) {
+    miss_stats::dump(steps);
+}
+
 /// A compiled compute pipeline together with its bind group layout.
 ///
 /// The layout is derived from the shader (`layout: None`), so it always
@@ -629,10 +687,12 @@ impl ComputeEngine {
             })
         };
         let bind_group = if cacheable {
+            let started = std::time::Instant::now();
             let (group, hit) =
                 ctx.pool
                     .bind_groups()
                     .get_or_create(&kernel.pipeline, &bound, create);
+            miss_stats::note(kernel.entry_point, hit, started.elapsed());
             let counter = if hit {
                 &ctx.counters.bind_group_hits
             } else {

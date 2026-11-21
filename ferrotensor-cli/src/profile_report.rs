@@ -90,6 +90,9 @@ impl ProfileRun {
 
     /// End the current optimizer step and start the next.
     pub fn after_step(&mut self) {
+        if self.steps.len() % 10 == 9 {
+            ferrotensor_backend::bind_stats_dump(10);
+        }
         let mark = GpuMark::now(&self.ctx);
         self.steps.push(ProfiledStep {
             wall: self.step_start.elapsed(),
