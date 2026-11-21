@@ -20,6 +20,7 @@ Five GPU kernel changes to LoRA training, in attention, matmul and the LoRA scal
 - Training attention saves the forward output and log-sum-exp and no longer reruns the forward kernel inside backward. `FlashAttentionNode` gains the public fields `out` and `stats`. (#168)
 - Attention forward and backward run in 16-row blocks with eight threads per row, so short sequences use many more workgroups. (#169)
 - Matmuls with 16 to 256 rows against a weight at least 256 wide and deep run through a new split-K kernel with a deterministic reduction. (#172)
+- The README and the LoRA SFT example compare this code with PyTorch + PEFT on one A10G (19 November 2026): 1.87×, 1.83× and 1.13× as fast as eager PyTorch at SmolLM2-135M, 360M and 1.7B, and 0.26× of PyTorch with `torch.compile` and CUDA graphs at 135M. This replaces the comparison measured on a 0.6 development build.
 
 ## [0.7.0] - 2026-11-19
 
