@@ -394,7 +394,8 @@ sequences) and at the highest point seen so far in the run. The rows:
 | loss (vocab-sized) | The logits, `d loss / d logits` and the logits' gradient |
 | readback staging | Buffers that copy results to the host |
 | other | Buffers created outside these phases (e.g. gradient-norm partial sums) |
-| total (live tensors) | The sum of the rows above |
+| pool slack (larger buffers) | Bytes a pooled buffer has beyond what its tensor asked for: the rounding up to a size class, or an idle buffer of a larger class (up to four times) that served the request. The rows above count what the tensors asked for |
+| total (live tensors) | The sum of the rows above, which is the bytes of the live buffers |
 | pool idle (cap 512 MiB) | Freed buffers the pool keeps for reuse; still allocated on the GPU. Once the GPU has finished with them the pool keeps at most the cap shown; while it still runs the work recorded before they were freed, the pool keeps them above the cap so later ops can reuse them (see below) |
 | total held (live + pool idle) | The highest live plus pool-idle bytes of the phase, and of the run so far |
 | freed, awaiting GPU | Buffers Ferrotensor has dropped but wgpu may not have destroyed yet (see below); the highest of the phase and of the run |
@@ -431,7 +432,8 @@ waits that a run without the flag does not have: it can change timing,
 never results. Without the flag there is no added wait.
 
 Below the table: how much of the live bytes the tensors' shapes need
-(wgpu rounds every buffer up to 4 bytes), the bytes held right after the
+(wgpu rounds every buffer up to 4 bytes, and the pool slack is counted
+separately), the bytes held right after the
 sample (live, pool idle, awaiting GPU), and the 10 largest live buffers at
 the phase peak with their category, dtype and shape.
 

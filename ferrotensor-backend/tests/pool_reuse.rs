@@ -8,7 +8,7 @@
 #![allow(clippy::expect_used)]
 
 use ferrotensor_backend::memory::wgpu_buffer_size;
-use ferrotensor_backend::{wgpu, ComputeEngine, UnifiedTensor, WgpuContext};
+use ferrotensor_backend::{wgpu, ComputeEngine, MemoryCategory, UnifiedTensor, WgpuContext};
 use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -261,4 +261,50 @@ fn a_larger_idle_buffer_serves_a_smaller_request_up_to_four_times_its_class() {
     let again = pool.get(&ctx.device, 1500);
     assert_eq!(again.size(), 1536);
     assert_eq!(pool.buffers_created(), created + 1);
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn the_extra_bytes_of_a_reused_larger_buffer_are_pool_slack() {
+    let ctx = pollster::block_on(WgpuContext::new());
+    let mem = ctx.memory();
+
+    // 2,048 elements are 8,192 bytes; the buffer goes idle in the pool.
+    drop(UnifiedTensor::empty(&ctx, &[2048]));
+    ctx.synchronize();
+    let created = ctx.pool.buffers_created();
+    let (live, slack, idle) = (
+        mem.live_bytes(),
+        mem.pool_slack_bytes(),
+        mem.pool_idle_bytes(),
+    );
+    let other = mem
+        .current()
+        .category(MemoryCategory::Other)
+        .allocated_bytes;
+
+    // 1,792 elements are 7,168 bytes, class 7,168; the idle 8,192 serves it.
+    let grad = UnifiedTensor::empty(&ctx, &[1792]);
+    assert_eq!(ctx.pool.buffers_created(), created, "the idle buffer");
+    assert_eq!(grad.size_in_bytes(), 7168);
+    let now = mem.current();
+    assert_eq!(
+        now.category(MemoryCategory::Other).allocated_bytes,
+        other + 7168,
+        "the category counts the bytes the tensor asked for"
+    );
+    assert_eq!(now.pool_slack_bytes, slack + 1024);
+    assert_eq!(mem.live_bytes(), live + 8192, "the buffer's bytes");
+    assert_eq!(mem.pool_idle_bytes(), idle - 8192);
+    let sum: u64 = now.categories.iter().map(|c| c.allocated_bytes).sum();
+    assert_eq!(sum + now.pool_slack_bytes, now.live_bytes);
+
+    drop(grad);
+    assert_eq!(mem.pool_slack_bytes(), slack);
+    assert_eq!(mem.live_bytes(), live);
+    assert_eq!(
+        mem.pool_idle_bytes(),
+        idle,
+        "the 8,192 bytes are idle again"
+    );
 }

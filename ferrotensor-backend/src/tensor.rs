@@ -124,12 +124,17 @@ impl TensorData {
         };
         // A buffer without a pool is dropped with the tensor; a pooled one
         // is kept or dropped by the pool, which counts it either way.
-        // The allocation is the buffer's own size, which a pooled buffer can
-        // have rounded up to its size class.
-        let memory =
-            context
-                .memory()
-                .allocate(dtype, shape, logical, buffer.size(), pool.is_none());
+        // The tensor asked for `size_in_bytes`; a pooled buffer can be larger
+        // (rounded up to its size class, or reused from a larger class), and
+        // the tracker counts the difference as pool slack.
+        let memory = context.memory().allocate(
+            dtype,
+            shape,
+            logical,
+            size_in_bytes,
+            buffer.size(),
+            pool.is_none(),
+        );
         Self {
             buffer,
             size_in_bytes,

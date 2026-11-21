@@ -71,8 +71,12 @@ fn tiny_lora_bytes() -> u64 {
 
 fn assert_consistent(s: &MemorySnapshot) {
     let sum: u64 = s.categories.iter().map(|c| c.allocated_bytes).sum();
-    assert_eq!(sum, s.live_bytes, "categories must add up to the total");
-    assert!(s.logical_bytes <= s.live_bytes);
+    assert_eq!(
+        sum + s.pool_slack_bytes,
+        s.live_bytes,
+        "categories and pool slack must add up to the total"
+    );
+    assert!(s.logical_bytes <= sum);
 }
 
 fn print(text: &str) {
@@ -109,7 +113,10 @@ fn memory_report_adds_up_and_does_not_change_training() {
         assert_eq!(b.f16_bytes, base_f16, "frozen f16 weights");
         assert_eq!(s.category(MemoryCategory::Trainable).allocated_bytes, lora);
     }
-    assert_eq!(load.live.live_bytes, base + lora);
+    assert_eq!(
+        load.live.live_bytes - load.live.pool_slack_bytes,
+        base + lora
+    );
     assert!(!load.peak.largest.is_empty());
 
     // The AdamW moments live in two flat buffers with every tensor padded to
@@ -175,7 +182,7 @@ fn memory_report_adds_up_and_does_not_change_training() {
             moments
         );
         assert_eq!(
-            live.live_bytes,
+            live.live_bytes - live.pool_slack_bytes,
             base + lora + moments,
             "something else stayed live"
         );
