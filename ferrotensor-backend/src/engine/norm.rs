@@ -6,7 +6,7 @@ use crate::{UnifiedTensor, WgpuContext};
 /// Whether a norm row can run in the vec4 kernels, which keep the row in the
 /// registers of the 256 threads of one workgroup: two vec4 per thread.
 fn row_fits_registers(size: usize) -> bool {
-    size % 4 == 0 && size <= 2048
+    size.is_multiple_of(4) && size <= 2048
 }
 
 impl ComputeEngine {

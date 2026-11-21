@@ -13,7 +13,7 @@ impl ComputeEngine {
         out: &UnifiedTensor,
     ) {
         let n: usize = a.shape.iter().product();
-        if n % 4 == 0 {
+        if n.is_multiple_of(4) {
             self.run(
                 ctx,
                 &self.add_v4,
@@ -198,7 +198,7 @@ impl ComputeEngine {
         out: &UnifiedTensor,
     ) {
         let n: usize = up.shape.iter().product();
-        if n % 4 == 0 {
+        if n.is_multiple_of(4) {
             self.run(
                 ctx,
                 &self.silu_gate_v4,
@@ -221,7 +221,7 @@ impl ComputeEngine {
         grad_gate: &UnifiedTensor,
     ) {
         let n: usize = up.shape.iter().product();
-        let (kernel, threads) = if n % 4 == 0 {
+        let (kernel, threads) = if n.is_multiple_of(4) {
             (&self.silu_gate_bw_v4, n / 4)
         } else {
             (&self.silu_gate_bw, n)
