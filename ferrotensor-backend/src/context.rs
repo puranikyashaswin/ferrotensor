@@ -47,12 +47,6 @@ where
     }
 }
 
-/// Whether a submission frees the pool's idle buffers: always without
-/// deferred trimming, otherwise only when it carried a full batch of ops.
-fn releases_idle_buffers(deferred_trim: bool, full: bool) -> bool {
-    !deferred_trim || full
-}
-
 /// Uploaded bytes after which [`WgpuContext::note_upload`] waits for the
 /// staging copies to finish so wgpu can free them.
 pub const UPLOAD_RELEASE_BYTES: u64 = 256 << 20;
@@ -94,9 +88,6 @@ pub struct WgpuContext {
     pending: Mutex<Pending>,
     /// Bytes uploaded since staging buffers were last released.
     staged: AtomicU64,
-    /// Whether idle pool buffers are freed only by a submission that carries
-    /// a full batch of ops; see [`set_deferred_trim`](Self::set_deferred_trim).
-    deferred_trim: AtomicBool,
     pub(crate) counters: GpuCounters,
     /// Whether kernel parameters go through immediates.
     immediates: bool,
@@ -353,7 +344,6 @@ impl WgpuContext {
             pool,
             pending: Mutex::new(Pending::default()),
             staged: AtomicU64::new(0),
-            deferred_trim: AtomicBool::new(false),
             counters: GpuCounters::default(),
             timer,
             max_pending_ops,
@@ -517,9 +507,7 @@ impl WgpuContext {
         // Callers wait for the last submitted work, so that poll let wgpu
         // destroy every buffer dropped before it.
         self.memory().gpu_reclaimed();
-        if !self.deferred_trim.load(Ordering::Relaxed) {
-            self.release_idle_buffers();
-        }
+        self.release_idle_buffers();
         if let Some(timer) = &self.timer {
             timer.collect();
         }
@@ -570,7 +558,6 @@ impl WgpuContext {
     }
 
     fn submit(&self, pending: &mut Pending) {
-        let full = pending.ops >= self.max_pending_ops;
         pending.ops = 0;
         if !pending.dispatches.is_empty() {
             self.encoder(pending);
@@ -591,22 +578,8 @@ impl WgpuContext {
             let tracker = memory.clone();
             self.queue
                 .on_submitted_work_done(move || tracker.gpu_completed(serial));
-            if releases_idle_buffers(self.deferred_trim.load(Ordering::Relaxed), full) {
-                self.release_idle_buffers();
-            }
+            self.release_idle_buffers();
         }
-    }
-
-    /// Frees idle pool buffers above the cap only while a submission of a
-    /// full batch of ops runs on the GPU, never right after a wait or in a
-    /// short submission.
-    ///
-    /// Destroying many large buffers costs the host tens of milliseconds, and
-    /// right after a wait the GPU has nothing queued, so it sat idle for all
-    /// of that. The buffers are released by the next full submission instead,
-    /// which does not change what is freed, only when. Off by default.
-    pub fn set_deferred_trim(&self, on: bool) {
-        self.deferred_trim.store(on, Ordering::Relaxed);
     }
 
     /// Drops pooled buffers above the cap that the GPU has finished with and,
@@ -716,14 +689,6 @@ mod tests {
         for bad in ["0", "-3", "eight", ""] {
             assert_eq!(limit_from_env_value(Some(bad), 8usize), 8, "{bad:?}");
         }
-    }
-
-    #[test]
-    fn deferred_trim_frees_buffers_only_in_full_submissions() {
-        assert!(releases_idle_buffers(false, false));
-        assert!(releases_idle_buffers(false, true));
-        assert!(!releases_idle_buffers(true, false));
-        assert!(releases_idle_buffers(true, true));
     }
 
     #[test]

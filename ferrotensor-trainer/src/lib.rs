@@ -210,13 +210,8 @@ impl Trainer {
     /// each sequence's stats on the call that ends its window (and none on
     /// the calls before); [`take_deferred_stats`](Self::take_deferred_stats)
     /// returns the rest of an unfinished window.
-    ///
-    /// Also frees the pool's idle buffers during the next full submission
-    /// rather than right after that read, which kept the GPU idle (see
-    /// [`WgpuContext::set_deferred_trim`]).
     pub fn with_deferred_loss_readback(mut self) -> Self {
         self.defer_loss_readback = true;
-        self.ctx.set_deferred_trim(true);
         self
     }
 
