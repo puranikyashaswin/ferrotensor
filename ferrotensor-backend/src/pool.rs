@@ -33,6 +33,26 @@ const CLASS_STEPS_LOG2: u32 = 3;
 /// taken when none of the class itself is idle.
 const MAX_REUSE_RATIO: u64 = 2;
 
+/// Measurement only: extra percent over the class an idle buffer may have
+/// (FERROTENSOR_POOL_SLACK_PCT, default 100 = twice the class, 0 = off).
+fn reuse_percent() -> u64 {
+    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("FERROTENSOR_POOL_SLACK_PCT")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(100)
+    })
+}
+
+/// Measurement only: pool cap in MiB (FERROTENSOR_POOL_CAP_MIB).
+pub fn cap_from_env() -> Option<u64> {
+    std::env::var("FERROTENSOR_POOL_CAP_MIB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|m| m << 20)
+}
+
 /// The size in bytes of the buffer a request of `requested` bytes is served
 /// from.
 ///
@@ -211,7 +231,7 @@ impl BufferPool {
         Self {
             buffers: Mutex::new(PoolState {
                 lists: FreeLists::default(),
-                max_pooled_bytes: DEFAULT_MAX_POOLED_BYTES,
+                max_pooled_bytes: cap_from_env().unwrap_or(DEFAULT_MAX_POOLED_BYTES),
                 overflow: true,
             }),
             usage,
@@ -332,7 +352,7 @@ impl BufferPool {
         if idle.is_none() {
             idle = state
                 .lists
-                .take_up_to(class, class.saturating_mul(MAX_REUSE_RATIO));
+                .take_up_to(class, class.saturating_mul(100 + reuse_percent()) / 100);
         }
         if let Some((taken, buffer)) = idle {
             drop(state);
