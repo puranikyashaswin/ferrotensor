@@ -28,6 +28,11 @@ const MIN_CLASSED_BYTES: u64 = 256;
 /// above the sizes it serves.
 const CLASS_STEPS_LOG2: u32 = 3;
 
+/// The most a reused idle buffer may be larger than the class of the request
+/// it serves, as a ratio: 4 means an idle buffer of up to four times the class
+/// is taken when none of the class itself is idle.
+const MAX_REUSE_RATIO: u64 = 4;
+
 /// The size in bytes of the buffer a request of `requested` bytes is served
 /// from.
 ///
@@ -49,7 +54,8 @@ pub fn size_class(requested: u64) -> u64 {
 ///
 /// A tensor's buffer is returned when its last reference drops. A request is
 /// rounded up to its [`size_class`] and served by an idle buffer of exactly
-/// that size, so a buffer can be up to 12.5% larger than the tensor in it.
+/// that size, else by the smallest idle buffer of up to four times that size,
+/// so a buffer can be up to four times as large as the tensor in it.
 /// Kernels still see the tensor's own size: the engine binds only the tensor's
 /// bytes of such a buffer, not the whole of it, since kernels bound their
 /// loops by `arrayLength`.
@@ -120,6 +126,16 @@ impl<B> FreeLists<B> {
         }
         self.pooled_bytes -= size;
         Some(buffer)
+    }
+
+    /// The most recently returned buffer of the smallest size from `size` to
+    /// `max` bytes that has one, with that size.
+    fn take_up_to(&mut self, size: u64, max: u64) -> Option<(u64, B)> {
+        if size > max {
+            return None;
+        }
+        let found = *self.free.range(size..=max).next()?.0;
+        self.take(found).map(|buffer| (found, buffer))
     }
 
     fn put(&mut self, size: u64, serial: u64, buffer: B) {
@@ -293,7 +309,8 @@ impl BufferPool {
     }
 
     /// A free buffer for a tensor of `size` bytes: an idle one of the
-    /// [`size_class`] of `size`, or a new one of that size.
+    /// [`size_class`] of `size`, else the smallest idle one of up to four times
+    /// that, else a new one of that size.
     #[expect(
         clippy::unwrap_used,
         reason = "lock poisoning means another thread panicked while holding the lock"
@@ -307,6 +324,15 @@ impl BufferPool {
         let mut idle = state.lists.take(class).map(|buffer| (class, buffer));
         if idle.is_none() && class != exact {
             idle = state.lists.take(exact).map(|buffer| (exact, buffer));
+        }
+        // Lengths that change on every micro-batch land on more classes than
+        // the cap holds idle, so each class would be trimmed before its
+        // length came back. A larger idle buffer, up to `MAX_REUSE_RATIO`
+        // times the class, serves the request instead of a new one.
+        if idle.is_none() {
+            idle = state
+                .lists
+                .take_up_to(class, class.saturating_mul(MAX_REUSE_RATIO));
         }
         if let Some((taken, buffer)) = idle {
             drop(state);
@@ -433,6 +459,23 @@ mod tests {
         assert_eq!(l.take(64), Some("a"));
         assert_eq!(l.take(64), None);
         assert_eq!(l.pooled_bytes, 128);
+    }
+
+    #[test]
+    fn take_up_to_gives_the_smallest_idle_size_in_range() {
+        let mut l = FreeLists::default();
+        l.put(300, 1, "a");
+        l.put(400, 1, "b");
+        l.put(400, 2, "c");
+        l.put(900, 2, "d");
+        assert_eq!(l.take_up_to(301, 600), Some((400, "c")), "newest of 400");
+        assert_eq!(l.take_up_to(301, 600), Some((400, "b")));
+        assert_eq!(l.take_up_to(301, 600), None, "900 is out of range");
+        assert_eq!(l.take_up_to(300, 600), Some((300, "a")), "the bounds count");
+        assert_eq!(l.take_up_to(500, 400), None, "empty range");
+        assert_eq!(l.take_up_to(500, 900), Some((900, "d")));
+        assert_eq!(l.pooled_bytes, 0);
+        assert!(l.free.is_empty());
     }
 
     #[test]
