@@ -664,7 +664,7 @@ mod tests {
         // 300 MiB is requested in steps 0, 3 and 6: six waits apart.
         let sizes = |step: usize| {
             let mut sizes = working_set();
-            if step % 3 == 0 {
+            if step.is_multiple_of(3) {
                 sizes.push(300 * MIB);
             }
             sizes
