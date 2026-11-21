@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.7.1] - 2026-11-19
+## [0.7.1] - 2026-11-21
 
 Five GPU kernel changes to LoRA training, in attention, matmul and the LoRA scale. One library change can break code: `FlashAttentionNode` has two new public fields, so code that builds it with a struct literal must set them (under Changed).
 
