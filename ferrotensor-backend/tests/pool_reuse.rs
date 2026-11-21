@@ -233,3 +233,32 @@ fn buffer_creations_stay_flat_when_the_length_changes_every_step() {
     assert_eq!(created_all, 0, "every new length is in a class seen before");
     assert_eq!(created_again, 0);
 }
+
+#[test]
+#[ignore = "needs a GPU"]
+fn a_larger_idle_buffer_serves_a_smaller_request_up_to_twice_its_class() {
+    let ctx = pollster::block_on(WgpuContext::new());
+    let pool = &ctx.pool;
+
+    let big = pool.get(&ctx.device, 8192);
+    assert_eq!(big.size(), 8192);
+    pool.return_buffer(big.size(), big);
+    let created = pool.buffers_created();
+
+    // 6,000 bytes is class 6,144, and the idle 8,192 is within twice that.
+    let reused = pool.get(&ctx.device, 6000);
+    assert_eq!(reused.size(), 8192, "the idle buffer, not a new one");
+    assert_eq!(pool.buffers_created(), created);
+    pool.return_buffer(reused.size(), reused);
+
+    // 3,000 bytes is class 3,072; twice that is 6,144, below the idle 8,192.
+    let small = pool.get(&ctx.device, 3000);
+    assert_eq!(small.size(), 3072);
+    assert_eq!(pool.buffers_created(), created + 1);
+
+    // The exact class comes first: 3,072 is idle now, so 3,000 takes it, not 8,192.
+    pool.return_buffer(small.size(), small);
+    let again = pool.get(&ctx.device, 3000);
+    assert_eq!(again.size(), 3072);
+    assert_eq!(pool.buffers_created(), created + 1);
+}
