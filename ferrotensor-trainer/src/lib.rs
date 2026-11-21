@@ -210,8 +210,13 @@ impl Trainer {
     /// each sequence's stats on the call that ends its window (and none on
     /// the calls before); [`take_deferred_stats`](Self::take_deferred_stats)
     /// returns the rest of an unfinished window.
+    ///
+    /// Also frees the pool's idle buffers during the next full submission
+    /// rather than right after that read, which kept the GPU idle (see
+    /// [`WgpuContext::set_deferred_trim`]).
     pub fn with_deferred_loss_readback(mut self) -> Self {
         self.defer_loss_readback = true;
+        self.ctx.set_deferred_trim(true);
         self
     }
 
@@ -474,9 +479,16 @@ impl Trainer {
         self.step_in_accum += sequences;
         if self.step_in_accum >= self.grad_accum_steps {
             self.step_in_accum = 0;
+            // The window's losses are read in the same readback as the
+            // gradient norm, so the GPU waits for the host once, not twice.
+            let mut update = EMPTY_STATS;
+            let applied = self.apply_gradients(train_params, &mut update);
+            // Nothing was read when there were no gradients.
             self.read_pending_losses();
             let mut stats = self.deferred.pop().map_or(EMPTY_STATS, |d| d.stats);
-            let applied = self.apply_gradients(train_params, &mut stats);
+            stats.optimizer_step = update.optimizer_step;
+            stats.grad_norm = update.grad_norm;
+            stats.lr = update.lr;
             self.optimizer.zero_grad(train_params);
             self.deferred.push(DeferredStats { stats, rows: None });
             applied?;
@@ -498,6 +510,28 @@ impl Trainer {
         let buffers: Vec<&UnifiedTensor> = self.pending_rows.iter().collect();
         let losses = pollster::block_on(UnifiedTensor::read_many(&self.ctx, &buffers))
             .expect("GPU device lost during readback");
+        self.fill_losses(&losses);
+    }
+
+    /// [`read_pending_losses`](Self::read_pending_losses) with `extra` read in
+    /// the same readback; returns the values of `extra`.
+    #[expect(
+        clippy::expect_used,
+        reason = "a readback fails only on device loss, and the caller has no error path"
+    )]
+    fn read_pending_losses_with(&mut self, extra: &UnifiedTensor) -> Vec<f32> {
+        let mut buffers: Vec<&UnifiedTensor> = self.pending_rows.iter().collect();
+        buffers.push(extra);
+        let mut values = pollster::block_on(UnifiedTensor::read_many(&self.ctx, &buffers))
+            .expect("GPU device lost during readback");
+        let extra_values = values.pop().unwrap_or_default();
+        self.fill_losses(&values);
+        extra_values
+    }
+
+    /// Sets the mean loss of every deferred sequence from `losses`, one
+    /// vector per pending row buffer, and drops the buffers.
+    fn fill_losses(&mut self, losses: &[Vec<f32>]) {
         for d in &mut self.deferred {
             if let Some((index, rows)) = d.rows.take() {
                 let sum: f64 = losses[index][rows].iter().map(|&l| l as f64).sum();
@@ -574,10 +608,13 @@ impl Trainer {
         // One readback serves the scaler and the clip: the scaled norm tells
         // whether anything overflowed, and the norm over S is the true norm.
         let packed = self.pack_flat_grads(&grads);
-        let scaled_norm = match &packed {
-            Some(packed) => flat_grad_norm(packed, &self.ctx, &self.engine),
-            None => global_grad_norm(&grads, &self.ctx, &self.engine),
+        let partials = match &packed {
+            Some(packed) => record_flat_grad_norm(packed, &self.ctx, &self.engine),
+            None => record_global_grad_norm(&grads, &self.ctx, &self.engine),
         };
+        let scaled_norm = partials.map_or(0.0, |partials| {
+            norm_from_partials(&self.read_pending_losses_with(&partials))
+        });
         let unscale = match self.scaler.as_mut() {
             Some(scaler) => scaler.unscale_factor(scaled_norm),
             None => scaled_norm.is_finite().then_some(1.0),
@@ -631,6 +668,9 @@ impl Trainer {
         self.model
             .refresh_lora_mirrors(&self.engine)
             .map_err(TrainError)?;
+        // Submit the step now: the GPU starts on it while the host moves on,
+        // rather than when the next forward pass has recorded enough work.
+        self.ctx.flush();
         self.optimizer_step_count += 1;
         stats.optimizer_step = true;
         Ok(())
@@ -756,6 +796,21 @@ pub(crate) fn global_grad_norm(
     ctx: &WgpuContext,
     engine: &ComputeEngine,
 ) -> f32 {
+    let Some(partials) = record_global_grad_norm(grads, ctx, engine) else {
+        return 0.0;
+    };
+    norm_from_partials(
+        &pollster::block_on(partials.to_vec(ctx)).expect("GPU device lost during readback"),
+    )
+}
+
+/// Records the kernels that write the partial sums of squares of `grads`;
+/// `None` when there is nothing to sum.
+pub(crate) fn record_global_grad_norm(
+    grads: &[UnifiedTensor],
+    ctx: &WgpuContext,
+    engine: &ComputeEngine,
+) -> Option<UnifiedTensor> {
     let chunks: usize = grads
         .iter()
         .map(|g| {
@@ -766,44 +821,35 @@ pub(crate) fn global_grad_norm(
         })
         .sum();
     if chunks == 0 {
-        return 0.0;
+        return None;
     }
     let partials = UnifiedTensor::empty(ctx, &[chunks]);
     let mut offset = 0;
     for grad in grads {
         offset += engine.sum_squares_partial(ctx, grad, &partials, offset);
     }
-    let sum_sq: f64 = pollster::block_on(partials.to_vec(ctx))
-        .expect("GPU device lost during readback")
-        .iter()
-        .map(|&x| x as f64)
-        .sum();
-    sum_sq.sqrt() as f32
+    Some(partials)
 }
 
-/// [`global_grad_norm`] over gradients packed into one buffer: one dispatch.
-/// Each gradient starts on a chunk boundary, so the partial sums are the same
-/// as the per-tensor ones and so is the norm.
-#[expect(
-    clippy::expect_used,
-    reason = "a readback fails only on device loss, and the caller has no error path"
-)]
-pub(crate) fn flat_grad_norm(
+/// [`record_global_grad_norm`] over gradients packed into one buffer: one
+/// dispatch.
+pub(crate) fn record_flat_grad_norm(
     packed_grads: &FlatGrads,
     ctx: &WgpuContext,
     engine: &ComputeEngine,
-) -> f32 {
+) -> Option<UnifiedTensor> {
     let chunks = packed_grads.layout.total() / SUM_SQUARES_CHUNK;
     if chunks == 0 {
-        return 0.0;
+        return None;
     }
     let partials = UnifiedTensor::empty(ctx, &[chunks]);
     engine.sum_squares_partial(ctx, &packed_grads.data, &partials, 0);
-    let sum_sq: f64 = pollster::block_on(partials.to_vec(ctx))
-        .expect("GPU device lost during readback")
-        .iter()
-        .map(|&x| x as f64)
-        .sum();
+    Some(partials)
+}
+
+/// The norm from the partial sums of squares, added up in f64.
+pub(crate) fn norm_from_partials(partials: &[f32]) -> f32 {
+    let sum_sq: f64 = partials.iter().map(|&x| x as f64).sum();
     sum_sq.sqrt() as f32
 }
 
@@ -1210,8 +1256,21 @@ pub fn masked_cross_entropy_from_logits(
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use super::{masked_cross_entropy_from_logits, padded_length};
+    use super::{masked_cross_entropy_from_logits, norm_from_partials, padded_length};
     use crate::data::TrainingExample;
+
+    #[test]
+    fn norm_is_the_root_of_the_partial_sums_added_in_f64() {
+        assert_eq!(norm_from_partials(&[9.0, 16.0]), 5.0);
+        assert_eq!(norm_from_partials(&[]), 0.0);
+        // An f32 running sum would drop the four 1.0s next to 2^24 and give
+        // exactly 4096; in f64 the sum is 16,777,220 and its root rounds to
+        // the f32 above 4096.
+        assert_eq!(
+            norm_from_partials(&[16_777_216.0, 1.0, 1.0, 1.0, 1.0]),
+            4096.000_5
+        );
+    }
 
     #[test]
     fn default_bucket_pads_up_to_two_sequences_to_32_and_more_to_the_longest() {
