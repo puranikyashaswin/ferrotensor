@@ -73,14 +73,14 @@ sequences per optimizer step.
   A10G). It runs on every pull request
   on software Vulkan. The model is tiny, so it does not catch effects that
   only appear at scale.
-- **Held-out loss against PyTorch + PEFT on CUDA.** Same GPU, same recipe,
-  one seed per run: the held-out loss before training is identical to four
-  decimals, and after 250 steps Ferrotensor is within 0.005 of PyTorch for
-  SmolLM2-135M and SmolLM2-1.7B. Ferrotensor is slower per step: 0.84× of
-  PyTorch's speed for 135M at batch 1, 0.32× at batch 8, and 0.37× for 1.7B,
-  and PyTorch used less GPU memory in every configuration. This comparison
-  was measured on a 0.6 development build with f32 base weights, before the
-  memory work below
+- **Speed and held-out loss against PyTorch + PEFT on CUDA.** On one NVIDIA
+  A10G with the same recipe (SmolLM2, LoRA rank 8, batch 1 × 8, 250 steps,
+  median of three repeats), the code in this release trains 1.87× as fast
+  as eager PyTorch + PEFT for SmolLM2-135M, 1.83× for 360M and 1.13× for
+  1.7B. Its held-out loss is within 0.004 of PyTorch's at all three sizes.
+  PyTorch with `torch.compile` and CUDA graphs is still faster: for 135M at
+  batch 1 × 8, Ferrotensor runs at 0.26× of its speed. No matched memory
+  comparison with PyTorch has been run since 0.6
   ([comparison](docs/examples/lora-sft.md#against-pytorch--peft-on-cuda-same-gpu)).
 - **Less GPU memory for LoRA.** Peak GPU memory (`nvidia-smi`, MiB) for 30
   optimizer steps with f16 base weights, batch 1 × 8-step accumulation

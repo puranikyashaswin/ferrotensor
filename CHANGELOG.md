@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-11-21
+
+Five GPU kernel changes to LoRA training, in attention, matmul and the LoRA scale. One library change can break code: `FlashAttentionNode` has two new public fields, so code that builds it with a struct literal must set them (under Changed).
+
+### Added
+- Library: `ComputeEngine::flash_attention_v2_with_stats` and `flash_attention_v2_backward_with_stats` run attention with the per-row log-sum-exp saved in the forward pass and read back in backward. (#168)
+
+### Changed
+- LoRA layers scale the rank-sized `x @ A` instead of the full-size product, and skip the scale when alpha equals rank. (#165)
+- The tile matmul reads a transposed weight along k, so the frozen forward `x @ W^T` loads it coalesced. (#166)
+- Training attention saves the forward output and log-sum-exp and no longer reruns the forward kernel inside backward. `FlashAttentionNode` gains the public fields `out` and `stats`. (#168)
+- Attention forward and backward run in 16-row blocks with eight threads per row, so short sequences use many more workgroups. (#169)
+- Matmuls with 16 to 256 rows against a weight at least 256 wide and deep run through a new split-K kernel with a deterministic reduction. (#172)
+- The README and the LoRA SFT example compare this code with PyTorch + PEFT on one A10G (19 November 2026): 1.87×, 1.83× and 1.13× as fast as eager PyTorch at SmolLM2-135M, 360M and 1.7B, and 0.26× of PyTorch with `torch.compile` and CUDA graphs at 135M. This replaces the comparison measured on a 0.6 development build.
+
 ## [0.7.0] - 2026-11-19
 
 Two behaviour changes to know before upgrading: `--train-modules layers.N` now matches layer `N` exactly, and `train --resume` with `--max-steps` at or below the saved step now trains nothing (both under Changed). `--q4-weights` is experimental and still fails its quality gate (under Added).
@@ -220,7 +235,8 @@ First public version.
 - Renamed the project from Rusty to Ferrotensor; crates are now `ferrotensor-*` and the CLI binary is `ferrotensor`.
 - Licensed under MIT OR Apache-2.0 (previously MIT only).
 
-[Unreleased]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.4.0...v0.5.0

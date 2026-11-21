@@ -1,6 +1,6 @@
 [package]
 name = "ferrotensor-benchmarks"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 description = "Benchmarks for the Ferrotensor GPU ML framework"
 authors.workspace = true
@@ -35,8 +35,8 @@ path = "benches/gpu.rs"
 harness = false
 
 [dependencies]
-ferrotensor = { path = "../ferrotensor", version = "0.7.0" }
-ferrotensor-backend = { path = "../ferrotensor-backend", version = "0.7.0" }
+ferrotensor = { path = "../ferrotensor", version = "0.7.1" }
+ferrotensor-backend = { path = "../ferrotensor-backend", version = "0.7.1" }
 pollster = "0.3"
 wgpu = "0.19"
 rand = "0.8"
