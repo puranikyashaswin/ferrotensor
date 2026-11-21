@@ -50,28 +50,25 @@ impl Tuned {
 }
 
 /// The fastest configuration of every base-weight product of LoRA
-/// fine-tuning SmolLM2-135M and 360M at 256 and 2048 rows, and of 1.7B at
-/// 2048 rows, from one `matmul-tune` run on an NVIDIA A10G. A K split stands
-/// only where it was at least 10% faster than the best unsplit configuration,
-/// since it costs a second pass and a partial-sum buffer that the bench's
-/// isolated calls charge only in part. The 1.7B products at 256 rows are not
-/// here: see [`STEP_RULE`]. The 1024-row rows are the fastest configuration of
+/// fine-tuning SmolLM2-135M and 360M at 2048 rows, and of 1.7B at 2048 rows,
+/// from one `matmul-tune` run on an NVIDIA A10G. A K split stands only where
+/// it was at least 10% faster than the best unsplit configuration, since it
+/// costs a second pass and a partial-sum buffer that the bench's isolated
+/// calls charge only in part. The 64, 128, 192 and 256-row rows of all three
+/// models (plain and fused products, and the head) are the configuration with
+/// the lowest geometric mean time over the row counts of their bucket (32 and
+/// 64, 96 and 128, 192, 256), from one `matmul_bench --tiles` run on an NVIDIA
+/// A10G that timed every tile of `CoopTile::ALL` and `CoopTile::PIPELINED`
+/// with K split 1 to 8 and to fill the GPU; four narrow 256-row products of
+/// the older `matmul-tune` run, absent from that sweep, stay. The 1024-row rows are the fastest configuration of
 /// each product of a 1024-row step of all three models (fused QKV and 135M
 /// gate/up with their LoRA columns, the other products plain, and the head),
 /// from one `matmul_bench --tiles --rows 1024` run on an NVIDIA A10G, which
 /// times every tile of `CoopTile::ALL` and `CoopTile::PIPELINED`.
 const TUNED: &[Tuned] = &[
     // SmolLM2-135M
-    Tuned::new(256, true, 576, 576, CoopTile::T32X64_W16X16_K64_DB, 1),
-    Tuned::new(256, false, 576, 576, CoopTile::T32X64_W16X16_K64_DB, 1),
     Tuned::new(256, true, 576, 192, CoopTile::T32X64_W16X16_K64_DB, 1),
     Tuned::new(256, false, 192, 576, CoopTile::T32X64_W16X16_K64_DB, 1),
-    Tuned::new(256, true, 576, 1536, CoopTile::T32X32_W16X16_K32, 1),
-    Tuned::new(256, false, 1536, 576, CoopTile::T64X64_W16X32_K32_DB, 6),
-    Tuned::new(256, true, 1536, 576, CoopTile::T64X64_W16X32_K32_DB, 6),
-    Tuned::new(256, false, 576, 1536, CoopTile::T32X32_W16X16_K32, 1),
-    Tuned::new(256, true, 576, 49152, CoopTile::T128X64_W32X32_K32_DB, 1),
-    Tuned::new(256, false, 49152, 576, CoopTile::T64X64_W16X32_K32_DB, 6),
     Tuned::new(2048, true, 576, 576, CoopTile::T128X64_W32X32_K32_DB, 1),
     Tuned::new(2048, false, 576, 576, CoopTile::T128X64_W32X32_K32_DB, 1),
     Tuned::new(2048, true, 576, 192, CoopTile::T32X32_W16X16_K32, 1),
@@ -83,16 +80,8 @@ const TUNED: &[Tuned] = &[
     Tuned::new(2048, true, 576, 49152, CoopTile::T128X64_W64X32_K32, 1),
     Tuned::new(2048, false, 49152, 576, CoopTile::T128X64_W32X32_K32_DB, 1),
     // SmolLM2-360M
-    Tuned::new(256, true, 960, 960, CoopTile::T32X64_W16X16_K64_DB, 1),
-    Tuned::new(256, false, 960, 960, CoopTile::T32X64_W16X16_K64_DB, 1),
     Tuned::new(256, true, 960, 320, CoopTile::T32X64_W16X16_K64_DB, 4),
     Tuned::new(256, false, 320, 960, CoopTile::T32X64_W16X16_K64_DB, 1),
-    Tuned::new(256, true, 960, 2560, CoopTile::T64X64_W16X32_K32_DB, 1),
-    Tuned::new(256, false, 2560, 960, CoopTile::T64X64_W16X32_K32_DB, 4),
-    Tuned::new(256, true, 2560, 960, CoopTile::T64X64_W16X32_K32_DB, 4),
-    Tuned::new(256, false, 960, 2560, CoopTile::T64X64_W16X32_K32_DB, 1),
-    Tuned::new(256, true, 960, 49152, CoopTile::T128X64_W64X32_K32, 1),
-    Tuned::new(256, false, 49152, 960, CoopTile::T64X64_W32X32_K32, 8),
     Tuned::new(2048, true, 960, 960, CoopTile::T64X64_W32X32_K32, 1),
     Tuned::new(2048, false, 960, 960, CoopTile::T64X64_W32X32_K32, 1),
     Tuned::new(2048, true, 960, 320, CoopTile::T64X64_W16X32_K32_DB, 1),
@@ -112,6 +101,144 @@ const TUNED: &[Tuned] = &[
     Tuned::new(2048, false, 2048, 8192, CoopTile::T64X64_W32X32_K32, 1),
     Tuned::new(2048, true, 2048, 49152, CoopTile::T128X64_W64X32_K32, 1),
     Tuned::new(2048, false, 49152, 2048, CoopTile::T64X64_W16X32_K32_DB, 1),
+    // SmolLM2-135M at 64, 128, 192 and 256 rows
+    Tuned::new(64, true, 576, 576, CoopTile::T32X32_W16X16_K64_DB, 5),
+    Tuned::new(64, true, 576, 1536, CoopTile::T32X64_W16X32_K32_DB, 1),
+    Tuned::new(64, true, 576, 49152, CoopTile::T64X64_W32X32_K32_PF, 1),
+    Tuned::new(64, true, 984, 576, CoopTile::T32X32_W16X16_K64_DB, 4),
+    Tuned::new(64, true, 1536, 576, CoopTile::T32X32_W16X16_K64_DB, 4),
+    Tuned::new(64, true, 3088, 576, CoopTile::T32X64_W16X16_K64_DB, 7),
+    Tuned::new(64, false, 576, 576, CoopTile::T32X32_W16X16_K64_DB, 5),
+    Tuned::new(64, false, 576, 984, CoopTile::T32X32_W16X16_K64_DB, 1),
+    Tuned::new(64, false, 576, 1536, CoopTile::T32X32_W16X16_K32, 1),
+    Tuned::new(64, false, 576, 3088, CoopTile::T32X32_W16X16_K32, 1),
+    Tuned::new(64, false, 1536, 576, CoopTile::T32X32_W16X16_K32, 4),
+    Tuned::new(64, false, 49152, 576, CoopTile::T32X64_W16X16_K64_DB, 8),
+    Tuned::new(128, true, 576, 576, CoopTile::T32X64_W16X16_K64_DB, 1),
+    Tuned::new(128, true, 576, 1536, CoopTile::T32X32_W16X16_K64_DB, 1),
+    Tuned::new(128, true, 576, 49152, CoopTile::T128X64_W32X32_K32_PF, 1),
+    Tuned::new(128, true, 984, 576, CoopTile::T32X32_W16X16_K32, 8),
+    Tuned::new(128, true, 1536, 576, CoopTile::T64X64_W16X32_K32_DB, 8),
+    Tuned::new(128, true, 3088, 576, CoopTile::T32X32_W16X16_K32, 8),
+    Tuned::new(128, false, 576, 576, CoopTile::T32X32_W16X16_K64_DB, 1),
+    Tuned::new(128, false, 576, 984, CoopTile::T32X64_W16X16_K64_DB, 1),
+    Tuned::new(128, false, 576, 1536, CoopTile::T32X32_W16X16_K64_DB, 1),
+    Tuned::new(128, false, 576, 3088, CoopTile::T64X64_W32X32_K32_PF, 1),
+    Tuned::new(128, false, 1536, 576, CoopTile::T64X64_W16X32_K32_DB, 6),
+    Tuned::new(128, false, 49152, 576, CoopTile::T128X128_W64X64_K32_PF, 32),
+    Tuned::new(192, true, 576, 576, CoopTile::T32X64_W16X16_K64_DB, 1),
+    Tuned::new(192, true, 576, 1536, CoopTile::T128X64_W32X32_K32_PF, 1),
+    Tuned::new(192, true, 576, 49152, CoopTile::T128X128_W64X64_K32_PF, 1),
+    Tuned::new(192, true, 984, 576, CoopTile::T32X64_W16X32_K32_DB, 4),
+    Tuned::new(192, true, 1536, 576, CoopTile::T32X32_W16X16_K64_DB, 1),
+    Tuned::new(192, true, 3088, 576, CoopTile::T64X64_W16X32_K32_DB, 6),
+    Tuned::new(192, false, 576, 576, CoopTile::T32X32_W16X16_K64_DB, 1),
+    Tuned::new(192, false, 576, 984, CoopTile::T64X64_W32X32_K32_DB, 3),
+    Tuned::new(192, false, 576, 1536, CoopTile::T32X32_W16X16_K64_DB, 1),
+    Tuned::new(192, false, 576, 3088, CoopTile::T64X64_W16X32_K32_DB, 1),
+    Tuned::new(192, false, 1536, 576, CoopTile::T64X64_W32X32_K32_DB, 6),
+    Tuned::new(192, false, 49152, 576, CoopTile::T64X64_W32X32_K32_PF, 8),
+    Tuned::new(256, true, 576, 576, CoopTile::T32X64_W16X32_K32_DB, 1),
+    Tuned::new(256, true, 576, 1536, CoopTile::T64X64_W32X32_K32_PF, 1),
+    Tuned::new(256, true, 576, 49152, CoopTile::T128X128_W64X64_K32_PF, 1),
+    Tuned::new(256, true, 984, 576, CoopTile::T32X64_W16X16_K64_DB, 1),
+    Tuned::new(256, true, 1536, 576, CoopTile::T32X64_W16X16_K64_DB, 1),
+    Tuned::new(256, true, 3088, 576, CoopTile::T64X64_W16X32_K32_DB, 5),
+    Tuned::new(256, false, 576, 576, CoopTile::T64X32_W32X16_K32_DB, 1),
+    Tuned::new(256, false, 576, 984, CoopTile::T64X64_W32X32_K32, 1),
+    Tuned::new(256, false, 576, 1536, CoopTile::T64X64_W32X32_K32_PF, 1),
+    Tuned::new(256, false, 576, 3088, CoopTile::T64X64_W32X32_K32_PF, 1),
+    Tuned::new(256, false, 1536, 576, CoopTile::T32X64_W16X32_K32_DB, 3),
+    Tuned::new(256, false, 49152, 576, CoopTile::T128X128_W64X64_K32_PF, 16),
+    // SmolLM2-360M at 64, 128, 192 and 256 rows
+    Tuned::new(64, true, 960, 960, CoopTile::T32X32_W16X16_K64_DB, 1),
+    Tuned::new(64, true, 960, 2560, CoopTile::T32X32_W16X16_K64_DB, 1),
+    Tuned::new(64, true, 960, 49152, CoopTile::T64X64_W32X32_K32_DB, 1),
+    Tuned::new(64, true, 1624, 960, CoopTile::T32X32_W16X16_K32, 5),
+    Tuned::new(64, true, 2560, 960, CoopTile::T32X64_W16X16_K64_DB, 5),
+    Tuned::new(64, false, 960, 960, CoopTile::T32X32_W16X16_K64_DB, 1),
+    Tuned::new(64, false, 960, 1624, CoopTile::T32X32_W16X16_K64_DB, 1),
+    Tuned::new(64, false, 960, 2560, CoopTile::T32X32_W16X16_K64_DB, 1),
+    Tuned::new(64, false, 2560, 960, CoopTile::T32X64_W16X16_K64_DB, 8),
+    Tuned::new(64, false, 49152, 960, CoopTile::T64X128_W32X64_K32_DB, 20),
+    Tuned::new(128, true, 960, 960, CoopTile::T32X64_W16X32_K32_DB, 4),
+    Tuned::new(128, true, 960, 2560, CoopTile::T32X64_W16X16_K64_DB, 1),
+    Tuned::new(128, true, 960, 49152, CoopTile::T128X64_W32X32_K32_PF, 1),
+    Tuned::new(128, true, 1624, 960, CoopTile::T64X64_W16X32_K32_DB, 6),
+    Tuned::new(128, true, 2560, 960, CoopTile::T128X64_W32X32_K32_PF, 10),
+    Tuned::new(128, false, 960, 960, CoopTile::T64X32_W32X16_K32_DB, 4),
+    Tuned::new(128, false, 960, 1624, CoopTile::T32X64_W16X16_K64_DB, 1),
+    Tuned::new(128, false, 960, 2560, CoopTile::T32X64_W16X16_K64_DB, 1),
+    Tuned::new(128, false, 2560, 960, CoopTile::T64X64_W32X32_K32_PF, 8),
+    Tuned::new(128, false, 49152, 960, CoopTile::T64X64_W32X32_K32_PF, 8),
+    Tuned::new(192, true, 960, 960, CoopTile::T32X64_W16X16_K64_DB, 1),
+    Tuned::new(192, true, 960, 2560, CoopTile::T64X64_W32X32_K32_PF, 2),
+    Tuned::new(192, true, 960, 49152, CoopTile::T128X128_W64X64_K32_PF, 1),
+    Tuned::new(192, true, 1624, 960, CoopTile::T64X64_W16X32_K32_DB, 4),
+    Tuned::new(192, true, 2560, 960, CoopTile::T64X64_W32X32_K32_PF, 5),
+    Tuned::new(192, false, 960, 960, CoopTile::T32X32_W16X16_K64_DB, 1),
+    Tuned::new(192, false, 960, 1624, CoopTile::T64X64_W32X32_K32, 1),
+    Tuned::new(192, false, 960, 2560, CoopTile::T32X64_W16X32_K32_DB, 1),
+    Tuned::new(192, false, 2560, 960, CoopTile::T64X64_W32X32_K32_PF, 7),
+    Tuned::new(192, false, 49152, 960, CoopTile::T64X64_W32X32_K32_DB, 7),
+    Tuned::new(256, true, 960, 960, CoopTile::T32X32_W16X16_K64_DB, 1),
+    Tuned::new(256, true, 960, 2560, CoopTile::T64X64_W16X32_K32_DB, 1),
+    Tuned::new(256, true, 960, 49152, CoopTile::T128X128_W64X64_K32_PF, 1),
+    Tuned::new(256, true, 1624, 960, CoopTile::T64X64_W16X32_K32_DB, 4),
+    Tuned::new(256, true, 2560, 960, CoopTile::T64X64_W32X32_K32_DB, 4),
+    Tuned::new(256, false, 960, 960, CoopTile::T32X64_W16X16_K64_DB, 1),
+    Tuned::new(256, false, 960, 1624, CoopTile::T128X64_W32X32_K32_PF, 3),
+    Tuned::new(256, false, 960, 2560, CoopTile::T32X64_W16X32_K32_DB, 1),
+    Tuned::new(256, false, 2560, 960, CoopTile::T128X64_W32X32_K32_DB, 5),
+    Tuned::new(256, false, 49152, 960, CoopTile::T128X128_W64X64_K32_PF, 10),
+    // SmolLM2-1.7B at 64, 128, 192 and 256 rows
+    Tuned::new(64, true, 2048, 2048, CoopTile::T32X32_W16X16_K64_DB, 1),
+    Tuned::new(64, true, 2048, 8192, CoopTile::T32X32_W16X16_K64_DB, 1),
+    Tuned::new(64, true, 2048, 49152, CoopTile::T64X64_W32X32_K32_DB, 1),
+    Tuned::new(64, true, 6168, 2048, CoopTile::T32X64_W16X16_K64_DB, 5),
+    Tuned::new(64, true, 8192, 2048, CoopTile::T32X32_W16X16_K64_DB, 5),
+    Tuned::new(64, false, 2048, 2048, CoopTile::T64X64_W16X32_K32_DB, 5),
+    Tuned::new(64, false, 2048, 6168, CoopTile::T64X64_W16X32_K32_DB, 1),
+    Tuned::new(64, false, 2048, 8192, CoopTile::T64X64_W32X32_K32_PF, 1),
+    Tuned::new(64, false, 8192, 2048, CoopTile::T64X64_W16X32_K32_DB, 6),
+    Tuned::new(64, false, 49152, 2048, CoopTile::T64X128_W32X64_K32_DB, 10),
+    Tuned::new(128, true, 2048, 2048, CoopTile::T128X64_W32X32_K32_DB, 5),
+    Tuned::new(128, true, 2048, 8192, CoopTile::T128X64_W32X32_K32_PF, 1),
+    Tuned::new(128, true, 2048, 49152, CoopTile::T128X64_W32X32_K32_PF, 1),
+    Tuned::new(128, true, 6168, 2048, CoopTile::T128X128_W32X32_K32_PF1, 5),
+    Tuned::new(128, true, 8192, 2048, CoopTile::T128X64_W32X32_K32_PF, 5),
+    Tuned::new(128, false, 2048, 2048, CoopTile::T128X64_W32X32_K32_PF, 5),
+    Tuned::new(128, false, 2048, 6168, CoopTile::T64X64_W32X32_K32_PF, 1),
+    Tuned::new(128, false, 2048, 8192, CoopTile::T128X64_W32X32_K32_PF, 1),
+    Tuned::new(128, false, 8192, 2048, CoopTile::T128X64_W32X32_K32_PF, 5),
+    Tuned::new(
+        128,
+        false,
+        49152,
+        2048,
+        CoopTile::T128X128_W64X64_K32_PF,
+        10,
+    ),
+    Tuned::new(192, true, 2048, 2048, CoopTile::T64X64_W32X32_K32_PF, 3),
+    Tuned::new(192, true, 2048, 8192, CoopTile::T64X64_W32X32_K32, 1),
+    Tuned::new(192, true, 2048, 49152, CoopTile::T128X128_W64X64_K32_PF, 1),
+    Tuned::new(192, true, 6168, 2048, CoopTile::T64X64_W16X32_K32_DB, 5),
+    Tuned::new(192, true, 8192, 2048, CoopTile::T64X128_W32X64_K32_DB, 3),
+    Tuned::new(192, false, 2048, 2048, CoopTile::T64X64_W32X32_K32_PF, 3),
+    Tuned::new(192, false, 2048, 6168, CoopTile::T64X128_W32X64_K32_DB, 1),
+    Tuned::new(192, false, 2048, 8192, CoopTile::T64X128_W32X64_K32_DB, 1),
+    Tuned::new(192, false, 8192, 2048, CoopTile::T64X128_W32X64_K32_DB, 5),
+    Tuned::new(192, false, 49152, 2048, CoopTile::T64X128_W32X64_K32_DB, 5),
+    Tuned::new(256, true, 2048, 2048, CoopTile::T64X64_W32X32_K32_PF, 1),
+    Tuned::new(256, true, 2048, 8192, CoopTile::T128X128_W64X64_K32_PF, 1),
+    Tuned::new(256, true, 2048, 49152, CoopTile::T128X128_W64X64_K32_PF, 1),
+    Tuned::new(256, true, 6168, 2048, CoopTile::T64X64_W32X32_K32, 4),
+    Tuned::new(256, true, 8192, 2048, CoopTile::T128X128_W64X64_K32_PF, 5),
+    Tuned::new(256, false, 2048, 2048, CoopTile::T64X64_W32X32_K32_PF, 1),
+    Tuned::new(256, false, 2048, 6168, CoopTile::T64X128_W32X64_K32_DB, 1),
+    Tuned::new(256, false, 2048, 8192, CoopTile::T128X128_W64X64_K32_PF, 1),
+    Tuned::new(256, false, 8192, 2048, CoopTile::T128X128_W64X64_K32_PF, 5),
+    Tuned::new(256, false, 49152, 2048, CoopTile::T128X128_W64X64_K32_PF, 5),
     // SmolLM2-135M at 1024 rows (fused QKV and gate/up with their LoRA columns)
     Tuned::new(1024, false, 576, 984, CoopTile::T64X64_W32X32_K32, 1),
     Tuned::new(1024, true, 984, 576, CoopTile::T64X64_W16X32_K32_DB, 1),
@@ -156,16 +283,19 @@ const TUNED: &[Tuned] = &[
     ),
 ];
 
-/// Rows the [`TUNED`] rows stand for, in the order they are looked up: the
-/// 256-row ones for up to 256 rows, the 1024-row ones and then the 2048-row
-/// ones up to 1024, the 2048-row ones above that, up to 2048. Training
-/// batches are padded to their longest sequence, so a step's row count is
-/// rarely exactly 256, 1024 or 2048, and an exact match would leave most
-/// products to the fallback rule. `m` is rounded up to a multiple of 16
-/// first, the size of a fragment row.
+/// Rows the [`TUNED`] rows stand for, in the order they are looked up: for up
+/// to 256 rows the row of the bucket (64, 128, 192 or 256 rows) and then the
+/// 256-row one, the 1024-row ones and then the 2048-row ones up to 1024, the
+/// 2048-row ones above that, up to 2048. Training batches are padded to their
+/// longest sequence, so a step's row count is rarely exactly one of these,
+/// and an exact match would leave most products to the fallback rule. `m` is
+/// rounded up to a multiple of 16 first, the size of a fragment row.
 fn tuned_rows(m: u32) -> &'static [u32] {
     match m.div_ceil(16) * 16 {
-        0..=256 => &[256],
+        0..=64 => &[64, 256],
+        65..=128 => &[128, 256],
+        129..=192 => &[192, 256],
+        193..=256 => &[256],
         257..=1024 => &[1024, 2048],
         1025..=2048 => &[2048],
         _ => &[],
@@ -186,7 +316,9 @@ fn tuned(m: u32, transposed_b: bool, k: u32, n: u32) -> Option<CoopConfig> {
 }
 
 /// The 1.7B base-weight products of up to 256 rows, as `(a@bT, k, n)`, whose
-/// `matmul-tune` winners lose in a training step. The bench winners (the
+/// `matmul-tune` winners lost in a training step. Their rows are now the
+/// small-row sweep's and this list applies only where a row's tile does not
+/// fit the device. The bench winners (the
 /// 128x64 and 64x64 tiles with one staging buffer, one K split of 3 or none)
 /// took 1.3 to 2.4 times as long in a `--profile` of a 30-step 1.7B run with
 /// micro-batches of 64 to 256 rows as the double-buffered 64x64 tile with K
@@ -395,16 +527,8 @@ mod tests {
     /// configuration)`, copied from that run's `matmul_tune.md`.
     const BENCH: &[(u32, bool, u32, u32, &str)] = &[
         // SmolLM2-135M
-        (256, true, 576, 576, "32x64/w16x16/k64/db s1"),
-        (256, false, 576, 576, "32x64/w16x16/k64/db s1"),
         (256, true, 576, 192, "32x64/w16x16/k64/db s5"),
         (256, false, 192, 576, "32x64/w16x16/k64/db s1"),
-        (256, true, 576, 1536, "32x32/w16x16/k32 s1"),
-        (256, false, 1536, 576, "64x64/w16x32/k32/db s6"),
-        (256, true, 1536, 576, "64x64/w16x32/k32/db s6"),
-        (256, false, 576, 1536, "32x32/w16x16/k32 s1"),
-        (256, true, 576, 49152, "128x64/w32x32/k32/db s1"),
-        (256, false, 49152, 576, "64x64/w16x32/k32/db s6"),
         (2048, true, 576, 576, "128x64/w32x32/k32/db s1"),
         (2048, false, 576, 576, "128x64/w32x32/k32/db s1"),
         (2048, true, 576, 192, "32x32/w16x16/k32 s1"),
@@ -416,16 +540,8 @@ mod tests {
         (2048, true, 576, 49152, "128x64/w64x32/k32 s1"),
         (2048, false, 49152, 576, "128x64/w64x32/k32 s2"),
         // SmolLM2-360M
-        (256, true, 960, 960, "32x64/w16x16/k64/db s1"),
-        (256, false, 960, 960, "32x64/w16x16/k64/db s1"),
         (256, true, 960, 320, "32x64/w16x16/k64/db s4"),
         (256, false, 320, 960, "32x64/w16x16/k64/db s1"),
-        (256, true, 960, 2560, "64x64/w16x32/k32/db s1"),
-        (256, false, 2560, 960, "64x64/w16x32/k32/db s4"),
-        (256, true, 2560, 960, "64x64/w16x32/k32/db s4"),
-        (256, false, 960, 2560, "64x64/w16x32/k32/db s1"),
-        (256, true, 960, 49152, "128x64/w64x32/k32 s1"),
-        (256, false, 49152, 960, "64x64/w32x32/k32 s8"),
         (2048, true, 960, 960, "64x64/w32x32/k32 s1"),
         (2048, false, 960, 960, "64x64/w32x32/k32 s1"),
         (2048, true, 960, 320, "64x64/w16x32/k32/db s1"),
@@ -489,6 +605,144 @@ mod tests {
         (1024, false, 49152, 2048, "128x128/w64x64/k32/db/pf s4"),
     ];
 
+    /// The configuration with the lowest geometric mean time over the row
+    /// counts of each bucket that `matmul_bench --tiles` found on an NVIDIA
+    /// A10G for the products of SmolLM2 training at up to 256 rows: `(bucket
+    /// rows, a@bT, k, n, configuration)`.
+    const BENCH_SMALL: &[(u32, bool, u32, u32, &str)] = &[
+        // SmolLM2-135M
+        (64, true, 576, 576, "32x32/w16x16/k64/db s5"),
+        (64, true, 576, 1536, "32x64/w16x32/k32/db s1"),
+        (64, true, 576, 49152, "64x64/w32x32/k32/db/pf s1"),
+        (64, true, 984, 576, "32x32/w16x16/k64/db s4"),
+        (64, true, 1536, 576, "32x32/w16x16/k64/db s4"),
+        (64, true, 3088, 576, "32x64/w16x16/k64/db s7"),
+        (64, false, 576, 576, "32x32/w16x16/k64/db s5"),
+        (64, false, 576, 984, "32x32/w16x16/k64/db s1"),
+        (64, false, 576, 1536, "32x32/w16x16/k32 s1"),
+        (64, false, 576, 3088, "32x32/w16x16/k32 s1"),
+        (64, false, 1536, 576, "32x32/w16x16/k32 s4"),
+        (64, false, 49152, 576, "32x64/w16x16/k64/db s8"),
+        (128, true, 576, 576, "32x64/w16x16/k64/db s1"),
+        (128, true, 576, 1536, "32x32/w16x16/k64/db s1"),
+        (128, true, 576, 49152, "128x64/w32x32/k32/db/pf s1"),
+        (128, true, 984, 576, "32x32/w16x16/k32 s8"),
+        (128, true, 1536, 576, "64x64/w16x32/k32/db s8"),
+        (128, true, 3088, 576, "32x32/w16x16/k32 s8"),
+        (128, false, 576, 576, "32x32/w16x16/k64/db s1"),
+        (128, false, 576, 984, "32x64/w16x16/k64/db s1"),
+        (128, false, 576, 1536, "32x32/w16x16/k64/db s1"),
+        (128, false, 576, 3088, "64x64/w32x32/k32/db/pf s1"),
+        (128, false, 1536, 576, "64x64/w16x32/k32/db s6"),
+        (128, false, 49152, 576, "128x128/w64x64/k32/db/pf s32"),
+        (192, true, 576, 576, "32x64/w16x16/k64/db s1"),
+        (192, true, 576, 1536, "128x64/w32x32/k32/db/pf s1"),
+        (192, true, 576, 49152, "128x128/w64x64/k32/db/pf s1"),
+        (192, true, 984, 576, "32x64/w16x32/k32/db s4"),
+        (192, true, 1536, 576, "32x32/w16x16/k64/db s1"),
+        (192, true, 3088, 576, "64x64/w16x32/k32/db s6"),
+        (192, false, 576, 576, "32x32/w16x16/k64/db s1"),
+        (192, false, 576, 984, "64x64/w32x32/k32/db s3"),
+        (192, false, 576, 1536, "32x32/w16x16/k64/db s1"),
+        (192, false, 576, 3088, "64x64/w16x32/k32/db s1"),
+        (192, false, 1536, 576, "64x64/w32x32/k32/db s6"),
+        (192, false, 49152, 576, "64x64/w32x32/k32/db/pf s8"),
+        (256, true, 576, 576, "32x64/w16x32/k32/db s1"),
+        (256, true, 576, 1536, "64x64/w32x32/k32/db/pf s1"),
+        (256, true, 576, 49152, "128x128/w64x64/k32/db/pf s1"),
+        (256, true, 984, 576, "32x64/w16x16/k64/db s1"),
+        (256, true, 1536, 576, "32x64/w16x16/k64/db s1"),
+        (256, true, 3088, 576, "64x64/w16x32/k32/db s5"),
+        (256, false, 576, 576, "64x32/w32x16/k32/db s1"),
+        (256, false, 576, 984, "64x64/w32x32/k32 s1"),
+        (256, false, 576, 1536, "64x64/w32x32/k32/db/pf s1"),
+        (256, false, 576, 3088, "64x64/w32x32/k32/db/pf s1"),
+        (256, false, 1536, 576, "32x64/w16x32/k32/db s3"),
+        (256, false, 49152, 576, "128x128/w64x64/k32/db/pf s16"),
+        // SmolLM2-360M
+        (64, true, 960, 960, "32x32/w16x16/k64/db s1"),
+        (64, true, 960, 2560, "32x32/w16x16/k64/db s1"),
+        (64, true, 960, 49152, "64x64/w32x32/k32/db s1"),
+        (64, true, 1624, 960, "32x32/w16x16/k32 s5"),
+        (64, true, 2560, 960, "32x64/w16x16/k64/db s5"),
+        (64, false, 960, 960, "32x32/w16x16/k64/db s1"),
+        (64, false, 960, 1624, "32x32/w16x16/k64/db s1"),
+        (64, false, 960, 2560, "32x32/w16x16/k64/db s1"),
+        (64, false, 2560, 960, "32x64/w16x16/k64/db s8"),
+        (64, false, 49152, 960, "64x128/w32x64/k32/db s20"),
+        (128, true, 960, 960, "32x64/w16x32/k32/db s4"),
+        (128, true, 960, 2560, "32x64/w16x16/k64/db s1"),
+        (128, true, 960, 49152, "128x64/w32x32/k32/db/pf s1"),
+        (128, true, 1624, 960, "64x64/w16x32/k32/db s6"),
+        (128, true, 2560, 960, "128x64/w32x32/k32/db/pf s10"),
+        (128, false, 960, 960, "64x32/w32x16/k32/db s4"),
+        (128, false, 960, 1624, "32x64/w16x16/k64/db s1"),
+        (128, false, 960, 2560, "32x64/w16x16/k64/db s1"),
+        (128, false, 2560, 960, "64x64/w32x32/k32/db/pf s8"),
+        (128, false, 49152, 960, "64x64/w32x32/k32/db/pf s8"),
+        (192, true, 960, 960, "32x64/w16x16/k64/db s1"),
+        (192, true, 960, 2560, "64x64/w32x32/k32/db/pf s2"),
+        (192, true, 960, 49152, "128x128/w64x64/k32/db/pf s1"),
+        (192, true, 1624, 960, "64x64/w16x32/k32/db s4"),
+        (192, true, 2560, 960, "64x64/w32x32/k32/db/pf s5"),
+        (192, false, 960, 960, "32x32/w16x16/k64/db s1"),
+        (192, false, 960, 1624, "64x64/w32x32/k32 s1"),
+        (192, false, 960, 2560, "32x64/w16x32/k32/db s1"),
+        (192, false, 2560, 960, "64x64/w32x32/k32/db/pf s7"),
+        (192, false, 49152, 960, "64x64/w32x32/k32/db s7"),
+        (256, true, 960, 960, "32x32/w16x16/k64/db s1"),
+        (256, true, 960, 2560, "64x64/w16x32/k32/db s1"),
+        (256, true, 960, 49152, "128x128/w64x64/k32/db/pf s1"),
+        (256, true, 1624, 960, "64x64/w16x32/k32/db s4"),
+        (256, true, 2560, 960, "64x64/w32x32/k32/db s4"),
+        (256, false, 960, 960, "32x64/w16x16/k64/db s1"),
+        (256, false, 960, 1624, "128x64/w32x32/k32/db/pf s3"),
+        (256, false, 960, 2560, "32x64/w16x32/k32/db s1"),
+        (256, false, 2560, 960, "128x64/w32x32/k32/db s5"),
+        (256, false, 49152, 960, "128x128/w64x64/k32/db/pf s10"),
+        // SmolLM2-1.7B
+        (64, true, 2048, 2048, "32x32/w16x16/k64/db s1"),
+        (64, true, 2048, 8192, "32x32/w16x16/k64/db s1"),
+        (64, true, 2048, 49152, "64x64/w32x32/k32/db s1"),
+        (64, true, 6168, 2048, "32x64/w16x16/k64/db s5"),
+        (64, true, 8192, 2048, "32x32/w16x16/k64/db s5"),
+        (64, false, 2048, 2048, "64x64/w16x32/k32/db s5"),
+        (64, false, 2048, 6168, "64x64/w16x32/k32/db s1"),
+        (64, false, 2048, 8192, "64x64/w32x32/k32/db/pf s1"),
+        (64, false, 8192, 2048, "64x64/w16x32/k32/db s6"),
+        (64, false, 49152, 2048, "64x128/w32x64/k32/db s10"),
+        (128, true, 2048, 2048, "128x64/w32x32/k32/db s5"),
+        (128, true, 2048, 8192, "128x64/w32x32/k32/db/pf s1"),
+        (128, true, 2048, 49152, "128x64/w32x32/k32/db/pf s1"),
+        (128, true, 6168, 2048, "128x128/w32x32/k32/pf s5"),
+        (128, true, 8192, 2048, "128x64/w32x32/k32/db/pf s5"),
+        (128, false, 2048, 2048, "128x64/w32x32/k32/db/pf s5"),
+        (128, false, 2048, 6168, "64x64/w32x32/k32/db/pf s1"),
+        (128, false, 2048, 8192, "128x64/w32x32/k32/db/pf s1"),
+        (128, false, 8192, 2048, "128x64/w32x32/k32/db/pf s5"),
+        (128, false, 49152, 2048, "128x128/w64x64/k32/db/pf s10"),
+        (192, true, 2048, 2048, "64x64/w32x32/k32/db/pf s3"),
+        (192, true, 2048, 8192, "64x64/w32x32/k32 s1"),
+        (192, true, 2048, 49152, "128x128/w64x64/k32/db/pf s1"),
+        (192, true, 6168, 2048, "64x64/w16x32/k32/db s5"),
+        (192, true, 8192, 2048, "64x128/w32x64/k32/db s3"),
+        (192, false, 2048, 2048, "64x64/w32x32/k32/db/pf s3"),
+        (192, false, 2048, 6168, "64x128/w32x64/k32/db s1"),
+        (192, false, 2048, 8192, "64x128/w32x64/k32/db s1"),
+        (192, false, 8192, 2048, "64x128/w32x64/k32/db s5"),
+        (192, false, 49152, 2048, "64x128/w32x64/k32/db s5"),
+        (256, true, 2048, 2048, "64x64/w32x32/k32/db/pf s1"),
+        (256, true, 2048, 8192, "128x128/w64x64/k32/db/pf s1"),
+        (256, true, 2048, 49152, "128x128/w64x64/k32/db/pf s1"),
+        (256, true, 6168, 2048, "64x64/w32x32/k32 s4"),
+        (256, true, 8192, 2048, "128x128/w64x64/k32/db/pf s5"),
+        (256, false, 2048, 2048, "64x64/w32x32/k32/db/pf s1"),
+        (256, false, 2048, 6168, "64x128/w32x64/k32/db s1"),
+        (256, false, 2048, 8192, "128x128/w64x64/k32/db/pf s1"),
+        (256, false, 8192, 2048, "128x128/w64x64/k32/db/pf s5"),
+        (256, false, 49152, 2048, "128x128/w64x64/k32/db/pf s5"),
+    ];
+
     /// The products whose selected configuration differs from the bench's:
     /// the bench winner split K and the best unsplit one was within 10% of it.
     const UNSPLIT: &[(u32, bool, u32, u32, &str)] = &[
@@ -499,8 +753,11 @@ mod tests {
     #[test]
     fn plan_selects_the_bench_winner_for_the_training_shapes() {
         let all = |_: CoopTile| true;
-        assert_eq!(BENCH.len() + BENCH_1024.len(), TUNED.len());
-        for &(m, transposed_b, k, n, winner) in BENCH_1024 {
+        assert_eq!(
+            BENCH.len() + BENCH_1024.len() + BENCH_SMALL.len(),
+            TUNED.len()
+        );
+        for &(m, transposed_b, k, n, winner) in BENCH_1024.iter().chain(BENCH_SMALL) {
             let got = plan((m, k, n), transposed_b, (160, true), all).expect("a tile fits");
             let name = format!("{} s{}", got.tile.name(), got.split);
             assert_eq!(name, winner, "m {m} k {k} n {n} transposed {transposed_b}");
@@ -536,50 +793,59 @@ mod tests {
         let got = plan((2048, 2048, 8192), true, (160, true), none_but_small);
         assert!(got.is_some_and(|c| c.tile.bm * c.tile.bn <= 32 * 64));
         // A padded batch has fewer rows than 256, 1024 or 2048: it runs the
-        // row count's bucket, which is the 256-row winner of 576 x 576 for up
-        // to 256 rows, the 1024-row winner up to 1024 and the 2048-row winner
-        // above that, up to 2048.
+        // row count's bucket, which is the winner of 576 x 576 at 64, 128,
+        // 192 or 256 rows up to 256 rows, the 1024-row winner up to 1024 and
+        // the 2048-row winner above that, up to 2048.
         for (m, want) in [
-            (64, CoopTile::ALL[12]),
-            (106, CoopTile::ALL[12]),
-            (130, CoopTile::ALL[12]),
-            (256, CoopTile::ALL[12]),
-            (257, CoopTile::T128X64_W32X32_K32_PF),
-            (1000, CoopTile::T128X64_W32X32_K32_PF),
-            (1024, CoopTile::T128X64_W32X32_K32_PF),
-            (1025, CoopTile::ALL[6]),
-            (1500, CoopTile::ALL[6]),
-            (2048, CoopTile::ALL[6]),
+            (33, (CoopTile::T32X32_W16X16_K64_DB, 5)),
+            (64, (CoopTile::T32X32_W16X16_K64_DB, 5)),
+            (65, (CoopTile::T32X64_W16X16_K64_DB, 1)),
+            (106, (CoopTile::T32X64_W16X16_K64_DB, 1)),
+            (130, (CoopTile::T32X64_W16X16_K64_DB, 1)),
+            (192, (CoopTile::T32X64_W16X16_K64_DB, 1)),
+            (193, (CoopTile::T32X64_W16X32_K32_DB, 1)),
+            (256, (CoopTile::T32X64_W16X32_K32_DB, 1)),
+            (257, (CoopTile::T128X64_W32X32_K32_PF, 1)),
+            (1000, (CoopTile::T128X64_W32X32_K32_PF, 1)),
+            (1024, (CoopTile::T128X64_W32X32_K32_PF, 1)),
+            (1025, (CoopTile::ALL[6], 1)),
+            (1500, (CoopTile::ALL[6], 1)),
+            (2048, (CoopTile::ALL[6], 1)),
         ] {
             let got = plan((m, 576, 576), true, (160, true), all).expect("a tile fits");
-            assert_eq!((got.tile, got.split), (want, 1), "m {m}");
+            assert_eq!((got.tile, got.split), want, "m {m}");
         }
         // A product with no 1024-row row runs its 2048-row one up to 1024
         // rows: 135M's LoRA-only 576 x 192 product.
         let got = plan((900, 576, 192), true, (160, true), all).expect("a tile fits");
         assert_eq!((got.tile, got.split), (CoopTile::ALL[2], 1));
-        // 1.7B at up to 256 rows has no row, since the bench winners lost in
-        // a training step: the double-buffered 64x64 tile runs, split until
-        // the grid fills the GPU.
+        // 1.7B at up to 256 rows has a row per bucket from the small-row
+        // sweep: the wide products take the larger tiles as the rows grow.
         for (m, a_bt, k, n, want) in [
-            (128, false, 2048, 8192, (4, 1)),
-            (128, true, 2048, 2048, (4, 3)),
-            (64, true, 8192, 2048, (4, 5)),
-            (256, false, 2048, 8192, (3, 1)),
+            (64, true, 2048, 2048, (CoopTile::T32X32_W16X16_K64_DB, 1)),
+            (128, true, 2048, 2048, (CoopTile::T128X64_W32X32_K32_DB, 5)),
+            (64, true, 8192, 2048, (CoopTile::T32X32_W16X16_K64_DB, 5)),
+            (
+                256,
+                false,
+                2048,
+                8192,
+                (CoopTile::T128X128_W64X64_K32_PF, 1),
+            ),
         ] {
             let got = plan((m, k, n), a_bt, (160, true), all).expect("a tile fits");
-            assert_eq!(
-                (got.tile, got.split),
-                (CoopTile::ALL[want.0], want.1),
-                "m {m} k {k} n {n}"
-            );
+            assert_eq!((got.tile, got.split), want, "m {m} k {k} n {n}");
         }
-        // Another 1.7B product, and the same product on a device without the
+        // A 1.7B product with no row, and a product on a device without the
         // table, run the router's own rule.
-        let got = plan((128, 2048, 49152), false, (160, true), all).expect("a tile fits");
+        let got = plan((128, 2048, 3000), false, (160, true), all).expect("a tile fits");
         assert_eq!((got.tile, got.split), (CoopTile::ALL[12], 1));
         let got = plan((128, 2048, 8192), false, (160, false), all).expect("a tile fits");
         assert_eq!((got.tile, got.split), (CoopTile::ALL[12], 1));
+        // A row whose tile does not fit the device falls to the step rule.
+        let small_only = |t: CoopTile| t.bm * t.bn <= 64 * 64;
+        let got = plan((256, 2048, 8192), false, (160, true), small_only).expect("a tile fits");
+        assert_eq!(got.tile, STEP_TILES[1]);
         // More rows than the table has run the router's own rule.
         let got = plan((4096, 576, 576), true, (160, true), all);
         assert_eq!(got.map(|c| c.tile), Some(CoopTile::ALL[1]));
@@ -590,24 +856,34 @@ mod tests {
     }
 
     #[test]
-    fn padded_row_counts_run_the_256_row_winner() {
+    fn padded_row_counts_run_their_buckets_row() {
         let all = |_: CoopTile| true;
-        // 106 and 200 rows are what a padded SmolLM2 micro-batch can have;
-        // each runs what the 256-row product runs, split included.
-        for &(m, transposed_b, k, n, _) in BENCH.iter().filter(|r| r.0 == 256) {
-            let want = plan((256, k, n), transposed_b, (160, true), all).expect("a tile fits");
-            for rows in [106, 200, 256] {
-                let got = plan((rows, k, n), transposed_b, (160, true), all).expect("a tile fits");
+        // Each row count of a bucket (rounded up to a multiple of 16) runs
+        // what the bucket's own row count runs, split included.
+        for &(bucket, transposed_b, k, n, _) in BENCH_SMALL {
+            let rows: &[u32] = match bucket {
+                64 => &[17, 33, 50, 64],
+                128 => &[65, 100, 128],
+                192 => &[129, 160, 192],
+                _ => &[193, 200, 256],
+            };
+            let want = plan((bucket, k, n), transposed_b, (160, true), all).expect("a tile fits");
+            for &m in rows {
+                let got = plan((m, k, n), transposed_b, (160, true), all).expect("a tile fits");
                 assert_eq!(
                     (got.tile, got.split),
                     (want.tile, want.split),
-                    "m {m} rows {rows} k {k} n {n}"
+                    "bucket {bucket} rows {m} k {k} n {n}"
                 );
             }
         }
-        // 135M down projection at 200 rows: tile 11 with K split into 6.
+        // The four narrow 256-row rows of the older run serve every bucket:
+        // 135M LoRA-only 576 x 192 at 100 rows.
+        let got = plan((100, 576, 192), true, (160, true), all).expect("a tile fits");
+        assert_eq!((got.tile, got.split), (CoopTile::ALL[12], 1));
+        // 135M down projection at 200 rows takes the 256-row row.
         let got = plan((200, 1536, 576), false, (160, true), all).expect("a tile fits");
-        assert_eq!((got.tile, got.split), (CoopTile::ALL[11], 6));
+        assert_eq!((got.tile, got.split), (CoopTile::T32X64_W16X32_K32_DB, 3));
         // The row count is rounded up to a multiple of 16 for the lookup, so
         // 2049 rows (2064) are past the table and 2048 are not.
         let past = plan((2049, 576, 576), true, (160, true), all).expect("a tile fits");
