@@ -852,8 +852,8 @@ mod tests {
         (2050, 130),
     ];
 
-    const ROWS: [u32; 15] = [
-        16, 33, 64, 96, 106, 130, 200, 256, 257, 512, 1000, 1500, 2048, 2049, 4096,
+    const ROWS: [u32; 16] = [
+        16, 33, 64, 96, 106, 130, 200, 256, 257, 512, 1000, 1200, 1500, 2048, 2049, 4096,
     ];
 
     /// FNV-1a 64 of the configuration the selector picks for every product of
@@ -862,8 +862,11 @@ mod tests {
     /// the tuned table, which can only move products of 257 to 1024 rows on a
     /// tuned device, and retaken again (it was 17442595157898385172) when the
     /// 64 to 256-row rows replaced the 256-row ones, which moves products of up
-    /// to 256 rows on a tuned device.
-    const PLAN_HASH: u64 = 1620736337270207953;
+    /// to 256 rows on a tuned device, and retaken a third time (it was
+    /// 1620736337270207953, with 1200 rows added to [`ROWS`]) when the 1280-row
+    /// rows joined the table and the 2048-row rows of 360M and 1.7B were
+    /// replaced, which moves products of 1025 to 2048 rows on a tuned device.
+    const PLAN_HASH: u64 = 4766422471105062887;
 
     #[test]
     fn selector_picks_what_it_picked_before_the_split() {
