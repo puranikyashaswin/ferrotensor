@@ -216,6 +216,19 @@ impl UnifiedTensor {
         Self::new(context, &data, shape)
     }
 
+    /// A zero-filled `f32` tensor from the buffer pool, cleared on the GPU.
+    ///
+    /// Unlike [`zeros`](Self::zeros) it uploads nothing from the host, so a
+    /// large scratch buffer made every step costs no upload bandwidth.
+    pub fn zeros_on_gpu(context: &WgpuContext, shape: &[usize]) -> Self {
+        let tensor = Self::empty(context, shape);
+        let size = tensor.size_in_bytes();
+        if size > 0 {
+            context.record(|encoder| encoder.clear_buffer(tensor.buffer(), 0, Some(size)));
+        }
+        tensor
+    }
+
     /// Uploads raw bytes as an `f32`-typed tensor (e.g. packed quantised data).
     pub fn from_bytes(context: &WgpuContext, data: &[u8], shape: &[usize]) -> Self {
         Self::from_bytes_with_dtype(context, data, shape, DType::FP32)
@@ -329,6 +342,13 @@ impl UnifiedTensor {
         }
     }
 
+    /// Whether no other tensor, view or clone shares this tensor's storage, so
+    /// writing into it in place changes nothing anyone else reads.
+    #[must_use]
+    pub fn is_unique(&self) -> bool {
+        Arc::strong_count(&self.data) == 1
+    }
+
     /// Copies the tensor back to the CPU, waiting for queued GPU work.
     pub async fn to_vec(&self, context: &WgpuContext) -> Vec<f32> {
         let start = Instant::now();
@@ -362,6 +382,62 @@ impl UnifiedTensor {
 
         let data = slice.get_mapped_range();
         let res = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        staging.unmap();
+        GpuCounters::add_elapsed(&context.counters.readback_nanos, start);
+        res
+    }
+
+    /// Reads the f32 values of every tensor in `tensors` back to the host
+    /// with one copy into one staging buffer, so the queue drains once
+    /// however many tensors there are.
+    pub async fn read_many(context: &WgpuContext, tensors: &[&UnifiedTensor]) -> Vec<Vec<f32>> {
+        let start = Instant::now();
+        let sizes: Vec<u64> = tensors.iter().map(|t| t.size_in_bytes()).collect();
+        let size: u64 = sizes.iter().sum();
+        if size == 0 {
+            return tensors.iter().map(|_| Vec::new()).collect();
+        }
+        context.counters.readbacks.fetch_add(1, Ordering::Relaxed);
+        context
+            .counters
+            .readback_bytes
+            .fetch_add(size, Ordering::Relaxed);
+        let staging = context.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Staging"),
+            size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let _counted = context.memory().allocate_raw(MemoryCategory::Staging, size);
+        context.record(|encoder| {
+            let mut offset = 0;
+            for (t, &bytes) in tensors.iter().zip(&sizes) {
+                if bytes > 0 {
+                    encoder.copy_buffer_to_buffer(&t.data.buffer, 0, &staging, offset, bytes);
+                }
+                offset += bytes;
+            }
+        });
+        context.flush();
+
+        let slice = staging.slice(..);
+        let mapped = Arc::new(AtomicBool::new(false));
+        let flag = mapped.clone();
+        slice.map_async(wgpu::MapMode::Read, move |_| {
+            flag.store(true, Ordering::Release)
+        });
+        context.poll_until(|| mapped.load(Ordering::Acquire));
+
+        let data = slice.get_mapped_range();
+        let all: &[f32] = bytemuck::cast_slice(&data);
+        let mut res = Vec::with_capacity(tensors.len());
+        let mut at = 0;
+        for &bytes in &sizes {
+            let len = (bytes / 4) as usize;
+            res.push(all[at..at + len].to_vec());
+            at += len;
+        }
         drop(data);
         staging.unmap();
         GpuCounters::add_elapsed(&context.counters.readback_nanos, start);

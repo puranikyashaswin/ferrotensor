@@ -12,8 +12,8 @@
 #![allow(clippy::unwrap_used)]
 
 use ferrotensor_backend::{
-    q4, AdamParams, AttentionOptions, ComputeEngine, DType, MatmulPath, MemoryCategory, SmallMTile,
-    UnifiedTensor, WgpuContext, MASKED_CE_SKIP, SUM_SQUARES_CHUNK,
+    q4, AdamParams, AttentionOptions, ComputeEngine, DType, Epilogue, MatmulPath, MemoryCategory,
+    SmallMTile, UnifiedTensor, WgpuContext, MASKED_CE_SKIP, SUM_SQUARES_CHUNK,
 };
 use q4::Q4Group;
 use std::io::Write as _;
@@ -1333,19 +1333,22 @@ fn rms_norm_backward_matches_cpu() {
         let go = rand_vec(rows * len, 72 + len as u64);
         let gx = zeros(&[rows, len]);
         let gw = zeros(&[len]);
-        g.engine.rms_norm_backward(
-            &g.ctx,
-            &upload(&x, &[rows, len]),
-            &upload(&w, &[len]),
-            &upload(&go, &[rows, len]),
-            &gx,
-            &gw,
-            eps,
+        let (tx, tw, tgo) = (
+            upload(&x, &[rows, len]),
+            upload(&w, &[len]),
+            upload(&go, &[rows, len]),
         );
+        let e = &g.engine;
+        e.rms_norm_backward(&g.ctx, &tx, &tw, &tgo, &gx, Some(&gw), eps);
         let (want_x, want_w) = cpu_rms_norm_backward(&x, &go, &w, len, eps);
         let name = format!("rms_norm_backward {rows}x{len}");
         assert_close(&format!("{name} grad_x"), &read(&gx), &want_x, 1e-4, 1e-3);
         assert_close(&format!("{name} grad_w"), &read(&gw), &want_w, 1e-4, 1e-3);
+        // A frozen weight gets no gradient: the input gradient is the same.
+        let gx_only = zeros(&[rows, len]);
+        e.rms_norm_backward(&g.ctx, &tx, &tw, &tgo, &gx_only, None, eps);
+        let bits = |t: &UnifiedTensor| read(t).iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&gx_only), bits(&gx), "{name} grad_x without grad_w");
     }
 }
 
@@ -1588,6 +1591,38 @@ fn rope_inverse_matches_cpu_and_undoes_rope() {
         g.engine.rope(&g.ctx, &t, hd, pos);
         g.engine.rope_theta_inverse(&g.ctx, &t, hd, pos, 10000.0);
         assert_close(&format!("{name} round trip"), &read(&t), &x, 1e-4, 1e-4);
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn rope_into_a_new_buffer_matches_in_place_and_keeps_the_input() {
+    // Against the in-place kernel bit for bit, and the CPU rotation.
+    let g = gpu();
+    let e = &g.engine;
+    let bits = |t: &UnifiedTensor| read(t).iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    for &(batch, seq, heads, hd, pos) in &[(1, 1, 1, 8, 0), (1, 5, 1, 64, 3), (2, 7, 4, 32, 11)] {
+        let x = rand_vec(batch * seq * heads * hd, 14);
+        let shape = [batch, seq, heads * hd];
+        let input = upload(&x, &shape);
+        let x_bits = bits(&input);
+        for inverse in [false, true] {
+            let name = format!("rope_to {shape:?} inverse {inverse}");
+            let in_place = upload(&x, &shape);
+            let out = zeros(&shape);
+            if inverse {
+                e.rope_theta_inverse(&g.ctx, &in_place, hd, pos, 10000.0);
+                e.rope_theta_inverse_to(&g.ctx, (&input, &out), hd, pos, 10000.0);
+            } else {
+                e.rope_theta(&g.ctx, &in_place, hd, pos, 10000.0);
+                e.rope_theta_to(&g.ctx, (&input, &out), hd, pos, 10000.0);
+            }
+            assert_eq!(bits(&out), bits(&in_place), "{name}");
+            assert_eq!(bits(&input), x_bits, "{name}: input written");
+            let dir = if inverse { -1.0 } else { 1.0 };
+            let want = cpu_rope_dir(&x, batch, seq, heads, hd, pos, dir);
+            assert_close(&name, &read(&out), &want, 1e-4, 1e-4);
+        }
     }
 }
 
@@ -2864,4 +2899,233 @@ fn argmax_rows_matches_the_host_argmax_including_ties() {
     let got: Vec<u32> = read(&out).iter().map(|v| v.to_bits()).collect();
     let want: Vec<u32> = x.chunks(len).map(host_argmax).collect();
     assert_eq!(got, want);
+}
+
+fn bits(x: &[f32]) -> Vec<u32> {
+    x.iter().map(|v| v.to_bits()).collect()
+}
+
+/// `alpha * op(a) @ op(b) + beta * init` on the CPU in f64, with `b` stored
+/// `[N, K]` when `transposed_b`.
+fn cpu_epilogue(
+    a: &[f32],
+    b: &[f32],
+    init: &[f32],
+    (m, k, n): (usize, usize, usize),
+    transposed_b: bool,
+    ep: Epilogue,
+) -> Vec<f32> {
+    (0..m * n)
+        .map(|i| {
+            let (r, c) = (i / n, i % n);
+            let dot: f64 = (0..k)
+                .map(|p| {
+                    let bv = if transposed_b {
+                        b[c * k + p]
+                    } else {
+                        b[p * n + c]
+                    };
+                    f64::from(a[r * k + p]) * f64::from(bv)
+                })
+                .sum();
+            let mut v = f64::from(ep.alpha) * dot;
+            if ep.beta != 0.0 {
+                v += f64::from(ep.beta) * f64::from(init[i]);
+            }
+            v as f32
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn matmul_epilogue_matches_cpu_on_every_path() {
+    let g = gpu();
+    // One shape per kernel: one row (the matrix-vector kernel for a@b, the
+    // thin kernel for a@bT), a thin a, a thin b (64x64 tiles with an f16 b),
+    // 64x64 tiles, and the small-M kernel with one slice of K and with three.
+    let small_m = |split| MatmulPath::SmallM {
+        tile: None,
+        split: Some(split),
+    };
+    let cases = [
+        ("one row", (1, 96, 80), MatmulPath::Previous),
+        ("thin a", (8, 96, 200), MatmulPath::Previous),
+        ("thin b", (200, 40, 8), MatmulPath::Previous),
+        ("tiles", (100, 72, 130), MatmulPath::Previous),
+        ("small-M, 1 slice", (64, 512, 256), small_m(1)),
+        ("small-M, 3 slices", (64, 512, 256), small_m(3)),
+    ];
+    let epilogues = [
+        Epilogue::STORE,
+        Epilogue::scaled(0.375),
+        Epilogue::ACCUMULATE,
+        Epilogue {
+            alpha: -2.0,
+            beta: 0.25,
+        },
+    ];
+    for (seed, (name, (m, k, n), path)) in cases.into_iter().enumerate() {
+        let seed = 9000 + 10 * seed as u64;
+        let a = rand_vec(m * k, seed);
+        // Multiples of 1/64 in [-1, 1] are exact in f16, so the f16 weight
+        // holds the same values as the f32 one.
+        let b: Vec<f32> = rand_vec(k * n, seed + 1)
+            .iter()
+            .map(|v| (v * 64.0).round() / 64.0)
+            .collect();
+        let init = rand_vec(m * n, seed + 2);
+        let a_up = upload(&a, &[m, k]);
+        for transposed_b in [false, true] {
+            let (b_stored, shape) = if transposed_b {
+                (transpose(&b, k, n), [n, k])
+            } else {
+                (b.clone(), [k, n])
+            };
+            let weights = [
+                ("f32", upload(&b_stored, &shape)),
+                (
+                    "f16",
+                    UnifiedTensor::from_f32_as_f16(&g.ctx, &b_stored, &shape),
+                ),
+            ];
+            for (dtype, b_up) in &weights {
+                let run = |ep: Epilogue, out: &UnifiedTensor| {
+                    g.engine
+                        .matmul_with_path_into(&g.ctx, transposed_b, [&a_up, b_up, out], path, ep)
+                        .unwrap();
+                };
+                let product = zeros(&[m, n]);
+                run(Epilogue::STORE, &product);
+                let product = read(&product);
+                for ep in epilogues {
+                    let label = format!("{name} {dtype} transposed_b {transposed_b} {ep:?}");
+                    // An out of NaN shows that beta = 0 never reads it.
+                    let start = if ep.beta == 0.0 {
+                        vec![f32::NAN; m * n]
+                    } else {
+                        init.clone()
+                    };
+                    let out = upload(&start, &[m, n]);
+                    run(ep, &out);
+                    let got = read(&out);
+                    let want = cpu_epilogue(&a, &b_stored, &init, (m, k, n), transposed_b, ep);
+                    assert_close(&label, &got, &want, 1e-4, 1e-4);
+                    // The product is rounded before the epilogue, so scaling
+                    // or adding the stored product gives the same bits.
+                    let from_product: Vec<f32> = product
+                        .iter()
+                        .zip(&init)
+                        .map(|(p, i)| {
+                            let v = ep.alpha * p;
+                            if ep.beta == 0.0 {
+                                v
+                            } else {
+                                v + ep.beta * i
+                            }
+                        })
+                        .collect();
+                    assert_eq!(bits(&got), bits(&from_product), "{label}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn transposed_a_matmul_accumulates_into_out() {
+    // The weight-gradient product a^T @ b added into an earlier gradient,
+    // as a second micro-batch adds its own: the thin kernel for a LoRA-rank
+    // output and 64x64 tiles for a wide one.
+    let g = gpu();
+    for (seed, (m, k, n)) in [(8, 200, 96), (72, 50, 90)].into_iter().enumerate() {
+        let seed = 9100 + 10 * seed as u64;
+        let a = rand_vec(k * m, seed);
+        let b = rand_vec(k * n, seed + 1);
+        let init = rand_vec(m * n, seed + 2);
+        let (a_up, b_up) = (upload(&a, &[k, m]), upload(&b, &[k, n]));
+        let out = upload(&init, &[m, n]);
+        g.engine
+            .matmul_at_into(&g.ctx, &a_up, &b_up, &out, Epilogue::ACCUMULATE);
+        let got = read(&out);
+        let want = cpu_epilogue(
+            &transpose(&a, k, m),
+            &b,
+            &init,
+            (m, k, n),
+            false,
+            Epilogue::ACCUMULATE,
+        );
+        assert_close(&format!("aT@b {m}x{k}x{n}"), &got, &want, 1e-4, 1e-4);
+        // The same bits as a separate product and add.
+        let product = zeros(&[m, n]);
+        g.engine.matmul_at(&g.ctx, &a_up, &b_up, &product);
+        let sum = zeros(&[m, n]);
+        g.engine
+            .add(&g.ctx, &upload(&init, &[m, n]), &product, &sum);
+        assert_eq!(bits(&got), bits(&read(&sum)), "aT@b {m}x{k}x{n}");
+    }
+}
+
+/// The GPU embedding lookup and its gradient against the host: rows copied
+/// exactly, zeros for ids outside the table, and each table row's gradient
+/// summed in position order, so both match bit for bit. 300 x 70 spans many
+/// workgroups, and 70 does not divide 64.
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn embedding_gather_and_scatter_match_the_host_bit_for_bit() {
+    let g = gpu();
+    let (vocab, hidden) = (300usize, 70usize);
+    let table = rand_vec(vocab * hidden, 51);
+    // Repeated ids, so rows sum several positions, and ids past the table.
+    let ids: Vec<u32> = (0..192u32).map(|p| (p * 37 + p / 5) % 330).collect();
+    let n = ids.len();
+    let id_buf = UnifiedTensor::from_bytes(&g.ctx, bytemuck::cast_slice(&ids), &[n]);
+    let out = UnifiedTensor::empty(&g.ctx, &[n, hidden]);
+    g.engine
+        .embedding_gather(&g.ctx, &upload(&table, &[vocab, hidden]), &id_buf, &out);
+    let mut want = Vec::with_capacity(n * hidden);
+    for &id in &ids {
+        let start = id as usize * hidden;
+        match table.get(start..start + hidden) {
+            Some(row) => want.extend_from_slice(row),
+            None => want.extend(std::iter::repeat_n(0.0, hidden)),
+        }
+    }
+    assert!(ids.iter().any(|&id| id as usize >= vocab));
+    assert_eq!(bits(&read(&out)), bits(&want), "gather");
+
+    let grad = rand_vec(n * hidden, 52);
+    let mut want = vec![0.0f32; vocab * hidden];
+    for (&id, row_grad) in ids.iter().zip(grad.chunks_exact(hidden)) {
+        let start = id as usize * hidden;
+        if let Some(row) = want.get_mut(start..start + hidden) {
+            for (sum, g) in row.iter_mut().zip(row_grad) {
+                *sum += g;
+            }
+        }
+    }
+    let (index, slots) = ComputeEngine::embedding_scatter_index(&ids, vocab);
+    let index_buf = UnifiedTensor::from_bytes(&g.ctx, bytemuck::cast_slice(&index), &[index.len()]);
+    let table_grad = UnifiedTensor::empty(&g.ctx, &[vocab, hidden]);
+    g.engine.embedding_scatter(
+        &g.ctx,
+        &upload(&grad, &[n, hidden]),
+        &index_buf,
+        slots,
+        &table_grad,
+    );
+    assert_eq!(bits(&read(&table_grad)), bits(&want), "scatter");
+}
+
+/// The scatter index of ids [2, 0, 2, 9, 0, 2] in a 4-row table: row 2 is
+/// slot 0 (positions 0, 2, 5), row 0 slot 1 (positions 1, 4), rows 1 and 3
+/// and the id 9 have no slot.
+#[test]
+fn embedding_scatter_index_groups_positions_by_row() {
+    let (index, slots) = ComputeEngine::embedding_scatter_index(&[2, 0, 2, 9, 0, 2], 4);
+    let none = u32::MAX;
+    assert_eq!(slots, 2);
+    assert_eq!(index, [1, none, 0, none, 0, 3, 5, 0, 2, 5, 1, 4]);
 }

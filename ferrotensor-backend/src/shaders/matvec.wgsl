@@ -1,8 +1,10 @@
 // ============================================================================
 // MATRIX-VECTOR PRODUCT (one row of activations)
 // ============================================================================
-// out[N] = x[K] @ w[K, N] for row-major w: the products of decoding one
-// token. The 64x64-tile matmul would leave 15 of its 16 thread rows idle.
+// out[N] = alpha * x[K] @ w[K, N] + beta * out[N] for row-major w: the
+// products of decoding one token. alpha and beta are the bits of
+// mv_params.zw; beta = 0 never reads out. The 64x64-tile matmul would
+// leave 15 of its 16 thread rows idle.
 //
 // A 16x16 workgroup covers 32 output columns. Thread (lane, slice) sums
 // columns 2 * lane and 2 * lane + 1 over k = slice, slice + 16, ..., so the
@@ -15,7 +17,15 @@ const MV_SLICES: u32 = 16u;
 @group(0) @binding(0) var<storage, read> mv_x: array<f32>;
 @group(0) @binding(1) var<storage, read> mv_w: array<f32>;
 @group(0) @binding(2) var<storage, read_write> mv_out: array<f32>;
-@group(0) @binding(3) var<uniform> mv_params: vec4<u32>; // K, N, unused, unused
+@group(0) @binding(3) var<uniform> mv_params: vec4<u32>; // K, N, alpha bits, beta bits
+
+// Stores alpha * v + beta * out[i] to out[i].
+fn mv_store(i: u32, v: f32) {
+    let beta = bitcast<f32>(mv_params.w);
+    var o = bitcast<f32>(mv_params.z) * v;
+    if (beta != 0.0) { o = o + beta * mv_out[i]; }
+    mv_out[i] = o;
+}
 
 var<workgroup> mv_partial: array<vec2<f32>, 256>; // [MV_SLICES][MV_LANES]
 
@@ -48,7 +58,7 @@ fn matvec(
         for (var s = 0u; s < MV_SLICES; s++) {
             sum += mv_partial[s * MV_LANES + lid.x];
         }
-        mv_out[col] = sum.x;
-        if (col + 1u < n) { mv_out[col + 1u] = sum.y; }
+        mv_store(col, sum.x);
+        if (col + 1u < n) { mv_store(col + 1u, sum.y); }
     }
 }

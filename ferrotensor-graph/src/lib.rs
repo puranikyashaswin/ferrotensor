@@ -110,20 +110,18 @@ pub struct Linear {
 
 impl Linear {
     fn project_2d(&self, engine: &ComputeEngine, x: &Tensor) -> Tensor {
-        let mut out = Tensor::matmul(x, &self.weight, engine);
-
-        if let Some(lora) = &self.lora {
-            // (x @ A) is [rows, rank]: scaling it there touches rank/out of the
-            // elements that scaling the [rows, out] product would, and gives
-            // the same result. A scale of 1 needs no kernel at all.
-            let mut temp = Tensor::matmul(x, &lora.a, engine);
-            let scale = lora.alpha / lora.rank as f32;
-            if (scale - 1.0).abs() > f32::EPSILON {
-                temp = Tensor::scale(&temp, scale, engine);
+        let mut out = match &self.lora {
+            Some(lora) => {
+                // The scale goes on (x @ A), which is [rows, rank]. A scale
+                // within an epsilon of 1 is taken as exactly 1.
+                let mut scale = lora.alpha / lora.rank as f32;
+                if (scale - 1.0).abs() <= f32::EPSILON {
+                    scale = 1.0;
+                }
+                Tensor::lora_matmul(x, &self.weight, (&lora.a, &lora.b), scale, engine)
             }
-            let lora_out = Tensor::matmul(&temp, &lora.b, engine);
-            out = Tensor::add(&out, &lora_out, engine);
-        }
+            None => Tensor::matmul(x, &self.weight, engine),
+        };
 
         if let Some(bias) = &self.bias {
             // The autograd ops have no broadcasting add: `ones[rows, 1] @

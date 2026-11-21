@@ -9,7 +9,9 @@
 //
 //   t(r, k)   = mt_t[r * ts.x + k * ts.y]
 //   w(k, c)   = mt_w[k * cols + c] (mode 0) or mt_w[c * K + k] (mode 1)
-//   out(r, c) = mt_out[r * os.x + c * os.y]
+//   out(r, c) = alpha * sum + beta * mt_out[r * os.x + c * os.y]
+//
+// alpha and beta are the bits of mt_params[2].xy; beta = 0 never reads out.
 //
 // Thread (lane, slice) owns columns 2 * lane and 2 * lane + 1 and steps K two
 // at a time from 2 * slice, so it reads w as 2x2 blocks: two pairs that are
@@ -25,8 +27,9 @@ const MT_ROWS: u32 = 8u;
 @group(0) @binding(0) var<storage, read> mt_t: array<f32>;
 @group(0) @binding(1) var<storage, read> mt_w: array<f32>;
 @group(0) @binding(2) var<storage, read_write> mt_out: array<f32>;
-// [rows, K, cols, mode], [t row stride, t k stride, out row stride, out col stride]
-@group(0) @binding(3) var<uniform> mt_params: array<vec4<u32>, 2>;
+// [rows, K, cols, mode], [t row stride, t k stride, out row stride, out col stride],
+// [alpha, beta, 0, 0]
+@group(0) @binding(3) var<uniform> mt_params: array<vec4<u32>, 3>;
 
 var<workgroup> mt_partial: array<vec2<f32>, 2048>; // [MT_ROWS][256 threads]
 
@@ -101,6 +104,10 @@ fn matmul_thin(
     let row = row0 + r;
     let col = col0 + lidx % (MT_LANES * 2u);
     if (row < rows && col < cols) {
-        mt_out[row * os.x + col * os.y] = sum;
+        let i = row * os.x + col * os.y;
+        let beta = bitcast<f32>(mt_params[2].y);
+        var o = bitcast<f32>(mt_params[2].x) * sum;
+        if (beta != 0.0) { o = o + beta * mt_out[i]; }
+        mt_out[i] = o;
     }
 }

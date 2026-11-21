@@ -36,8 +36,13 @@ mod profile;
 pub mod q4;
 mod tensor;
 
-pub use context::{ContextError, WgpuContext, UPLOAD_RELEASE_BYTES};
-pub use engine::{AdamParams, AttentionOptions, ComputeEngine, MASKED_CE_SKIP, SUM_SQUARES_CHUNK};
+pub use context::{
+    ContextError, WgpuContext, PASS_DISPATCHES_ENV, PENDING_OPS_ENV, UPLOAD_RELEASE_BYTES,
+};
+pub use engine::{
+    AdamParams, AttentionOptions, ComputeEngine, Epilogue, FlatLayout, FLAT_MAX_ELEMS,
+    MASKED_CE_SKIP, SUM_SQUARES_CHUNK,
+};
 #[doc(hidden)]
 pub use engine::{MatmulPath, SmallMLaunch, SmallMTile};
 pub use kernel_timing::{KernelTime, KernelTimes, KernelTiming, KernelTimingMode};

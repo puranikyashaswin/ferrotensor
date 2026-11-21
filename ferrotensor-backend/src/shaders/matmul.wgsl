@@ -1,11 +1,15 @@
 // ============================================================================
 // REGISTER-BLOCKED MATMUL
 // ============================================================================
-// out[M, N] = op(a) @ op(b) for row-major f32 matrices, where mmb_params.w
-// selects the operand layout:
+// out[M, N] = alpha * op(a) @ op(b) + beta * out for row-major f32 matrices,
+// where mmb_params[0].w selects the operand layout:
 //   0: a is [M, K], b is [K, N]
 //   1: a is [M, K], b is [N, K]   (a @ b^T)
 //   2: a is [K, M], b is [K, N]   (a^T @ b)
+//
+// alpha and beta are the bits of mmb_params[1].xy. With beta = 0 the kernel
+// never reads out, so out may start uninitialised; with beta = 1 a gradient
+// is added into the buffer that already holds the earlier ones.
 //
 // Each 16x16 workgroup computes a 64x64 tile of `out`; each thread owns
 // 4x4 outputs held in vec4 registers. K is consumed in slices of MMB_BK,
@@ -28,7 +32,16 @@ const MMB_BS_ROW: u32 = 17u;
 @group(0) @binding(0) var<storage, read> mmb_a: array<f32>;
 @group(0) @binding(1) var<storage, read> mmb_b: array<f32>;
 @group(0) @binding(2) var<storage, read_write> mmb_out: array<f32>;
-@group(0) @binding(3) var<uniform> mmb_params: vec4<u32>; // M, K, N, mode
+@group(0) @binding(3) var<uniform> mmb_params: array<vec4<u32>, 2>; // [M, K, N, mode], [alpha, beta, 0, 0]
+
+// Stores alpha * v + beta * out[i] to out[i]. The product is rounded to f32
+// before the add, as when a separate kernel added two buffers.
+fn mmb_store(i: u32, v: f32) {
+    let beta = bitcast<f32>(mmb_params[1].y);
+    var o = bitcast<f32>(mmb_params[1].x) * v;
+    if (beta != 0.0) { o = o + beta * mmb_out[i]; }
+    mmb_out[i] = o;
+}
 
 var<workgroup> mmb_as4: array<vec4<f32>, 256>; // [MMB_BK][MMB_BM / 4]
 var<workgroup> mmb_bs4: array<vec4<f32>, 272>; // [MMB_BK][MMB_BS_ROW], last vec4 unused
@@ -54,10 +67,10 @@ fn matmul_blocked(
     @builtin(local_invocation_id) lid: vec3<u32>,
     @builtin(workgroup_id) wg: vec3<u32>,
 ) {
-    let m = mmb_params.x;
-    let k = mmb_params.y;
-    let n = mmb_params.z;
-    let mode = mmb_params.w;
+    let m = mmb_params[0].x;
+    let k = mmb_params[0].y;
+    let n = mmb_params[0].z;
+    let mode = mmb_params[0].w;
     let b_k_inner = mmb_b_k_inner(mode);
     let row0 = wg.y * MMB_BM;
     let col0 = wg.x * MMB_BN;
@@ -117,10 +130,10 @@ fn matmul_blocked(
             {
                 let c = col0 + (lid.x + 16u * 0u) * 4u;
                 let v = acc0_0;
-                if (c < n) { mmb_out[r * n + c] = v.x; }
-                if (c + 1u < n) { mmb_out[r * n + c + 1u] = v.y; }
-                if (c + 2u < n) { mmb_out[r * n + c + 2u] = v.z; }
-                if (c + 3u < n) { mmb_out[r * n + c + 3u] = v.w; }
+                if (c < n) { mmb_store(r * n + c, v.x); }
+                if (c + 1u < n) { mmb_store(r * n + c + 1u, v.y); }
+                if (c + 2u < n) { mmb_store(r * n + c + 2u, v.z); }
+                if (c + 3u < n) { mmb_store(r * n + c + 3u, v.w); }
             }
         }
     }
@@ -130,10 +143,10 @@ fn matmul_blocked(
             {
                 let c = col0 + (lid.x + 16u * 0u) * 4u;
                 let v = acc1_0;
-                if (c < n) { mmb_out[r * n + c] = v.x; }
-                if (c + 1u < n) { mmb_out[r * n + c + 1u] = v.y; }
-                if (c + 2u < n) { mmb_out[r * n + c + 2u] = v.z; }
-                if (c + 3u < n) { mmb_out[r * n + c + 3u] = v.w; }
+                if (c < n) { mmb_store(r * n + c, v.x); }
+                if (c + 1u < n) { mmb_store(r * n + c + 1u, v.y); }
+                if (c + 2u < n) { mmb_store(r * n + c + 2u, v.z); }
+                if (c + 3u < n) { mmb_store(r * n + c + 3u, v.w); }
             }
         }
     }
@@ -143,10 +156,10 @@ fn matmul_blocked(
             {
                 let c = col0 + (lid.x + 16u * 0u) * 4u;
                 let v = acc2_0;
-                if (c < n) { mmb_out[r * n + c] = v.x; }
-                if (c + 1u < n) { mmb_out[r * n + c + 1u] = v.y; }
-                if (c + 2u < n) { mmb_out[r * n + c + 2u] = v.z; }
-                if (c + 3u < n) { mmb_out[r * n + c + 3u] = v.w; }
+                if (c < n) { mmb_store(r * n + c, v.x); }
+                if (c + 1u < n) { mmb_store(r * n + c + 1u, v.y); }
+                if (c + 2u < n) { mmb_store(r * n + c + 2u, v.z); }
+                if (c + 3u < n) { mmb_store(r * n + c + 3u, v.w); }
             }
         }
     }
@@ -156,10 +169,10 @@ fn matmul_blocked(
             {
                 let c = col0 + (lid.x + 16u * 0u) * 4u;
                 let v = acc3_0;
-                if (c < n) { mmb_out[r * n + c] = v.x; }
-                if (c + 1u < n) { mmb_out[r * n + c + 1u] = v.y; }
-                if (c + 2u < n) { mmb_out[r * n + c + 2u] = v.z; }
-                if (c + 3u < n) { mmb_out[r * n + c + 3u] = v.w; }
+                if (c < n) { mmb_store(r * n + c, v.x); }
+                if (c + 1u < n) { mmb_store(r * n + c + 1u, v.y); }
+                if (c + 2u < n) { mmb_store(r * n + c + 2u, v.z); }
+                if (c + 3u < n) { mmb_store(r * n + c + 3u, v.w); }
             }
         }
     }
