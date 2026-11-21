@@ -1268,7 +1268,7 @@ mod tests {
         // the f32 above 4096.
         assert_eq!(
             norm_from_partials(&[16_777_216.0, 1.0, 1.0, 1.0, 1.0]),
-            4096.000_5
+            4_096.000_5
         );
     }
 
