@@ -6,7 +6,7 @@ Install:
 
 - Python 3.10+ (wheels for macOS arm64 and Linux x86_64): `pip install ferrotensor`
 - Rust 1.88+ library: `cargo add ferrotensor`
-- LoRA command-line tool (`train`, `eval`, `generate`): `cargo install ferrotensor-cli`
+- Command-line tool (`info`, `plan`, `finetune`, `train`, `eval`, `generate`, `chat`, `merge`, `export-gguf`, `pretrain`): `cargo install ferrotensor-cli`. Most commands take `--json` and all use exit codes 0, 1 and 2; `--model` takes a directory or a Hugging Face id already in the local cache. `export-gguf` writes GGUF v3; loading it in llama.cpp is not yet checked. `pretrain` is byte-level.
 
 Tested on an NVIDIA A10G (24 GB) through Vulkan, an Apple M2 (8 GB) through Metal, and software Vulkan (Mesa lavapipe) in CI; other GPUs are untested. On the A10G, LoRA on SmolLM2-1.7B took held-out loss from 2.65 to 1.06 in 250 steps; against PyTorch + PEFT on CUDA with the same recipe on the same GPU, the held-out loss is identical before training and within 0.005 after, and Ferrotensor runs at 0.32 to 0.84 of PyTorch's speed. LoRA loss and gradients are checked against PyTorch autograd in CI; the largest gradient difference is below 1e-6 (9.5e-7 in the confirmation run). Peak GPU memory for LoRA on SmolLM2-1.7B is 8,142 MiB in 0.7 (11,671 MiB in 0.6) and 5,313 MiB with --checkpoint-blocks, which prints the same losses as the 0.7 default; peak host memory is 1,575 MiB in 0.7, down from 5,087 MiB.
 
@@ -28,6 +28,7 @@ Tested on an NVIDIA A10G (24 GB) through Vulkan, an Apple M2 (8 GB) through Meta
 - [Rust API on docs.rs](https://docs.rs/ferrotensor)
 - [Python API](https://puranikyashaswin.github.io/ferrotensor/docs/python-reference.html): what the bindings cover and how they differ from PyTorch
 - [Changelog](https://puranikyashaswin.github.io/ferrotensor/docs/changelog.html)
+- [AGENTS.md](https://github.com/puranikyashaswin/ferrotensor/blob/main/AGENTS.md): the command line for coding agents and scripts: JSON output per command and exit codes
 - [Source on GitHub](https://github.com/puranikyashaswin/ferrotensor)
 
 ## Optional

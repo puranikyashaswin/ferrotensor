@@ -67,7 +67,7 @@
    "@type": "SoftwareApplication",
    "@id": "https://puranikyashaswin.github.io/ferrotensor/#cli",
    "name": "ferrotensor-cli",
-   "description": "The ferrotensor command: LoRA fine-tuning (train), evaluation (eval) and text generation (generate) for small Llama-style models.",
+   "description": "The ferrotensor command: a GPU check, memory planning, LoRA fine-tuning, evaluation, text generation, chat, adapter merging, GGUF export and byte-level pretraining for small Llama-style models.",
    "applicationCategory": "DeveloperApplication",
    "operatingSystem": "macOS, Linux",
    "softwareVersion": "{{ft_version}}",
@@ -198,7 +198,7 @@
         </div>
         <div class="panel" role="tabpanel" id="panel-cli" aria-labelledby="tab-cli">
           <div class="cmd"><code><span class="prompt" aria-hidden="true">$ </span>cargo install ferrotensor-cli</code><button class="copy" type="button" data-copy="cargo install ferrotensor-cli">Copy</button></div>
-          <p>The <code>ferrotensor</code> command: LoRA <code>train</code>, <code>eval</code> and <code>generate</code>.</p>
+          <p>The <code>ferrotensor</code> command: <code>info</code>, <code>plan</code>, <code>finetune</code>, <code>chat</code>, <code>merge</code>, <code>export-gguf</code> and <code>pretrain</code>, plus <code>train</code>, <code>eval</code> and <code>generate</code>.</p>
         </div>
       </div>
 
@@ -419,10 +419,10 @@ x = ft.<span class="f">tensor</span>([[<span class="n">0</span>, <span class="n"
 <line class="a-line" x1="220.0" y1="240" x2="220.0" y2="257" marker-end="url(#ah-wide)"/>
 <rect class="a-box a-acc" x="520" y="30" width="440" height="58" rx="6"/>
 <text class="a-t" x="532" y="54.3" font-size="16">ferrotensor-cli</text>
-<text class="a-s" x="532" y="75.9" font-size="13">train · eval · generate  (+ ferrotensor-monitor)</text>
+<text class="a-s" x="532" y="75.9" font-size="13">plan · finetune · chat · merge · export-gguf · pretrain</text>
 <rect class="a-box" x="520" y="106" width="440" height="58" rx="6"/>
 <text class="a-t" x="532" y="130.3" font-size="16">ferrotensor-trainer</text>
-<text class="a-s" x="532" y="151.9" font-size="13">LoRA, checkpoints</text>
+<text class="a-s" x="532" y="151.9" font-size="13">LoRA, checkpoints  (+ ferrotensor-monitor)</text>
 <line class="a-line" x1="740.0" y1="88" x2="740.0" y2="105" marker-end="url(#ah-wide)"/>
 <rect class="a-box" x="520" y="182" width="440" height="58" rx="6"/>
 <text class="a-t" x="532" y="206.3" font-size="16">ferrotensor-graph</text>
@@ -471,7 +471,7 @@ x = ft.<span class="f">tensor</span>([[<span class="n">0</span>, <span class="n"
 <line class="a-line" x1="85.0" y1="226" x2="85.0" y2="239" marker-end="url(#ah-narrow)"/>
 <rect class="a-box a-acc" x="190" y="30" width="170" height="56" rx="6"/>
 <text class="a-t" x="202" y="53.9" font-size="13">ferrotensor-cli</text>
-<text class="a-s" x="202" y="71.4" font-size="11">train · eval · generate</text>
+<text class="a-s" x="202" y="71.4" font-size="11">plan · finetune · chat</text>
 <rect class="a-box" x="190" y="100" width="170" height="56" rx="6"/>
 <text class="a-t" x="202" y="123.9" font-size="13">ferrotensor-trainer</text>
 <text class="a-s" x="202" y="141.4" font-size="11">LoRA, checkpoints</text>
@@ -602,7 +602,8 @@ x = ft.<span class="f">tensor</span>([[<span class="n">0</span>, <span class="n"
     <ul class="limits">
       <li><strong>Mostly f32.</strong> The LoRA command stores frozen weights as f16; activations, gradients and the tensor API are f32, with no <code>f16</code> or <code>bf16</code> tensors yet.</li>
       <li><strong>One GPU.</strong> No multi-GPU or distributed training; the CLI's <code>--world-size</code> flag is a prototype.</li>
-      <li><strong>Up to 1.7B measured.</strong> LoRA fine-tuning is tested on Llama-style models from SmolLM2-135M to 1.7B; larger models are untested. Released LFM2 checkpoints are not supported.</li>
+      <li><strong>Up to 1.7B measured.</strong> LoRA fine-tuning is tested on Llama-style models from SmolLM2-135M to 1.7B; larger models are untested. Qwen2 checkpoints load and are checked against Hugging Face Transformers on a tiny random model only; real Qwen2.5 checkpoints are not measured. Released LFM2 checkpoints are not supported.</li>
+      <li><strong>Newer commands are lightly checked.</strong> <code>plan</code>, <code>finetune</code>, <code>chat</code>, <code>merge</code>, <code>export-gguf</code> and <code>pretrain</code> are tested in CI, on software Vulkan where they use the GPU. <code>export-gguf</code> writes GGUF v3; loading the file in llama.cpp is not yet checked. <code>pretrain</code> is byte-level and meant for learning and experiments.</li>
       <li><strong>Tiny workloads are faster on the CPU.</strong> Chains of tiny ops are still faster on the CPU.</li>
       <li><strong>Not every op.</strong> No convolutions, sort, top-k or cumsum in the tensor API.</li>
       <li><strong>Slower than PyTorch on CUDA.</strong> On the same NVIDIA A10G, a LoRA step takes <a href="docs/examples/lora-sft.html#against-pytorch--peft-on-cuda-same-gpu">1.2 to 3.1 times</a> PyTorch's time (0.84, 0.32 and 0.37 of its speed). Most of the gap is likely in large matmuls, where PyTorch uses cuBLAS; it is not profiled kernel by kernel.</li>
