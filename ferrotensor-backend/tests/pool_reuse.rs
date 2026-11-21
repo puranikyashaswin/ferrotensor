@@ -308,3 +308,34 @@ fn the_extra_bytes_of_a_reused_larger_buffer_are_pool_slack() {
         "the 8,192 bytes are idle again"
     );
 }
+
+#[test]
+#[ignore = "needs a GPU"]
+fn a_returned_buffer_is_kept_above_the_cap_for_the_keep_waits() {
+    let (ctx, _engine, _src) = setup();
+    let bytes = wgpu_buffer_size(N as u64 * 4);
+    // A cap of 0 that spares buffers returned within the last 3 full waits.
+    ctx.pool.set_overflow(true);
+    ctx.pool.set_keep_waits(3);
+    assert_eq!(ctx.pool.keep_waits(), 3);
+    drop(UnifiedTensor::empty(&ctx, &[N]));
+    assert_eq!(ctx.pool.pooled_bytes(), bytes);
+    ctx.synchronize();
+    ctx.synchronize();
+    assert_eq!(ctx.pool.pooled_bytes(), bytes, "two waits old");
+    // A request takes the buffer, which restarts its age when it returns.
+    let created = ctx.pool.buffers_created();
+    drop(UnifiedTensor::empty(&ctx, &[N]));
+    assert_eq!(ctx.pool.buffers_created(), created, "the idle buffer");
+    ctx.synchronize();
+    ctx.synchronize();
+    assert_eq!(ctx.pool.pooled_bytes(), bytes, "two waits old again");
+    ctx.synchronize();
+    assert_eq!(ctx.pool.pooled_bytes(), 0, "three waits old: trimmed");
+    // `set_max_pooled_bytes` makes the cap strict.
+    ctx.pool.set_max_pooled_bytes(0);
+    assert_eq!(ctx.pool.keep_waits(), 0);
+    drop(UnifiedTensor::empty(&ctx, &[N]));
+    ctx.synchronize();
+    assert_eq!(ctx.pool.pooled_bytes(), 0);
+}

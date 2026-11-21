@@ -20,6 +20,27 @@ pub fn pool_overflow_from_env_value(value: Option<&str>) -> bool {
     !matches!(value.as_deref(), Some("0" | "false" | "off" | "no"))
 }
 
+/// Default number of full GPU waits a returned buffer is kept for, even above
+/// the idle cap (see [`BufferPool::set_keep_waits`]). A training step waits
+/// for the GPU about twice (the loss readback and the gradient norm), so 8
+/// covers the last four steps.
+pub const DEFAULT_KEEP_WAITS: u64 = 8;
+
+/// Environment variable read when a [`WgpuContext`](crate::WgpuContext) is
+/// created: the number of full GPU waits an idle buffer is kept for (see
+/// [`BufferPool::set_keep_waits`]); `0` gives the strict cap of earlier
+/// versions. Unset, or anything that is not a whole number, leaves
+/// [`DEFAULT_KEEP_WAITS`].
+pub const POOL_KEEP_WAITS_ENV: &str = "FERROTENSOR_POOL_KEEP_WAITS";
+
+/// The keep-waits count for a [`POOL_KEEP_WAITS_ENV`] value (`None` when the
+/// variable is unset).
+pub fn pool_keep_waits_from_env_value(value: Option<&str>) -> u64 {
+    value
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_KEEP_WAITS)
+}
+
 /// Smallest request, in bytes, that is rounded up to a size class; smaller
 /// ones keep their exact size, which is at most 64 distinct values.
 const MIN_CLASSED_BYTES: u64 = 256;
@@ -80,6 +101,18 @@ pub fn size_class(requested: u64) -> u64 {
 ///
 /// With overflow off, buffers beyond the cap are dropped as they are
 /// returned (the behaviour before overflow existed).
+///
+/// # Keeping the working set
+///
+/// A step that needs more idle bytes than the cap holds would destroy buffers
+/// each time the GPU goes idle and create them again in the next step, and
+/// destroying a buffer takes host time while the GPU has nothing queued. So
+/// the cap applies only to buffers that have been idle for at least
+/// `keep_waits` full GPU waits ([`DEFAULT_KEEP_WAITS`]): a buffer returned more
+/// recently is kept even above the cap. A step's working set comes back every
+/// step and is never trimmed; a size class that stops recurring is released
+/// after `keep_waits` waits. [`set_max_pooled_bytes`](Self::set_max_pooled_bytes)
+/// makes the cap strict again (`keep_waits` 0).
 pub struct BufferPool {
     buffers: Mutex<PoolState>,
     usage: BufferUsages,
@@ -97,13 +130,22 @@ pub struct BufferPool {
 struct PoolState {
     lists: FreeLists<Arc<Buffer>>,
     max_pooled_bytes: u64,
+    keep_waits: u64,
     overflow: bool,
 }
 
+/// An idle buffer's tags: the submission that was being recorded when it was
+/// returned, and the number of full GPU waits made by then.
+#[derive(Clone, Copy)]
+struct Returned {
+    serial: u64,
+    waits: u64,
+}
+
 /// Idle buffers by size; each list oldest first, every entry tagged with
-/// the submission that was being recorded when it was returned.
+/// when it was returned.
 struct FreeLists<B> {
-    free: BTreeMap<u64, VecDeque<(u64, B)>>,
+    free: BTreeMap<u64, VecDeque<(Returned, B)>>,
     pooled_bytes: u64,
 }
 
@@ -138,29 +180,31 @@ impl<B> FreeLists<B> {
         self.take(found).map(|buffer| (found, buffer))
     }
 
-    fn put(&mut self, size: u64, serial: u64, buffer: B) {
+    fn put(&mut self, size: u64, serial: u64, waits: u64, buffer: B) {
         self.free
             .entry(size)
             .or_default()
-            .push_back((serial, buffer));
+            .push_back((Returned { serial, waits }, buffer));
         self.pooled_bytes += size;
     }
 
-    /// Removes the oldest buffers returned while a submission up to `done`
-    /// was being recorded, until at most `max` bytes remain. Buffers
-    /// returned later are kept even above `max`.
+    /// Removes the oldest buffers until at most `max` bytes remain. Only a
+    /// buffer returned while a submission up to `done` was being recorded, and
+    /// at least `keep` full waits before the `waits` made so far, is removed;
+    /// the others are kept even above `max`.
     #[expect(
         clippy::expect_used,
         reason = "the size was just read from the free map, so its list exists and is non-empty"
     )]
-    fn trim(&mut self, max: u64, done: u64) -> Vec<(u64, B)> {
+    fn trim(&mut self, max: u64, done: u64, waits: u64, keep: u64) -> Vec<(u64, B)> {
         let mut out = Vec::new();
         while self.pooled_bytes > max {
             let oldest = self
                 .free
                 .iter()
-                .filter_map(|(&size, list)| list.front().map(|&(serial, _)| (serial, size)))
-                .filter(|&(serial, _)| serial <= done)
+                .filter_map(|(&size, list)| list.front().map(|&(tag, _)| (tag, size)))
+                .filter(|&(tag, _)| tag.serial <= done && tag.waits.saturating_add(keep) <= waits)
+                .map(|(tag, size)| (tag.serial, size))
                 .min();
             let Some((_, size)) = oldest else { break };
             let list = self.free.get_mut(&size).expect("listed size");
@@ -212,6 +256,7 @@ impl BufferPool {
             buffers: Mutex::new(PoolState {
                 lists: FreeLists::default(),
                 max_pooled_bytes: DEFAULT_MAX_POOLED_BYTES,
+                keep_waits: DEFAULT_KEEP_WAITS,
                 overflow: true,
             }),
             usage,
@@ -244,7 +289,10 @@ impl BufferPool {
 
     /// Change how many bytes of freed buffers the pool keeps (0 disables
     /// reuse once the GPU has finished with them). Buffers above the new
-    /// cap are released immediately.
+    /// cap are released immediately. The cap becomes strict: this sets
+    /// [`keep_waits`](Self::keep_waits) to 0, so no buffer is kept above it
+    /// because it was returned recently; call
+    /// [`set_keep_waits`](Self::set_keep_waits) after this to change that.
     #[expect(
         clippy::unwrap_used,
         reason = "lock poisoning means another thread panicked while holding the lock"
@@ -252,6 +300,7 @@ impl BufferPool {
     pub fn set_max_pooled_bytes(&self, max: u64) {
         let mut state = self.buffers.lock().unwrap();
         state.max_pooled_bytes = max;
+        state.keep_waits = 0;
         if state.lists.pooled_bytes > max {
             self.release_all(&mut state);
         }
@@ -265,6 +314,29 @@ impl BufferPool {
     )]
     pub fn max_pooled_bytes(&self) -> u64 {
         self.buffers.lock().unwrap().max_pooled_bytes
+    }
+
+    /// Keep a returned buffer even above the cap until `waits` full GPU waits
+    /// have passed without a request taking it (see the
+    /// [type docs](Self#keeping-the-working-set)); 0 trims strictly to the
+    /// cap. Changes no results. The context sets it from
+    /// [`POOL_KEEP_WAITS_ENV`] when created.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "lock poisoning means another thread panicked while holding the lock"
+    )]
+    pub fn set_keep_waits(&self, waits: u64) {
+        self.buffers.lock().unwrap().keep_waits = waits;
+    }
+
+    /// The full GPU waits a returned buffer is kept for above the cap
+    /// ([`DEFAULT_KEEP_WAITS`] unless changed).
+    #[expect(
+        clippy::unwrap_used,
+        reason = "lock poisoning means another thread panicked while holding the lock"
+    )]
+    pub fn keep_waits(&self) -> u64 {
+        self.buffers.lock().unwrap().keep_waits
     }
 
     /// Keep buffers returned beyond the cap for reuse until the GPU has
@@ -405,14 +477,18 @@ impl BufferPool {
             self.tracker.gpu_dropped(size);
             return;
         }
-        state
-            .lists
-            .put(size, self.tracker.recording_serial(), buffer);
+        state.lists.put(
+            size,
+            self.tracker.recording_serial(),
+            self.tracker.full_waits(),
+            buffer,
+        );
         self.tracker.pool_put(size);
     }
 
     /// Drops the oldest idle buffers above the cap whose work the GPU is
-    /// known to have finished; returns how many were dropped. wgpu destroys
+    /// known to have finished and that were returned at least `keep_waits`
+    /// full waits ago; returns how many were dropped. wgpu destroys
     /// them at the next device poll, so the caller polls right after and
     /// they are not counted as awaiting GPU.
     #[expect(
@@ -422,8 +498,13 @@ impl BufferPool {
     pub(crate) fn trim(&self) -> usize {
         let dropped = {
             let mut state = self.buffers.lock().unwrap();
-            let max = state.max_pooled_bytes;
-            state.lists.trim(max, self.tracker.completed_serial())
+            let (max, keep) = (state.max_pooled_bytes, state.keep_waits);
+            state.lists.trim(
+                max,
+                self.tracker.completed_serial(),
+                self.tracker.full_waits(),
+                keep,
+            )
         };
         for (size, buffer) in &dropped {
             self.bind_groups.evict(buffer);
@@ -450,9 +531,9 @@ mod tests {
     #[test]
     fn take_matches_exact_size_newest_first() {
         let mut l = FreeLists::default();
-        l.put(64, 1, "a");
-        l.put(64, 2, "b");
-        l.put(128, 2, "c");
+        l.put(64, 1, 0, "a");
+        l.put(64, 2, 0, "b");
+        l.put(128, 2, 0, "c");
         assert_eq!(l.pooled_bytes, 256);
         assert_eq!(l.take(32), None, "no size classes");
         assert_eq!(l.take(64), Some("b"));
@@ -464,10 +545,10 @@ mod tests {
     #[test]
     fn take_up_to_gives_the_smallest_idle_size_in_range() {
         let mut l = FreeLists::default();
-        l.put(300, 1, "a");
-        l.put(400, 1, "b");
-        l.put(400, 2, "c");
-        l.put(900, 2, "d");
+        l.put(300, 1, 0, "a");
+        l.put(400, 1, 0, "b");
+        l.put(400, 2, 0, "c");
+        l.put(900, 2, 0, "d");
         assert_eq!(l.take_up_to(301, 600), Some((400, "c")), "newest of 400");
         assert_eq!(l.take_up_to(301, 600), Some((400, "b")));
         assert_eq!(l.take_up_to(301, 600), None, "900 is out of range");
@@ -481,21 +562,150 @@ mod tests {
     #[test]
     fn trim_keeps_buffers_the_gpu_may_still_use() {
         let mut l = FreeLists::default();
-        l.put(100, 1, "old");
-        l.put(100, 3, "new");
-        l.put(50, 2, "mid");
+        l.put(100, 1, 0, "old");
+        l.put(100, 3, 0, "new");
+        l.put(50, 2, 0, "mid");
         // Cap 0, but only submission 1 is known to be done.
-        let out = l.trim(0, 1);
+        let out = l.trim(0, 1, 0, 0);
         assert_eq!(out, vec![(100, "old")]);
         assert_eq!(l.pooled_bytes, 150);
         // Oldest first; stops once under the cap.
-        let out = l.trim(100, 3);
+        let out = l.trim(100, 3, 0, 0);
         assert_eq!(out, vec![(50, "mid")]);
         assert_eq!(l.pooled_bytes, 100);
-        assert_eq!(l.trim(100, 3), vec![]);
-        assert_eq!(l.trim(0, 3), vec![(100, "new")]);
+        assert_eq!(l.trim(100, 3, 0, 0), vec![]);
+        assert_eq!(l.trim(0, 3, 0, 0), vec![(100, "new")]);
         assert_eq!(l.pooled_bytes, 0);
         assert!(l.free.is_empty());
+    }
+
+    #[test]
+    fn trim_keeps_buffers_returned_within_the_keep_waits() {
+        let mut l = FreeLists::default();
+        l.put(100, 1, 0, "a");
+        l.put(100, 2, 5, "b");
+        l.put(50, 3, 6, "c");
+        // Six waits made, keep 4: only "a" (returned at wait 0) is old enough.
+        assert_eq!(l.trim(0, 9, 6, 4), vec![(100, "a")]);
+        assert_eq!(l.pooled_bytes, 150);
+        // "b" is 4 waits old at wait 9, "c" only 3.
+        assert_eq!(l.trim(0, 9, 9, 4), vec![(100, "b")]);
+        assert_eq!(l.pooled_bytes, 50);
+        assert_eq!(l.trim(0, 9, 10, 4), vec![(50, "c")]);
+        assert!(l.free.is_empty());
+    }
+
+    #[test]
+    fn old_buffers_are_still_trimmed_to_the_cap_only() {
+        let mut l = FreeLists::default();
+        l.put(100, 1, 0, "a");
+        l.put(100, 2, 0, "b");
+        l.put(100, 3, 0, "c");
+        assert_eq!(l.trim(150, 9, 8, 8), vec![(100, "a"), (100, "b")]);
+        assert_eq!(l.pooled_bytes, 100);
+        // A buffer the GPU may still use is kept however old it is.
+        assert_eq!(l.trim(0, 2, 99, 8), vec![]);
+        assert_eq!(l.pooled_bytes, 100);
+    }
+
+    const MIB: u64 = 1 << 20;
+
+    /// Steps that request `sizes(step)`, return every buffer at the end and
+    /// wait for the GPU twice, trimming to a 512 MiB cap after each step:
+    /// the buffers created in each step and the bytes idle at the end.
+    fn simulate(keep: u64, steps: usize, sizes: impl Fn(usize) -> Vec<u64>) -> (Vec<u32>, u64) {
+        let mut l = FreeLists::default();
+        let (mut next, mut serial, mut waits) = (0u32, 0u64, 0u64);
+        let mut created = Vec::new();
+        for step in 0..steps {
+            let before = next;
+            let held: Vec<(u64, u32)> = sizes(step)
+                .into_iter()
+                .map(|size| {
+                    let buffer = l.take(size).unwrap_or_else(|| {
+                        next += 1;
+                        next
+                    });
+                    (size, buffer)
+                })
+                .collect();
+            created.push(next - before);
+            serial += 1;
+            for (size, buffer) in held {
+                l.put(size, serial, waits, buffer);
+            }
+            waits += 2;
+            l.trim(512 * MIB, serial, waits, keep);
+        }
+        (created, l.pooled_bytes)
+    }
+
+    /// Twenty distinct sizes from 96 to 115 MiB: 2,110 MiB, over the cap.
+    fn working_set() -> Vec<u64> {
+        (96..116).map(|mib| mib * MIB).collect()
+    }
+
+    #[test]
+    fn a_working_set_over_the_cap_is_created_once_not_every_step() {
+        // Strict cap: the four largest buffers (454 MiB) survive each step's
+        // trim, so each later step creates the other 16.
+        let (created, idle) = simulate(0, 6, |_| working_set());
+        assert_eq!(created, vec![20, 16, 16, 16, 16, 16]);
+        assert_eq!(idle, 454 * MIB);
+        // Kept for 8 waits (four steps): nothing is created after step 0
+        // and all 2,110 MiB stay idle.
+        let (created, idle) = simulate(8, 6, |_| working_set());
+        assert_eq!(created, vec![20, 0, 0, 0, 0, 0]);
+        assert_eq!(idle, 2110 * MIB);
+    }
+
+    #[test]
+    fn a_size_that_recurs_every_third_step_is_kept_only_if_the_wait_count_covers_it() {
+        // 300 MiB is requested in steps 0, 3 and 6: six waits apart.
+        let sizes = |step: usize| {
+            let mut sizes = working_set();
+            if step % 3 == 0 {
+                sizes.push(300 * MIB);
+            }
+            sizes
+        };
+        let (created, _) = simulate(8, 8, sizes);
+        assert_eq!(created, vec![21, 0, 0, 0, 0, 0, 0, 0]);
+        // Kept for 4 waits it is released before it comes back.
+        let (created, _) = simulate(4, 8, sizes);
+        assert_eq!(created, vec![21, 0, 0, 1, 0, 0, 1, 0]);
+    }
+
+    #[test]
+    fn a_size_that_stops_recurring_is_released_after_the_keep_waits() {
+        // Step 0 uses a 300 MiB buffer, later steps never ask for it again.
+        let sizes = |step: usize| {
+            let mut sizes = working_set();
+            if step == 0 {
+                sizes.push(300 * MIB);
+            }
+            sizes
+        };
+        // Returned at wait 0, old enough at wait 8, which the trim at the end
+        // of step 3 reaches: 2,110 MiB of the working set stay.
+        let (_, idle) = simulate(8, 3, sizes);
+        assert_eq!(idle, 2410 * MIB, "still kept after three steps");
+        let (_, idle) = simulate(8, 4, sizes);
+        assert_eq!(idle, 2110 * MIB, "released after four");
+    }
+
+    #[test]
+    fn env_value_sets_the_keep_waits() {
+        assert_eq!(pool_keep_waits_from_env_value(None), DEFAULT_KEEP_WAITS);
+        assert_eq!(pool_keep_waits_from_env_value(Some("0")), 0);
+        assert_eq!(pool_keep_waits_from_env_value(Some(" 16 ")), 16);
+        for bad in ["", "-1", "many", "1.5"] {
+            assert_eq!(
+                pool_keep_waits_from_env_value(Some(bad)),
+                DEFAULT_KEEP_WAITS,
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]
@@ -511,7 +721,7 @@ mod tests {
             })
         };
         let a = get(&mut l, 4096);
-        l.put(4096, 1, a);
+        l.put(4096, 1, 0, a);
         let b = get(&mut l, 4096);
         assert_eq!(b, a, "reused");
         let _ = get(&mut l, 8192);

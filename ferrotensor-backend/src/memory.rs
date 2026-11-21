@@ -238,6 +238,9 @@ pub struct MemoryTracker {
     recording: AtomicU64,
     /// Highest submission known to have finished on the GPU.
     completed: AtomicU64,
+    /// Times the context waited for all submitted work to finish (see
+    /// [`gpu_reclaimed`](Self::gpu_reclaimed)).
+    full_waits: AtomicU64,
     detailed: AtomicBool,
     registry: Mutex<Registry>,
 }
@@ -258,6 +261,7 @@ impl Default for MemoryTracker {
             awaiting_by_submission: Mutex::new(VecDeque::new()),
             recording: AtomicU64::new(1),
             completed: AtomicU64::new(0),
+            full_waits: AtomicU64::new(0),
             detailed: AtomicBool::new(false),
             registry: Mutex::new(Registry::default()),
         }
@@ -664,6 +668,12 @@ impl MemoryTracker {
         self.note_peaks(self.live_bytes());
     }
 
+    /// Number of times the context has waited for all submitted work to
+    /// finish.
+    pub(crate) fn full_waits(&self) -> u64 {
+        self.full_waits.load(Relaxed)
+    }
+
     /// Number of the submission being recorded.
     pub(crate) fn recording_serial(&self) -> u64 {
         self.recording.load(Relaxed)
@@ -714,6 +724,7 @@ impl MemoryTracker {
         let mut by_submission = self.awaiting_by_submission.lock().unwrap();
         by_submission.clear();
         self.awaiting_gpu.store(0, Relaxed);
+        self.full_waits.fetch_add(1, Relaxed);
         // Everything recorded so far was submitted and has finished, so
         // close the current batch number: buffers returned under it are
         // free, and buffers dropped from now on count against the next.
@@ -1099,6 +1110,9 @@ mod tests {
         assert_eq!(t.awaiting_gpu_bytes(), 0);
         assert_eq!(t.completed_serial(), 3);
         assert_eq!(t.recording_serial(), 4);
+        assert_eq!(t.full_waits(), 1);
+        t.gpu_reclaimed();
+        assert_eq!(t.full_waits(), 2, "one per full wait, not per submission");
     }
 
     #[test]

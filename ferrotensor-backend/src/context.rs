@@ -325,6 +325,11 @@ impl WgpuContext {
                 .ok()
                 .as_deref(),
         ));
+        pool.set_keep_waits(crate::pool::pool_keep_waits_from_env_value(
+            std::env::var(crate::pool::POOL_KEEP_WAITS_ENV)
+                .ok()
+                .as_deref(),
+        ));
         let env = |name: &str| std::env::var(name).ok();
         let max_pending_ops =
             limit_from_env_value(env(PENDING_OPS_ENV).as_deref(), MAX_PENDING_OPS);
