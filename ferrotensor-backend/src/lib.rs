@@ -45,6 +45,8 @@ pub use context::{
     ContextError, WgpuContext, PASS_DISPATCHES_ENV, PENDING_OPS_ENV, UNIFORM_PARAMS_ENV,
     UPLOAD_RELEASE_BYTES,
 };
+#[doc(hidden)]
+pub use engine::bind_stats_dump;
 pub use engine::{
     AdamParams, AttentionOptions, AutotuneReport, ComputeEngine, Epilogue, FlatLayout, FusedA,
     FusedOut, FusedSpec, LoraGrad, LoraMirror, LoraProj, AUTOTUNE_ENV, FLAT_MAX_ELEMS,
