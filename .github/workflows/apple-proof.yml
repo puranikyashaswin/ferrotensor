@@ -1,0 +1,238 @@
+name: Apple silicon LoRA proof
+
+# LoRA fine-tuning of a SmolLM2 model on GitHub's macOS arm64 runner (Apple
+# silicon, Metal on a paravirtualised GPU, about 7 GB of RAM), measured. The
+# run follows docs/examples/lora-sft.md: the same Alpaca split, no memory
+# flags, so `finetune` takes its settings from `plan`. If the first model does
+# not complete, the job tries the next one in FALLBACK, so the summary names
+# the largest model that fits. The GPU is paravirtualised: the step times say
+# nothing about speed on a physical Mac.
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: Hugging Face model id to try first
+        default: HuggingFaceTB/SmolLM2-1.7B
+      steps:
+        description: Optimizer steps
+        default: "20"
+  push:
+    branches: ["proof/apple-*"]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  WGPU_BACKEND: metal
+  MODEL: ${{ inputs.model || 'HuggingFaceTB/SmolLM2-1.7B' }}
+  FALLBACK: HuggingFaceTB/SmolLM2-360M
+  STEPS: ${{ inputs.steps || '20' }}
+  # Watchdogs, in seconds, so a run that swaps without end still leaves time
+  # for the fallback model and the summary.
+  TRAIN_LIMIT: "9000"
+  EVAL_LIMIT: "2400"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  proof:
+    name: LoRA on the Apple silicon runner
+    runs-on: macos-latest
+    timeout-minutes: 340
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4.2.2
+
+      - name: Hardware
+        run: |
+          mkdir -p proof
+          sysctl hw.memsize hw.model machdep.cpu.brand_string hw.ncpu
+          sw_vers
+          sysctl vm.swapusage
+          system_profiler SPDisplaysDataType || true
+          python3 -I - <<'PY'
+          import json, subprocess
+          def sh(*cmd):
+              return subprocess.run(cmd, capture_output=True, text=True).stdout.strip()
+          hw = {
+              "memsize_bytes": int(sh("sysctl", "-n", "hw.memsize")),
+              "model": sh("sysctl", "-n", "hw.model"),
+              "cpu": sh("sysctl", "-n", "machdep.cpu.brand_string"),
+              "ncpu": int(sh("sysctl", "-n", "hw.ncpu")),
+              "macos": sh("sw_vers", "-productVersion"),
+              "macos_build": sh("sw_vers", "-buildVersion"),
+              "swap_at_start": sh("sysctl", "-n", "vm.swapusage"),
+          }
+          json.dump(hw, open("proof/hardware.json", "w"), indent=2)
+          print(json.dumps(hw, indent=2))
+          PY
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.2
+
+      - name: Build the CLI (release)
+        run: cargo build --release -p ferrotensor-cli
+
+      # The adapter wgpu picks, and the kernel self-check on it.
+      - name: Adapter and kernel self-check
+        run: |
+          set +e
+          ./target/release/ferrotensor info --check --json > proof/info.json
+          echo "exit $?"
+          cat proof/info.json
+
+      - name: Data (alpaca-cleaned, walkthrough split)
+        run: |
+          mkdir -p data/alpaca-cleaned data/alpaca
+          curl -fsSL --retry 3 -o data/alpaca-cleaned/alpaca_data_cleaned.json \
+            https://huggingface.co/datasets/yahma/alpaca-cleaned/resolve/main/alpaca_data_cleaned.json
+          # The split of scripts/lora-run.sh: 2,000 for training, 64 held out.
+          python3 -I - <<'PY'
+          import json, random
+          rows = json.load(open("data/alpaca-cleaned/alpaca_data_cleaned.json"))
+          out = []
+          for r in rows:
+              p = r["instruction"].strip()
+              if r.get("input", "").strip():
+                  p += "\n\n" + r["input"].strip()
+              resp = r["output"].strip()
+              if len(p) + len(resp) <= 500 and resp:
+                  out.append({"prompt": p, "response": resp})
+          random.Random(0).shuffle(out)
+          for name, rs in (("val", out[:64]), ("train", out[64:2064])):
+              with open(f"data/alpaca/{name}.jsonl", "w") as f:
+                  for x in rs:
+                      f.write(json.dumps(x) + "\n")
+          print("train 2000, val 64")
+          PY
+          wc -l data/alpaca/*.jsonl
+
+      - name: Plan, fine-tune, evaluate, reload
+        run: |
+          # Failures are recorded, not fatal: the summary reports them.
+          set +e
+          bin="$PWD/target/release/ferrotensor"
+          # Runs a command with a time limit in seconds; perl execs into it, so
+          # the alarm reaches the command itself and /usr/bin/time sees its usage.
+          limit=(perl -e 'alarm shift @ARGV; exec @ARGV or die "exec: $!"')
+
+          download() {
+            local repo="$1" dir="$2"
+            mkdir -p "$dir"
+            curl -fsSL --retry 3 "https://huggingface.co/api/models/$repo" -o "$dir/.api.json"
+            python3 -I -c 'import json,sys; [print(s["rfilename"]) for s in json.load(open(sys.argv[1]))["siblings"] if "/" not in s["rfilename"] and s["rfilename"].endswith((".json", ".safetensors"))]' "$dir/.api.json" \
+              | while read -r f; do
+                  curl -fsSL --retry 3 -o "$dir/$f" "https://huggingface.co/$repo/resolve/main/$f"
+                done
+            ls -l "$dir"
+          }
+
+          prove() {
+            local repo="$1" name="${1##*/}"
+            local dir="data/models/$name" run="proof/$name"
+            mkdir -p "$run"
+            echo "::group::download $repo"
+            download "$repo" "$dir"
+            echo "::endgroup::"
+
+            echo "== plan $repo"
+            "$bin" plan --model "$dir" --json > "$run/plan.json"
+            echo "$?" > "$run/plan.exit"
+            cat "$run/plan.json"
+
+            local train_flags=(--data data/alpaca/train.jsonl --eval-data data/alpaca/val.jsonl
+              --max-steps "$STEPS" --lr 5e-4 --warmup-steps 5 --log-every 1
+              --memory-report=5 --json)
+
+            echo "== finetune $repo (no memory flags, $STEPS steps)"
+            sysctl -n vm.swapusage > "$run/swap_before.txt"
+            /usr/bin/time -l "${limit[@]}" "$TRAIN_LIMIT" "$bin" finetune --model "$dir" \
+              --out "$run/out" "${train_flags[@]}" \
+              > "$run/finetune.json" 2> "$run/finetune.stderr"
+            echo "$?" > "$run/finetune.exit"
+            sysctl -n vm.swapusage > "$run/swap_after.txt"
+            tail -n 80 "$run/finetune.stderr"
+            cat "$run/finetune.json"
+
+            # The planner may find that nothing fits this budget. Then the
+            # same run with --force measures what happens with the smallest
+            # configuration.
+            local out="$run/out"
+            if [ "$(cat "$run/finetune.exit")" = 2 ] && grep -q "no configuration fits" "$run/finetune.json"; then
+              echo "== finetune $repo --force (the planner found no configuration that fits)"
+              out="$run/out-force"
+              /usr/bin/time -l "${limit[@]}" "$TRAIN_LIMIT" "$bin" finetune --model "$dir" --force \
+                --out "$out" "${train_flags[@]}" \
+                > "$run/finetune-force.json" 2> "$run/finetune-force.stderr"
+              echo "$?" > "$run/finetune-force.exit"
+              sysctl -n vm.swapusage > "$run/swap_after_force.txt"
+              tail -n 80 "$run/finetune-force.stderr"
+              cat "$run/finetune-force.json"
+            fi
+
+            local adapter="$out/lora_adapters.safetensors"
+            if [ -s "$adapter" ]; then
+              local seq_len
+              seq_len=$(python3 -I -c 'import json,sys
+          for p in sys.argv[1:]:
+              try: print(json.load(open(p))["chosen"]["seq_len"]); break
+              except Exception: pass
+          else: print(256)' "$run/finetune-force.json" "$run/finetune.json")
+              echo "== eval --lora on the held-out split (seq-len $seq_len)"
+              /usr/bin/time -l "${limit[@]}" "$EVAL_LIMIT" "$bin" eval --model "$dir" \
+                --data data/alpaca/val.jsonl --seq-len "$seq_len" --lora "$adapter" --json \
+                > "$run/eval.json" 2> "$run/eval.stderr"
+              echo "$?" > "$run/eval.exit"
+              tail -n 30 "$run/eval.stderr"
+              cat "$run/eval.json"
+
+              echo "== reload the adapter and generate (greedy)"
+              /usr/bin/time -l "${limit[@]}" "$EVAL_LIMIT" "$bin" generate --model "$dir" --lora "$adapter" \
+                --prompt "Give three tips for staying healthy." --temperature 0 --max-new-tokens 40 --json \
+                > "$run/generate.json" 2> "$run/generate.stderr"
+              echo "$?" > "$run/generate.exit"
+              tail -n 30 "$run/generate.stderr"
+              cat "$run/generate.json"
+            else
+              echo "no adapter was written; skipping eval and reload"
+            fi
+          }
+
+          passed() {
+            python3 -I scripts/apple-proof-summary.py --check "proof/${1##*/}"
+          }
+
+          echo "$MODEL" > proof/tried.txt
+          prove "$MODEL" || true
+          if ! passed "$MODEL"; then
+            echo "$MODEL did not complete; trying $FALLBACK"
+            echo "$FALLBACK" >> proof/tried.txt
+            prove "$FALLBACK" || true
+          fi
+
+      - name: Summary
+        if: ${{ !cancelled() }}
+        run: |
+          python3 -I scripts/apple-proof-summary.py proof > proof/summary.md
+          cat proof/summary.md >> "$GITHUB_STEP_SUMMARY"
+          cat proof/summary.json
+
+      - uses: actions/upload-artifact@v4.4.3
+        if: ${{ !cancelled() }}
+        with:
+          name: apple-proof
+          path: |
+            proof/**/*.json
+            proof/**/*.txt
+            proof/**/*.exit
+            proof/**/*.stderr
+            proof/**/*.jsonl
+            proof/summary.md
+          if-no-files-found: warn
