@@ -219,7 +219,7 @@ impl Coop {
                 self.fits(t, transposed_b)
             })
         };
-        let pick = tuner.pick(key, static_cfg, &usable, &list);
+        let pick = tuner.pick(key, m, static_cfg, &usable, &list);
         (pick.config, pick.sample)
     }
 

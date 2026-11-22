@@ -37,7 +37,7 @@
 use super::autotune_cache::{self, Choice, Platform};
 use super::epilogue::EpilogueKind;
 use super::loader::LoaderKind;
-use super::plan::{grid_fits, split_k, split_to_fill};
+use super::plan::{grid_fits, row_bucket, split_k, split_to_fill, ROW_STEP};
 use super::{CoopConfig, CoopTile};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -250,19 +250,11 @@ impl TuneKey {
     }
 }
 
-/// The row bucket of `m` rows: products of up to 64 rows (the kernel's
-/// smallest) share the first, and every product past 2048 rows the last.
+/// The row bucket of `m` rows: the router's own (see [`row_bucket`]), so that
+/// every row count of a key has the same static pick, and every product past
+/// 2048 rows the last.
 pub(super) fn m_bucket(m: u32) -> u32 {
-    match m {
-        0..=64 => 64,
-        65..=128 => 128,
-        129..=192 => 192,
-        193..=256 => 256,
-        257..=512 => 512,
-        513..=1024 => 1024,
-        1025..=2048 => 2048,
-        _ => 4096,
-    }
+    row_bucket(m).unwrap_or(4096)
 }
 
 /// Workgroups over waves of `target`: the share of the last wave's slots
@@ -332,6 +324,17 @@ fn median(times: &[u64]) -> u64 {
     sorted.get(sorted.len() / 2).copied().unwrap_or(u64::MAX)
 }
 
+/// `nanos` that a dispatch of `rows` rows took, as it would take at the
+/// `bucket`'s rows if the time grew with the rows. The candidates of a key are
+/// timed on different steps, whose row counts differ by up to a factor of two
+/// inside a bucket; comparing the raw times made a candidate that happened to
+/// run on a short step look the fastest.
+fn nanos_at_bucket_rows(nanos: u64, rows: u32, bucket: u32) -> u64 {
+    let rows = u128::from(rows.div_ceil(ROW_STEP).max(1) * ROW_STEP);
+    let reference = u128::from(bucket).max(rows);
+    u64::try_from(u128::from(nanos) * reference / rows).unwrap_or(u64::MAX)
+}
+
 /// The index of the candidate to settle on and its median time in
 /// nanoseconds, once every candidate has [`TIMINGS`] timings (`u64::MAX` for
 /// a timing that was unusable). Candidate 0 is the static pick: another
@@ -364,6 +367,8 @@ struct Trial {
 struct Open {
     key: TuneKey,
     candidate: usize,
+    /// Rows of the product this dispatch ran.
+    rows: u32,
     /// Dispatches still to report: 2 with K split (the product and its
     /// reduction), else 1.
     parts_left: u32,
@@ -466,13 +471,14 @@ impl Tuner {
         self.spent += time;
     }
 
-    /// What to run for the `key` product when the static rules pick
-    /// `static_cfg`. `usable` says whether a configuration runs this
+    /// What to run for the `key` product of `rows` rows when the static rules
+    /// pick `static_cfg`. `usable` says whether a configuration runs this
     /// product on this device, and `candidates` lists the configurations to
     /// try when the key has none yet.
     pub(super) fn pick(
         &mut self,
         key: TuneKey,
+        rows: u32,
         static_cfg: CoopConfig,
         usable: &dyn Fn(CoopConfig) -> bool,
         candidates: &dyn Fn() -> Vec<CoopConfig>,
@@ -547,6 +553,7 @@ impl Tuner {
             Open {
                 key,
                 candidate,
+                rows,
                 parts_left: if split > 1 { 2 } else { 1 },
                 nanos: 0,
                 unusable: false,
@@ -580,7 +587,11 @@ impl Tuner {
         let Some(done) = self.open.remove(&sample) else {
             return;
         };
-        let value = if done.unusable { u64::MAX } else { done.nanos };
+        let value = if done.unusable {
+            u64::MAX
+        } else {
+            nanos_at_bucket_rows(done.nanos, done.rows, done.key.m_bucket)
+        };
         if let Some(trial) = self.trials.get_mut(&done.key) {
             if let Some(times) = trial.times.get_mut(done.candidate) {
                 times.push(value);
@@ -695,7 +706,7 @@ mod tests {
     ) -> (CoopConfig, usize) {
         let list = || others.to_vec();
         for timed in 0..1000 {
-            let pick = t.pick(key, static_cfg, &any, &list);
+            let pick = t.pick(key, key.m_bucket(), static_cfg, &any, &list);
             let Some(sample) = pick.sample else {
                 return (pick.config, timed);
             };
@@ -797,19 +808,53 @@ mod tests {
     }
 
     #[test]
+    fn timings_from_steps_of_different_rows_are_compared_per_row() {
+        // Both candidates take their time in proportion to the rows: B 20%
+        // longer per row than A. The steps alternate between 1024 and 512
+        // rows, so B is timed on the short ones and its raw times are lower.
+        let key = TuneKey::new(true, KEY, (1024, 2048, 2048));
+        let per_row = |c: CoopConfig| if c == B { 1_200 } else { 1_000 };
+        let mut t = tuner(BTreeMap::new(), DEFAULT_BUDGET);
+        let list = || vec![B];
+        let mut ran = None;
+        for step in 0..1000_u32 {
+            let rows = if step % 2 == 0 { 1024 } else { 512 };
+            let pick = t.pick(key, rows, A, &any, &list);
+            let Some(sample) = pick.sample else {
+                ran = Some(pick.config);
+                break;
+            };
+            let nanos = per_row(pick.config) * u64::from(rows);
+            t.record(sample, Some(Duration::from_nanos(nanos)));
+        }
+        assert_eq!(ran, Some(A));
+    }
+
+    #[test]
+    fn a_timing_is_scaled_to_the_rows_of_the_bucket() {
+        assert_eq!(nanos_at_bucket_rows(100_000, 512, 1024), 200_000);
+        assert_eq!(nanos_at_bucket_rows(100_000, 1024, 1024), 100_000);
+        // Rows are rounded up like the router's, and a step past the
+        // bucket's last row is not scaled down.
+        assert_eq!(nanos_at_bucket_rows(100_000, 505, 512), 100_000);
+        assert_eq!(nanos_at_bucket_rows(100_000, 4000, 4096), 102_400);
+        assert_eq!(nanos_at_bucket_rows(100_000, 5000, 4096), 100_000);
+    }
+
+    #[test]
     fn unusable_timings_never_win() {
         let mut t = tuner(BTreeMap::new(), DEFAULT_BUDGET);
         let list = || vec![B];
         for _ in 0..TIMINGS {
             for _ in 0..2 {
-                let pick = t.pick(key(), A, &any, &list);
+                let pick = t.pick(key(), 256, A, &any, &list);
                 let sample = pick.sample.expect("a timing");
                 // B's timestamps ran backwards; A's are fine.
                 let time = (pick.config == A).then(|| Duration::from_micros(10));
                 t.record(sample, time);
             }
         }
-        let pick = t.pick(key(), A, &any, &list);
+        let pick = t.pick(key(), 256, A, &any, &list);
         assert_eq!((pick.config, pick.sample), (A, None));
         assert_eq!(t.report().shapes_tuned, 1);
     }
@@ -820,7 +865,7 @@ mod tests {
         let mut t = tuner(BTreeMap::new(), Duration::ZERO);
         for (m, k, n) in [(64, 576, 576), (256, 2048, 8192), (2048, 49152, 576)] {
             let key = TuneKey::new(false, KEY, (m, k, n));
-            let pick = t.pick(key, A, &any, &|| vec![B, C]);
+            let pick = t.pick(key, m, A, &any, &|| vec![B, C]);
             assert_eq!(
                 pick,
                 Pick {
@@ -871,7 +916,7 @@ mod tests {
             },
         );
         let mut t = tuner(entries, DEFAULT_BUDGET);
-        let pick = t.pick(key(), A, &|c| c != D, &Vec::new);
+        let pick = t.pick(key(), 256, A, &|c| c != D, &Vec::new);
         assert_eq!(pick.config, A);
     }
 
@@ -879,9 +924,15 @@ mod tests {
     fn rows_share_a_key_within_their_bucket() {
         let bucket = |m| TuneKey::new(false, KEY, (m, 576, 576)).m_bucket();
         assert_eq!(
-            [1, 64, 65, 128, 129, 192, 193, 256, 257, 512, 513, 1024, 1025, 2048, 2049, 9000]
-                .map(m_bucket),
-            [64, 64, 128, 128, 192, 192, 256, 256, 512, 512, 1024, 1024, 2048, 2048, 4096, 4096]
+            [
+                1, 64, 65, 128, 129, 192, 193, 256, 257, 320, 321, 384, 385, 512, 513, 640, 641,
+                1024, 1025, 1408, 1409, 2048, 2049, 9000
+            ]
+            .map(m_bucket),
+            [
+                64, 64, 128, 128, 192, 192, 256, 256, 320, 320, 384, 384, 512, 512, 640, 640, 1024,
+                1024, 1408, 1408, 2048, 2048, 4096, 4096
+            ]
         );
         assert_eq!(bucket(200), bucket(256));
         assert_ne!(bucket(256), bucket(257));
