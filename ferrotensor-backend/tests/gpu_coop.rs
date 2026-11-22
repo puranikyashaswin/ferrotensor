@@ -315,6 +315,104 @@ fn coop_large_m_without_bounds_checks_matches_f64_off_the_tile() {
     assert!(ran > 0, "no register-prefetch tile fits this device");
 }
 
+/// The columns of `a @ b` (`b` is `[K, N]`) in `cols`, as f64 for every row:
+/// `[m * cols.len()]`, row by row. A full reference of a 1.7B-sized product
+/// takes minutes on a CI machine, and these columns hold every part of the
+/// grid the tail split cares about.
+fn cpu_matmul_columns(
+    a: &[f32],
+    b: &[f32],
+    (m, k, n): (usize, usize, usize),
+    cols: &[usize],
+) -> Vec<f64> {
+    let mut out = vec![0.0f64; m * cols.len()];
+    for i in 0..m {
+        for p in 0..k {
+            let av = f64::from(a[i * k + p]);
+            for (c, &j) in cols.iter().enumerate() {
+                out[i * cols.len() + c] += av * f64::from(b[p * n + j]);
+            }
+        }
+    }
+    out
+}
+
+/// The columns `cols` of `x` (`[m, n]`), row by row.
+fn gather_columns(x: &[f32], (m, n): (usize, usize), cols: &[usize]) -> Vec<f32> {
+    (0..m)
+        .flat_map(|i| cols.iter().map(move |&j| x[i * n + j]))
+        .collect()
+}
+
+/// Products of a 128x128 tile whose grid is not a whole number of waves of
+/// 160 workgroups run their last column blocks with K split (the tail
+/// split), and the rest whole. 1.7B gate shapes: 1024 rows have 512 tiles
+/// (a tail of 4 column blocks in 5 slices), 1352 rows have 704 (6 blocks in
+/// 2 slices) and 1280 rows have 640, exactly 4 waves, so no tail. The
+/// columns checked are every 37th, those around the start of the tail and
+/// the last 130, against f64 on the f16-rounded operands, with the store
+/// and with alpha and beta over an earlier `out`.
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn coop_tail_split_matches_f64_where_the_tail_exists_and_where_it_does_not() {
+    let Some(g) =
+        coop_gpu("coop_tail_split_matches_f64_where_the_tail_exists_and_where_it_does_not")
+    else {
+        return;
+    };
+    let (k, n) = (2048, 8192);
+    let mut cols: Vec<usize> = (0..n).step_by(37).collect();
+    cols.extend((7360..7760).step_by(5));
+    cols.extend(n - 130..n);
+    let mut ran = 0;
+    for (seed, m) in [1024usize, 1352, 1280].into_iter().enumerate() {
+        let a = rand_vec(m * k, 600 + seed as u64);
+        let b = rand_vec(k * n, 700 + seed as u64);
+        let old = rand_vec(m * n, 800 + seed as u64);
+        let product = cpu_matmul_columns(&f16_round(&a), &f16_round(&b), (m, k, n), &cols);
+        let old_cols = gather_columns(&old, (m, n), &cols);
+        let zeros = vec![0.0; m * n];
+        for tile in &CoopTile::PIPELINED[3..5] {
+            for transposed_b in [false, true] {
+                for (alpha, beta) in [(1.0f32, 0.0f32), (0.5, 0.25)] {
+                    let want: Vec<f64> = product
+                        .iter()
+                        .zip(&old_cols)
+                        .map(|(&p, &o)| f64::from(alpha) * p + f64::from(beta) * f64::from(o))
+                        .collect();
+                    let config = CoopConfig {
+                        tile: *tile,
+                        split: 1,
+                    };
+                    let out0 = if beta == 0.0 { &zeros } else { &old };
+                    let Some(got) = run_or_skip(
+                        g,
+                        (m, k, n),
+                        (&a, &b),
+                        transposed_b,
+                        (Epilogue { alpha, beta }, out0),
+                        config,
+                    ) else {
+                        continue;
+                    };
+                    let e = max_rel_error(&gather_columns(&got, (m, n), &cols), &want);
+                    eprintln!(
+                        "{m}x{k}x{n} {} transposed_b {transposed_b} alpha {alpha} beta {beta}: max rel err {e:.2e}",
+                        tile.name()
+                    );
+                    assert!(
+                        e < 2e-5,
+                        "{m} rows {} transposed_b {transposed_b} alpha {alpha} beta {beta}: {e:e}",
+                        tile.name()
+                    );
+                    ran += 1;
+                }
+            }
+        }
+    }
+    assert!(ran > 0, "no 128x128 tile fits this device");
+}
+
 /// Products of 32 to 63 rows go to the cooperative kernel, not the small-M one.
 #[test]
 #[ignore = "needs a GPU; run with --ignored --test-threads=1"]

@@ -654,13 +654,93 @@ pub(super) fn split_to_fill(tile: CoopTile, (m, k, n): (u32, u32, u32), target: 
     split_k(k, tile.bk, wanted).0
 }
 
+/// Most bytes of partial sums a tail split may allocate: it uses the
+/// `[slices, m, n]` layout of the full split, though only its tail columns
+/// are written, so a wide product (the head) would ask for gigabytes.
+const TAIL_PARTS_MAX_BYTES: u64 = 256 << 20;
+
+/// How the last column blocks of a grid split K: the grid has
+/// `cols` column blocks (of `bn` columns) at its right edge whose workgroups
+/// each run `slices` slices of K, and the blocks before them run whole.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct TailSplit {
+    /// Column blocks, counted from the right edge of the grid, that split K.
+    pub cols: u32,
+    /// Slices of K per tail workgroup, at least 2.
+    pub slices: u32,
+}
+
+/// The tail split of a product whose grid of `tile` has more than `slots`
+/// workgroups that are not a whole number of waves: the whole tiles run
+/// unsplit, and the `T mod slots` tiles left over, rounded up to whole column
+/// blocks, run `slots / tail tiles` slices of K each so that they fill one
+/// more wave of shorter workgroups instead of a wave that is mostly empty.
+/// `None` when the grid is within one wave or a whole number of waves, the
+/// tail would leave no whole tile, K is too short for two slices of
+/// [`MIN_STEPS_PER_SPLIT`] steps, or the partial sums are over
+/// [`TAIL_PARTS_MAX_BYTES`].
+pub(super) fn tail_split(
+    tile: CoopTile,
+    (m, k, n): (u32, u32, u32),
+    slots: u32,
+) -> Option<TailSplit> {
+    let (gx, gy) = tile.groups(m, n);
+    let tiles = gx.checked_mul(gy)?;
+    let left = tiles
+        .checked_rem(slots)
+        .filter(|&r| r > 0 && tiles > slots)?;
+    let cols = left.div_ceil(gy);
+    let tail = cols * gy;
+    if cols >= gx || tail > slots / 2 {
+        return None;
+    }
+    let most = (k.div_ceil(tile.bk) / MIN_STEPS_PER_SPLIT).max(1);
+    let (slices, _) = split_k(k, tile.bk, (slots / tail).min(most));
+    let parts = u64::from(slices) * u64::from(m) * u64::from(n) * 4;
+    (slices >= 2 && parts <= TAIL_PARTS_MAX_BYTES).then_some(TailSplit { cols, slices })
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
     use super::{
-        bucket_of, plan, plan_fused, split_k, CoopTile, LARGE_M_TILES, SMALL_M_TILES, STEP_TILES,
-        TUNED,
+        bucket_of, plan, plan_fused, split_k, tail_split, CoopTile, TailSplit, LARGE_M_TILES,
+        SMALL_M_TILES, STEP_TILES, TUNED,
     };
+
+    #[test]
+    fn tail_split_covers_the_workgroups_past_whole_waves() {
+        let tile = CoopTile::T128X128_W64X32_K32_PF;
+        let got = |dims: (u32, u32, u32)| tail_split(tile, dims, 160);
+        // 1.7B gate: 64 x 8 = 512 tiles is 3 waves and 32 tiles. They are 4
+        // column blocks of 8 row tiles, in 5 slices of K: 4 x 8 x 5 = 160.
+        assert_eq!(
+            got((1024, 2048, 8192)),
+            Some(TailSplit { cols: 4, slices: 5 })
+        );
+        // 64 x 11 = 704 tiles, 64 left over, rounded up to 6 blocks of 11.
+        assert_eq!(
+            got((1352, 2048, 8192)),
+            Some(TailSplit { cols: 6, slices: 2 })
+        );
+        // 49 x 8 = 392 tiles, 72 left over: 9 blocks in 2 slices.
+        assert_eq!(
+            got((1024, 2048, 6168)),
+            Some(TailSplit { cols: 9, slices: 2 })
+        );
+        // 64 x 10 = 640 tiles are 4 whole waves.
+        assert_eq!(got((1280, 2048, 8192)), None);
+        // 16 x 8 = 128 tiles are less than one wave.
+        assert_eq!(got((1024, 2048, 2048)), None);
+        // 26 x 10 = 260 tiles leave 100, more than half a wave.
+        assert_eq!(got((1280, 2048, 3328)), None);
+        // K of two steps cannot make two slices of two steps.
+        assert_eq!(got((1024, 64, 8192)), None);
+        // The head would need 1 GB of partial sums, over the cap.
+        assert_eq!(got((1024, 2048, 49152)), None);
+        // No workgroups at all.
+        assert_eq!(tail_split(tile, (1024, 2048, 8192), 0), None);
+    }
 
     #[test]
     fn split_k_keeps_whole_steps_and_no_empty_slice() {

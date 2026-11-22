@@ -53,7 +53,7 @@ use fused::params_vec4s;
 pub(super) use fused::{params_vec4s as kind_params_vec4s, reference_source};
 pub(super) use loader::{LoaderKind, MAX_SOURCES, SOURCE_BINDING};
 use mainloop::main_loop;
-use plan::{grid_fits, plan, split_k};
+use plan::{grid_fits, plan, split_k, tail_split};
 pub use tiles::{CoopConfig, CoopTile};
 use tiles::{PAD, SUBGROUP};
 
@@ -67,6 +67,18 @@ const MIN_ROWS: u32 = 32;
 /// Fewest output rows of a product whose kernel is compiled without index
 /// bounds clamps and without loop bounding (see [`Coop::kernel`]).
 const UNCHECKED_MIN_ROWS: u32 = 256;
+
+/// Rows above which a product may take the tail split (see
+/// [`plan::tail_split`]). Smaller products keep their router rows, which the
+/// wave model it rests on was not measured against.
+const TAIL_SPLIT_ABOVE_ROWS: u32 = 256;
+
+/// The line of the kernel that sets the first column of its tile, and the
+/// line that adds a column block offset from the parameters to it. The
+/// offset kernel is built by replacing one with the other, so the source of
+/// every other kernel stays as it was.
+const N0_LINE: &str = "let n0 = wg.x * BN;";
+const N0_OFFSET_LINE: &str = "let n0 = (wg.x + params[1].z) * BN;";
 
 /// What one compiled kernel is specialised for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -87,8 +99,9 @@ pub(super) struct CoopKey {
 
 /// The cooperative-matrix kernels of a device that has them.
 pub(super) struct Coop {
-    /// By key and whether the module was compiled without bounds checks.
-    kernels: Mutex<HashMap<(CoopKey, bool), Arc<Kernel>>>,
+    /// By key, whether the module was compiled without bounds checks and
+    /// whether it starts at a column block that the parameters give.
+    kernels: Mutex<HashMap<(CoopKey, bool, bool), Arc<Kernel>>>,
     /// The reduction passes of split fused products, by epilogue.
     fused_reduce: Mutex<HashMap<EpilogueKind, Arc<Kernel>>>,
     /// One `u32` counter of staging threads that clamped an `a` value (or a
@@ -235,6 +248,19 @@ impl Coop {
 
     /// The compiled kernel for `key`, for a product of `rows` output rows.
     fn kernel(&self, ctx: &WgpuContext, key: CoopKey, rows: u32) -> Arc<Kernel> {
+        self.kernel_from(ctx, key, rows, false)
+    }
+
+    /// As [`kernel`](Self::kernel); with `column_offset` the first column
+    /// block of the grid is the one `params[1].z` names, which is how the
+    /// tail split runs the last blocks of a grid apart from the others.
+    fn kernel_from(
+        &self,
+        ctx: &WgpuContext,
+        key: CoopKey,
+        rows: u32,
+        column_offset: bool,
+    ) -> Arc<Kernel> {
         // From UNCHECKED_MIN_ROWS rows up, and while FERROTENSOR_SHADER_CHECKS is
         // unset, the module is built without bounds checks and without loop
         // bounding. That is safe because every global read and write of the
@@ -249,42 +275,49 @@ impl Coop {
         // context's checks, and the two builds are cached apart.
         let unchecked = rows >= UNCHECKED_MIN_ROWS && !ShaderChecks::env_is_set();
         let mut cache = self.kernels.lock().unwrap_or_else(PoisonError::into_inner);
-        Arc::clone(cache.entry((key, unchecked)).or_insert_with(|| {
-            let mut src = source(key);
-            if self.immediates {
-                src = immediate_source(&src);
-            }
-            let checks = if unchecked {
-                ShaderChecks {
-                    loop_bounding: false,
-                    bounds: false,
-                    ..ctx.shader_checks()
-                }
-            } else {
-                ctx.shader_checks()
-            };
-            let module = checks.module(&ctx.device, "matmul_coop", src);
-            let pipeline = Arc::new(ctx.device.create_compute_pipeline(
-                &wgpu::ComputePipelineDescriptor {
-                    label: Some("matmul_coop"),
-                    layout: None,
-                    module: &module,
-                    entry_point: Some("matmul_coop"),
-                    // The kernel writes every workgroup value before reading it.
-                    compilation_options: wgpu::PipelineCompilationOptions {
-                        zero_initialize_workgroup_memory: false,
-                        ..Default::default()
-                    },
-                    cache: None,
-                },
-            ));
-            let layout = pipeline.get_bind_group_layout(0);
-            Arc::new(Kernel {
-                pipeline,
-                layout,
-                entry_point: "matmul_coop",
-            })
-        }))
+        Arc::clone(
+            cache
+                .entry((key, unchecked, column_offset))
+                .or_insert_with(|| {
+                    let mut src = source(key);
+                    if column_offset {
+                        src = src.replace(N0_LINE, N0_OFFSET_LINE);
+                    }
+                    if self.immediates {
+                        src = immediate_source(&src);
+                    }
+                    let checks = if unchecked {
+                        ShaderChecks {
+                            loop_bounding: false,
+                            bounds: false,
+                            ..ctx.shader_checks()
+                        }
+                    } else {
+                        ctx.shader_checks()
+                    };
+                    let module = checks.module(&ctx.device, "matmul_coop", src);
+                    let pipeline = Arc::new(ctx.device.create_compute_pipeline(
+                        &wgpu::ComputePipelineDescriptor {
+                            label: Some("matmul_coop"),
+                            layout: None,
+                            module: &module,
+                            entry_point: Some("matmul_coop"),
+                            // The kernel writes every workgroup value before reading it.
+                            compilation_options: wgpu::PipelineCompilationOptions {
+                                zero_initialize_workgroup_memory: false,
+                                ..Default::default()
+                            },
+                            cache: None,
+                        },
+                    ));
+                    let layout = pipeline.get_bind_group_layout(0);
+                    Arc::new(Kernel {
+                        pipeline,
+                        layout,
+                        entry_point: "matmul_coop",
+                    })
+                }),
+        )
     }
 }
 
@@ -490,7 +523,84 @@ impl ComputeEngine {
             size_class: if m <= 256 { "m<=256" } else { "m>256" },
         };
         let (gx, gy) = tile.groups(m, n);
-        if split == 1 {
+        // Rows above 256 only: smaller products keep their router rows, which
+        // the wave model below was not measured on.
+        let tail = if split == 1 && m > TAIL_SPLIT_ABOVE_ROWS {
+            tail_split(tile, (m, k, n), coop.target)
+        } else {
+            None
+        };
+        if let Some(tail) = tail {
+            // Whole column blocks first, with the normal epilogue.
+            let whole = gx - tail.cols;
+            self.run_tagged(
+                ctx,
+                &kernel,
+                label,
+                &[
+                    (0, a.buffer()),
+                    (1, b.buffer()),
+                    (2, out.buffer()),
+                    (3, &params),
+                    (4, coop.overflows.buffer()),
+                ],
+                (whole, gy, 1),
+                tune,
+            );
+            // Then the tail blocks with K split, partial sums at their own
+            // columns of a `[slices, m, n]` buffer.
+            let (slices, per) = split_k(k, tile.bk, tail.slices);
+            let (alpha, beta) = (
+                Epilogue::STORE.alpha.to_bits(),
+                Epilogue::STORE.beta.to_bits(),
+            );
+            let words = [m, k, n, per, alpha, beta, whole, 0];
+            let tail_params = uniform(ctx, bytemuck::cast_slice(&words));
+            let tail_kernel = coop.kernel_from(ctx, key, m, true);
+            let parts = UnifiedTensor::empty(ctx, &[slices as usize, m as usize, n as usize]);
+            self.run_tagged(
+                ctx,
+                &tail_kernel,
+                label,
+                &[
+                    (0, a.buffer()),
+                    (1, b.buffer()),
+                    (2, parts.buffer()),
+                    (3, &tail_params),
+                    (4, coop.overflows.buffer()),
+                ],
+                (tail.cols, gy, slices),
+                tune,
+            );
+            let first = whole * tile.bn;
+            let cols = n - first;
+            let reduce_params = uniform(
+                ctx,
+                bytemuck::cast_slice(&[
+                    m,
+                    n,
+                    first,
+                    cols,
+                    slices,
+                    ep.alpha.to_bits(),
+                    ep.beta.to_bits(),
+                    0,
+                ]),
+            );
+            let reduce = KernelLabel {
+                entry: self.split_reduce_cols.entry_point,
+                layout: "",
+                size_class: "",
+            };
+            self.run_tagged(
+                ctx,
+                &self.split_reduce_cols,
+                reduce,
+                &[(0, parts.buffer()), (1, out.buffer()), (2, &reduce_params)],
+                grid((m * cols).div_ceil(256)),
+                tune,
+            );
+        } else if split == 1 {
             self.run_tagged(
                 ctx,
                 &kernel,
@@ -644,7 +754,10 @@ fn matmul_coop(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_i
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic)]
 mod tests {
-    use super::{immediate_source, plan, source, CoopKey, CoopTile, EpilogueKind, LoaderKind};
+    use super::{
+        immediate_source, plan, source, CoopKey, CoopTile, EpilogueKind, LoaderKind, N0_LINE,
+        N0_OFFSET_LINE,
+    };
 
     fn keys() -> Vec<CoopKey> {
         let mut keys = Vec::new();
@@ -842,6 +955,19 @@ mod tests {
         13147694747433239255,
         15820869452388351058,
     ];
+
+    /// The offset kernel of the tail split is the plain kernel with one line
+    /// replaced, so the line has to be in every kernel's source.
+    #[test]
+    fn the_column_offset_replaces_the_one_line_that_sets_n0() {
+        for key in keys() {
+            let src = source(key);
+            assert_eq!(src.matches(N0_LINE).count(), 1, "{key:?}");
+            let offset = src.replace(N0_LINE, N0_OFFSET_LINE);
+            assert_eq!(offset.matches(N0_OFFSET_LINE).count(), 1, "{key:?}");
+            assert!(!offset.contains(N0_LINE), "{key:?}");
+        }
+    }
 
     #[test]
     fn generated_wgsl_is_what_it_was_before_the_split() {

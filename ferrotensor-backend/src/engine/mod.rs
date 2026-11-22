@@ -418,6 +418,9 @@ pub struct ComputeEngine {
     flash_attn_v2_bw_dkdv: Kernel,
     flash_group_sum: Kernel,
     split_reduce: Kernel,
+    /// `matmul_split_reduce_cols`: the reduction of a range of columns, for the
+    /// coop matmul's tail split.
+    split_reduce_cols: Kernel,
     /// Small-M matmul kernels, compiled the first time a tile and layout run.
     small_m: Mutex<HashMap<small_m::SmallMKey, Arc<Kernel>>>,
     /// The device's workgroup memory in bytes, which bounds the small-M tiles.
@@ -510,6 +513,7 @@ impl ComputeEngine {
             flash_attn_v2_bw_dkdv: k("flash_bwd_dk_dv"),
             flash_group_sum: k("flash_group_sum"),
             split_reduce: k("matmul_split_reduce"),
+            split_reduce_cols: k("matmul_split_reduce_cols"),
             small_m: Mutex::new(HashMap::new()),
             small_m_max_bytes: limits.max_compute_workgroup_storage_size,
             small_m_max_threads: limits
