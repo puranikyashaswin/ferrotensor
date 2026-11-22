@@ -229,7 +229,7 @@ impl ComputeEngine {
         };
         let (gx, gy) = tile.groups(m, n);
         if split == 1 {
-            let kernel = self.fused_kernel(ctx, coop, key(r.epilogue), tune);
+            let kernel = self.fused_kernel(ctx, coop, key(r.epilogue), (m, tune));
             let words = r.params_words(kps, params_vec4s(r.loader, r.epilogue));
             let params = uniform(ctx, bytemuck::cast_slice(&words));
             self.run_tagged(
@@ -244,7 +244,7 @@ impl ComputeEngine {
         }
         // The kernel stores each slice's raw sum (alpha 1, beta 0, the plain
         // epilogue) and the reduction applies the product's own epilogue.
-        let kernel = self.fused_kernel(ctx, coop, key(EpilogueKind::AlphaBeta), tune);
+        let kernel = self.fused_kernel(ctx, coop, key(EpilogueKind::AlphaBeta), (m, tune));
         let words = r.params_words_with(
             kps,
             params_vec4s(r.loader, EpilogueKind::AlphaBeta),
@@ -279,17 +279,18 @@ impl ComputeEngine {
         Ok(CoopConfig { tile, split })
     }
 
-    /// The compiled kernel for `key`; with a `tune` sample its compile time
-    /// is charged to the autotuner, as a trial's cost.
+    /// The compiled kernel for `key` and a product of `rows` rows; with a
+    /// `tune` sample its compile time is charged to the autotuner, as a
+    /// trial's cost.
     fn fused_kernel(
         &self,
         ctx: &WgpuContext,
         coop: &Coop,
         key: CoopKey,
-        tune: Option<u64>,
+        (rows, tune): (u32, Option<u64>),
     ) -> Arc<Kernel> {
         let compiling = Instant::now();
-        let kernel = coop.kernel(ctx, key);
+        let kernel = coop.kernel(ctx, key, rows);
         if tune.is_some() {
             if let Some(mut tuner) = coop.tuner() {
                 tuner.charge(compiling.elapsed());

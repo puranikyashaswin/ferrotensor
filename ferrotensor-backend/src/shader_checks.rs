@@ -8,7 +8,9 @@ use std::fmt;
 /// created: `default` (all of wgpu's checks), or a comma-separated list of
 /// the checks to leave out: `noloop`, `nobounds`, `nodiv`, `nozeroinit`, or
 /// `none` for all of them. Unset, it is [`ShaderChecks::DEFAULT`], which is
-/// `noloop`.
+/// `noloop`. Unset, the cooperative-matrix kernel also drops its bounds checks
+/// for products of 256 rows or more (every access of that kernel has its own
+/// guard); set to anything, it uses the checks that value asks for.
 pub const SHADER_CHECKS_ENV: &str = "FERROTENSOR_SHADER_CHECKS";
 
 /// Which of wgpu's runtime checks the built-in kernels are compiled with.
@@ -79,6 +81,13 @@ impl ShaderChecks {
         Ok(checks)
     }
 
+    /// Whether [`SHADER_CHECKS_ENV`] is set to a non-empty value. The
+    /// cooperative-matrix kernel of large products leaves out its bounds
+    /// checks and loop bounding only while it is not.
+    pub(crate) fn env_is_set() -> bool {
+        std::env::var_os(SHADER_CHECKS_ENV).is_some_and(|v| !v.to_string_lossy().trim().is_empty())
+    }
+
     /// The checks [`SHADER_CHECKS_ENV`] asks for; an unknown value is
     /// logged and [`Self::DEFAULT`] used.
     pub(crate) fn from_env() -> Self {
@@ -141,7 +150,10 @@ impl ShaderChecks {
         // in bounds by those sizes, and their integer divisors are constants
         // or the dimensions and head counts of a tensor shape, which are never
         // zero for a shape that is dispatched. Only the loop bounding is left
-        // out unless `FERROTENSOR_SHADER_CHECKS` asks for more.
+        // out unless `FERROTENSOR_SHADER_CHECKS` asks for more. The one
+        // exception is the cooperative-matrix kernel for 256 rows or more,
+        // built without bounds checks too; its safety argument is on
+        // `Coop::kernel`.
         unsafe { device.create_shader_module_trusted(desc, runtime_checks) }
     }
 }

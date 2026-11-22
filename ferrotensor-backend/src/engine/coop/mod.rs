@@ -29,6 +29,7 @@
 
 use super::{grid, immediate_params, uniform, ComputeEngine, Epilogue, Kernel};
 use crate::kernel_timing::KernelLabel;
+use crate::shader_checks::ShaderChecks;
 use crate::{DType, ReadbackError, UnifiedTensor, WgpuContext};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -63,6 +64,10 @@ use tiles::{PAD, SUBGROUP};
 /// rows run here too.
 const MIN_ROWS: u32 = 32;
 
+/// Fewest output rows of a product whose kernel is compiled without index
+/// bounds clamps and without loop bounding (see [`Coop::kernel`]).
+const UNCHECKED_MIN_ROWS: u32 = 256;
+
 /// What one compiled kernel is specialised for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) struct CoopKey {
@@ -82,7 +87,8 @@ pub(super) struct CoopKey {
 
 /// The cooperative-matrix kernels of a device that has them.
 pub(super) struct Coop {
-    kernels: Mutex<HashMap<CoopKey, Arc<Kernel>>>,
+    /// By key and whether the module was compiled without bounds checks.
+    kernels: Mutex<HashMap<(CoopKey, bool), Arc<Kernel>>>,
     /// The reduction passes of split fused products, by epilogue.
     fused_reduce: Mutex<HashMap<EpilogueKind, Arc<Kernel>>>,
     /// One `u32` counter of staging threads that clamped an `a` value (or a
@@ -227,14 +233,37 @@ impl Coop {
         tile.threads() <= self.max_threads && tile.workgroup_bytes(transposed_b) <= self.max_bytes
     }
 
-    fn kernel(&self, ctx: &WgpuContext, key: CoopKey) -> Arc<Kernel> {
+    /// The compiled kernel for `key`, for a product of `rows` output rows.
+    fn kernel(&self, ctx: &WgpuContext, key: CoopKey, rows: u32) -> Arc<Kernel> {
+        // From UNCHECKED_MIN_ROWS rows up, and while FERROTENSOR_SHADER_CHECKS is
+        // unset, the module is built without bounds checks and without loop
+        // bounding. That is safe because every global read and write of the
+        // kernel has its own guard on `m`, `n` and `k` (`gr < m && gk < k` in
+        // the `a` loads, `gn < n && gk < k` in the `b` loads, `r < m && col < n`
+        // in every epilogue); the grid is `ceil(m / BM)` by `ceil(n / BN)`, so
+        // `m0 < m` and `n0 < n` for the poison write; the host checks that each
+        // buffer holds its shape; workgroup-memory indices are bounded by the
+        // tile sizes; and every loop runs a constant number of times or
+        // `steps` times. The access-by-access audit is in
+        // notes/coop-unchecked-2026-11-22.md. Smaller products keep the
+        // context's checks, and the two builds are cached apart.
+        let unchecked = rows >= UNCHECKED_MIN_ROWS && !ShaderChecks::env_is_set();
         let mut cache = self.kernels.lock().unwrap_or_else(PoisonError::into_inner);
-        Arc::clone(cache.entry(key).or_insert_with(|| {
+        Arc::clone(cache.entry((key, unchecked)).or_insert_with(|| {
             let mut src = source(key);
             if self.immediates {
                 src = immediate_source(&src);
             }
-            let module = ctx.shader_checks().module(&ctx.device, "matmul_coop", src);
+            let checks = if unchecked {
+                ShaderChecks {
+                    loop_bounding: false,
+                    bounds: false,
+                    ..ctx.shader_checks()
+                }
+            } else {
+                ctx.shader_checks()
+            };
+            let module = checks.module(&ctx.device, "matmul_coop", src);
             let pipeline = Arc::new(ctx.device.create_compute_pipeline(
                 &wgpu::ComputePipelineDescriptor {
                     label: Some("matmul_coop"),
@@ -442,7 +471,7 @@ impl ComputeEngine {
         let (split, kps) = split_k(k, tile.bk, config.split);
         let key = coop_key(tile, transposed_b, (k, n));
         let compiling = Instant::now();
-        let kernel = coop.kernel(ctx, key);
+        let kernel = coop.kernel(ctx, key, m);
         if tune.is_some() {
             // A trial's compile time is part of what tuning costs.
             if let Some(mut tuner) = coop.tuner() {
