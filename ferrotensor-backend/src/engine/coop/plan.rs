@@ -1,5 +1,8 @@
 //! Which tile, and how many slices of K, the router runs a product with.
 
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
 use super::{CoopConfig, CoopTile};
 
 /// Largest workgroup count per grid dimension.
@@ -492,12 +495,26 @@ fn tuned_rows(m: u32) -> &'static [u32] {
     }
 }
 
+/// [`TUNED`] by `(rows, transposed_b, k, n)`, to the position of its row. The
+/// router looks a product up at every dispatch, and a scan of the table for
+/// each of the up to three row keys of a bucket takes longer as the table
+/// grows, which the 135M and 360M steps, that wait on the CPU, showed.
+static TUNED_INDEX: OnceLock<HashMap<(u32, bool, u32, u32), usize>> = OnceLock::new();
+
 /// The measured configuration for this product, when the router has one.
 fn tuned(m: u32, transposed_b: bool, k: u32, n: u32) -> Option<CoopConfig> {
+    let index = TUNED_INDEX.get_or_init(|| {
+        let mut index = HashMap::with_capacity(TUNED.len());
+        for (at, t) in TUNED.iter().enumerate() {
+            // The first row of a key wins, as a scan of the table would.
+            index.entry((t.m, t.transposed_b, t.k, t.n)).or_insert(at);
+        }
+        index
+    });
     let row = tuned_rows(m).iter().find_map(|&rows| {
-        TUNED
-            .iter()
-            .find(|t| (t.m, t.transposed_b, t.k, t.n) == (rows, transposed_b, k, n))
+        index
+            .get(&(rows, transposed_b, k, n))
+            .and_then(|&at| TUNED.get(at))
     })?;
     Some(CoopConfig {
         tile: row.tile,
