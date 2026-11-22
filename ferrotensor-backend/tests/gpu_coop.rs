@@ -236,6 +236,85 @@ fn coop_matmul_matches_cpu_on_f16_rounded_inputs() {
     }
 }
 
+/// Shapes of 1000 and 1352 rows, neither a multiple of any tile height, so the
+/// last row of tiles is partial. They are the large-M products (256 rows or
+/// more) that run in the kernel built without bounds checks while
+/// `FERROTENSOR_SHADER_CHECKS` is unset. The last shape has a K that is not a
+/// multiple of 4 and an N that is not a multiple of 8, which take the scalar
+/// staging loads.
+const UNCHECKED_SHAPES: &[(usize, usize, usize)] = &[
+    (1000, 576, 1536),
+    (1352, 1024, 1160),
+    (1352, 2048, 2048),
+    (1000, 1002, 71),
+];
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn coop_large_m_without_bounds_checks_matches_f64_off_the_tile() {
+    let Some(g) = coop_gpu("coop_large_m_without_bounds_checks_matches_f64_off_the_tile") else {
+        return;
+    };
+    let checks = std::env::var("FERROTENSOR_SHADER_CHECKS").unwrap_or_else(|_| "unset".into());
+    for (seed, &(m, k, n)) in UNCHECKED_SHAPES.iter().enumerate() {
+        let a = rand_vec(m * k, 300 + seed as u64);
+        let b = rand_vec(k * n, 400 + seed as u64);
+        // The reference is f64 on the f16-rounded operands, so what is left
+        // is f32 summation (below 2e-5 of the largest output) and not
+        // the 2^-11 rounding of the inputs.
+        let want = cpu_matmul(&f16_round(&a), &f16_round(&b), (m, k, n));
+        let zeros = vec![0.0; m * n];
+        for transposed_b in [false, true] {
+            let got = run_coop(
+                g,
+                (m, k, n),
+                &a,
+                &b,
+                transposed_b,
+                (Epilogue::STORE, &zeros),
+            );
+            let e = max_rel_error(&got, &want);
+            eprintln!(
+                "coop {m}x{k}x{n} transposed_b {transposed_b} (shader checks {checks}): max rel err {e:.2e}"
+            );
+            assert!(e < 2e-5, "{m}x{k}x{n} transposed_b {transposed_b}: {e:e}");
+        }
+    }
+    // Every register-prefetch tile, K whole and split in 3, on the first
+    // shape: the router picks only some of them, and each is its own kernel.
+    let (m, k, n) = UNCHECKED_SHAPES[0];
+    let a = rand_vec(m * k, 500);
+    let b = rand_vec(k * n, 501);
+    let want = cpu_matmul(&f16_round(&a), &f16_round(&b), (m, k, n));
+    let zeros = vec![0.0; m * n];
+    let mut ran = 0;
+    for &tile in &CoopTile::PIPELINED {
+        for split in [1, 3] {
+            for transposed_b in [false, true] {
+                let config = CoopConfig { tile, split };
+                let Some(got) = run_or_skip(
+                    g,
+                    (m, k, n),
+                    (&a, &b),
+                    transposed_b,
+                    (Epilogue::STORE, &zeros),
+                    config,
+                ) else {
+                    continue;
+                };
+                let e = max_rel_error(&got, &want);
+                assert!(
+                    e < 2e-5,
+                    "{} split {split} transposed_b {transposed_b}: {e:e}",
+                    tile.name()
+                );
+                ran += 1;
+            }
+        }
+    }
+    assert!(ran > 0, "no register-prefetch tile fits this device");
+}
+
 /// Products of 32 to 63 rows go to the cooperative kernel, not the small-M one.
 #[test]
 #[ignore = "needs a GPU; run with --ignored --test-threads=1"]

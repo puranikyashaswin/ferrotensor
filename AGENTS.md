@@ -254,7 +254,10 @@ the group once.
   and `ShaderChecks::module` in `ferrotensor-backend/src/shader_checks.rs`, which
   builds the crate's own WGSL kernels with `create_shader_module_trusted`
   without naga's forced loop bounding, and without the other runtime checks
-  `FERROTENSOR_SHADER_CHECKS` leaves out (`default` keeps all of wgpu's).
+  `FERROTENSOR_SHADER_CHECKS` leaves out (`default` keeps all of wgpu's). With
+  that variable unset, the cooperative-matrix kernel of products of 256 rows or
+  more is also built without bounds checks: each of its accesses has its own
+  guard (see `Coop::kernel`).
 - A comment says why the code does something. A doc comment is one summary sentence, plus
   `# Errors`, `# Panics` or `# Safety` when they apply.
 - No new dependency without the maintainer's approval. One concern per PR.
