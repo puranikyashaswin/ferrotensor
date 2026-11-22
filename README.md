@@ -396,7 +396,7 @@ against them. Kernel-level numbers for Ferrotensor alone are in
 ## Contributing
 
 Contributions are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) covers setup,
-tests and the PR process; [docs/good-first-issues.md](docs/good-first-issues.md)
+tests and the PR process; [the issue tracker](https://github.com/puranikyashaswin/ferrotensor/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)
 lists concrete starting points; [docs/writing-a-kernel.md](docs/writing-a-kernel.md)
 walks through adding a GPU op.
 
