@@ -643,7 +643,8 @@ pub(super) fn split_to_fill(tile: CoopTile, (m, k, n): (u32, u32, u32), target: 
 #[allow(clippy::expect_used)]
 mod tests {
     use super::{
-        plan, plan_fused, split_k, CoopTile, LARGE_M_TILES, SMALL_M_TILES, STEP_TILES, TUNED,
+        plan, plan_fused, row_bucket, split_k, CoopTile, LARGE_M_TILES, SMALL_M_TILES, STEP_TILES,
+        TUNED,
     };
 
     #[test]
