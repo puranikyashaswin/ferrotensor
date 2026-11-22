@@ -865,8 +865,12 @@ mod tests {
     /// to 256 rows on a tuned device, and retaken a third time (it was
     /// 1620736337270207953, with 1200 rows added to [`ROWS`]) when the 1280-row
     /// rows joined the table and the 2048-row rows of 360M and 1.7B were
-    /// replaced, which moves products of 1025 to 2048 rows on a tuned device.
-    const PLAN_HASH: u64 = 4766422471105062887;
+    /// replaced, which moves products of 1025 to 2048 rows on a tuned device,
+    /// and retaken a fourth time (it was 4766422471105062887) when the rows of
+    /// 320, 384, 512 and 640 rows joined the table and the 1024, 1280 and 360M
+    /// 2048-row rows of 360M and 1.7B were retuned, which moves products of
+    /// 257 to 2048 rows on a tuned device.
+    const PLAN_HASH: u64 = 9955952549834230422;
 
     #[test]
     fn selector_picks_what_it_picked_before_the_split() {
