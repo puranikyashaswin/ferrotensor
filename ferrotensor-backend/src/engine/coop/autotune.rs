@@ -37,7 +37,7 @@
 use super::autotune_cache::{self, Choice, Platform};
 use super::epilogue::EpilogueKind;
 use super::loader::LoaderKind;
-use super::plan::{grid_fits, row_bucket, split_k, split_to_fill, ROW_STEP};
+use super::plan::{grid_fits, split_k, split_to_fill, ROW_STEP};
 use super::{CoopConfig, CoopTile};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -250,11 +250,23 @@ impl TuneKey {
     }
 }
 
-/// The row bucket of `m` rows: the router's own (see [`row_bucket`]), so that
-/// every row count of a key has the same static pick, and every product past
-/// 2048 rows the last.
+/// The row bucket of `m` rows: products of up to 64 rows (the kernel's
+/// smallest) share the first, and every product past 2048 rows the last. These
+/// are coarser than the router's buckets: a key per router bucket gave 135M and
+/// 360M steps, which visit each key a few times, 11 keys still timing
+/// candidates at the end of a 120-step run instead of 7, and the timing of
+/// slower candidates cost them about 1% of the step.
 pub(super) fn m_bucket(m: u32) -> u32 {
-    row_bucket(m).unwrap_or(4096)
+    match m {
+        0..=64 => 64,
+        65..=128 => 128,
+        129..=192 => 192,
+        193..=256 => 256,
+        257..=512 => 512,
+        513..=1024 => 1024,
+        1025..=2048 => 2048,
+        _ => 4096,
+    }
 }
 
 /// Workgroups over waves of `target`: the share of the last wave's slots
@@ -924,15 +936,9 @@ mod tests {
     fn rows_share_a_key_within_their_bucket() {
         let bucket = |m| TuneKey::new(false, KEY, (m, 576, 576)).m_bucket();
         assert_eq!(
-            [
-                1, 64, 65, 128, 129, 192, 193, 256, 257, 320, 321, 384, 385, 512, 513, 640, 641,
-                1024, 1025, 1408, 1409, 2048, 2049, 9000
-            ]
-            .map(m_bucket),
-            [
-                64, 64, 128, 128, 192, 192, 256, 256, 320, 320, 384, 384, 512, 512, 640, 640, 1024,
-                1024, 1408, 1408, 2048, 2048, 4096, 4096
-            ]
+            [1, 64, 65, 128, 129, 192, 193, 256, 257, 512, 513, 1024, 1025, 2048, 2049, 9000]
+                .map(m_bucket),
+            [64, 64, 128, 128, 192, 192, 256, 256, 512, 512, 1024, 1024, 2048, 2048, 4096, 4096]
         );
         assert_eq!(bucket(200), bucket(256));
         assert_ne!(bucket(256), bucket(257));

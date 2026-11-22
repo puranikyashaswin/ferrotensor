@@ -463,8 +463,7 @@ pub(super) const ROW_STEP: u32 = 16;
 /// 1408 bucket is the 1280-row row, then the 2048-row one. Training batches
 /// are padded to their longest sequence, so a step's row count is rarely
 /// exactly the one a row was measured at, and an exact match would leave most
-/// products to the fallback rule. The autotuner uses the same buckets, so
-/// that every row count of one of its keys has the same static pick.
+/// products to the fallback rule.
 const ROW_BUCKETS: &[(u32, &[u32])] = &[
     (64, &[64, 256]),
     (128, &[128, 256]),
@@ -479,17 +478,16 @@ const ROW_BUCKETS: &[(u32, &[u32])] = &[
     (2048, &[2048]),
 ];
 
-/// The last row of the bucket of `m` rows (rounded up to a multiple of
-/// [`ROW_STEP`]), or `None` past 2048 rows, where the router has no rows.
-pub(super) fn row_bucket(m: u32) -> Option<u32> {
+/// The bucket of `m` rows (rounded up to a multiple of [`ROW_STEP`]), or
+/// `None` past 2048 rows, where the router has no rows.
+fn bucket_of(m: u32) -> Option<&'static (u32, &'static [u32])> {
     let rows = m.div_ceil(ROW_STEP) * ROW_STEP;
-    ROW_BUCKETS.iter().map(|b| b.0).find(|&last| rows <= last)
+    ROW_BUCKETS.iter().find(|b| rows <= b.0)
 }
 
 /// The [`TUNED`] rows to look up for `m` rows, in order.
 fn tuned_rows(m: u32) -> &'static [u32] {
-    let rows = m.div_ceil(ROW_STEP) * ROW_STEP;
-    match ROW_BUCKETS.iter().find(|b| rows <= b.0) {
+    match bucket_of(m) {
         Some(bucket) => bucket.1,
         None => &[],
     }
@@ -660,7 +658,7 @@ pub(super) fn split_to_fill(tile: CoopTile, (m, k, n): (u32, u32, u32), target: 
 #[allow(clippy::expect_used)]
 mod tests {
     use super::{
-        plan, plan_fused, row_bucket, split_k, CoopTile, LARGE_M_TILES, SMALL_M_TILES, STEP_TILES,
+        bucket_of, plan, plan_fused, split_k, CoopTile, LARGE_M_TILES, SMALL_M_TILES, STEP_TILES,
         TUNED,
     };
 
@@ -1289,9 +1287,9 @@ mod tests {
     fn rows_between_the_buckets_run_the_bucket_above() {
         let all = |_: CoopTile| true;
         for (m, bucket) in [(1, 64), (257, 320), (321, 384), (385, 512), (2048, 2048)] {
-            assert_eq!(row_bucket(m), Some(bucket), "m {m}");
+            assert_eq!(bucket_of(m).map(|b| b.0), Some(bucket), "m {m}");
         }
-        assert_eq!(row_bucket(2049), None);
+        assert_eq!(bucket_of(2049), None);
         for &(bucket, transposed_b, k, n, winner) in BENCH_MID {
             let rows: &[u32] = match bucket {
                 320 => &[257, 300, 320],
