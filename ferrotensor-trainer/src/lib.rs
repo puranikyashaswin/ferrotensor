@@ -134,6 +134,9 @@ pub struct Trainer {
     /// With deferred readback, the submission that ended the previous
     /// micro-batch's backward pass; the next backward waits for it.
     backward_mark: Option<u64>,
+    /// The shape of each micro-batch trained since the last
+    /// [`take_micro_shapes`](Self::take_micro_shapes), in order.
+    micro_shapes: Vec<MicroShape>,
 }
 
 /// A sequence's [`StepStats`], with its loss still on the GPU until `rows`
@@ -163,6 +166,25 @@ pub fn padded_length(longest: usize, sequences: usize, length_bucket: usize) -> 
         bucket => bucket,
     };
     longest.div_ceil(bucket) * bucket
+}
+
+/// The padded size of one micro-batch, as the model's matmuls see it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MicroShape {
+    /// Rows through the model: sequences times `padded_len`.
+    pub rows: usize,
+    /// The length every sequence of the micro-batch is padded to.
+    pub padded_len: usize,
+}
+
+/// The [`MicroShape`] of a micro-batch of `sequences` sequences whose longest
+/// has `longest` tokens, for a [`Trainer::length_bucket`] of `length_bucket`.
+pub fn micro_shape(longest: usize, sequences: usize, length_bucket: usize) -> MicroShape {
+    let padded_len = padded_length(longest, sequences, length_bucket);
+    MicroShape {
+        rows: sequences * padded_len,
+        padded_len,
+    }
 }
 
 /// Stats of a step with no supervised tokens.
@@ -201,7 +223,14 @@ impl Trainer {
             pending_rows: Vec::new(),
             deferred: Vec::new(),
             backward_mark: None,
+            micro_shapes: Vec::new(),
         }
+    }
+
+    /// The shapes of the micro-batches trained since the last call, in
+    /// order, and clears them.
+    pub fn take_micro_shapes(&mut self) -> Vec<MicroShape> {
+        std::mem::take(&mut self.micro_shapes)
     }
 
     /// Read the losses of a whole accumulation window back at once, when it
@@ -345,7 +374,9 @@ impl Trainer {
         train_params: &[Tensor],
     ) -> Result<(), TrainError> {
         let len = input_ids.len().min(target_ids.len());
-        let padded_len = padded_length(len, 1, self.length_bucket);
+        let shape = micro_shape(len, 1, self.length_bucket);
+        let padded_len = shape.padded_len;
+        self.micro_shapes.push(shape);
         let mut inputs = input_ids[..len].to_vec();
         let mut targets = target_ids[..len].to_vec();
         let mut mask = match loss_mask {
@@ -705,7 +736,9 @@ impl Trainer {
             .map(|s| s.0.len().min(s.1.len()))
             .max()
             .unwrap_or(0);
-        let padded_len = padded_length(longest, chunk.len(), self.length_bucket);
+        let shape = micro_shape(longest, chunk.len(), self.length_bucket);
+        let padded_len = shape.padded_len;
+        self.micro_shapes.push(shape);
         let mut inputs = Vec::with_capacity(chunk.len());
         let mut targets = Vec::with_capacity(chunk.len() * padded_len);
         let mut masks = Vec::with_capacity(chunk.len() * padded_len);
@@ -1210,7 +1243,7 @@ pub fn masked_cross_entropy_from_logits(
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use super::{masked_cross_entropy_from_logits, padded_length};
+    use super::{masked_cross_entropy_from_logits, micro_shape, padded_length, MicroShape};
     use crate::data::TrainingExample;
 
     #[test]
@@ -1222,6 +1255,17 @@ mod tests {
         assert_eq!(padded_length(61, 3, 0), 61);
         assert_eq!(padded_length(61, 4, 0), 61);
         assert_eq!(padded_length(214, 8, 0), 214);
+    }
+
+    #[test]
+    fn micro_shape_counts_the_padded_rows_of_the_whole_micro_batch() {
+        let shape = |rows, padded_len| MicroShape { rows, padded_len };
+        assert_eq!(micro_shape(214, 8, 0), shape(1712, 214));
+        assert_eq!(micro_shape(256, 8, 0), shape(2048, 256));
+        assert_eq!(micro_shape(61, 1, 0), shape(64, 64));
+        assert_eq!(micro_shape(61, 2, 0), shape(128, 64));
+        assert_eq!(micro_shape(61, 8, 16), shape(512, 64));
+        assert_eq!(micro_shape(0, 4, 0), shape(0, 0));
     }
 
     #[test]
