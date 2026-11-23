@@ -600,7 +600,7 @@ The tokenizer must be byte-level BPE with the pre-tokenizer of GPT-2 or of
 SmolLM (llama.cpp `gpt-2` and `smollm`); SentencePiece-style tokenizers such
 as TinyLlama's are refused. An existing `--out`, a `model_type` other than
 `llama`, a scaled `rope_scaling` or `rope_parameters` (Llama 3.1 and
-later), projection biases (Qwen2), a quantized base and tensors without a
+later: the training and `generate` paths run it, the GGUF file does not carry it yet), projection biases (Qwen2), a quantized base and tensors without a
 llama.cpp name are refused too, with exit code 2. The file is written to the GGUF v3 specification.
 On the A10G run of 16 November 2026, llama.cpp (commit `9fba51d`, CPU build,
 `llama-simple`) loaded the SmolLM2-1.7B file of 218 tensors, and its greedy

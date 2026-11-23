@@ -11,6 +11,7 @@
 use crate::checkpoint::LoraCheckpoint;
 use crate::merge::{adapters_by_target, write_through_temp_file, Float, LowRank};
 use ferrotensor_graph::model_builder::check_supported;
+use ferrotensor_graph::rope::rope_scaling;
 use ferrotensor_loader::{Lfm2Config, ModelLoader, WeightsContext};
 use serde_json::Value as Json;
 use std::collections::HashMap;
@@ -495,9 +496,19 @@ pub fn export_gguf(
         )
         .into());
     }
+    check_supported(&config).map_err(|e| format!("{}: {e}", config_path.display()))?;
     // The file carries no rotary scaling, so a scaled RoPE would load and
     // give wrong logits.
-    check_supported(&config).map_err(|e| format!("{}: {e}", config_path.display()))?;
+    if rope_scaling(&config)
+        .map_err(|e| format!("{}: {e}", config_path.display()))?
+        .is_some()
+    {
+        return Err(format!(
+            "{}: scaled RoPE (rope_type \"llama3\") is not supported: the GGUF export writes unscaled RoPE",
+            config_path.display()
+        )
+        .into());
+    }
     if config.quantization.is_some() {
         return Err(format!(
             "{} has quantization: the base is quantized; export-gguf needs an F32, F16 or BF16 checkpoint",
@@ -1127,12 +1138,15 @@ mod tests {
     fn refuses_scaled_rope_and_qwen2_style_biases() {
         let err = refusal("rope-scaling", |dir| {
             let mut config = tiny_config();
-            config["rope_scaling"] = serde_json::json!({ "rope_type": "llama3", "factor": 8.0 });
+            config["rope_scaling"] = serde_json::json!({
+                "rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0,
+                "high_freq_factor": 4.0, "original_max_position_embeddings": 8192
+            });
             write_json(&dir.join("config.json"), &config);
         });
         assert!(
             err.ends_with(
-                "config.json: rope_scaling type \"llama3\" is not supported: RoPE runs unscaled"
+                "config.json: scaled RoPE (rope_type \"llama3\") is not supported: the GGUF export writes unscaled RoPE"
             ),
             "{err}"
         );

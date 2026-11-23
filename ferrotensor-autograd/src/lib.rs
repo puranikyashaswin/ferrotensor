@@ -515,6 +515,9 @@ pub struct RoPENode {
     pub pos: usize,
     /// RoPE base frequency.
     pub theta: f32,
+    /// Inverse frequency of each rotation pair, when it is not derived from
+    /// `theta` (scaled RoPE).
+    pub inv_freq: Option<UnifiedTensor>,
 }
 impl AutogradNode for RoPENode {
     fn inputs(&self) -> Vec<Tensor> {
@@ -527,7 +530,14 @@ impl AutogradNode for RoPENode {
         let ctx = &self.input.ctx;
         let grad_in = UnifiedTensor::empty(ctx, &self.input.data.shape);
         engine.copy_tensor(ctx, grad, &grad_in, 0);
-        engine.rope_theta_inverse(ctx, &grad_in, self.head_dim, self.pos, self.theta);
+        engine.rope_freqs_inverse(
+            ctx,
+            &grad_in,
+            self.head_dim,
+            self.pos,
+            self.theta,
+            self.inv_freq.as_ref(),
+        );
         vec![grad_in]
     }
 }
@@ -1126,14 +1136,29 @@ impl Tensor {
         theta: f32,
         engine: &ComputeEngine,
     ) -> Tensor {
+        Tensor::rope_freqs(input, head_dim, pos, theta, None, engine)
+    }
+
+    /// [`rope_theta`](Tensor::rope_theta) with the inverse frequency of each
+    /// rotation pair given as `inv_freq` (`[head_dim / 2]`), as scaled RoPE
+    /// needs; `None` derives them from `theta`.
+    pub fn rope_freqs(
+        input: &Tensor,
+        head_dim: usize,
+        pos: usize,
+        theta: f32,
+        inv_freq: Option<&UnifiedTensor>,
+        engine: &ComputeEngine,
+    ) -> Tensor {
         let out_data = UnifiedTensor::empty(&input.ctx, &input.data.shape);
         engine.copy_tensor(&input.ctx, &input.data, &out_data, 0);
-        engine.rope_theta(&input.ctx, &out_data, head_dim, pos, theta);
+        engine.rope_freqs(&input.ctx, &out_data, head_dim, pos, theta, inv_freq);
         let node = Arc::new(RoPENode {
             input: input.clone(),
             head_dim,
             pos,
             theta,
+            inv_freq: inv_freq.cloned(),
         });
         Tensor::with_creator(input.ctx.clone(), out_data, node)
     }

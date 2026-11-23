@@ -226,7 +226,7 @@ tested, incomplete, or only checked on one machine.
 | `DataLoader` | **Stable** | Batching, seeded shuffling, optional prefetching on a background thread (`epoch_prefetched`) |
 | Reproducible randomness | **Stable** | `manual_seed` (Rust and Python) seeds random tensors, layer initialisation and dropout |
 | LoRA fine-tuning of Llama-style models (`ferrotensor-cli`) | **Experimental** | Measured with SmolLM2-135M, 360M and 1.7B on an NVIDIA A10G (24 GB), Qwen2.5-0.5B-Instruct on the A10G (one 30-step run), and SmolLM2-135M on an Apple M2 (8 GB) with a 0.4 build; see the [LoRA walkthrough](docs/examples/lora-sft.md). Larger models are untested |
-| Llama / LFM2-style blocks (`ferrotensor-graph`) | **Experimental** | Attention with RoPE, SwiGLU MLP, RMSNorm, KV cache. Qwen2 checkpoints (biased query, key and value projections, tied embeddings) load: a tiny random `Qwen2ForCausalLM` gives the logits and LoRA gradients of Hugging Face transformers in CI; the real Qwen2.5-0.5B-Instruct checkpoint loads on an A10G (held-out loss 1.3359, and greedy `generate` answers "The capital of France is Paris."; one run, [results](benchmarks/RESULTS.md#real-hardware-run-16-november-2026)). Qwen3-style per-head q/k norms are implemented and checked on a small synthetic model against a CPU reference; real Qwen3 checkpoints are not measured yet |
+| Llama / LFM2-style blocks (`ferrotensor-graph`) | **Experimental** | Attention with RoPE, SwiGLU MLP, RMSNorm, KV cache. Qwen2 checkpoints (biased query, key and value projections, tied embeddings) load: a tiny random `Qwen2ForCausalLM` gives the logits and LoRA gradients of Hugging Face transformers in CI; the real Qwen2.5-0.5B-Instruct checkpoint loads on an A10G (held-out loss 1.3359, and greedy `generate` answers "The capital of France is Paris."; one run, [results](benchmarks/RESULTS.md#real-hardware-run-16-november-2026)). Llama 3 RoPE scaling (`rope_type: "llama3"`) is supported: on an NVIDIA A10G (24 GB), Llama-3.2-1B (the `unsloth/Llama-3.2-1B` mirror) gives f32 logits within 4.4e-5 (largest absolute difference over 8 prompts) of transformers 5.23.0 in float32, and a 250-step `finetune --no-chat-template` (batch 1 x 8, sequence length 256, rank 8) took the held-out loss from 1.8367 to 1.3300, against 1.3221 for the PyTorch + PEFT twin (one run each). Llama 3 tokenizers have no ChatML tokens, so `chat` refuses them. Qwen3-style per-head q/k norms are implemented and checked on a small synthetic model against a CPU reference; real Qwen3 checkpoints are not measured yet |
 | Flash attention kernels (`ferrotensor-backend`) | **Experimental** | Forward v2 and a backward kernel; see the `flash_attention_*` cases in `ferrotensor-autograd/tests/grad_check.rs` |
 | Checkpoint/resume (`ferrotensor-trainer`) | **Experimental** | |
 | Loss scaler (`GradScaler` in `ferrotensor-trainer`) | **Experimental** | A library type: `Trainer::with_grad_scaler` attaches it, the CLI does not use it, and `ferrotensor demo` only constructs one. Gradients are f32, so there is no f16 underflow for it to guard against |
@@ -314,7 +314,7 @@ cargo run -p ferrotensor-cli --release -- finetune \
 ```
 
 `chat` needs a tokenizer with the ChatML tokens for now (SmolLM2 has them,
-TinyLlama does not); `generate --raw` works with any model.
+TinyLlama and Llama 3 do not); `generate --raw` works with any model.
 
 `finetune` picks the batch size, sequence length, gradient accumulation and
 block checkpointing that fit this machine's GPU memory, prints that plan,

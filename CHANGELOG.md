@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Llama 3 RoPE scaling (`rope_type: "llama3"` in `rope_scaling` or `rope_parameters`: `factor`, `low_freq_factor`, `high_freq_factor`, `original_max_position_embeddings`). The host computes the scaled inverse frequency of each rotation pair as `transformers` does, and the `rope` kernel reads that table in the forward and backward passes, in KV-cache decoding and in batched forwards. Llama 3 checkpoints such as Llama-3.2-1B load and train (on an NVIDIA A10G, f32 logits within 4.4e-5 of transformers 5.23.0 on 8 prompts, and held-out loss 1.3300 after 250 steps against 1.3221 for PyTorch + PEFT); train them with `--no-chat-template`, because their tokenizers have no ChatML tokens and `chat` refuses them. Linear, dynamic, yarn and longrope scaling are still refused. `export-gguf` still refuses scaled RoPE.
+- The tokenizer loader reads a `tokenizer.json` whose BPE merges are pairs (`["a", "b"]`), as Llama 3.2 ships, which `tokenizers` 0.19 refused.
+- `ferrotensor_graph::rope::{Llama3Scaling, rope_scaling}` and a `rope_inv_freq: Option<UnifiedTensor>` field on `Attention`, which can break code that builds `Attention` with a struct literal.
+
 ## [0.7.1] - 2026-11-21
 
 Five GPU kernel changes to LoRA training, in attention, matmul and the LoRA scale. One library change can break code: `FlashAttentionNode` has two new public fields, so code that builds it with a struct literal must set them (under Changed).

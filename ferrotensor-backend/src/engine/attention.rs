@@ -26,7 +26,23 @@ impl ComputeEngine {
         pos: usize,
         theta: f32,
     ) {
-        self.rotate(ctx, tensor, head_dim, pos, theta, false);
+        self.rotate(ctx, tensor, head_dim, pos, theta, None, false);
+    }
+
+    /// [`rope_theta`](Self::rope_theta) with the inverse frequency of each
+    /// rotation pair given as `inv_freq` (`[head_dim / 2]`) instead of
+    /// derived from `theta`; `None` is `rope_theta`. Scaled RoPE (Llama 3)
+    /// supplies its table here.
+    pub fn rope_freqs(
+        &self,
+        ctx: &WgpuContext,
+        tensor: &UnifiedTensor,
+        head_dim: usize,
+        pos: usize,
+        theta: f32,
+        inv_freq: Option<&UnifiedTensor>,
+    ) {
+        self.rotate(ctx, tensor, head_dim, pos, theta, inv_freq, false);
     }
 
     /// The inverse of [`rope_theta`](Self::rope_theta), in place: rotates by
@@ -40,10 +56,24 @@ impl ComputeEngine {
         pos: usize,
         theta: f32,
     ) {
-        self.rotate(ctx, tensor, head_dim, pos, theta, true);
+        self.rotate(ctx, tensor, head_dim, pos, theta, None, true);
     }
 
-    /// Shared body of [`rope_theta`](Self::rope_theta) and its inverse.
+    /// The inverse of [`rope_freqs`](Self::rope_freqs), in place.
+    pub fn rope_freqs_inverse(
+        &self,
+        ctx: &WgpuContext,
+        tensor: &UnifiedTensor,
+        head_dim: usize,
+        pos: usize,
+        theta: f32,
+        inv_freq: Option<&UnifiedTensor>,
+    ) {
+        self.rotate(ctx, tensor, head_dim, pos, theta, inv_freq, true);
+    }
+
+    /// Shared body of [`rope_freqs`](Self::rope_freqs) and its inverse.
+    #[allow(clippy::too_many_arguments)]
     fn rotate(
         &self,
         ctx: &WgpuContext,
@@ -51,6 +81,7 @@ impl ComputeEngine {
         head_dim: usize,
         pos: usize,
         theta: f32,
+        inv_freq: Option<&UnifiedTensor>,
         inverse: bool,
     ) {
         let (seq_len, tokens) = match tensor.shape.len() {
@@ -69,15 +100,19 @@ impl ComputeEngine {
                 heads as u32,
                 theta.to_bits(),
                 inverse as u32,
-                0,
+                // Nonzero: read the inverse frequencies from the table.
+                inv_freq.is_some() as u32,
                 0,
             ]),
         );
         let pairs = tensor.shape.iter().product::<usize>() / 2;
+        // The shader declares the table always; an unused binding gets a stub.
+        let stub = dummy_storage(ctx);
+        let table = inv_freq.map_or(&stub, UnifiedTensor::buffer);
         self.run(
             ctx,
             &self.rope,
-            &[(0, tensor.buffer()), (1, &params)],
+            &[(0, tensor.buffer()), (1, &params), (2, table)],
             groups64(pairs),
         );
     }
