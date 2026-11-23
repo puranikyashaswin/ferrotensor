@@ -621,9 +621,19 @@ pub(super) fn plan_fused(
 /// The router rows of 135M and 360M have no Plain entry: they run the table.
 const PLAIN_QKV_DX: Tuned = Tuned::new(1024, true, 6168, 2048, CoopTile::T128X128_W64X64_K32_PF, 3);
 
-/// Rows from which the [`PLAIN_QKV_DX`] configuration stands, and the last
-/// row of the buckets the sweep measured it in (320 to 1408).
-const PLAIN_QKV_DX_ROWS: std::ops::RangeInclusive<u32> = 320..=1408;
+/// Rows the [`PLAIN_QKV_DX`] tile stands for: the buckets the sweeps measured
+/// (320 to 2048 on an A10G).
+const PLAIN_QKV_DX_ROWS: std::ops::RangeInclusive<u32> = 320..=2048;
+
+/// Rows up to which the K split of [`PLAIN_QKV_DX`] (3) is the fastest one.
+/// Above them the same tile is fastest with K split 2 at 1536 and 1792 rows
+/// (933 and 1078 us against 1200 and 1343 us for the router's pick) and ties
+/// at 2048 rows (1267 us against 1266 us with split 3; the router's pick is
+/// 1710 us there, which is why the Plain loader needs a row for them).
+const PLAIN_QKV_DX_SPLIT3_ROWS: u32 = 1408;
+
+/// The K split of [`PLAIN_QKV_DX`] above [`PLAIN_QKV_DX_SPLIT3_ROWS`].
+const PLAIN_QKV_DX_TALL_SPLIT: u32 = 2;
 
 /// The [`PLAIN_QKV_DX`] configuration for this product, when it is that one.
 fn plain_row(m: u32, transposed_b: bool, k: u32, n: u32) -> Option<CoopConfig> {
@@ -631,7 +641,11 @@ fn plain_row(m: u32, transposed_b: bool, k: u32, n: u32) -> Option<CoopConfig> {
     let is_it = transposed_b == row.transposed_b && k == row.k && n == row.n;
     (is_it && PLAIN_QKV_DX_ROWS.contains(&m)).then_some(CoopConfig {
         tile: row.tile,
-        split: row.split,
+        split: if m <= PLAIN_QKV_DX_SPLIT3_ROWS {
+            row.split
+        } else {
+            PLAIN_QKV_DX_TALL_SPLIT
+        },
     })
 }
 
@@ -722,6 +736,7 @@ mod tests {
         let tuned = (160, true);
         let pick = |c: Option<super::CoopConfig>| c.map(|c| (c.tile, c.split));
         let want = Some((CoopTile::T128X128_W64X64_K32_PF, 3));
+        let want_tall = Some((CoopTile::T128X128_W64X64_K32_PF, 2));
         // 1.7B qkv dX over the packed buffer (K = 6144 + 3 x 8, N = 2048): the
         // 896, 1024 and 1352 rows of the 1.7B steps, and both ends of the range.
         for m in [320, 896, 1024, 1352, 1408] {
@@ -737,6 +752,15 @@ mod tests {
                 "{m}"
             );
         }
+        // Above 1408 rows the same tile runs with K split 2, up to 2048 rows.
+        for m in [1409, 1536, 1792, 2048] {
+            let dims = (m, 6168, 2048);
+            assert_eq!(
+                pick(plan_plain_fused(dims, true, tuned, all)),
+                want_tall,
+                "{m}"
+            );
+        }
         // Outside the measured rows, another K or N, a plain device or one
         // that fits no tile: as plan_fused.
         let fused = |dims, tb, target, fits: &dyn Fn(CoopTile) -> bool| {
@@ -747,7 +771,7 @@ mod tests {
         };
         for (dims, tb) in [
             ((256, 6168, 2048), true),
-            ((1536, 6168, 2048), true),
+            ((2049, 6168, 2048), true),
             ((1024, 6168, 2048), false),
             ((1024, 6192, 2048), true),
             ((1024, 984, 576), true),
