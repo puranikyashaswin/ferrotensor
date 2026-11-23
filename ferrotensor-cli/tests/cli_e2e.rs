@@ -217,8 +217,15 @@ fn train_writes_adapter_state_and_metrics() {
 
     let metrics = std::fs::read_to_string(out.path().join("metrics.jsonl")).expect("metrics");
     for line in metrics.lines().filter(|l| !l.trim().is_empty()) {
-        serde_json::from_str::<serde_json::Value>(line)
+        let value = serde_json::from_str::<serde_json::Value>(line)
             .unwrap_or_else(|e| panic!("metrics line {line:?} is not JSON: {e}"));
+        let rows = value["rows"].as_array().expect("rows list");
+        let lens = value["padded_len"].as_array().expect("padded_len list");
+        assert!(!rows.is_empty() && rows.len() == lens.len(), "{line}");
+        for (rows, len) in rows.iter().zip(lens) {
+            let (rows, len) = (rows.as_u64().expect("rows"), len.as_u64().expect("len"));
+            assert!(len > 0 && rows >= len && rows % len == 0, "{line}");
+        }
     }
 }
 

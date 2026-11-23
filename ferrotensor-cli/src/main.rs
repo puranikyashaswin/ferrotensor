@@ -48,7 +48,7 @@ use ferrotensor_trainer::checkpoint::{
 use ferrotensor_trainer::peft::{export_peft_adapter, is_peft_adapter_dir, load_peft_adapter};
 use ferrotensor_trainer::{
     build_sft_example, masked_cross_entropy_from_logits, DataLoader, Dataset, FileGradSyncConfig,
-    GradScaler, TextDataset, Trainer,
+    GradScaler, MicroShape, TextDataset, Trainer,
 };
 use model_id::resolve_model;
 use std::collections::HashMap;
@@ -580,6 +580,25 @@ Try a smaller --batch-size (with a larger --grad-accum for the same sequences pe
 a shorter --seq-len, or --lite; keep the default f16 base weights (no --f32-weights).";
 
 /// Whether a panic message means the GPU device was lost or ran out of memory.
+/// One `metrics.jsonl` line. `rows` and `padded_len` list the padded size of
+/// each micro-batch since the previous line: `rows` is sequences times
+/// `padded_len`, the row count the model's matmuls ran on. `tokens` counts
+/// supervised tokens only.
+fn metrics_line(
+    step: usize,
+    (loss, grad_norm, lr): (f32, f32, f32),
+    (tokens, seconds, elapsed): (usize, f32, f32),
+    shapes: &[MicroShape],
+) -> serde_json::Value {
+    let rows: Vec<usize> = shapes.iter().map(|s| s.rows).collect();
+    let padded_len: Vec<usize> = shapes.iter().map(|s| s.padded_len).collect();
+    serde_json::json!({
+        "step": step, "loss": loss, "grad_norm": grad_norm, "lr": lr,
+        "tokens": tokens, "seconds": seconds, "elapsed": elapsed,
+        "rows": rows, "padded_len": padded_len,
+    })
+}
+
 fn looks_like_gpu_memory_loss(message: &str) -> bool {
     let m = message.to_ascii_lowercase();
     m.contains("device is lost") || m.contains("out of memory") || m.contains("outofmemory")
@@ -1952,6 +1971,7 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
     let skip_micro = start_step * micro_per_step;
     let mut micro_seen = 0usize;
     let (mut win_loss, mut win_tok, mut win_seq) = (0.0f64, 0usize, 0usize);
+    let mut win_shapes: Vec<MicroShape> = Vec::new();
     let mut win_start = Instant::now();
     let run_start = Instant::now();
     let mut best: Option<f32> = None;
@@ -1981,7 +2001,9 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
                 continue;
             }
             micro_seen += batch.batch_size;
-            for s in trainer.train_batch(&batch, &train_params)? {
+            let stats = trainer.train_batch(&batch, &train_params)?;
+            win_shapes.extend(trainer.take_micro_shapes());
+            for s in stats {
                 win_loss += s.loss as f64 * s.tokens as f64;
                 win_tok += s.tokens;
                 win_seq += 1;
@@ -2013,16 +2035,18 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
                     writeln!(
                         metrics,
                         "{}",
-                        serde_json::json!({
-                            "step": step, "loss": loss, "grad_norm": last_norm, "lr": last_lr,
-                            "tokens": win_tok, "seconds": secs,
-                            "elapsed": run_start.elapsed().as_secs_f32(),
-                        })
+                        metrics_line(
+                            step,
+                            (loss, last_norm, last_lr),
+                            (win_tok, secs, run_start.elapsed().as_secs_f32()),
+                            &win_shapes,
+                        )
                     )?;
                     first_loss.get_or_insert(loss);
                     last_loss = loss;
                     best = Some(best.map_or(loss, |b: f32| b.min(loss)));
                     (win_loss, win_tok, win_seq) = (0.0, 0, 0);
+                    win_shapes.clear();
                     win_start = Instant::now();
                 }
                 if args.save_every > 0 && step.is_multiple_of(args.save_every) && step < total_steps
@@ -2168,6 +2192,27 @@ mod tests {
 
     fn parse(args: &[&str]) -> std::result::Result<Cli, clap::Error> {
         Cli::try_parse_from(std::iter::once("ferrotensor-cli").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn metrics_line_carries_the_padded_rows_and_length_of_each_micro_batch() {
+        let shapes = [
+            MicroShape {
+                rows: 1712,
+                padded_len: 214,
+            },
+            MicroShape {
+                rows: 2048,
+                padded_len: 256,
+            },
+        ];
+        let line = metrics_line(7, (1.5, 2.0, 0.25), (300, 0.5, 9.0), &shapes);
+        assert_eq!(line["rows"], serde_json::json!([1712, 2048]));
+        assert_eq!(line["padded_len"], serde_json::json!([214, 256]));
+        assert_eq!(line["step"], 7);
+        assert_eq!(line["tokens"], 300);
+        let empty = metrics_line(1, (0.0, 0.0, 0.0), (0, 0.0, 0.0), &[]);
+        assert_eq!(empty["rows"], serde_json::json!([]));
     }
 
     #[test]
