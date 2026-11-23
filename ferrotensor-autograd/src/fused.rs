@@ -619,8 +619,7 @@ impl FusedAttentionNode {
                 ctx,
                 [&q4, &k4, &v4],
                 [&out4, &grad4],
-                &packed,
-                &self.stats,
+                (&packed, &self.stats),
                 &options,
                 rope,
             ) {

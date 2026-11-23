@@ -575,8 +575,7 @@ fn packed_attention_backward_matches_the_three_buffer_call_and_the_cpu() {
                 &g.ctx,
                 [&tq, &tk, &tv],
                 [&out, &tdo],
-                &packed,
-                &stats,
+                (&packed, &stats),
                 &opts,
                 rope,
             );

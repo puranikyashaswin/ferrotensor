@@ -515,6 +515,7 @@ impl ComputeEngine {
     /// [`flash_attention_v2_rope_with_stats`](Self::flash_attention_v2_rope_with_stats)
     /// with the three gradients written side by side into one buffer.
     ///
+    /// `(packed, stats)` is the output buffer and the saved statistics.
     /// `packed` is f32 `[batch * seq, ld]` with `ld >= (heads + 2 * kv_heads) *
     /// head_dim`: row `r` holds `dQ[r]` in columns `0 .. heads * head_dim`,
     /// `dK[r]` in the next `kv_heads * head_dim` and `dV[r]` in the next
@@ -536,8 +537,7 @@ impl ComputeEngine {
         ctx: &WgpuContext,
         [q, k, v]: [&UnifiedTensor; 3],
         [out, grad_out]: [&UnifiedTensor; 2],
-        packed: &UnifiedTensor,
-        stats: &UnifiedTensor,
+        (packed, stats): (&UnifiedTensor, &UnifiedTensor),
         opts: &AttentionOptions,
         (theta, pos): (f32, u32),
     ) -> bool {
