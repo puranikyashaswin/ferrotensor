@@ -136,7 +136,7 @@ fn gpu() -> Gpu {
 }
 
 fn host(gpu: &Gpu, t: &UnifiedTensor) -> Vec<f32> {
-    pollster::block_on(t.to_vec(&gpu.ctx))
+    pollster::block_on(t.to_vec(&gpu.ctx)).expect("GPU readback")
 }
 
 /// The fixture checkpoint with an adapter on every linear layer and the LM

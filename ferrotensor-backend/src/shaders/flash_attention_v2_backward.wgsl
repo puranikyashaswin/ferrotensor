@@ -8,9 +8,11 @@
 //      (second sweep). Delta and L are stored for pass 2. When lse_saved is
 //      set, the forward pass already wrote L into the stats and the first
 //      sweep is skipped.
-//   2. flash_bwd_dk_dv: per key row, dV_j = sum_i P_ij M_ij dO_i and
-//      dK_j = scale * sum_i dS_ij Q_i (summed over the query heads that
-//      share this KV head).
+//   2. flash_bwd_dk_dv: per key row and query head, dV_j = sum_i P_ij M_ij dO_i
+//      and dK_j = scale * sum_i dS_ij Q_i. With grouped-query attention each
+//      query head writes its own partial and flash_group_sum adds the heads
+//      that share a KV head, so the workgroups of one KV head run side by
+//      side rather than one after another.
 // with P = softmax(S), M the dropout multiplier and
 //      dS_ij = P_ij * (M_ij * (dO_i . V_j) - Delta_i).
 // Like the forward kernel, each workgroup owns FAB_ROWS rows (queries or
@@ -51,12 +53,18 @@ struct FlashBwdParams {
     window: u32,
     seed_hi: u32,
     lse_saved: u32,
-    _pad2: u32,
+    // 1: flash_bwd_dk_dv writes dK and dV as [batch, seq_k, num_kv_heads,
+    // head_dim] (one query head per key head); 0: per-query-head partials
+    // [batch, seq_k, num_heads, head_dim] that flash_group_sum adds up.
+    dkv_direct: u32,
 };
 @group(0) @binding(8) var<uniform> fab2_params: FlashBwdParams;
 @group(0) @binding(9) var<storage, read> fab2_mask: array<f32>;
 // Per (batch, head, query) row: [Delta, LSE].
 @group(0) @binding(10) var<storage, read_write> fab2_stats: array<vec2<f32>>;
+// The per-query-head dK and dV partials flash_group_sum adds up; only that entry binds them.
+@group(0) @binding(11) var<storage, read> fab2_dkp: array<f32>;
+@group(0) @binding(12) var<storage, read> fab2_dvp: array<f32>;
 
 const FAB_MASKED: f32 = -1.0e30;
 const FAB_ROWS: u32 = 16u;
@@ -337,14 +345,15 @@ fn flash_bwd_dq(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id
     }
 }
 
-// Dispatch: (1, ceil(seq_k / FAB_ROWS), batch * num_kv_heads)
+// Dispatch: (1, ceil(seq_k / FAB_ROWS), batch * num_heads)
 @compute @workgroup_size(128)
 fn flash_bwd_dk_dv(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wg: vec3<u32>) {
     let p = fab2_params;
     let d4 = (p.head_dim + 3u) / 4u;
-    let b = wg.z / p.num_kv_heads;
-    let kvh = wg.z % p.num_kv_heads;
-    let group = p.num_heads / p.num_kv_heads;
+    let b = wg.z / p.num_heads;
+    let h = wg.z % p.num_heads;
+    let kvh = h / (p.num_heads / p.num_kv_heads);
+    let bh = wg.z;
     let row = lid / FAB_TPR;
     let lane = lid % FAB_TPR;
     let row_first = row * FAB_TPR;
@@ -353,6 +362,9 @@ fn flash_bwd_dk_dv(@builtin(local_invocation_index) lid: u32, @builtin(workgroup
     let kj = k0 + row;
     let valid = kj < p.seq_k;
     let kv_off = fab2_kv_off(b, kj, kvh);
+    // Where this head's dK and dV go: the KV head's own row, or a per-query-head partial.
+    var out_off = kv_off;
+    if (p.dkv_direct == 0u) { out_off = ((b * p.seq_k + kj) * p.num_heads + h) * p.head_dim; }
     let k1 = min(k0 + FAB_ROWS, p.seq_k) - 1u;
 
     var k_reg: array<vec4<f32>, 4>;
@@ -387,62 +399,58 @@ fn flash_bwd_dk_dv(@builtin(local_invocation_index) lid: u32, @builtin(workgroup
         }
     }
 
-    for (var g = 0u; g < group; g++) {
-        let h = kvh * group + g;
-        let bh = b * p.num_heads + h;
-        for (var qt = q_begin; qt < q_end; qt += FAB_TILE) {
-            // Stage Q (fab2_t0) and dO (fab2_t1) rows [qt, qt + FAB_TILE).
-            for (var i = lid; i < FAB_TILE * d4; i += FAB_THREADS) {
-                let r = i / d4;
-                let c = i % d4;
-                var qv = vec4<f32>(0.0);
-                var dv = vec4<f32>(0.0);
-                if (qt + r < p.seq_q) {
-                    let base = fab2_q_off(b, qt + r, h);
-                    qv = fab2_ld4_q(base, c);
-                    dv = fab2_ld4_do(base, c);
-                }
-                fab2_t0[r * FAB_D4 + c] = qv;
-                fab2_t1[r * FAB_D4 + c] = dv;
+    for (var qt = q_begin; qt < q_end; qt += FAB_TILE) {
+        // Stage Q (fab2_t0) and dO (fab2_t1) rows [qt, qt + FAB_TILE).
+        for (var i = lid; i < FAB_TILE * d4; i += FAB_THREADS) {
+            let r = i / d4;
+            let c = i % d4;
+            var qv = vec4<f32>(0.0);
+            var dv = vec4<f32>(0.0);
+            if (qt + r < p.seq_q) {
+                let base = fab2_q_off(b, qt + r, h);
+                qv = fab2_ld4_q(base, c);
+                dv = fab2_ld4_do(base, c);
             }
-            workgroupBarrier();
-            if (valid) {
-                for (var j = 0u; j < FAB_TILE; j++) {
-                    var dot4 = vec4<f32>(0.0);
-                    var dov4 = vec4<f32>(0.0);
-                    for (var i = 0u; i < n_sl; i++) {
-                        let c = j * FAB_D4 + lane + i * FAB_TPR;
-                        dot4 = fma(k_reg[i], fab2_t0[c], dot4);
-                        dov4 = fma(v_reg[i], fab2_t1[c], dov4);
-                    }
-                    fab2_part[j * FAB_THREADS + lid] = vec2<f32>(
-                        dot4.x + dot4.y + dot4.z + dot4.w,
-                        dov4.x + dov4.y + dov4.z + dov4.w,
-                    );
-                }
-            }
-            workgroupBarrier();
-            if (valid) {
-                for (var j = 0u; j < FAB_TILE; j++) {
-                    let qi = qt + j;
-                    if (!fab2_visible(qi, kj)) { continue; }
-                    let sums = fab2_row_sum(j, row_first);
-                    let s = sums.x + fab2_mask_at(b, h, qi, kj);
-                    if (s <= FAB_MASKED) { continue; }
-                    let stats = fab2_stats[fab2_row(b, h, qi)];
-                    let pij = exp(s - stats.y);
-                    let mij = dropout_scale(p.dropout_prob, p.seed, p.seed_hi, bh, qi, kj);
-                    let ds = pij * (mij * sums.y - stats.x) * p.scale;
-                    let pm = pij * mij;
-                    for (var i = 0u; i < n_sl; i++) {
-                        let c = j * FAB_D4 + lane + i * FAB_TPR;
-                        dv_acc[i] = fma(vec4<f32>(pm), fab2_t1[c], dv_acc[i]);
-                        dk_acc[i] = fma(vec4<f32>(ds), fab2_t0[c], dk_acc[i]);
-                    }
-                }
-            }
-            workgroupBarrier();
+            fab2_t0[r * FAB_D4 + c] = qv;
+            fab2_t1[r * FAB_D4 + c] = dv;
         }
+        workgroupBarrier();
+        if (valid) {
+            for (var j = 0u; j < FAB_TILE; j++) {
+                var dot4 = vec4<f32>(0.0);
+                var dov4 = vec4<f32>(0.0);
+                for (var i = 0u; i < n_sl; i++) {
+                    let c = j * FAB_D4 + lane + i * FAB_TPR;
+                    dot4 = fma(k_reg[i], fab2_t0[c], dot4);
+                    dov4 = fma(v_reg[i], fab2_t1[c], dov4);
+                }
+                fab2_part[j * FAB_THREADS + lid] = vec2<f32>(
+                    dot4.x + dot4.y + dot4.z + dot4.w,
+                    dov4.x + dov4.y + dov4.z + dov4.w,
+                );
+            }
+        }
+        workgroupBarrier();
+        if (valid) {
+            for (var j = 0u; j < FAB_TILE; j++) {
+                let qi = qt + j;
+                if (!fab2_visible(qi, kj)) { continue; }
+                let sums = fab2_row_sum(j, row_first);
+                let s = sums.x + fab2_mask_at(b, h, qi, kj);
+                if (s <= FAB_MASKED) { continue; }
+                let stats = fab2_stats[fab2_row(b, h, qi)];
+                let pij = exp(s - stats.y);
+                let mij = dropout_scale(p.dropout_prob, p.seed, p.seed_hi, bh, qi, kj);
+                let ds = pij * (mij * sums.y - stats.x) * p.scale;
+                let pm = pij * mij;
+                for (var i = 0u; i < n_sl; i++) {
+                    let c = j * FAB_D4 + lane + i * FAB_TPR;
+                    dv_acc[i] = fma(vec4<f32>(pm), fab2_t1[c], dv_acc[i]);
+                    dk_acc[i] = fma(vec4<f32>(ds), fab2_t0[c], dk_acc[i]);
+                }
+            }
+        }
+        workgroupBarrier();
     }
 
     if (valid) {
@@ -450,11 +458,38 @@ fn flash_bwd_dk_dv(@builtin(local_invocation_index) lid: u32, @builtin(workgroup
             let d = (lane + i * FAB_TPR) * 4u;
             let gk = dk_acc[i];
             let gv = dv_acc[i];
-            fab2_dk[kv_off + d] = gk.x;
-            fab2_dv[kv_off + d] = gv.x;
-            if (d + 1u < p.head_dim) { fab2_dk[kv_off + d + 1u] = gk.y; fab2_dv[kv_off + d + 1u] = gv.y; }
-            if (d + 2u < p.head_dim) { fab2_dk[kv_off + d + 2u] = gk.z; fab2_dv[kv_off + d + 2u] = gv.z; }
-            if (d + 3u < p.head_dim) { fab2_dk[kv_off + d + 3u] = gk.w; fab2_dv[kv_off + d + 3u] = gv.w; }
+            fab2_dk[out_off + d] = gk.x;
+            fab2_dv[out_off + d] = gv.x;
+            if (d + 1u < p.head_dim) { fab2_dk[out_off + d + 1u] = gk.y; fab2_dv[out_off + d + 1u] = gv.y; }
+            if (d + 2u < p.head_dim) { fab2_dk[out_off + d + 2u] = gk.z; fab2_dv[out_off + d + 2u] = gv.z; }
+            if (d + 3u < p.head_dim) { fab2_dk[out_off + d + 3u] = gk.w; fab2_dv[out_off + d + 3u] = gv.w; }
         }
     }
+}
+
+// dK and dV of each KV head as the sum of its query heads' partials, added in
+// head order so a run gives the same bits every time.
+// Dispatch: groups of 256 threads over batch * seq_k * num_kv_heads * head_dim.
+@compute @workgroup_size(256)
+fn flash_group_sum(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) groups: vec3<u32>,
+) {
+    let p = fab2_params;
+    // Grids wider than 65535 workgroups spill into y.
+    let i = gid.y * groups.x * 256u + gid.x;
+    if (i >= p.batch_size * p.seq_k * p.num_kv_heads * p.head_dim) { return; }
+    let group = p.num_heads / p.num_kv_heads;
+    let d = i % p.head_dim;
+    // (batch * seq_k + key) * num_kv_heads + kv head: its query heads are the next `group` rows.
+    let r = i / p.head_dim;
+    var sk = 0.0;
+    var sv = 0.0;
+    for (var g = 0u; g < group; g++) {
+        let o = (r * group + g) * p.head_dim + d;
+        sk += fab2_dkp[o];
+        sv += fab2_dvp[o];
+    }
+    fab2_dk[i] = sk;
+    fab2_dv[i] = sv;
 }

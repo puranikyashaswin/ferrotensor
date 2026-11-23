@@ -1,8 +1,8 @@
 //! Rotary embeddings and fused (flash) attention.
 
-use super::{dummy_storage, groups64, uniform, ComputeEngine};
+use super::flash_coop::{Rope, Shape};
+use super::{dummy_storage, grid, groups64, uniform, Arg, ComputeEngine, Params, Scratch};
 use crate::{DType, UnifiedTensor, WgpuContext};
-use wgpu::Buffer;
 
 /// Query or key rows per workgroup of the attention kernels (`FA_TILE_Q` and `FAB_ROWS` in WGSL).
 const ATTENTION_ROWS: u32 = 16;
@@ -26,7 +26,7 @@ impl ComputeEngine {
         pos: usize,
         theta: f32,
     ) {
-        self.rotate(ctx, tensor, head_dim, pos, theta, false);
+        self.rotate(ctx, (tensor, None), head_dim, pos, theta, false);
     }
 
     /// The inverse of [`rope_theta`](Self::rope_theta), in place: rotates by
@@ -40,14 +40,41 @@ impl ComputeEngine {
         pos: usize,
         theta: f32,
     ) {
-        self.rotate(ctx, tensor, head_dim, pos, theta, true);
+        self.rotate(ctx, (tensor, None), head_dim, pos, theta, true);
     }
 
-    /// Shared body of [`rope_theta`](Self::rope_theta) and its inverse.
+    /// [`rope_theta`](Self::rope_theta) of `input` written to `out` (same
+    /// shape), leaving `input` as it is.
+    pub fn rope_theta_to(
+        &self,
+        ctx: &WgpuContext,
+        (input, out): (&UnifiedTensor, &UnifiedTensor),
+        head_dim: usize,
+        pos: usize,
+        theta: f32,
+    ) {
+        self.rotate(ctx, (input, Some(out)), head_dim, pos, theta, false);
+    }
+
+    /// [`rope_theta_inverse`](Self::rope_theta_inverse) of `input` written
+    /// to `out` (same shape), leaving `input` as it is.
+    pub fn rope_theta_inverse_to(
+        &self,
+        ctx: &WgpuContext,
+        (input, out): (&UnifiedTensor, &UnifiedTensor),
+        head_dim: usize,
+        pos: usize,
+        theta: f32,
+    ) {
+        self.rotate(ctx, (input, Some(out)), head_dim, pos, theta, true);
+    }
+
+    /// Shared body of [`rope_theta`](Self::rope_theta) and its inverse: in
+    /// place, or into `out` when it is given.
     fn rotate(
         &self,
         ctx: &WgpuContext,
-        tensor: &UnifiedTensor,
+        (tensor, out): (&UnifiedTensor, Option<&UnifiedTensor>),
         head_dim: usize,
         pos: usize,
         theta: f32,
@@ -74,12 +101,20 @@ impl ComputeEngine {
             ]),
         );
         let pairs = tensor.shape.iter().product::<usize>() / 2;
-        self.run(
-            ctx,
-            &self.rope,
-            &[(0, tensor.buffer()), (1, &params)],
-            groups64(pairs),
-        );
+        match out {
+            None => self.run(
+                ctx,
+                &self.rope,
+                &[(0, tensor.buffer()), (1, &params)],
+                groups64(pairs),
+            ),
+            Some(out) => self.run(
+                ctx,
+                &self.rope_out,
+                &[(0, tensor.buffer()), (1, out.buffer()), (2, &params)],
+                groups64(pairs),
+            ),
+        }
     }
 
     /// Single-head attention: `q`, `k`, `v`, `out` are `[seq_len, head_dim]`.
@@ -146,7 +181,7 @@ impl ComputeEngine {
         opts: &AttentionOptions,
         mask: Option<&UnifiedTensor>,
     ) {
-        self.attention_forward(ctx, q, k, v, out, None, opts, mask);
+        self.attention_forward(ctx, q, k, v, out, None, opts, mask, None);
     }
 
     /// [`flash_attention_v2_with`](Self::flash_attention_v2_with) that also
@@ -173,11 +208,43 @@ impl ComputeEngine {
         opts: &AttentionOptions,
         mask: Option<&UnifiedTensor>,
     ) {
-        self.attention_forward(ctx, q, k, v, out, Some(stats), opts, mask);
+        self.attention_forward(ctx, q, k, v, out, Some(stats), opts, mask, None);
+    }
+
+    /// [`flash_attention_v2_with_stats`](Self::flash_attention_v2_with_stats)
+    /// on RoPE-rotated queries and keys, rotating them inside the kernel.
+    ///
+    /// `q` and `k` are the tensors before RoPE; row `i` of either is
+    /// rotated as position `pos + i` with base frequency `theta`, the same
+    /// rotate-half rotation as [`rope_theta`](Self::rope_theta), and the
+    /// result is that of calling `rope_theta` on both and then
+    /// [`flash_attention_v2_with_stats`](Self::flash_attention_v2_with_stats).
+    /// The caller keeps `q` and `k` un-rotated, and
+    /// [`flash_attention_v2_rope_backward_with_stats`](Self::flash_attention_v2_rope_backward_with_stats)
+    /// gives the gradients with respect to them. A call the cooperative
+    /// kernels do not take rotates copies first. `stats` is as there; `None`
+    /// saves no log-sum-exp.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors flash_attention_v2_with_stats plus the rotation"
+    )]
+    pub fn flash_attention_v2_rope_with_stats(
+        &self,
+        ctx: &WgpuContext,
+        q: &UnifiedTensor,
+        k: &UnifiedTensor,
+        v: &UnifiedTensor,
+        out: &UnifiedTensor,
+        stats: Option<&UnifiedTensor>,
+        opts: &AttentionOptions,
+        (theta, pos): (f32, u32),
+    ) {
+        let rope = Some(Rope { theta, pos });
+        self.attention_forward(ctx, q, k, v, out, stats, opts, None, rope);
     }
 
     /// Shared body of the forward entry points; `stats`, when given,
-    /// receives the per-row log-sum-exp.
+    /// receives the per-row log-sum-exp, and `rope` rotates `q` and `k`.
     #[expect(
         clippy::too_many_arguments,
         reason = "one argument per kernel binding and option"
@@ -192,14 +259,24 @@ impl ComputeEngine {
         stats: Option<&UnifiedTensor>,
         opts: &AttentionOptions,
         mask: Option<&UnifiedTensor>,
+        rope: Option<Rope>,
     ) {
         let dims = AttentionDims::new(q, k);
         if let Some(s) = stats {
             dims.check_stats(s);
         }
-        let params = dims.params(ctx, opts, mask, stats.is_some());
+        if let Some(r) = rope {
+            if !self.flash_coop_routes(dims.shape(), opts, mask.is_some()) {
+                // Only the cooperative kernels rotate in place of the load:
+                // the others get rotated copies.
+                let (q_rot, k_rot) = self.rotated_copies(ctx, q, k, r);
+                self.attention_forward(ctx, &q_rot, &k_rot, v, out, stats, opts, mask, None);
+                return;
+            }
+        }
+        let params = dims.params(ctx, opts, mask, (stats.is_some(), rope.is_some()));
         let dummy;
-        let mask_buf = match mask {
+        let mask_buf: &dyn Arg = match mask {
             Some(m) => m.buffer(),
             None => {
                 dummy = dummy_storage(ctx);
@@ -227,13 +304,18 @@ impl ComputeEngine {
             return;
         }
         let stats_dummy;
-        let stats_buf = match stats {
+        let stats_buf: &dyn Arg = match stats {
             Some(s) => s.buffer(),
             None => {
                 stats_dummy = dummy_storage(ctx);
                 &stats_dummy
             }
         };
+        let shape = dims.shape();
+        if self.flash_coop_routes(shape, opts, mask.is_some()) {
+            self.flash_coop_forward(ctx, shape, [q, k, v, out], stats_buf, (&params, rope));
+            return;
+        }
         self.run(
             ctx,
             &self.flash_attn_v2,
@@ -324,7 +406,7 @@ impl ComputeEngine {
         mask: Option<&UnifiedTensor>,
     ) {
         let grads = [grad_q, grad_k, grad_v];
-        self.attention_backward(ctx, q, k, v, out, grad_out, grads, None, opts, mask);
+        self.attention_backward(ctx, q, k, v, out, grad_out, grads, None, opts, mask, None);
     }
 
     /// [`flash_attention_v2_backward_with`](Self::flash_attention_v2_backward_with)
@@ -354,11 +436,83 @@ impl ComputeEngine {
         mask: Option<&UnifiedTensor>,
     ) {
         let grads = [grad_q, grad_k, grad_v];
-        self.attention_backward(ctx, q, k, v, out, grad_out, grads, Some(stats), opts, mask);
+        self.attention_backward(
+            ctx,
+            q,
+            k,
+            v,
+            out,
+            grad_out,
+            grads,
+            Some(stats),
+            opts,
+            mask,
+            None,
+        );
+    }
+
+    /// Backward pass of
+    /// [`flash_attention_v2_rope_with_stats`](Self::flash_attention_v2_rope_with_stats).
+    ///
+    /// `q` and `k` are the un-rotated tensors that call took, `out` and
+    /// `stats` what it wrote, and `(theta, pos)` the same pair. `grad_q` and
+    /// `grad_k` are the gradients with respect to the un-rotated `q` and `k`,
+    /// so the transposed rotation is already applied. `grad_v` is as in
+    /// [`flash_attention_v2_backward_with_stats`](Self::flash_attention_v2_backward_with_stats).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors flash_attention_v2_backward_with_stats plus the rotation"
+    )]
+    pub fn flash_attention_v2_rope_backward_with_stats(
+        &self,
+        ctx: &WgpuContext,
+        q: &UnifiedTensor,
+        k: &UnifiedTensor,
+        v: &UnifiedTensor,
+        out: &UnifiedTensor,
+        grad_out: &UnifiedTensor,
+        grads: [&UnifiedTensor; 3],
+        stats: &UnifiedTensor,
+        opts: &AttentionOptions,
+        (theta, pos): (f32, u32),
+    ) {
+        let rope = Some(Rope { theta, pos });
+        self.attention_backward(
+            ctx,
+            q,
+            k,
+            v,
+            out,
+            grad_out,
+            grads,
+            Some(stats),
+            opts,
+            None,
+            rope,
+        );
+    }
+
+    /// `q` and `k` rotated by `rope` into new tensors, for the kernels that
+    /// do not rotate as they load.
+    fn rotated_copies(
+        &self,
+        ctx: &WgpuContext,
+        q: &UnifiedTensor,
+        k: &UnifiedTensor,
+        rope: Rope,
+    ) -> (UnifiedTensor, UnifiedTensor) {
+        let head_dim = q.shape.last().copied().unwrap_or(1);
+        let q_rot = UnifiedTensor::empty_with_dtype(ctx, &q.shape, q.dtype);
+        let k_rot = UnifiedTensor::empty_with_dtype(ctx, &k.shape, k.dtype);
+        let pos = rope.pos as usize;
+        self.rope_theta_to(ctx, (q, &q_rot), head_dim, pos, rope.theta);
+        self.rope_theta_to(ctx, (k, &k_rot), head_dim, pos, rope.theta);
+        (q_rot, k_rot)
     }
 
     /// Shared body of the backward entry points; without `saved` stats the
-    /// kernel recomputes each row's log-sum-exp.
+    /// kernel recomputes each row's log-sum-exp, and `rope` says `q` and `k`
+    /// are un-rotated.
     #[expect(
         clippy::too_many_arguments,
         reason = "one argument per kernel binding and option"
@@ -375,14 +529,47 @@ impl ComputeEngine {
         saved: Option<&UnifiedTensor>,
         opts: &AttentionOptions,
         mask: Option<&UnifiedTensor>,
+        rope: Option<Rope>,
     ) {
         let dims = AttentionDims::new(q, k);
         if let Some(s) = saved {
             dims.check_stats(s);
         }
-        let params = dims.params_bwd(ctx, opts, mask, saved.is_some());
+        // The cooperative kernels need the saved log-sum-exp.
+        let shape = dims.shape();
+        let coop = saved.is_some() && self.flash_coop_routes(shape, opts, mask.is_some());
+        if let Some(r) = rope {
+            if !coop {
+                // The other kernels see rotated copies, and what they write
+                // for Q and K is the gradient of the rotated tensors: the
+                // transposed rotation turns it into the gradient of the
+                // un-rotated ones.
+                let (q_rot, k_rot) = self.rotated_copies(ctx, q, k, r);
+                let gq = UnifiedTensor::empty_with_dtype(ctx, &grad_q.shape, grad_q.dtype);
+                let gk = UnifiedTensor::empty_with_dtype(ctx, &grad_k.shape, grad_k.dtype);
+                let grads = [&gq, &gk, grad_v];
+                self.attention_backward(
+                    ctx, &q_rot, &k_rot, v, out, grad_out, grads, saved, opts, mask, None,
+                );
+                let head_dim = q.shape.last().copied().unwrap_or(1);
+                let pos = r.pos as usize;
+                self.rope_theta_inverse_to(ctx, (&gq, grad_q), head_dim, pos, r.theta);
+                self.rope_theta_inverse_to(ctx, (&gk, grad_k), head_dim, pos, r.theta);
+                return;
+            }
+        }
+        // With grouped-query attention each query head's dK and dV go to a
+        // partial that flash_group_sum adds up; with one query head per KV
+        // head they go straight to the gradients.
+        let group = dims.heads / dims.kv_heads;
+        let params = dims.params_bwd(
+            ctx,
+            opts,
+            mask,
+            (saved.is_some(), group == 1, rope.is_some()),
+        );
         let dummy;
-        let mask_buf = match mask {
+        let mask_buf: &dyn Arg = match mask {
             Some(m) => m.buffer(),
             None => {
                 dummy = dummy_storage(ctx);
@@ -391,52 +578,112 @@ impl ComputeEngine {
         };
         // Per (batch, head, query) row: [Delta, LSE].
         let scratch;
-        let stats = match saved {
+        let stats: &dyn Arg = match saved {
             Some(s) => s.buffer(),
             None => {
-                scratch = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                let buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("Flash Bwd Stats"),
                     size: (dims.batch * dims.heads * dims.seq_q).max(1) as u64 * 8,
                     usage: wgpu::BufferUsages::STORAGE,
                     mapped_at_creation: false,
                 });
                 // Dropped at the end of this function, before the dispatches run.
-                ctx.memory().count_dispatch_buffer(scratch.size());
+                ctx.memory().count_dispatch_buffer(buffer.size());
+                scratch = Scratch(buffer);
                 &scratch
             }
         };
-        let (b, h, hkv) = (dims.batch, dims.heads, dims.kv_heads);
-        self.run(
-            ctx,
-            &self.flash_attn_v2_bw_dq,
-            &[
-                (0, q.buffer()),
-                (1, k.buffer()),
-                (2, v.buffer()),
-                (3, out.buffer()),
-                (4, grad_out.buffer()),
-                (5, grad_q.buffer()),
-                (8, &params),
-                (9, mask_buf),
-                (10, stats),
-            ],
-            (1, dims.seq_q.div_ceil(ATTENTION_ROWS), b * h),
+        let (b, h) = (dims.batch, dims.heads);
+        if coop {
+            self.flash_coop_dq(
+                ctx,
+                shape,
+                [q, k, v, out, grad_out, grad_q],
+                (stats, &params, rope),
+            );
+        } else {
+            self.run(
+                ctx,
+                &self.flash_attn_v2_bw_dq,
+                &[
+                    (0, q.buffer()),
+                    (1, k.buffer()),
+                    (2, v.buffer()),
+                    (3, out.buffer()),
+                    (4, grad_out.buffer()),
+                    (5, grad_q.buffer()),
+                    (8, &params),
+                    (9, mask_buf),
+                    (10, stats),
+                ],
+                (1, dims.seq_q.div_ceil(ATTENTION_ROWS), b * h),
+            );
+        }
+        let dkdv_grid = (1, dims.seq_k.div_ceil(ATTENTION_ROWS), b * h);
+        // dK and dV go to `grads`: the gradients themselves, or the
+        // per-query-head partials.
+        let dkdv = |grads: (&dyn Arg, &dyn Arg)| {
+            if coop {
+                self.flash_coop_dkdv(
+                    ctx,
+                    shape,
+                    [q, k, v, grad_out],
+                    grads,
+                    (stats, &params, rope),
+                );
+                return;
+            }
+            self.run(
+                ctx,
+                &self.flash_attn_v2_bw_dkdv,
+                &[
+                    (0, q.buffer()),
+                    (1, k.buffer()),
+                    (2, v.buffer()),
+                    (4, grad_out.buffer()),
+                    (6, grads.0),
+                    (7, grads.1),
+                    (8, &params),
+                    (9, mask_buf),
+                    (10, stats),
+                ],
+                dkdv_grid,
+            );
+        };
+        if group == 1 {
+            dkdv((grad_k.buffer(), grad_v.buffer()));
+            return;
+        }
+        // Per-query-head partials, [batch, seq_k, num_heads, head_dim], made for
+        // this call like the stats scratch above.
+        let partial_size = (b * dims.seq_k * h * dims.head_dim).max(1) as u64 * 4;
+        let partial = |label: &'static str| {
+            let buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: partial_size,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+            ctx.memory().count_dispatch_buffer(buffer.size());
+            Scratch(buffer)
+        };
+        let (dk_part, dv_part) = (
+            partial("Flash Bwd dK Partial"),
+            partial("Flash Bwd dV Partial"),
         );
+        dkdv((&dk_part, &dv_part));
+        let elements = b * dims.seq_k * dims.kv_heads * dims.head_dim;
         self.run(
             ctx,
-            &self.flash_attn_v2_bw_dkdv,
+            &self.flash_group_sum,
             &[
-                (0, q.buffer()),
-                (1, k.buffer()),
-                (2, v.buffer()),
-                (4, grad_out.buffer()),
                 (6, grad_k.buffer()),
                 (7, grad_v.buffer()),
                 (8, &params),
-                (9, mask_buf),
-                (10, stats),
+                (11, &dk_part),
+                (12, &dv_part),
             ],
-            (1, dims.seq_k.div_ceil(ATTENTION_ROWS), b * hkv),
+            grid(elements.div_ceil(256)),
         );
     }
 }
@@ -499,6 +746,16 @@ impl AttentionDims {
         );
     }
 
+    fn shape(&self) -> Shape {
+        Shape {
+            batch: self.batch,
+            heads: self.heads,
+            seq_q: self.seq_q,
+            seq_k: self.seq_k,
+            head_dim: self.head_dim,
+        }
+    }
+
     fn scale(&self) -> f32 {
         1.0 / (self.head_dim as f32).sqrt()
     }
@@ -509,8 +766,8 @@ impl AttentionDims {
         ctx: &WgpuContext,
         opts: &AttentionOptions,
         mask: Option<&UnifiedTensor>,
-        write_stats: bool,
-    ) -> Buffer {
+        (write_stats, rope): (bool, bool),
+    ) -> Params {
         let (has_mask, s) = mask_strides(mask);
         let params: [u32; 20] = [
             self.batch,
@@ -532,7 +789,7 @@ impl AttentionDims {
             opts.window,
             (opts.seed >> 32) as u32,
             write_stats as u32,
-            0,
+            rope as u32,
         ];
         uniform(ctx, bytemuck::cast_slice(&params))
     }
@@ -543,8 +800,8 @@ impl AttentionDims {
         ctx: &WgpuContext,
         opts: &AttentionOptions,
         mask: Option<&UnifiedTensor>,
-        lse_saved: bool,
-    ) -> Buffer {
+        (lse_saved, dkv_direct, rope): (bool, bool, bool),
+    ) -> Params {
         let (has_mask, s) = mask_strides(mask);
         let params: [u32; 20] = [
             self.batch,
@@ -565,8 +822,9 @@ impl AttentionDims {
             s[3],
             opts.window,
             (opts.seed >> 32) as u32,
-            lse_saved as u32,
-            0,
+            // Bit 0: the log-sum-exp is saved; bit 1: the kernel rotates Q and K.
+            (lse_saved as u32) | ((rope as u32) << 1),
+            dkv_direct as u32,
         ];
         uniform(ctx, bytemuck::cast_slice(&params))
     }

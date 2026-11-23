@@ -1,6 +1,6 @@
 use crate::model_builder::Architecture;
-use crate::{Attention, KVCacheLayer, Linear, RMSNorm, Tensor, MLP};
-use ferrotensor_backend::{ComputeEngine, UnifiedTensor};
+use crate::{Attention, FuseChoice, FusedMode, KVCacheLayer, Linear, RMSNorm, Tensor, MLP};
+use ferrotensor_backend::{ComputeEngine, MemoryCategory, UnifiedTensor};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -356,8 +356,8 @@ impl Lfm2Model {
 
     /// Let `embed_tokens` receive a gradient (it is frozen otherwise, even
     /// when the other base weights train). While it trains, every lookup
-    /// reads the table back from the GPU, so it sees each optimizer step;
-    /// the host copy is dropped. A tied `lm_head` is a separate copy and does
+    /// gathers its rows on the GPU, so it sees each optimizer step; the host
+    /// copy is dropped. A tied `lm_head` is a separate copy and does
     /// not follow the table.
     pub fn with_trainable_embedding(mut self, on: bool) -> Self {
         self.embed_tokens.requires_grad = on;
@@ -553,11 +553,45 @@ impl Lfm2Model {
         mask: Option<&UnifiedTensor>,
         dropout_seed: Option<u64>,
     ) -> Tensor {
+        let x = self.blocks_output(engine, input_ids, pos, cache, mask, dropout_seed);
+        // Final norm and head.
+        let x = self.norm_f.forward(engine, &x);
+        self.lm_head.forward(engine, &x)
+    }
+
+    /// [`forward_with_dropout`](Self::forward_with_dropout) at position 0
+    /// without a cache, with the final norm and `lm_head` run only on the
+    /// positions `head_rows`: logits `[head_rows.len(), vocab]`, row `i` the
+    /// logits of position `head_rows[i]`. The vocab-sized matmul of the other
+    /// positions, forward and backward, is skipped, and they get no gradient
+    /// from the head, as when their loss is zero. `head_rows` must not be
+    /// empty.
+    pub fn forward_head_rows(
+        &self,
+        engine: &ComputeEngine,
+        input_ids: &[u32],
+        dropout_seed: Option<u64>,
+        head_rows: &[u32],
+    ) -> Tensor {
+        let x = self.blocks_output(engine, input_ids, 0, None, None, dropout_seed);
+        self.head_on_rows(engine, x, head_rows)
+    }
+
+    /// The embedding and every block: hidden states `[1, seq, hidden]`.
+    fn blocks_output(
+        &self,
+        engine: &ComputeEngine,
+        input_ids: &[u32],
+        pos: usize,
+        cache: Option<&mut crate::KVCache>,
+        mask: Option<&UnifiedTensor>,
+        dropout_seed: Option<u64>,
+    ) -> Tensor {
         let ctx = self.embed_tokens.ctx.clone();
 
         // 1. Embedding
         // Note: Generic Embedding.forward usually handles this, manual here for LFM specific
-        let mut x = self.lookup_embeddings(&ctx, &[input_ids]);
+        let mut x = self.lookup_embeddings(engine, &ctx, &[input_ids]);
         if let Some(norm) = &self.embedding_norm {
             x = norm.forward(engine, &x);
         }
@@ -568,10 +602,23 @@ impl Lfm2Model {
             let seed = dropout_seed.map(|s| crate::dropout::layer_seed(s, i));
             x = self.run_block(layer, engine, &x, pos, layer_cache, mask, seed);
         }
+        x
+    }
 
-        // 3. Final Norm & Head
-        x = self.norm_f.forward(engine, &x);
-        self.lm_head.forward(engine, &x)
+    /// Logits `[head_rows.len(), vocab]` of the positions `head_rows` of the
+    /// flattened hidden states `x`. Positions are gathered before the final
+    /// norm, which works on each row alone, so the values are those of the
+    /// full computation. An `x` that is not `f32` is normed and projected
+    /// whole and its logits, which are `f32`, are gathered instead.
+    fn head_on_rows(&self, engine: &ComputeEngine, x: Tensor, head_rows: &[u32]) -> Tensor {
+        if let Some(rows) = Tensor::gather_rows(&x, head_rows, engine) {
+            let rows = self.norm_f.forward(engine, &rows);
+            return self.lm_head.forward(engine, &rows);
+        }
+        let logits = self
+            .lm_head
+            .forward(engine, &self.norm_f.forward(engine, &x));
+        Tensor::gather_rows(&logits, head_rows, engine).unwrap_or(logits)
     }
 
     /// Whether [`forward_batch`](Self::forward_batch) can run: every block is
@@ -600,6 +647,37 @@ impl Lfm2Model {
         rows: &[&[u32]],
         dropout_seed: Option<u64>,
     ) -> Tensor {
+        let x = self.batch_blocks_output(engine, rows, dropout_seed);
+        let x = self.norm_f.forward(engine, &x);
+        self.lm_head.forward(engine, &x)
+    }
+
+    /// [`forward_batch_with_dropout`](Self::forward_batch_with_dropout) with
+    /// the final norm and `lm_head` run only on the positions `head_rows`
+    /// of the batch's flattened `[batch * seq]` rows (sequence `s`, position
+    /// `p` is row `s * seq + p`): logits `[head_rows.len(), vocab]`, as
+    /// [`forward_head_rows`](Self::forward_head_rows).
+    ///
+    /// # Panics
+    /// As [`forward_batch`](Self::forward_batch).
+    pub fn forward_batch_head_rows(
+        &self,
+        engine: &ComputeEngine,
+        rows: &[&[u32]],
+        dropout_seed: Option<u64>,
+        head_rows: &[u32],
+    ) -> Tensor {
+        let x = self.batch_blocks_output(engine, rows, dropout_seed);
+        self.head_on_rows(engine, x, head_rows)
+    }
+
+    /// The embedding and every block for a batch: `[batch, seq, hidden]`.
+    fn batch_blocks_output(
+        &self,
+        engine: &ComputeEngine,
+        rows: &[&[u32]],
+        dropout_seed: Option<u64>,
+    ) -> Tensor {
         assert!(
             self.supports_batching(),
             "forward_batch needs an all-attention model"
@@ -610,7 +688,7 @@ impl Lfm2Model {
             "forward_batch: rows must have the same length"
         );
         let ctx = self.embed_tokens.ctx.clone();
-        let mut x = self.lookup_embeddings(&ctx, rows);
+        let mut x = self.lookup_embeddings(engine, &ctx, rows);
         if let Some(norm) = &self.embedding_norm {
             x = norm.forward(engine, &x);
         }
@@ -618,8 +696,7 @@ impl Lfm2Model {
             let seed = dropout_seed.map(|s| crate::dropout::layer_seed(s, i));
             x = self.run_block(layer, engine, &x, 0, None, None, seed);
         }
-        x = self.norm_f.forward(engine, &x);
-        self.lm_head.forward(engine, &x)
+        x
     }
 
     /// Hidden states `[batch, seq, hidden]` after the blocks listed in
@@ -657,7 +734,7 @@ impl Lfm2Model {
             self.layers.len()
         );
         let ctx = self.embed_tokens.ctx.clone();
-        let mut x = self.lookup_embeddings(&ctx, rows);
+        let mut x = self.lookup_embeddings(engine, &ctx, rows);
         if let Some(norm) = &self.embedding_norm {
             x = norm.forward(engine, &x);
         }
@@ -671,22 +748,28 @@ impl Lfm2Model {
     }
 
     /// Embeddings `[rows, seq, hidden]` for equally long rows of ids.
+    #[expect(
+        clippy::expect_used,
+        reason = "a readback fails only on device loss, and the caller has no error path"
+    )]
     fn lookup_embeddings(
         &self,
+        engine: &ComputeEngine,
         ctx: &Arc<ferrotensor_backend::WgpuContext>,
         rows: &[&[u32]],
     ) -> Tensor {
-        // The lookup runs on the host (there is no GPU gather kernel yet).
-        // A frozen table reads a cached copy; a training table changes every
-        // optimizer step, so it is read back each time.
-        let read_back;
+        // A training table changes every optimizer step, so its rows are
+        // gathered on the GPU rather than read back and gathered on the host,
+        // which would wait for the GPU on every forward. A frozen table keeps
+        // the host lookup from a cached copy: one upload and no dispatch.
+        if self.embed_tokens.requires_grad {
+            return Tensor::embedding_gpu(&self.embed_tokens, rows, engine);
+        }
         let mut cached = self.embed_host.borrow_mut();
-        let table: &[f32] = if self.embed_tokens.requires_grad {
-            read_back = pollster::block_on(self.embed_tokens.data.to_vec(ctx));
-            &read_back
-        } else {
-            cached.get_or_insert_with(|| pollster::block_on(self.embed_tokens.data.to_vec(ctx)))
-        };
+        let table = cached.get_or_insert_with(|| {
+            pollster::block_on(self.embed_tokens.data.to_vec(ctx))
+                .expect("GPU device lost during readback")
+        });
         Tensor::embedding(&self.embed_tokens, table, rows)
     }
 
@@ -708,6 +791,78 @@ impl Lfm2Model {
     #[cfg(test)]
     pub(crate) fn host_embeddings(&self) -> Option<Vec<f32>> {
         self.embed_host.borrow().clone()
+    }
+
+    /// Gives every eligible layer its fused projections (see [`crate::fused`])
+    /// for training and returns how many groups it built; a layer that does
+    /// not qualify, or any layer when `mode` is [`FusedMode::Auto`] and the
+    /// engine has no cooperative matmul, keeps the unfused path. Every kind
+    /// of group is on; see
+    /// [`enable_fused_projections_with`](Self::enable_fused_projections_with)
+    /// to choose.
+    ///
+    /// # Errors
+    ///
+    /// When building a group fails, such as a failed GPU readback.
+    pub fn enable_fused_projections(
+        &mut self,
+        engine: &ComputeEngine,
+        mode: FusedMode,
+    ) -> Result<usize, String> {
+        let (qkv, gate_up) = self.enable_fused_projections_with(engine, mode, FuseChoice::ON, 0)?;
+        Ok(qkv + gate_up)
+    }
+
+    /// [`enable_fused_projections`](Self::enable_fused_projections) for the
+    /// kinds of group `choice` allows, where `rows` is the row count of one
+    /// pass (batch size times sequence length) for its `auto` rule. Returns
+    /// the number of q, k and v groups and of gate and up groups built.
+    ///
+    /// Each group keeps the only copy of its projections' weights, so the
+    /// model holds them once. Call this after the adapters and the trainable
+    /// set are final. The f16 mirror of each `A` is current on return; run
+    /// [`refresh_lora_mirrors`](Self::refresh_lora_mirrors) after every
+    /// optimizer step, adapter load and resume.
+    ///
+    /// # Errors
+    ///
+    /// When building a group fails, such as a failed GPU readback.
+    pub fn enable_fused_projections_with(
+        &mut self,
+        engine: &ComputeEngine,
+        mode: FusedMode,
+        choice: FuseChoice,
+        rows: usize,
+    ) -> Result<(usize, usize), String> {
+        let ctx = self.embed_tokens.ctx.clone();
+        // The groups hold the frozen weights now, so the memory report counts
+        // them with the base weights.
+        let _tag = ctx.memory().scope(MemoryCategory::BaseWeights);
+        let (mut qkv, mut gate_up) = (0, 0);
+        for layer in &mut self.layers {
+            if let Lfm2LayerOp::Attention(attn) = &mut layer.op {
+                qkv += usize::from(attn.enable_fused(&ctx, engine, mode, choice, rows)?);
+            }
+            gate_up += usize::from(layer.mlp.enable_fused(&ctx, engine, mode, choice, rows)?);
+        }
+        Ok((qkv, gate_up))
+    }
+
+    /// Rewrites the f16 mirror of every fused group's LoRA `A` matrices from
+    /// the f32 tensors. A model without fused groups does nothing.
+    ///
+    /// # Errors
+    ///
+    /// When a kernel refuses the call.
+    pub fn refresh_lora_mirrors(&self, engine: &ComputeEngine) -> Result<(), String> {
+        let ctx = &self.embed_tokens.ctx;
+        for layer in &self.layers {
+            if let Lfm2LayerOp::Attention(attn) = &layer.op {
+                attn.refresh_fused(ctx, engine)?;
+            }
+            layer.mlp.refresh_fused(ctx, engine)?;
+        }
+        Ok(())
     }
 
     /// Only the LoRA adapter tensors (what LoRA fine-tuning updates).

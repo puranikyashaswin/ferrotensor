@@ -103,7 +103,7 @@ fn embedding_gradient_matches_finite_differences() {
         .borrow()
         .clone()
         .expect("the table has a gradient");
-    let grad = pollster::block_on(grad.to_vec(&gpu.ctx));
+    let grad = pollster::block_on(grad.to_vec(&gpu.ctx)).expect("GPU readback");
     let table = host(&gpu, &model.embed_tokens);
 
     let h = 5e-3f32;
@@ -191,7 +191,7 @@ fn block_checkpointing_gives_the_same_embedding_gradient() {
         let model = embed_model(&gpu, dir.path()).with_block_checkpointing(checkpointing);
         loss(&gpu, &model).0.backward(&gpu.engine);
         let grad = model.embed_tokens.grad.borrow().clone().expect("gradient");
-        pollster::block_on(grad.to_vec(&gpu.ctx))
+        pollster::block_on(grad.to_vec(&gpu.ctx)).expect("GPU readback")
     };
     let (on, off) = (grad(true), grad(false));
     assert_eq!(on.len(), VOCAB * HIDDEN);

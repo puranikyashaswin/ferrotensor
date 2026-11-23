@@ -2,6 +2,7 @@
 //!
 //! Comprehensive test suite to verify numerical accuracy and correctness
 //! of the Flash Attention implementation.
+#![allow(clippy::expect_used)]
 
 #[cfg(test)]
 mod tests {
@@ -58,7 +59,7 @@ mod tests {
         let v = UnifiedTensor::new(&ctx, &v_data, &[seq_len, hidden_dim]);
 
         let output = flash_attn.forward(&q, &k, &v, &ctx, &engine);
-        let result = pollster::block_on(output.to_vec(&ctx));
+        let result = pollster::block_on(output.to_vec(&ctx)).expect("GPU readback");
 
         // Verify output is not all zeros
         assert!(result.iter().any(|&x| x.abs() > 1e-6));
@@ -92,7 +93,7 @@ mod tests {
         let v = UnifiedTensor::new(&ctx, &q_data, &[seq_len, hidden_dim]);
 
         let output = flash_attn.forward(&q, &k, &v, &ctx, &engine);
-        let result = pollster::block_on(output.to_vec(&ctx));
+        let result = pollster::block_on(output.to_vec(&ctx)).expect("GPU readback");
 
         // Check that output is reasonable (not NaN, not Inf)
         for &val in &result {
@@ -167,7 +168,7 @@ mod tests {
             let output = flash_attn.forward(&q, &k, &v, &ctx, &engine);
             assert_eq!(output.shape, vec![1, seq_len, hidden_dim]);
 
-            let result = pollster::block_on(output.to_vec(&ctx));
+            let result = pollster::block_on(output.to_vec(&ctx)).expect("GPU readback");
             assert!(result.iter().all(|&x| x.is_finite()));
         }
     }

@@ -14,11 +14,17 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
 use ferrotensor_backend::{
-    AdamParams, AttentionOptions, ComputeEngine, DType, UnifiedTensor, WgpuContext,
+    AdamParams, AttentionOptions, ComputeEngine, DType, Epilogue, FlatLayout, UnifiedTensor,
+    WgpuContext,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::Arc;
+
+mod fused;
+pub use fused::{
+    AttentionGeometry, FusedAttentionNode, FusedGateUpNode, FusedLora, FusedProjections,
+};
 
 thread_local! {
     static GRAD_ENABLED: Cell<bool> = const { Cell::new(true) };
@@ -61,6 +67,17 @@ pub trait AutogradNode {
     fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor>;
     /// The tensors this op consumed.
     fn inputs(&self) -> Vec<Tensor>;
+    /// Adds this op's input gradients straight into the inputs' gradient
+    /// slots and returns `true`, or returns `false` (the default) so that
+    /// [`Tensor::backward`] adds the gradients
+    /// [`backward`](AutogradNode::backward) returns.
+    ///
+    /// Ops whose gradients are matmul products override it, so the matmul
+    /// adds into the slot (see [`Tensor::accumulate_grad_with`]) instead of
+    /// writing a new buffer that a second kernel then adds.
+    fn backward_accumulate(&self, _grad: &UnifiedTensor, _engine: &ComputeEngine) -> bool {
+        false
+    }
 }
 
 /// A GPU tensor that records the ops applied to it for backpropagation.
@@ -188,6 +205,9 @@ impl Tensor {
             let Some(grad) = tensor.grad.borrow_mut().take() else {
                 continue;
             };
+            if creator.backward_accumulate(&grad, engine) {
+                continue;
+            }
             let input_grads = creator.backward(&grad, engine);
             let inputs = creator.inputs();
             for (input, input_grad) in inputs.iter().zip(input_grads) {
@@ -214,6 +234,42 @@ impl Tensor {
         } else {
             // Defensive: every node returns its input's shape today.
             *grad_ref = Some(new_grad.reshaped(&self.data.shape));
+        }
+    }
+
+    /// Add a matmul product to this tensor's gradient: `run(out, ep)` records
+    /// a matmul that stores `ep.alpha * product + ep.beta * out` in `out`.
+    ///
+    /// When this tensor already has a gradient that nothing else shares, the
+    /// product is added into it in place (`Epilogue::ACCUMULATE`); the kernel
+    /// rounds the product to f32 and then adds, so the result has the bits
+    /// [`accumulate_grad`](Self::accumulate_grad) gives. A shared gradient is
+    /// left untouched and the sum goes to a new buffer, as there.
+    pub fn accumulate_grad_with(
+        &self,
+        engine: &ComputeEngine,
+        run: impl FnOnce(&UnifiedTensor, Epilogue),
+    ) {
+        let mut grad_ref = self.grad.borrow_mut();
+        let size: usize = self.data.shape.iter().product();
+        match grad_ref.as_ref() {
+            Some(existing)
+                if existing.is_unique() && existing.shape.iter().product::<usize>() == size =>
+            {
+                run(existing, Epilogue::ACCUMULATE);
+            }
+            Some(existing) => {
+                let product = UnifiedTensor::empty(&self.ctx, &self.data.shape);
+                run(&product, Epilogue::STORE);
+                let res = UnifiedTensor::empty(&self.ctx, &self.data.shape);
+                engine.add(&self.ctx, existing, &product, &res);
+                *grad_ref = Some(res);
+            }
+            None => {
+                let product = UnifiedTensor::empty(&self.ctx, &self.data.shape);
+                run(&product, Epilogue::STORE);
+                *grad_ref = Some(product);
+            }
         }
     }
 
@@ -287,6 +343,123 @@ impl AutogradNode for MatMulNode {
         };
         vec![grad_a, grad_b]
     }
+    /// The same gradients as [`backward`](AutogradNode::backward), each
+    /// added into its input's slot by the matmul that computes it.
+    fn backward_accumulate(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> bool {
+        let ctx = &self.a.ctx;
+        if self.a.requires_grad {
+            self.a.accumulate_grad_with(engine, |out, ep| {
+                engine.matmul_bt_into(ctx, grad, &self.b.data, out, ep);
+            });
+        }
+        if self.b.requires_grad {
+            self.b.accumulate_grad_with(engine, |out, ep| {
+                engine.matmul_at_into(ctx, &self.a.data, grad, out, ep);
+            });
+        }
+        true
+    }
+}
+
+/// Backward node of [`Tensor::lora_matmul`]: `y = x @ w + scale * (x @ a) @ b`.
+pub struct LoraMatMulNode {
+    /// Input `[M, K]`.
+    pub x: Tensor,
+    /// Base weight `[K, N]` (f32, f16 or 4-bit).
+    pub w: Tensor,
+    /// Adapter down-projection `[K, R]`.
+    pub a: Tensor,
+    /// Adapter up-projection `[R, N]`.
+    pub b: Tensor,
+    /// `scale * (x @ a)`, `[M, R]`, kept from the forward pass.
+    pub xa: UnifiedTensor,
+    /// The adapter's scale, `alpha / rank`.
+    pub scale: f32,
+}
+impl LoraMatMulNode {
+    /// The gradient of `x @ a`: `scale * grad @ b^T`, with the bits of the
+    /// separate matmul and scale ops.
+    fn grad_xa(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> UnifiedTensor {
+        let g = UnifiedTensor::empty(&self.x.ctx, &self.xa.shape);
+        let ep = Epilogue::scaled(self.scale);
+        engine.matmul_bt_into(&self.x.ctx, grad, &self.b.data, &g, ep);
+        g
+    }
+}
+impl AutogradNode for LoraMatMulNode {
+    fn inputs(&self) -> Vec<Tensor> {
+        vec![
+            self.x.clone(),
+            self.w.clone(),
+            self.a.clone(),
+            self.b.clone(),
+        ]
+    }
+    /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
+    fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
+        let ctx = &self.x.ctx;
+        // Inputs that need no gradient get a placeholder, as in MatMulNode.
+        let slot = |t: &Tensor| {
+            let shape: &[usize] = if t.requires_grad { &t.data.shape } else { &[1] };
+            UnifiedTensor::empty(ctx, shape)
+        };
+        let (grad_x, grad_w, grad_a, grad_b) =
+            (slot(&self.x), slot(&self.w), slot(&self.a), slot(&self.b));
+        if self.x.requires_grad || self.a.requires_grad {
+            let g_xa = self.grad_xa(grad, engine);
+            if self.x.requires_grad {
+                engine.matmul_bt_into(ctx, &g_xa, &self.a.data, &grad_x, Epilogue::STORE);
+            }
+            if self.a.requires_grad {
+                engine.matmul_at_into(ctx, &self.x.data, &g_xa, &grad_a, Epilogue::STORE);
+            }
+        }
+        if self.x.requires_grad {
+            engine.matmul_bt_into(ctx, grad, &self.w.data, &grad_x, Epilogue::ACCUMULATE);
+        }
+        if self.w.requires_grad {
+            engine.matmul_at_into(ctx, &self.x.data, grad, &grad_w, Epilogue::STORE);
+        }
+        if self.b.requires_grad {
+            engine.matmul_at_into(ctx, &self.xa, grad, &grad_b, Epilogue::STORE);
+        }
+        vec![grad_x, grad_w, grad_a, grad_b]
+    }
+    /// Adds the gradients into the inputs' slots in the order the separate
+    /// matmul, scale and add ops reached them: the adapter's share of `x`'s
+    /// gradient before the base weight's, so every sum keeps its bits.
+    fn backward_accumulate(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> bool {
+        let ctx = &self.x.ctx;
+        if self.b.requires_grad {
+            self.b.accumulate_grad_with(engine, |out, ep| {
+                engine.matmul_at_into(ctx, &self.xa, grad, out, ep);
+            });
+        }
+        if self.x.requires_grad || self.a.requires_grad {
+            let g_xa = self.grad_xa(grad, engine);
+            if self.x.requires_grad {
+                self.x.accumulate_grad_with(engine, |out, ep| {
+                    engine.matmul_bt_into(ctx, &g_xa, &self.a.data, out, ep);
+                });
+            }
+            if self.a.requires_grad {
+                self.a.accumulate_grad_with(engine, |out, ep| {
+                    engine.matmul_at_into(ctx, &self.x.data, &g_xa, out, ep);
+                });
+            }
+        }
+        if self.x.requires_grad {
+            self.x.accumulate_grad_with(engine, |out, ep| {
+                engine.matmul_bt_into(ctx, grad, &self.w.data, out, ep);
+            });
+        }
+        if self.w.requires_grad {
+            self.w.accumulate_grad_with(engine, |out, ep| {
+                engine.matmul_at_into(ctx, &self.x.data, grad, out, ep);
+            });
+        }
+        true
+    }
 }
 
 /// Backward node of [`Tensor::add`].
@@ -302,10 +475,20 @@ impl AutogradNode for AddNode {
     }
     /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
     fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
-        let grad_a = UnifiedTensor::empty(&self.a.ctx, &self.a.data.shape);
-        let grad_b = UnifiedTensor::empty(&self.b.ctx, &self.b.data.shape);
-        engine.add_backward(&self.a.ctx, grad, &grad_a, &grad_b);
-        vec![grad_a, grad_b]
+        // Both gradients equal `grad`, so an op's output gets `grad` itself:
+        // its gradient is only ever written in place by
+        // `accumulate_grad_with`, which copies a buffer anything else holds.
+        // A parameter's gradient is scaled and clipped in place before the
+        // optimizer step, so a leaf gets a buffer of its own.
+        let own = |t: &Tensor| {
+            if t.creator.is_some() || !t.requires_grad {
+                return grad.clone();
+            }
+            let copy = UnifiedTensor::empty(&t.ctx, &grad.shape);
+            engine.copy_tensor(&t.ctx, grad, &copy, 0);
+            copy
+        };
+        vec![own(&self.a), own(&self.b)]
     }
 }
 
@@ -522,12 +705,12 @@ impl AutogradNode for RoPENode {
     }
     /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
     fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
-        // The gradient of a rotation is the inverse rotation; rotate a copy
-        // so the upstream gradient is left untouched.
+        // The gradient of a rotation is the inverse rotation; it is written
+        // to a new buffer so the upstream gradient is left untouched.
         let ctx = &self.input.ctx;
         let grad_in = UnifiedTensor::empty(ctx, &self.input.data.shape);
-        engine.copy_tensor(ctx, grad, &grad_in, 0);
-        engine.rope_theta_inverse(ctx, &grad_in, self.head_dim, self.pos, self.theta);
+        let (head_dim, pos, theta) = (self.head_dim, self.pos, self.theta);
+        engine.rope_theta_inverse_to(ctx, (grad, &grad_in), head_dim, pos, theta);
         vec![grad_in]
     }
 }
@@ -581,16 +764,50 @@ impl AutogradNode for RMSNormNode {
         let ctx = &self.input.ctx;
         let grad_x = UnifiedTensor::empty(ctx, &self.input.data.shape);
         let grad_w = UnifiedTensor::empty(ctx, &self.weight.data.shape);
+        // A frozen norm weight's gradient is never read, so its kernel is
+        // skipped; `grad_w` only fills the weight's place in the result.
+        let wanted = self.weight.requires_grad.then_some(&grad_w);
         engine.rms_norm_backward(
             ctx,
             &self.input.data,
             &self.weight.data,
             grad,
             &grad_x,
-            &grad_w,
+            wanted,
             self.eps,
         );
         vec![grad_x, grad_w]
+    }
+    /// The same gradients as [`backward`](AutogradNode::backward), with the
+    /// input gradient added into the input's slot by the norm kernel itself.
+    ///
+    /// A residual stream's tensor already holds the skip connection's
+    /// gradient when its norm runs, so this removes the `add` that would sum
+    /// the two. A frozen input has no slot, so that case keeps the default.
+    fn backward_accumulate(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> bool {
+        if !self.input.requires_grad {
+            return false;
+        }
+        let ctx = &self.input.ctx;
+        let grad_w = self
+            .weight
+            .requires_grad
+            .then(|| UnifiedTensor::empty(ctx, &self.weight.data.shape));
+        self.input.accumulate_grad_with(engine, |out, ep| {
+            engine.rms_norm_backward_beta(
+                ctx,
+                &self.input.data,
+                &self.weight.data,
+                grad,
+                (out, ep.beta),
+                grad_w.as_ref(),
+                self.eps,
+            );
+        });
+        if let Some(grad_w) = &grad_w {
+            self.weight.accumulate_grad(engine, grad_w);
+        }
+        true
     }
 }
 
@@ -608,9 +825,14 @@ impl AutogradNode for SelectTokenNode {
         vec![self.input.clone()]
     }
     /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
+    #[expect(
+        clippy::expect_used,
+        reason = "a readback fails only on device loss, and the caller has no error path"
+    )]
     fn backward(&self, grad: &UnifiedTensor, _engine: &ComputeEngine) -> Vec<UnifiedTensor> {
         let mut full_grad = vec![0.0f32; self.input.data.shape.iter().product()];
-        let token_grad = pollster::block_on(grad.to_vec(&self.input.ctx));
+        let token_grad = pollster::block_on(grad.to_vec(&self.input.ctx))
+            .expect("GPU device lost during readback");
         let start = self.token_index * self.vocab_size;
         let end = start + self.vocab_size;
         full_grad[start..end].copy_from_slice(&token_grad);
@@ -634,9 +856,14 @@ impl AutogradNode for EmbeddingNode {
         vec![self.table.clone()]
     }
     /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
+    #[expect(
+        clippy::expect_used,
+        reason = "a readback fails only on device loss, and the caller has no error path"
+    )]
     fn backward(&self, grad: &UnifiedTensor, _engine: &ComputeEngine) -> Vec<UnifiedTensor> {
         let hidden = self.table.data.shape[1];
-        let output_grad = pollster::block_on(grad.to_vec(&self.table.ctx));
+        let output_grad = pollster::block_on(grad.to_vec(&self.table.ctx))
+            .expect("GPU device lost during readback");
         let mut table_grad = vec![0.0f32; self.table.data.shape.iter().product()];
         // A repeated id sums the gradients of all its positions; an id outside
         // the table looked up zeros, so it gets nothing.
@@ -656,6 +883,32 @@ impl AutogradNode for EmbeddingNode {
     }
 }
 
+/// Backward node of [`Tensor::embedding_gpu`].
+pub struct GpuEmbeddingNode {
+    /// Table `[vocab, hidden]`.
+    pub table: Tensor,
+    /// The looked-up id of each output row, in order.
+    pub ids: Vec<u32>,
+}
+impl AutogradNode for GpuEmbeddingNode {
+    fn inputs(&self) -> Vec<Tensor> {
+        vec![self.table.clone()]
+    }
+    /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
+    fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
+        let ctx = &self.table.ctx;
+        // The ids are known on the host, so the index of which positions
+        // feed which row is built here and the gradient never comes back.
+        let (index, slots) =
+            ComputeEngine::embedding_scatter_index(&self.ids, self.table.data.shape[0]);
+        let index_bytes: Vec<u8> = index.iter().flat_map(|i| i.to_le_bytes()).collect();
+        let index_buf = UnifiedTensor::from_bytes(ctx, &index_bytes, &[index.len()]);
+        let table_grad = UnifiedTensor::empty(ctx, &self.table.data.shape);
+        engine.embedding_scatter(ctx, grad, &index_buf, slots, &table_grad);
+        vec![table_grad]
+    }
+}
+
 /// Backward node of [`Tensor::mse_loss`].
 pub struct MSELossNode {
     /// Predictions.
@@ -668,10 +921,15 @@ impl AutogradNode for MSELossNode {
         vec![self.pred.clone(), self.target.clone()]
     }
     /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
+    #[expect(
+        clippy::expect_used,
+        reason = "a readback fails only on device loss, and the caller has no error path"
+    )]
     fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
         let grad_in = UnifiedTensor::empty(&self.pred.ctx, &self.pred.data.shape);
         engine.mse_loss_backward(&self.pred.ctx, &self.pred.data, &self.target.data, &grad_in);
         let upstream = pollster::block_on(grad.to_vec(&self.pred.ctx))
+            .expect("GPU device lost during readback")
             .first()
             .copied()
             .unwrap_or(1.0);
@@ -700,6 +958,10 @@ impl AutogradNode for CrossEntropyLossNode {
         vec![self.logits.clone()]
     }
     /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
+    #[expect(
+        clippy::expect_used,
+        reason = "a readback fails only on device loss, and the caller has no error path"
+    )]
     fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
         let grad_logits = UnifiedTensor::empty(&self.logits.ctx, &self.logits.data.shape);
         engine.cross_entropy_backward(
@@ -709,6 +971,7 @@ impl AutogradNode for CrossEntropyLossNode {
             &grad_logits,
         );
         let upstream = pollster::block_on(grad.to_vec(&self.logits.ctx))
+            .expect("GPU device lost during readback")
             .first()
             .copied()
             .unwrap_or(1.0);
@@ -1022,6 +1285,38 @@ impl Tensor {
         });
         Tensor::with_creator(a.ctx.clone(), out_data, node)
     }
+    /// `x @ w + scale * (x @ a) @ b`: a linear layer with a low-rank adapter,
+    /// in three matmuls. `x` is `[M, K]`, `w` `[K, N]` (f32, f16 or 4-bit),
+    /// and the adapter's `a` `[K, R]` and `b` `[R, N]` are f32.
+    ///
+    /// The values are those of [`matmul`](Self::matmul), [`scale`](Self::scale)
+    /// and [`add`](Self::add) applied in that order: the scale is applied to
+    /// the rounded `x @ a`, and the adapter's product is added to the rounded
+    /// base product. Backward adds into the gradients in the same order.
+    pub fn lora_matmul(
+        x: &Tensor,
+        w: &Tensor,
+        (a, b): (&Tensor, &Tensor),
+        scale: f32,
+        engine: &ComputeEngine,
+    ) -> Tensor {
+        let ctx = &x.ctx;
+        let rows = x.data.shape[0];
+        let out = UnifiedTensor::empty(ctx, &[rows, w.data.shape[1]]);
+        engine.matmul_into(ctx, &x.data, &w.data, &out, Epilogue::STORE);
+        let xa = UnifiedTensor::empty(ctx, &[rows, a.data.shape[1]]);
+        engine.matmul_into(ctx, &x.data, &a.data, &xa, Epilogue::scaled(scale));
+        engine.matmul_into(ctx, &xa, &b.data, &out, Epilogue::ACCUMULATE);
+        let node = Arc::new(LoraMatMulNode {
+            x: x.clone(),
+            w: w.clone(),
+            a: a.clone(),
+            b: b.clone(),
+            xa,
+            scale,
+        });
+        Tensor::with_creator(ctx.clone(), out, node)
+    }
     /// Element-wise sum of equally shaped tensors.
     pub fn add(a: &Tensor, b: &Tensor, engine: &ComputeEngine) -> Tensor {
         let out_data = UnifiedTensor::empty(&a.ctx, &a.data.shape);
@@ -1075,11 +1370,16 @@ impl Tensor {
     /// Squared-error loss `0.5 * sum((pred - target)^2)`, shape `[1]`.
     ///
     /// Its gradient is `pred - target` (the backward kernel's output).
+    #[expect(
+        clippy::expect_used,
+        reason = "a readback fails only on device loss, and the caller has no error path"
+    )]
     pub fn mse_loss(pred: &Tensor, target: &Tensor, engine: &ComputeEngine) -> Tensor {
         // The kernel writes 0.5 * (p - t)^2 per element; sum on the host.
         let per_element = UnifiedTensor::empty(&pred.ctx, &pred.data.shape);
         engine.mse_loss(&pred.ctx, &pred.data, &target.data, &per_element);
         let total: f32 = pollster::block_on(per_element.to_vec(&pred.ctx))
+            .expect("GPU device lost during readback")
             .iter()
             .sum();
         let out_data = UnifiedTensor::new(&pred.ctx, &[total], &[1]);
@@ -1127,8 +1427,8 @@ impl Tensor {
         engine: &ComputeEngine,
     ) -> Tensor {
         let out_data = UnifiedTensor::empty(&input.ctx, &input.data.shape);
-        engine.copy_tensor(&input.ctx, &input.data, &out_data, 0);
-        engine.rope_theta(&input.ctx, &out_data, head_dim, pos, theta);
+        let io = (input.data.as_ref(), &out_data);
+        engine.rope_theta_to(&input.ctx, io, head_dim, pos, theta);
         let node = Arc::new(RoPENode {
             input: input.clone(),
             head_dim,
@@ -1178,10 +1478,69 @@ impl Tensor {
         Tensor::with_creator(table.ctx.clone(), out_data, node)
     }
 
+    /// [`embedding`](Self::embedding) gathered on the GPU from `table`
+    /// itself, for a table that trains: it needs no host copy, so no lookup
+    /// waits for the GPU to read the table back, and the gradient is summed
+    /// on the GPU too. Same values as [`embedding`](Self::embedding); a table
+    /// that is not `f32` or an empty lookup takes the host path.
+    #[expect(
+        clippy::expect_used,
+        reason = "a readback fails only on device loss, and the caller has no error path"
+    )]
+    pub fn embedding_gpu(table: &Tensor, rows: &[&[u32]], engine: &ComputeEngine) -> Tensor {
+        let ids: Vec<u32> = rows.iter().flat_map(|r| r.iter().copied()).collect();
+        let seq_len = rows.first().map_or(0, |r| r.len());
+        let (vocab, hidden) = (table.data.shape[0], table.data.shape[1]);
+        if table.data.dtype != DType::FP32 || ids.is_empty() || vocab * hidden == 0 {
+            let host = pollster::block_on(table.data.to_vec(&table.ctx))
+                .expect("GPU device lost during readback");
+            return Self::embedding(table, &host, rows);
+        }
+        let ctx = &table.ctx;
+        let id_bytes: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
+        let id_buf = UnifiedTensor::from_bytes(ctx, &id_bytes, &[ids.len()]);
+        let out_data = UnifiedTensor::empty(ctx, &[rows.len(), seq_len, hidden]);
+        engine.embedding_gather(ctx, &table.data, &id_buf, &out_data);
+        if !table.requires_grad {
+            return Tensor::frozen(ctx.clone(), out_data);
+        }
+        let node = Arc::new(GpuEmbeddingNode {
+            table: table.clone(),
+            ids,
+        });
+        Tensor::with_creator(ctx.clone(), out_data, node)
+    }
+
+    /// The rows `rows` of `input` (`[.., hidden]`, its leading dimensions
+    /// flattened) as `[rows.len(), hidden]`, gathered on the GPU. The
+    /// gradient puts each output row's gradient back at its source row and
+    /// leaves every other row at zero, so a loss on the gathered rows trains
+    /// the model as the same loss with zero gradient on the other rows would.
+    /// A row index past the end gives zeros and no gradient. `None` for an
+    /// input that is not `f32` or an empty `rows`.
+    pub fn gather_rows(input: &Tensor, rows: &[u32], engine: &ComputeEngine) -> Option<Tensor> {
+        let hidden = *input.data.shape.last()?;
+        let flat = input.data.shape.iter().product::<usize>() / hidden.max(1);
+        if input.data.dtype != DType::FP32 || rows.is_empty() || flat * hidden == 0 {
+            return None;
+        }
+        let table = Tensor::reshape(input, &[flat, hidden]);
+        let ctx = &table.ctx;
+        let id_bytes: Vec<u8> = rows.iter().flat_map(|id| id.to_le_bytes()).collect();
+        let id_buf = UnifiedTensor::from_bytes(ctx, &id_bytes, &[rows.len()]);
+        let out_data = UnifiedTensor::empty(ctx, &[rows.len(), hidden]);
+        engine.embedding_gather(ctx, &table.data, &id_buf, &out_data);
+        let node = Arc::new(GpuEmbeddingNode {
+            table: table.clone(),
+            ids: rows.to_vec(),
+        });
+        Some(Tensor::with_creator(ctx.clone(), out_data, node))
+    }
+
     /// Row `token_index` of `[seq, vocab]` logits.
     #[expect(
         clippy::expect_used,
-        reason = "shape precondition: input has at least one dimension"
+        reason = "shape precondition: input has at least one dimension; the readback fails only on device loss, and this API has no error path"
     )]
     pub fn select_token(input: &Tensor, token_index: usize) -> Tensor {
         let vocab_size = *input
@@ -1189,7 +1548,8 @@ impl Tensor {
             .shape
             .last()
             .expect("select_token requires a non-empty tensor");
-        let full = pollster::block_on(input.data.to_vec(&input.ctx));
+        let full = pollster::block_on(input.data.to_vec(&input.ctx))
+            .expect("GPU device lost during readback");
         let start = token_index * vocab_size;
         let end = start + vocab_size;
         let out_data = UnifiedTensor::new(&input.ctx, &full[start..end], &[vocab_size]);
@@ -1395,6 +1755,17 @@ pub trait Optimizer: Send + Sync {
     fn step(&mut self, params: &[Tensor]);
     /// Clear the gradients of `params`.
     fn zero_grad(&mut self, params: &[Tensor]);
+    /// Whether [`step_flat`](Optimizer::step_flat) works for this optimizer.
+    fn supports_flat_step(&self) -> bool {
+        false
+    }
+    /// Update `params` from `grads`, their gradients packed into one buffer
+    /// in the order of the parameters that hold a gradient. The step reads
+    /// `grads`, not the gradients the parameters hold. The default says the
+    /// optimizer has no flat step.
+    fn step_flat(&mut self, _params: &[Tensor], _grads: &FlatGrads) -> Result<(), String> {
+        Err("this optimizer has no flat step".to_string())
+    }
     /// Set the learning rate used by the next [`step`](Optimizer::step)
     /// (for schedules). The default ignores it.
     fn set_lr(&mut self, _lr: f32) {}
@@ -1420,6 +1791,51 @@ pub trait Optimizer: Send + Sync {
         _state: &OptimizerCheckpoint,
     ) -> Result<OptimizerLoad, String> {
         Err("this optimizer cannot restore saved state".to_string())
+    }
+}
+
+/// The gradients of a parameter list packed into one buffer, so the norm, the
+/// clip and the optimizer step each run as one dispatch over all of them.
+pub struct FlatGrads {
+    /// Where each gradient starts in [`data`](Self::data).
+    pub layout: FlatLayout,
+    /// The packed gradients. The gaps between them stay zero.
+    pub data: UnifiedTensor,
+}
+
+impl FlatGrads {
+    /// A zeroed buffer for gradients of `sizes` elements, or `None` when they
+    /// would not fit one buffer.
+    pub fn new(ctx: &WgpuContext, sizes: &[usize]) -> Option<Self> {
+        let layout = FlatLayout::new(sizes)?;
+        let data = UnifiedTensor::zeros_on_gpu(ctx, &[layout.total()]);
+        Some(Self { layout, data })
+    }
+
+    /// Copies `grads` into the buffer, one copy each.
+    ///
+    /// # Errors
+    ///
+    /// When `grads` do not have the sizes the buffer was made for.
+    pub fn pack(
+        &self,
+        ctx: &WgpuContext,
+        engine: &ComputeEngine,
+        grads: &[UnifiedTensor],
+    ) -> Result<(), String> {
+        let sizes: Vec<usize> = grads.iter().map(|g| g.shape.iter().product()).collect();
+        if sizes != self.layout.sizes() {
+            return Err("the gradients do not match the flat layout".to_string());
+        }
+        for (i, grad) in grads.iter().enumerate() {
+            if grad.dtype != DType::FP32 {
+                return Err("flat gradients must be f32".to_string());
+            }
+            if sizes[i] > 0 {
+                engine.copy_into_flat(ctx, grad, &self.data, self.layout.offset(i));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1496,6 +1912,21 @@ pub struct AdamW {
     pub t: f32,
     m_states: HashMap<usize, UnifiedTensor>,
     v_states: HashMap<usize, UnifiedTensor>,
+    /// While [`step_flat`](Optimizer::step_flat) is in use, the moments of
+    /// the parameters it covers live here and not in the maps above.
+    flat: Option<FlatState>,
+}
+
+/// The moments of a parameter list packed into flat buffers, and a flat
+/// buffer for the weights the update runs on.
+struct FlatState {
+    ctx: Arc<WgpuContext>,
+    /// Address of each parameter's data, in order.
+    ptrs: Vec<usize>,
+    shapes: Vec<Vec<usize>>,
+    layout: FlatLayout,
+    m: UnifiedTensor,
+    v: UnifiedTensor,
 }
 
 impl AdamW {
@@ -1511,6 +1942,7 @@ impl AdamW {
             t: 0.0,
             m_states: HashMap::new(),
             v_states: HashMap::new(),
+            flat: None,
         }
     }
 
@@ -1520,6 +1952,7 @@ impl AdamW {
     }
 
     fn apply_step(&mut self, params: &[Tensor]) {
+        self.spill_flat();
         self.t += 1.0;
         let p = AdamParams {
             lr: self.lr,
@@ -1551,6 +1984,109 @@ impl AdamW {
         }
     }
 
+    /// Moves the moments out of the flat buffers into one tensor per
+    /// parameter, which is where the per-tensor step and the checkpoint
+    /// code expect them.
+    fn spill_flat(&mut self) {
+        let Some(flat) = self.flat.take() else {
+            return;
+        };
+        for (i, key) in flat.ptrs.iter().enumerate() {
+            let offset = flat.layout.offset(i);
+            let Some(shape) = flat.shapes.get(i) else {
+                continue;
+            };
+            let m = UnifiedTensor::empty(&flat.ctx, shape);
+            let v = UnifiedTensor::empty(&flat.ctx, shape);
+            self.engine.copy_from_flat(&flat.ctx, &flat.m, offset, &m);
+            self.engine.copy_from_flat(&flat.ctx, &flat.v, offset, &v);
+            self.m_states.insert(*key, m);
+            self.v_states.insert(*key, v);
+        }
+    }
+
+    /// Makes `self.flat` cover `ts` in `layout`, moving in the moments the
+    /// per-tensor maps hold for them.
+    fn ensure_flat(&mut self, ts: &[&Tensor], layout: &FlatLayout, ctx: &Arc<WgpuContext>) {
+        let ptrs: Vec<usize> = ts.iter().map(|p| Arc::as_ptr(&p.data) as usize).collect();
+        if self
+            .flat
+            .as_ref()
+            .is_some_and(|f| f.ptrs == ptrs && f.layout == *layout)
+        {
+            return;
+        }
+        self.spill_flat();
+        let total = [layout.total()];
+        let m = UnifiedTensor::zeros_on_gpu(ctx, &total);
+        let v = UnifiedTensor::zeros_on_gpu(ctx, &total);
+        for (i, key) in ptrs.iter().enumerate() {
+            if let Some(old) = self.m_states.remove(key) {
+                self.engine.copy_into_flat(ctx, &old, &m, layout.offset(i));
+            }
+            if let Some(old) = self.v_states.remove(key) {
+                self.engine.copy_into_flat(ctx, &old, &v, layout.offset(i));
+            }
+        }
+        self.flat = Some(FlatState {
+            ctx: Arc::clone(ctx),
+            ptrs,
+            shapes: ts.iter().map(|p| p.data.shape.clone()).collect(),
+            layout: layout.clone(),
+            m,
+            v,
+        });
+    }
+
+    /// One AdamW step over every parameter at once: the weights are copied
+    /// into a temporary buffer, updated by one dispatch against `grads` and the
+    /// flat moments, and copied back.
+    fn apply_flat_step(&mut self, params: &[Tensor], grads: &FlatGrads) -> Result<(), String> {
+        let ts: Vec<&Tensor> = params
+            .iter()
+            .filter(|p| p.grad.borrow().is_some())
+            .collect();
+        let sizes: Vec<usize> = ts.iter().map(|p| p.data.shape.iter().product()).collect();
+        if sizes != grads.layout.sizes() {
+            return Err("the flat gradients do not match the parameters".to_string());
+        }
+        if ts.iter().any(|p| p.data.dtype != DType::FP32) {
+            return Err("a flat step needs f32 parameters".to_string());
+        }
+        let Some(first) = ts.first() else {
+            return Ok(());
+        };
+        let ctx = Arc::clone(&first.ctx);
+        self.t += 1.0;
+        let p = AdamParams {
+            lr: self.lr,
+            beta1: self.beta1,
+            beta2: self.beta2,
+            eps: self.eps,
+            weight_decay: self.weight_decay,
+            t: self.t,
+            _pad: [0.0; 2],
+        };
+        self.ensure_flat(&ts, &grads.layout, &ctx);
+        let Some(flat) = self.flat.as_ref() else {
+            return Err("the flat optimizer state is missing".to_string());
+        };
+        // The weights only need the buffer for this step, so it is made
+        // here and freed after, and does not stay live between steps.
+        let weights = UnifiedTensor::zeros_on_gpu(&ctx, &[grads.layout.total()]);
+        for (i, param) in ts.iter().enumerate() {
+            self.engine
+                .copy_into_flat(&ctx, &param.data, &weights, grads.layout.offset(i));
+        }
+        self.engine
+            .adamw_update(&ctx, &weights, &grads.data, &flat.m, &flat.v, &p);
+        for (i, param) in ts.iter().enumerate() {
+            self.engine
+                .copy_from_flat(&ctx, &weights, grads.layout.offset(i), &param.data);
+        }
+        Ok(())
+    }
+
     /// Clear the gradients of `params`.
     pub fn zero_grad(&mut self, params: &[Tensor]) {
         self.clear_grads(params);
@@ -1567,6 +2103,12 @@ impl Optimizer for AdamW {
     fn step(&mut self, params: &[Tensor]) {
         self.apply_step(params);
     }
+    fn supports_flat_step(&self) -> bool {
+        true
+    }
+    fn step_flat(&mut self, params: &[Tensor], grads: &FlatGrads) -> Result<(), String> {
+        self.apply_flat_step(params, grads)
+    }
     fn set_lr(&mut self, lr: f32) {
         self.lr = lr;
     }
@@ -1574,6 +2116,10 @@ impl Optimizer for AdamW {
         self.clear_grads(params);
     }
     /// Serialize optimizer state keyed by parameter name (`None` if unsupported).
+    #[expect(
+        clippy::expect_used,
+        reason = "a readback fails only on device loss, and the caller has no error path"
+    )]
     fn save_state(
         &self,
         ctx: &Arc<WgpuContext>,
@@ -1584,28 +2130,57 @@ impl Optimizer for AdamW {
             .map(|(name, tensor)| (Arc::as_ptr(&tensor.data) as usize, name.clone()))
             .collect();
 
-        let mut m_states = HashMap::new();
-        let mut v_states = HashMap::new();
-        for (ptr, state) in &self.m_states {
-            if let Some(name) = names_by_ptr.get(ptr) {
-                m_states.insert(
-                    name.clone(),
-                    OptimizerTensorState {
-                        shape: state.shape.clone(),
-                        data: pollster::block_on(state.to_vec(ctx)),
-                    },
-                );
+        let mut m_host: Vec<(usize, Vec<usize>, Vec<f32>)> = self
+            .m_states
+            .iter()
+            .map(|(ptr, s)| {
+                (
+                    *ptr,
+                    s.shape.clone(),
+                    pollster::block_on(s.to_vec(ctx)).expect("GPU device lost during readback"),
+                )
+            })
+            .collect();
+        let mut v_host: Vec<(usize, Vec<usize>, Vec<f32>)> = self
+            .v_states
+            .iter()
+            .map(|(ptr, s)| {
+                (
+                    *ptr,
+                    s.shape.clone(),
+                    pollster::block_on(s.to_vec(ctx)).expect("GPU device lost during readback"),
+                )
+            })
+            .collect();
+        if let Some(flat) = &self.flat {
+            let m_all =
+                pollster::block_on(flat.m.to_vec(ctx)).expect("GPU device lost during readback");
+            let v_all =
+                pollster::block_on(flat.v.to_vec(ctx)).expect("GPU device lost during readback");
+            for (i, ptr) in flat.ptrs.iter().enumerate() {
+                let start = flat.layout.offset(i);
+                let end = start + flat.layout.sizes().get(i).copied().unwrap_or(0);
+                if let (Some(shape), Some(m), Some(v)) = (
+                    flat.shapes.get(i),
+                    m_all.get(start..end),
+                    v_all.get(start..end),
+                ) {
+                    m_host.push((*ptr, shape.clone(), m.to_vec()));
+                    v_host.push((*ptr, shape.clone(), v.to_vec()));
+                }
             }
         }
-        for (ptr, state) in &self.v_states {
-            if let Some(name) = names_by_ptr.get(ptr) {
-                v_states.insert(
-                    name.clone(),
-                    OptimizerTensorState {
-                        shape: state.shape.clone(),
-                        data: pollster::block_on(state.to_vec(ctx)),
-                    },
-                );
+
+        let mut m_states = HashMap::new();
+        let mut v_states = HashMap::new();
+        for (ptr, shape, data) in m_host {
+            if let Some(name) = names_by_ptr.get(&ptr) {
+                m_states.insert(name.clone(), OptimizerTensorState { shape, data });
+            }
+        }
+        for (ptr, shape, data) in v_host {
+            if let Some(name) = names_by_ptr.get(&ptr) {
+                v_states.insert(name.clone(), OptimizerTensorState { shape, data });
             }
         }
 
@@ -1650,6 +2225,7 @@ impl Optimizer for AdamW {
         self.t = state.t;
         self.m_states.clear();
         self.v_states.clear();
+        self.flat = None;
         for name in matched {
             let key = Arc::as_ptr(&named_params[name].data) as usize;
             let (m, v) = (&state.m_states[name], &state.v_states[name]);

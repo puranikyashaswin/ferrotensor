@@ -13,7 +13,7 @@ keywords = ["wgpu", "wgsl", "gpu", "tensor", "compute"]
 categories = ["science", "algorithms"]
 
 [dependencies]
-wgpu = "0.19"
+wgpu = "=30.0.2"
 half = "2"
 pollster = "0.3"
 log = "0.4"
@@ -22,7 +22,7 @@ bytemuck = { version = "1.14", features = ["derive"] }
 
 
 [dev-dependencies]
-naga = { version = "0.19", features = ["wgsl-in"] }
+naga = { version = "=30.0.2", features = ["wgsl-in"] }
 
 [lints]
 workspace = true

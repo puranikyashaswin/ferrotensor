@@ -121,7 +121,7 @@ fn linear_and_rmsnorm_match_reference_fixture() {
     );
     let linear = Linear::new(linear_weight);
     let linear_out = linear.forward(&engine, &input);
-    let linear_actual = pollster::block_on(linear_out.data.to_vec(&ctx));
+    let linear_actual = pollster::block_on(linear_out.data.to_vec(&ctx)).expect("GPU readback");
     let linear_expected = flatten_3d(&fixture.linear_output);
     assert_close(&linear_actual, &linear_expected, 1e-3);
 
@@ -131,7 +131,7 @@ fn linear_and_rmsnorm_match_reference_fixture() {
     );
     let rms = RMSNorm::new(rms_weight, fixture.meta.eps);
     let rms_out = rms.forward(&engine, &input);
-    let rms_actual = pollster::block_on(rms_out.data.to_vec(&ctx));
+    let rms_actual = pollster::block_on(rms_out.data.to_vec(&ctx)).expect("GPU readback");
     let rms_expected = flatten_3d(&fixture.rms_output);
     assert_close(&rms_actual, &rms_expected, 1e-3);
 }

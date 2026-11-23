@@ -428,7 +428,7 @@ pub async fn save_peft_adapter(
     }
     let mut tensors = HashMap::new();
     for (name, tensor) in model.named_lora_params() {
-        let values = tensor.data.to_vec(ctx).await;
+        let values = tensor.data.to_vec(ctx).await?;
         tensors.insert(name, (tensor.data.shape.clone(), values));
     }
     let checkpoint = LoraCheckpoint {

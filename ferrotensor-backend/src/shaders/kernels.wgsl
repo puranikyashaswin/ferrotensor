@@ -72,6 +72,42 @@ fn rope(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     rope_data[idx2] = v1 * sin_a + v2 * cos_a;
 }
 
+// Out of place: rotates ropo_src into ropo_dst, so an autograd op needs no
+// copy of its input (forward) or of the upstream gradient (backward). The
+// math is rope's, line for line, so both give the same bits. Its uniform
+// comes last, as in every other kernel here: a version with the uniform at
+// binding 1 between the two buffers wrote nothing on Metal and lost the
+// device on DX12 (WARP), while software Vulkan passed.
+@group(0) @binding(0) var<storage, read> ropo_src: array<f32>;
+@group(0) @binding(1) var<storage, read_write> ropo_dst: array<f32>;
+@group(0) @binding(2) var<uniform> ropo_params: array<vec4<u32>, 2>; // as rope_params
+
+@compute @workgroup_size(64)
+fn rope_out(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let global_id = vec3<u32>(gid.x + gid.y * nwg.x * 64u, 0u, 0u);
+    let idx = global_id.x;
+    let head_dim = ropo_params[0].x;
+    let half_dim = head_dim / 2u;
+    let token_idx = idx / half_dim;
+    let dim_idx = idx % half_dim;
+    let seq_len = ropo_params[0].y;
+    let base_pos = ropo_params[0].z;
+    let heads = max(ropo_params[0].w, 1u);
+    let pos = f32(base_pos + (token_idx / heads) % seq_len);
+    let freq_exp = -2.0 * f32(dim_idx) / f32(head_dim);
+    let dir = select(1.0, -1.0, ropo_params[1].y != 0u);
+    let angle = dir * pos * pow(bitcast<f32>(ropo_params[1].x), freq_exp);
+    let cos_a = cos(angle);
+    let sin_a = sin(angle);
+    let idx1 = token_idx * head_dim + dim_idx;
+    let idx2 = idx1 + half_dim;
+    if (idx1 >= arrayLength(&ropo_dst)) { return; }
+    let v1 = ropo_src[idx1];
+    let v2 = ropo_src[idx2];
+    ropo_dst[idx1] = v1 * cos_a - v2 * sin_a;
+    ropo_dst[idx2] = v1 * sin_a + v2 * cos_a;
+}
+
 // --- 3. RMSNorm ---
 @group(0) @binding(0) var<storage, read> rms_input: array<f32>;
 @group(0) @binding(1) var<storage, read> rms_weight: array<f32>;
@@ -99,13 +135,15 @@ fn rms_norm(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wg
 
 // RMSNorm backward, one workgroup per row. With inv = 1 / rms(x):
 // grad_x = g * w * inv - x * inv^3 * sum(g * w * x) / size.
-// Each row's inv is kept for rms_norm_backward_weight.
+// Each row's inv is kept for rms_norm_backward_weight. With beta != 0 the result
+// is added to grad_x's earlier contents (beta * grad_x + the gradient); with
+// beta = 0 grad_x is never read.
 @group(0) @binding(0) var<storage, read> rmsb_x: array<f32>;
 @group(0) @binding(1) var<storage, read> rmsb_g: array<f32>;
 @group(0) @binding(2) var<storage, read> rmsb_w: array<f32>;
 @group(0) @binding(3) var<storage, read_write> rmsb_gx: array<f32>;
 @group(0) @binding(4) var<storage, read_write> rmsb_inv: array<f32>;
-@group(0) @binding(5) var<uniform> rmsb_params: vec4<u32>; // size, rows, eps bits, 0
+@group(0) @binding(5) var<uniform> rmsb_params: vec4<u32>; // size, rows, eps bits, beta bits
 
 @compute @workgroup_size(256)
 fn rms_norm_backward(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wg: vec3<u32>,
@@ -125,8 +163,14 @@ fn rms_norm_backward(@builtin(local_invocation_index) lid: u32, @builtin(workgro
     gwx = row_sum(lid, gwx);
     let inv = 1.0 / sqrt(ss / f32(size) + bitcast<f32>(rmsb_params.z));
     let coef = gwx * inv * inv * inv / f32(size);
+    let beta = bitcast<f32>(rmsb_params.w);
     for (var i = lid; i < size; i += ROW_WG) {
-        rmsb_gx[off + i] = rmsb_g[off + i] * rmsb_w[i] * inv - rmsb_x[off + i] * coef;
+        let gv = rmsb_g[off + i] * rmsb_w[i] * inv - rmsb_x[off + i] * coef;
+        if (beta == 0.0) {
+            rmsb_gx[off + i] = gv;
+        } else {
+            rmsb_gx[off + i] = beta * rmsb_gx[off + i] + gv;
+        }
     }
     if (lid == 0u) { rmsb_inv[row] = inv; }
 }
@@ -914,4 +958,56 @@ fn fp16_to_fp32(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_work
     else { bits = packed & 0xFFFFu; }
     
     cast_fp32_out[i] = f16_bits_to_f32(bits);
+}
+
+// Embedding lookup, the forward of Tensor::embedding_gpu:
+// emb_out[p * hidden + c] = emb_table[emb_ids[p] * hidden + c], and zero for
+// an id outside the table, as the host lookup does.
+@group(0) @binding(0) var<storage, read> emb_table: array<f32>;
+@group(0) @binding(1) var<storage, read> emb_ids: array<u32>;
+@group(0) @binding(2) var<storage, read_write> emb_out: array<f32>;
+@group(0) @binding(3) var<uniform> emb_params: vec4<u32>; // hidden, vocab, 0, 0
+
+@compute @workgroup_size(64)
+fn embedding_gather(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = gid.x + gid.y * nwg.x * 64u;
+    if (i >= arrayLength(&emb_out)) { return; }
+    let hidden = emb_params.x;
+    let id = emb_ids[i / hidden];
+    if (id >= emb_params.y) {
+        emb_out[i] = 0.0;
+        return;
+    }
+    emb_out[i] = emb_table[id * hidden + i % hidden];
+}
+
+// Gradient of embedding_gather without atomics: one thread per table
+// element sums the output-gradient rows of the positions that looked its row
+// up, in position order, so the result is the host scatter-add bit for bit.
+// embg_index holds, one after the other: per table row the slot of its
+// unique id or EMBG_NONE (vocab entries), the start of each slot's positions
+// (slots + 1 entries), and the positions grouped by slot.
+const EMBG_NONE: u32 = 0xFFFFFFFFu;
+@group(0) @binding(0) var<storage, read> embg_grad: array<f32>;
+@group(0) @binding(1) var<storage, read> embg_index: array<u32>;
+@group(0) @binding(2) var<storage, read_write> embg_out: array<f32>;
+@group(0) @binding(3) var<uniform> embg_params: vec4<u32>; // hidden, vocab, slots, 0
+
+@compute @workgroup_size(64)
+fn embedding_scatter(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = gid.x + gid.y * nwg.x * 64u;
+    if (i >= arrayLength(&embg_out)) { return; }
+    let hidden = embg_params.x;
+    let vocab = embg_params.y;
+    let slot = embg_index[i / hidden];
+    var sum = 0.0;
+    if (slot != EMBG_NONE) {
+        let col = i % hidden;
+        let positions = vocab + embg_params.z + 1u;
+        let end = embg_index[vocab + slot + 1u];
+        for (var k = embg_index[vocab + slot]; k < end; k = k + 1u) {
+            sum = sum + embg_grad[embg_index[positions + k] * hidden + col];
+        }
+    }
+    embg_out[i] = sum;
 }

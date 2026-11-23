@@ -48,7 +48,7 @@ impl ComputeEngine {
     /// `input` and `weight`, given the output gradient `grad_out`.
     ///
     /// `grad_input` has `input`'s shape; `grad_weight` has `weight`'s and is
-    /// summed over all rows.
+    /// summed over all rows, and `None` skips it (a frozen weight).
     #[allow(clippy::too_many_arguments)]
     pub fn rms_norm_backward(
         &self,
@@ -57,9 +57,41 @@ impl ComputeEngine {
         weight: &UnifiedTensor,
         grad_out: &UnifiedTensor,
         grad_input: &UnifiedTensor,
-        grad_weight: &UnifiedTensor,
+        grad_weight: Option<&UnifiedTensor>,
         eps: f32,
     ) {
+        self.rms_norm_backward_beta(
+            ctx,
+            input,
+            weight,
+            grad_out,
+            (grad_input, 0.0),
+            grad_weight,
+            eps,
+        );
+    }
+
+    /// [`rms_norm_backward`](Self::rms_norm_backward) that adds into
+    /// `grad_input`, given as `(tensor, beta)`: the tensor ends as
+    /// `norm_gradient + beta * tensor`.
+    ///
+    /// With a residual stream the tensor holds the gradient the skip
+    /// connection already delivered, so `beta = 1` replaces the separate
+    /// `add` dispatch that sums the two. With `beta = 0` the kernel never
+    /// reads the tensor, which may then be uninitialised. `grad_weight` is
+    /// always overwritten, never accumulated.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rms_norm_backward_beta(
+        &self,
+        ctx: &WgpuContext,
+        input: &UnifiedTensor,
+        weight: &UnifiedTensor,
+        grad_out: &UnifiedTensor,
+        grad_input: (&UnifiedTensor, f32),
+        grad_weight: Option<&UnifiedTensor>,
+        eps: f32,
+    ) {
+        let (grad_input, beta) = grad_input;
         let size = *input.shape.last().unwrap_or(&1);
         let rows = input.shape.iter().product::<usize>() / size.max(1);
         if rows == 0 || size == 0 {
@@ -68,7 +100,7 @@ impl ComputeEngine {
         let inv_rms = UnifiedTensor::empty(ctx, &[rows]);
         let params = uniform(
             ctx,
-            bytemuck::cast_slice(&[size as u32, rows as u32, eps.to_bits(), 0]),
+            bytemuck::cast_slice(&[size as u32, rows as u32, eps.to_bits(), beta.to_bits()]),
         );
         self.run(
             ctx,
@@ -83,6 +115,9 @@ impl ComputeEngine {
             ],
             grid(rows as u32),
         );
+        let Some(grad_weight) = grad_weight else {
+            return;
+        };
         let params = uniform(ctx, bytemuck::cast_slice(&[size as u32, rows as u32, 0, 0]));
         self.run(
             ctx,

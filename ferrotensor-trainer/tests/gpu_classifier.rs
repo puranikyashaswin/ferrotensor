@@ -175,7 +175,7 @@ fn classifier_gradients_match_finite_differences() {
             &head.weights[which]
         };
         let grad = tensor.grad.borrow().clone().expect("head gradient");
-        let analytic = pollster::block_on(grad.to_vec(&gpu.ctx))[index];
+        let analytic = pollster::block_on(grad.to_vec(&gpu.ctx)).expect("GPU readback")[index];
         let base = host(&gpu, tensor);
         let (mut up, mut down) = (base.clone(), base);
         up[index] += step;

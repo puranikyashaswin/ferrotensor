@@ -16,6 +16,7 @@
 //! first values: [0.0, 0.01, 0.02, 0.03, 0.04]
 //! max |gpu - cpu reference| = 2.21e-6
 //! ```
+#![allow(clippy::expect_used)]
 
 use ferrotensor_backend::{ComputeEngine, UnifiedTensor, WgpuContext};
 use ferrotensor_graph::FlashAttention;
@@ -78,7 +79,7 @@ fn main() {
         let attention = FlashAttention::new(DIM, HEADS, true);
         let start = Instant::now();
         let out = attention.forward(&q, &k, &v, &ctx, &engine);
-        let gpu = out.to_vec(&ctx).await;
+        let gpu = out.to_vec(&ctx).await.expect("GPU readback");
         println!(
             "flash attention forward: {:.2} ms (includes the read back)",
             start.elapsed().as_secs_f64() * 1e3

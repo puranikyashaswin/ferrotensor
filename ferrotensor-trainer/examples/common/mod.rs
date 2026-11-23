@@ -238,7 +238,7 @@ pub fn pattern() -> Vec<u32> {
 pub fn eval_loss(gpu: &Gpu, model: &Lfm2Model, seq: &[u32]) -> f32 {
     let (input, target) = (&seq[..seq.len() - 1], &seq[1..]);
     let logits = model.forward(&gpu.engine, input, 0, None, None);
-    let host = pollster::block_on(logits.data.to_vec(&gpu.ctx));
+    let host = pollster::block_on(logits.data.to_vec(&gpu.ctx)).expect("GPU readback");
     let mask = vec![1u8; target.len()];
     masked_cross_entropy_from_logits(&host, VOCAB, target, &mask)
         .expect("loss")

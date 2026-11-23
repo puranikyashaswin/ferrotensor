@@ -5,7 +5,7 @@
 //! [`self_check`]. Both are meant for bug reports and for trying Ferrotensor
 //! on hardware it has not been tested on yet.
 
-use crate::{ComputeEngine, KernelTimingMode, UnifiedTensor, WgpuContext};
+use crate::{ComputeEngine, KernelTimingMode, ReadbackError, UnifiedTensor, WgpuContext};
 
 /// One adapter wgpu found, with the limits that matter for the kernels.
 #[derive(Clone, Debug, PartialEq)]
@@ -23,7 +23,7 @@ pub struct AdapterReport {
     /// Largest single buffer, in bytes.
     pub max_buffer_size: u64,
     /// Largest storage buffer a kernel can bind, in bytes.
-    pub max_storage_buffer_binding_size: u32,
+    pub max_storage_buffer_binding_size: u64,
     /// Most threads in one workgroup.
     pub max_compute_invocations_per_workgroup: u32,
     /// Workgroup shared memory, in bytes.
@@ -33,8 +33,113 @@ pub struct AdapterReport {
     /// How `--profile` would time kernels here; `None` without timestamp
     /// queries.
     pub kernel_timing: Option<KernelTimingMode>,
+    /// Cooperative-matrix shapes and types the adapter offers; empty without
+    /// them.
+    pub cooperative_matrix: Vec<CoopMatrixConfig>,
     /// Whether [`WgpuContext::new`] picks this adapter.
     pub selected: bool,
+}
+
+/// One cooperative-matrix configuration: an `M x K` times `K x N` product
+/// with inputs of `ab_type` accumulated into `cr_type`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CoopMatrixConfig {
+    /// Rows of A and of the result.
+    pub m: u32,
+    /// Columns of B and of the result.
+    pub n: u32,
+    /// Columns of A and rows of B.
+    pub k: u32,
+    /// Element type of A and B: `"f16"`, `"f32"`, `"i32"` or `"u32"`.
+    pub ab_type: &'static str,
+    /// Element type of the accumulator and the result.
+    pub cr_type: &'static str,
+    /// Whether the accumulation can saturate instead of overflowing.
+    pub saturating_accumulation: bool,
+}
+
+fn scalar_name(ty: wgpu::CooperativeScalarType) -> &'static str {
+    match ty {
+        wgpu::CooperativeScalarType::F32 => "f32",
+        wgpu::CooperativeScalarType::F16 => "f16",
+        wgpu::CooperativeScalarType::I32 => "i32",
+        wgpu::CooperativeScalarType::U32 => "u32",
+    }
+}
+
+/// The cooperative-matrix configurations `adapter` offers, or none when it
+/// lacks [`wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX`].
+pub fn cooperative_matrix_configs(adapter: &wgpu::Adapter) -> Vec<CoopMatrixConfig> {
+    if !adapter
+        .features()
+        .contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
+    {
+        return Vec::new();
+    }
+    adapter
+        .cooperative_matrix_properties()
+        .into_iter()
+        .map(|p| CoopMatrixConfig {
+            m: p.m_size,
+            n: p.n_size,
+            k: p.k_size,
+            ab_type: scalar_name(p.ab_type),
+            cr_type: scalar_name(p.cr_type),
+            saturating_accumulation: p.saturating_accumulation,
+        })
+        .collect()
+}
+
+/// Environment variable that opts in to wgpu's experimental features. Only
+/// with `FERROTENSOR_EXPERIMENTAL=1` does [`optional_features`] ask for
+/// cooperative matrices, so a default run never enables an experimental
+/// feature.
+pub const EXPERIMENTAL_ENV: &str = "FERROTENSOR_EXPERIMENTAL";
+
+/// Whether [`EXPERIMENTAL_ENV`] is set to `1`.
+pub(crate) fn experimental_opt_in() -> bool {
+    std::env::var(EXPERIMENTAL_ENV).is_ok_and(|v| v == "1")
+}
+
+/// The optional features [`WgpuContext`] asks for when `adapter` has them:
+/// `f16` in shaders, immediates when they hold the largest kernel
+/// parameters (not on DX12), and cooperative matrices when
+/// [`EXPERIMENTAL_ENV`] is `1`. None of them is required.
+pub fn optional_features(adapter: &wgpu::Adapter) -> wgpu::Features {
+    let mut wanted = wgpu::Features::SHADER_F16;
+    // naga's HLSL writer cannot yet translate an immediate that is not a
+    // struct (gfx-rs/wgpu#5683), and most kernel parameters are vectors or
+    // arrays, so DX12 keeps uniform buffers.
+    let hlsl = adapter.get_info().backend == wgpu::Backend::Dx12;
+    if !hlsl && adapter.limits().max_immediate_size >= crate::engine::IMMEDIATE_BYTES {
+        wanted |= wgpu::Features::IMMEDIATES;
+    }
+    if experimental_opt_in() {
+        wanted |= wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX;
+    }
+    adapter.features() & wanted
+}
+
+/// The token wgpu needs before a device may enable an experimental feature
+/// in `features`; disabled when there is none.
+pub(crate) fn experimental_features(features: wgpu::Features) -> wgpu::ExperimentalFeatures {
+    if features.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+        enable_experimental_features()
+    } else {
+        wgpu::ExperimentalFeatures::disabled()
+    }
+}
+
+#[expect(
+    unsafe_code,
+    reason = "wgpu marks opting in to experimental features unsafe; see the SAFETY note"
+)]
+fn enable_experimental_features() -> wgpu::ExperimentalFeatures {
+    // SAFETY: the opt-in only lets the device enable the experimental
+    // cooperative-matrix feature. Ferrotensor dispatches no shader that uses
+    // cooperative matrices, so none of that feature's code paths run. It is
+    // reached only when `FERROTENSOR_EXPERIMENTAL=1` asks for the feature.
+    unsafe { wgpu::ExperimentalFeatures::enabled() }
 }
 
 /// Vendor name for a PCI vendor id.
@@ -80,6 +185,7 @@ fn report(adapter: &wgpu::Adapter, selected: Option<&wgpu::AdapterInfo>) -> Adap
         max_compute_workgroup_storage_size: limits.max_compute_workgroup_storage_size,
         shader_f16: adapter.features().contains(wgpu::Features::SHADER_F16),
         kernel_timing: KernelTimingMode::for_features(adapter.features()),
+        cooperative_matrix: cooperative_matrix_configs(adapter),
         selected: selected == Some(&info),
     }
 }
@@ -87,24 +193,33 @@ fn report(adapter: &wgpu::Adapter, selected: Option<&wgpu::AdapterInfo>) -> Adap
 /// The backends to try: those named in `WGPU_BACKEND` (a comma list such as
 /// `vulkan` or `metal,gl`), or all of them when it is unset.
 pub fn backends() -> wgpu::Backends {
-    wgpu::util::backend_bits_from_env().unwrap_or(wgpu::Backends::all())
+    wgpu::Backends::from_env().unwrap_or(wgpu::Backends::all())
+}
+
+/// A wgpu instance on `backends`, with the backend options (such as the DX12
+/// shader compiler, `WGPU_DX12_COMPILER`) read from the environment.
+pub fn instance(backends: wgpu::Backends) -> wgpu::Instance {
+    let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+    desc.backends = backends;
+    desc.backend_options = wgpu::BackendOptions::from_env_or_default();
+    wgpu::Instance::new(desc)
 }
 
 /// Every adapter wgpu can open on this machine, across the [`backends`] in
 /// use, with the one [`WgpuContext::new`] would pick marked `selected`.
 pub fn list_adapters() -> Vec<AdapterReport> {
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: backends(),
-        ..Default::default()
-    });
-    let chosen = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+    let instance = instance(backends());
+    let chosen = match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         compatible_surface: None,
+        apply_limit_buckets: false,
         force_fallback_adapter: false,
-    }))
-    .map(|a| a.get_info());
-    instance
-        .enumerate_adapters(backends())
+    })) {
+        Ok(adapter) => Some(adapter.get_info()),
+        // No adapter would be picked, so none is marked selected.
+        Err(_) => None,
+    };
+    pollster::block_on(instance.enumerate_adapters(backends()))
         .iter()
         .map(|a| report(a, chosen.as_ref()))
         .collect()
@@ -147,7 +262,10 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
 
 /// Run matmul (odd, non-square sizes), softmax and RMSNorm on `ctx`'s GPU
 /// and compare each with a CPU reference computed in f64.
-pub async fn self_check(ctx: &WgpuContext) -> Vec<CheckResult> {
+///
+/// # Errors
+/// [`ReadbackError`] when a result cannot be read back from the GPU.
+pub async fn self_check(ctx: &WgpuContext) -> Result<Vec<CheckResult>, ReadbackError> {
     let engine = ComputeEngine::new(ctx);
     let mut results = Vec::new();
 
@@ -171,7 +289,7 @@ pub async fn self_check(ctx: &WgpuContext) -> Vec<CheckResult> {
     engine.matmul(ctx, &ga, &gb, &gc);
     results.push(CheckResult {
         name: format!("matmul {m}x{k} @ {k}x{n}"),
-        max_abs_err: max_abs_diff(&gc.to_vec(ctx).await, &want),
+        max_abs_err: max_abs_diff(&gc.to_vec(ctx).await?, &want),
         tolerance: 1e-4,
     });
 
@@ -192,7 +310,7 @@ pub async fn self_check(ctx: &WgpuContext) -> Vec<CheckResult> {
     engine.softmax(ctx, &gx, &gy);
     results.push(CheckResult {
         name: format!("softmax {rows}x{cols}"),
-        max_abs_err: max_abs_diff(&gy.to_vec(ctx).await, &want),
+        max_abs_err: max_abs_diff(&gy.to_vec(ctx).await?, &want),
         tolerance: 1e-6,
     });
 
@@ -216,11 +334,11 @@ pub async fn self_check(ctx: &WgpuContext) -> Vec<CheckResult> {
     engine.rms_norm(ctx, &gx, &gw, &gy);
     results.push(CheckResult {
         name: format!("rms_norm {rows}x{cols}"),
-        max_abs_err: max_abs_diff(&gy.to_vec(ctx).await, &want),
+        max_abs_err: max_abs_diff(&gy.to_vec(ctx).await?, &want),
         tolerance: 1e-4,
     });
 
-    results
+    Ok(results)
 }
 
 #[cfg(test)]

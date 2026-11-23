@@ -14,7 +14,7 @@ categories = ["science", "algorithms"]
 
 [dependencies]
 # GPU Backend
-wgpu = "0.19"
+wgpu = "=30.0.2"
 pollster = "0.3"
 bytemuck = "1.18"
 
@@ -28,7 +28,7 @@ thiserror = "2.0"
 rand = "0.8"
 
 [dev-dependencies]
-naga = { version = "0.19", features = ["wgsl-in"] }
+naga = { version = "=30.0.2", features = ["wgsl-in"] }
 
 [lints]
 workspace = true

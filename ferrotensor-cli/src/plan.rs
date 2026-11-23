@@ -226,8 +226,11 @@ pub struct TrainConfig {
     pub batch_size: usize,
     /// Forward passes per optimizer step.
     pub grad_accum: usize,
-    /// Tokens per sequence.
+    /// Tokens per sequence, the cut `--seq-len` makes.
     pub seq_len: usize,
+    /// Rows per sequence the memory estimate plans for: `seq_len` when the
+    /// data is not known, else what [`LengthProfile::planning_len`] gives.
+    pub padded_len: usize,
     /// LoRA rank (adapters on q, k, v and o projections).
     pub lora_rank: usize,
     /// Frozen base weight storage.
@@ -263,7 +266,7 @@ pub fn estimate_peak_mib(shape: &ModelShape, config: &TrainConfig) -> Estimate {
     let h = shape.hidden as f64;
     let vocab = shape.vocab as f64;
     let layers = shape.n_layers as f64;
-    let tokens = (config.batch_size * config.seq_len) as f64;
+    let tokens = (config.batch_size * config.padded_len) as f64;
     let precision = config.precision;
 
     // The embedding stays f32 and lm_head gets its own copy at the chosen
@@ -320,6 +323,50 @@ pub fn estimate_peak_mib(shape: &ModelShape, config: &TrainConfig) -> Estimate {
     }
 }
 
+/// Share of a dataset's sequences that fit the rows the estimate plans for.
+/// A micro-batch is padded to its longest sequence, so the longest ones set
+/// the peak. The margin is judged at this length; the longest sequence of
+/// the data must also fit the budget without the margin (see [`Plan::fits`]).
+const PLANNING_PERCENT: usize = 99;
+
+/// Token counts of a dataset's examples, as the planner needs them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LengthProfile {
+    /// Ascending.
+    lengths: Vec<usize>,
+}
+
+impl LengthProfile {
+    /// The profile of `lengths`; `None` when there are none.
+    pub fn new(mut lengths: Vec<usize>) -> Option<Self> {
+        if lengths.is_empty() {
+            return None;
+        }
+        lengths.sort_unstable();
+        Some(Self { lengths })
+    }
+
+    /// Number of examples.
+    pub fn examples(&self) -> usize {
+        self.lengths.len()
+    }
+
+    /// Rows per sequence to plan memory for when examples are cut at `cap`
+    /// tokens: the [`PLANNING_PERCENT`]th percentile of the cut lengths, nearest rank,
+    /// and at least 1.
+    pub fn planning_len(&self, cap: usize) -> usize {
+        let rank = (PLANNING_PERCENT * self.lengths.len()).div_ceil(100);
+        let index = rank.clamp(1, self.lengths.len()) - 1;
+        self.lengths[index].min(cap).max(1)
+    }
+
+    /// Rows per sequence of the longest batch the data can make when examples
+    /// are cut at `cap` tokens, and at least 1.
+    pub fn longest_len(&self, cap: usize) -> usize {
+        self.lengths.last().copied().unwrap_or(1).min(cap).max(1)
+    }
+}
+
 /// Values the chooser keeps instead of trying its own; `None` tries them.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Pinned {
@@ -338,8 +385,13 @@ pub struct Plan {
     pub config: TrainConfig,
     /// Its estimated memory.
     pub estimate: Estimate,
-    /// Whether the estimate plus the safety margin fits the budget.
+    /// Whether the estimate plus the safety margin fits the budget, and the
+    /// estimate for a batch of the data's longest sequences fits it without
+    /// the margin.
     pub fits: bool,
+    /// The estimate for a batch whose sequences are all as long as the longest
+    /// one of the data (the same as `estimate` without data).
+    pub longest_peak_mib: u64,
 }
 
 /// The first configuration that fits `budget_mib` with the safety margin:
@@ -353,6 +405,19 @@ pub fn choose(
     precision: Precision,
     lora_rank: usize,
     pinned: Pinned,
+) -> Plan {
+    choose_for(shape, budget_mib, precision, lora_rank, pinned, None)
+}
+
+/// [`choose`] with the memory estimated for the rows `lengths` says the
+/// data pads to, instead of `--seq-len` rows for every sequence.
+pub fn choose_for(
+    shape: &ModelShape,
+    budget_mib: u64,
+    precision: Precision,
+    lora_rank: usize,
+    pinned: Pinned,
+    lengths: Option<&LengthProfile>,
 ) -> Plan {
     let seq_pin = pinned.seq_len.map(NonZeroUsize::get);
     let seq_lens: &[usize] = match &seq_pin {
@@ -374,15 +439,27 @@ pub fn choose(
             batch_size,
             grad_accum: grad_accum_for(batch_size),
             seq_len,
+            padded_len: lengths.map_or(seq_len, |profile| profile.planning_len(seq_len)),
             lora_rank,
             precision,
             checkpointing,
         };
         let estimate = estimate_peak_mib(shape, &config);
+        // The margin covers the rare batch that is longer than the planning
+        // length, but not a data set whose longest batch would overflow the
+        // GPU: that one has to fit the budget itself.
+        let longest = TrainConfig {
+            padded_len: lengths.map_or(seq_len, |profile| profile.longest_len(seq_len)),
+            ..config
+        };
+        let longest_peak_mib = estimate_peak_mib(shape, &longest)
+            .peak_mib
+            .max(estimate.peak_mib);
         Plan {
             config,
             estimate,
-            fits: estimate.peak_mib as f64 <= usable_mib,
+            fits: estimate.peak_mib as f64 <= usable_mib && longest_peak_mib <= budget_mib,
+            longest_peak_mib,
         }
     };
     for &seq_len in seq_lens {
@@ -655,7 +732,7 @@ pub fn run(args: PlanArgs) -> Result<Exit, Box<dyn std::error::Error>> {
         ..Pinned::default()
     };
     let mut report = match &args.model {
-        Some(dir) => plan_model(dir, budget.mib, args.weights, args.lora_rank, pinned)?.1,
+        Some(dir) => plan_model(dir, budget.mib, args.weights, args.lora_rank, pinned, None)?.1,
         None => plan_documented(&args, budget.mib, pinned),
     };
     push_common_notes(&mut report.notes, &budget);
@@ -692,7 +769,8 @@ pub struct TrainingPlan {
 }
 
 /// Plans training the model in `dir` at `precision` and `lora_rank`,
-/// keeping the `pinned` values.
+/// keeping the `pinned` values, with memory estimated for the rows `lengths`
+/// says the data pads to (`--seq-len` rows when it is `None`).
 ///
 /// # Errors
 ///
@@ -704,14 +782,16 @@ pub fn plan_training(
     precision: Precision,
     lora_rank: usize,
     pinned: Pinned,
+    lengths: Option<&LengthProfile>,
 ) -> Result<TrainingPlan, Box<dyn std::error::Error>> {
     let (adapter, budget) = machine_budget(flags)?;
-    let (plan, mut report) = plan_model(dir, budget.mib, precision, lora_rank, pinned)?;
+    let (plan, mut report) = plan_model(dir, budget.mib, precision, lora_rank, pinned, lengths)?;
     push_common_notes(&mut report.notes, &budget);
     Ok(TrainingPlan {
         plan,
         budget_mib: budget.mib,
-        needed_budget_mib: (plan.estimate.peak_mib as f64 / (1.0 - SAFETY_MARGIN)).ceil() as u64,
+        needed_budget_mib: ((plan.estimate.peak_mib as f64 / (1.0 - SAFETY_MARGIN)).ceil() as u64)
+            .max(plan.longest_peak_mib),
         lines: human_lines(adapter.as_ref(), &budget, &report),
     })
 }
@@ -780,18 +860,32 @@ fn plan_model(
     precision: Precision,
     lora_rank: usize,
     pinned: Pinned,
+    lengths: Option<&LengthProfile>,
 ) -> Result<(Plan, Report), Box<dyn std::error::Error>> {
     let config_path = crate::resolve_model(dir)?.join("config.json");
     let config = ModelLoader::load_config(&config_path)
         .map_err(|e| crate::unmet(format!("cannot read {}: {e}", config_path.display())))?;
     let model_arg = dir.display().to_string();
     let shape = ModelShape::from_config(model_arg.clone(), &config);
-    let plan = choose(&shape, budget_mib, precision, lora_rank, pinned);
+    let plan = choose_for(&shape, budget_mib, precision, lora_rank, pinned, lengths);
     let mut notes: Vec<String> = short_seq_note(&shape.name, plan.config.seq_len)
         .into_iter()
         .collect();
     if !config.layer_types.is_empty() || config.model_type.as_deref() == Some("lfm2") {
         notes.push("LFM2 blocks are estimated as Llama blocks; not calibrated".into());
+    }
+    if let Some(profile) = lengths.filter(|_| plan.config.padded_len < plan.config.seq_len) {
+        notes.push(format!(
+            "memory is estimated for {} rows per sequence, the {}th percentile of the \
+             {} tokenized examples, not for --seq-len {}; a batch of the longest sequences \
+             ({} rows each) is estimated at {} MiB and has to fit the budget without the margin",
+            plan.config.padded_len,
+            PLANNING_PERCENT,
+            profile.examples(),
+            plan.config.seq_len,
+            profile.longest_len(plan.config.seq_len),
+            plan.longest_peak_mib
+        ));
     }
     if plan.config.checkpointing == Checkpointing::Blocks {
         notes.push(
@@ -799,7 +893,14 @@ fn plan_model(
         );
     }
     if !plan.fits && precision == Precision::F16 {
-        let q4 = choose(&shape, budget_mib, Precision::Q4, lora_rank, pinned);
+        let q4 = choose_for(
+            &shape,
+            budget_mib,
+            Precision::Q4,
+            lora_rank,
+            pinned,
+            lengths,
+        );
         if q4.fits {
             notes.push(format!(
                 "with --weights q4 (experimental, worse held-out loss) this fits: {}, {} MiB",
@@ -913,6 +1014,7 @@ mod tests {
             batch_size,
             grad_accum: grad_accum_for(batch_size),
             seq_len: 256,
+            padded_len: 256,
             lora_rank: 8,
             precision: Precision::F16,
             checkpointing,
@@ -993,6 +1095,7 @@ mod tests {
                 batch_size,
                 grad_accum,
                 seq_len,
+                padded_len: seq_len,
                 lora_rank: 8,
                 precision: Precision::F16,
                 checkpointing,
@@ -1132,6 +1235,114 @@ mod tests {
                  pass --seq-len N to plan and train to keep a length"
             )
         );
+    }
+
+    /// An instruction-tuning set like the one the A10G runs train on: 990
+    /// examples of 20 to 160 tokens and 10 longer ones up to 224.
+    fn alpaca_like_lengths() -> LengthProfile {
+        let mut lengths: Vec<usize> = (0..990).map(|i| 20 + i * 140 / 989).collect();
+        lengths.extend((0..10).map(|i| 161 + i * 7));
+        LengthProfile::new(lengths).expect("lengths")
+    }
+
+    #[test]
+    fn planning_len_is_the_nearest_rank_percentile_cut_at_the_cap() {
+        assert_eq!(LengthProfile::new(Vec::new()), None);
+        let three = LengthProfile::new(vec![5, 1, 3]).expect("lengths");
+        assert_eq!((three.examples(), three.planning_len(256)), (3, 5));
+        assert_eq!(three.planning_len(4), 4);
+        let hundred = LengthProfile::new((1..=100).rev().collect()).expect("lengths");
+        // The 99th of 100 sorted lengths, not the longest.
+        assert_eq!(hundred.planning_len(256), 99);
+        assert_eq!(hundred.planning_len(50), 50);
+        assert_eq!(hundred.planning_len(0), 1);
+        let alpaca = alpaca_like_lengths();
+        assert_eq!((alpaca.examples(), alpaca.planning_len(256)), (1000, 160));
+        assert_eq!(alpaca.planning_len(128), 128);
+    }
+
+    #[test]
+    fn short_data_plans_batch_8_without_checkpointing_for_1_7b_on_24_gb() {
+        let shape = smollm2("SmolLM2-1.7B");
+        let lengths = alpaca_like_lengths();
+        let batch_8 = Pinned {
+            batch_size: NonZeroUsize::new(8),
+            ..Pinned::default()
+        };
+        // 8 x 160 rows: 16,596 MiB, under the 19,573 MiB an A10G's 23,028
+        // MiB leaves after the margin.
+        let with_data = choose_for(&shape, 23028, Precision::F16, 8, batch_8, Some(&lengths));
+        assert_eq!(
+            (
+                with_data.config.checkpointing,
+                with_data.config.batch_size,
+                with_data.config.seq_len,
+                with_data.config.padded_len,
+                with_data.estimate.peak_mib,
+                with_data.fits
+            ),
+            (Checkpointing::Off, 8, 256, 160, 16596, true)
+        );
+        // A batch of the longest sequences, 8 x 224 rows, is 21,115 MiB and
+        // fits the 23,028 MiB budget itself.
+        assert_eq!(with_data.longest_peak_mib, 21115);
+        // On a 21,000 MiB budget 16,596 MiB is under the margin (17,850 MiB),
+        // but the longest batch does not fit, so the planner checkpoints.
+        let tight = choose_for(&shape, 21000, Precision::F16, 8, batch_8, Some(&lengths));
+        assert_eq!(
+            (
+                tight.config.checkpointing,
+                tight.longest_peak_mib < 21000,
+                tight.fits
+            ),
+            (Checkpointing::Blocks, true, true)
+        );
+        // 8 x 256 rows (23,375 MiB) do not fit, so without the data the
+        // planner checkpoints.
+        let blind = choose(&shape, 23028, Precision::F16, 8, batch_8);
+        assert_eq!(
+            (
+                blind.config.checkpointing,
+                blind.config.padded_len,
+                blind.estimate.peak_mib
+            ),
+            (Checkpointing::Blocks, 256, 7139)
+        );
+        // Unpinned, the data lets batch 8 win over batch 4 x 2.
+        let unpinned = choose_for(
+            &shape,
+            23028,
+            Precision::F16,
+            8,
+            Pinned::default(),
+            Some(&lengths),
+        );
+        assert_eq!(
+            (unpinned.config.checkpointing, unpinned.config.batch_size),
+            (Checkpointing::Off, 8)
+        );
+        let unpinned_blind = choose(&shape, 23028, Precision::F16, 8, Pinned::default());
+        assert_eq!(
+            (
+                unpinned_blind.config.checkpointing,
+                unpinned_blind.config.batch_size
+            ),
+            (Checkpointing::Off, 4)
+        );
+    }
+
+    #[test]
+    fn the_smaller_models_plan_the_same_with_or_without_the_data() {
+        let lengths = alpaca_like_lengths();
+        for name in ["SmolLM2-135M", "SmolLM2-360M"] {
+            let shape = smollm2(name);
+            let pick = |profile| {
+                let plan = choose_for(&shape, 23028, Precision::F16, 8, Pinned::default(), profile);
+                (plan.config.checkpointing, plan.config.batch_size)
+            };
+            assert_eq!(pick(None), (Checkpointing::Off, 8), "{name}");
+            assert_eq!(pick(Some(&lengths)), (Checkpointing::Off, 8), "{name}");
+        }
     }
 
     #[test]
@@ -1281,6 +1492,7 @@ mod tests {
             max_compute_workgroup_storage_size: 16384,
             shader_f16: false,
             kernel_timing: None,
+            cooperative_matrix: Vec::new(),
             selected: true,
         }
     }

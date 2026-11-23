@@ -29,6 +29,11 @@ name = "tensor-api"
 path = "src/bin/tensor_api.rs"
 bench = false
 
+[[bin]]
+name = "matmul-tune"
+path = "src/bin/matmul_tune.rs"
+bench = false
+
 [[bench]]
 name = "gpu"
 path = "benches/gpu.rs"
@@ -38,7 +43,7 @@ harness = false
 ferrotensor = { path = "../ferrotensor", version = "0.7.1" }
 ferrotensor-backend = { path = "../ferrotensor-backend", version = "0.7.1" }
 pollster = "0.3"
-wgpu = "0.19"
+wgpu = "=30.0.2"
 rand = "0.8"
 
 [lints]

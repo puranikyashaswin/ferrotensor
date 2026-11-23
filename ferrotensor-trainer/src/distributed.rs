@@ -127,7 +127,7 @@ pub fn average_grads_file_sync(
 
     let param_count = grads.len();
     for (param_idx, grad) in grads.iter().enumerate() {
-        let values = pollster::block_on(grad.to_vec(ctx));
+        let values = pollster::block_on(grad.to_vec(ctx))?;
         let bytes: Vec<u8> = bytemuck::cast_slice(&values).to_vec();
         atomic_write_bytes(&rank_grad_path(&step_dir, cfg.rank, param_idx), &bytes)?;
     }
