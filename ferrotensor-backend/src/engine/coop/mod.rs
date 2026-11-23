@@ -32,7 +32,7 @@ use crate::kernel_timing::KernelLabel;
 use crate::shader_checks::ShaderChecks;
 use crate::{DType, ReadbackError, UnifiedTensor, WgpuContext};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Instant;
 
 mod autotune;
@@ -67,6 +67,23 @@ const MIN_ROWS: u32 = 32;
 /// Fewest output rows of a product whose kernel is compiled without index
 /// bounds clamps and without loop bounding (see [`Coop::kernel`]).
 const UNCHECKED_MIN_ROWS: u32 = 256;
+
+/// Row tiles that consecutive workgroups walk inside one column block before
+/// the next column block starts (see the tile map in [`source`]).
+const RASTER_GROUP: u32 = 8;
+
+/// [`RASTER_GROUP`], or the value of `FERROTENSOR_RASTER_GROUP` (read once, for
+/// bench sweeps; 1 is the earlier column-fastest order).
+fn raster_group() -> u32 {
+    static GROUP: OnceLock<u32> = OnceLock::new();
+    *GROUP.get_or_init(|| {
+        std::env::var("FERROTENSOR_RASTER_GROUP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&g| g > 0)
+            .unwrap_or(RASTER_GROUP)
+    })
+}
 
 /// What one compiled kernel is specialised for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -241,7 +258,8 @@ impl Coop {
         // kernel has its own guard on `m`, `n` and `k` (`gr < m && gk < k` in
         // the `a` loads, `gn < n && gk < k` in the `b` loads, `r < m && col < n`
         // in every epilogue); the grid is `ceil(m / BM)` by `ceil(n / BN)`, so
-        // `m0 < m` and `n0 < n` for the poison write; the host checks that each
+        // `m0 < m` and `n0 < n` for the poison write (the grouped raster maps
+        // the ids of that grid one to one onto its tiles); the host checks that each
         // buffer holds its shape; workgroup-memory indices are bounded by the
         // tile sizes; and every loop runs a constant number of times or
         // `steps` times. The access-by-access audit is in
@@ -589,6 +607,7 @@ const BN: u32 = {bn}u;
 const BK: u32 = {bk}u;
 const AP: u32 = {ap}u;
 const BP: u32 = {bp}u;
+const GROUP: u32 = {group}u;
 const F16_MAX: f32 = 65504.0;
 
 {arrays}var<workgroup> cs: array<f32, {cs_len}>;
@@ -604,8 +623,19 @@ fn matmul_coop(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_i
   let lane = li % 32u;
   let wr = (warp / {warps_n}u) * {wm}u;
   let wc = (warp % {warps_n}u) * {wn}u;
-  let m0 = wg.y * BM;
-  let n0 = wg.x * BN;
+  // The grid is tiles_n by tiles_m, x fastest. Workgroup ids are dealt out in
+  // groups of GROUP row tiles: a group walks down one column block, then moves
+  // to the next, so the workgroups that run at the same time share the weight
+  // columns they read. The last group has the row tiles that are left. This
+  // is a one-to-one map of ids to tiles.
+  let tiles_m = (m + BM - 1u) / BM;
+  let tiles_n = (n + BN - 1u) / BN;
+  let id = wg.y * tiles_n + wg.x;
+  let first = (id / (GROUP * tiles_n)) * GROUP;
+  let rows = min(tiles_m - first, GROUP);
+  let within = id % (GROUP * tiles_n);
+  let m0 = (first + within % rows) * BM;
+  let n0 = (within / rows) * BN;
   // This workgroup's slice of K, [kb, ke), and where its sums go. Slices
   // are whole steps of BK, so a step never reads into the next slice.
   let kb = wg.z * params[0].w;
@@ -630,6 +660,7 @@ fn matmul_coop(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_i
         bm = t.bm,
         bn = t.bn,
         bk = t.bk,
+        group = raster_group(),
         ap = t.bk + PAD,
         bp = t.bn + PAD,
         cs_len = warps * 256,

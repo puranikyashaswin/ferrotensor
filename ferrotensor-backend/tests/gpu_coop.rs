@@ -1274,3 +1274,144 @@ fn pipelined_tiles_apply_alpha_beta_and_count_overflow() {
         );
     }
 }
+
+/// Rows around the grouped raster of the kernel (8 row tiles of the tile's
+/// rows per group): 1352 rows is 11 row tiles of 128 (a last group of 3), 1100
+/// is 9 (a last group of 1), 1000 is 8 (one whole group, last tile partial in
+/// rows) and 1024 is 8 whole tiles. N is not a multiple of every tile's width,
+/// so the last column block is partial too.
+const RASTER_SHAPES: &[(usize, usize, usize)] = &[
+    (1352, 96, 264),
+    (1100, 72, 136),
+    (1000, 80, 200),
+    (1024, 64, 1032),
+];
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn coop_grouped_raster_matches_f64_with_partial_groups() {
+    let Some(g) = coop_gpu("coop_grouped_raster_matches_f64_with_partial_groups") else {
+        return;
+    };
+    for (seed, &(m, k, n)) in RASTER_SHAPES.iter().enumerate() {
+        let a = f16_round(&rand_vec(m * k, 700 + seed as u64));
+        let b = f16_round(&rand_vec(k * n, 710 + seed as u64));
+        let old = rand_vec(m * n, 720 + seed as u64);
+        let product = cpu_matmul(&a, &b, (m, k, n));
+        // A tile that ran twice or not at all would show in `0.5 * a @ b + 0.25 * old`.
+        let want: Vec<f64> = product
+            .iter()
+            .zip(&old)
+            .map(|(&p, &o)| 0.5 * p + 0.25 * f64::from(o))
+            .collect();
+        for transposed_b in [false, true] {
+            let ep = (
+                Epilogue {
+                    alpha: 0.5,
+                    beta: 0.25,
+                },
+                old.as_slice(),
+            );
+            // The router's own pick, then every tile with K whole and split.
+            let got = run_coop(g, (m, k, n), &a, &b, transposed_b, ep);
+            let e = max_rel_error(&got, &want);
+            assert!(
+                e < 2e-5,
+                "router {m}x{k}x{n} transposed_b {transposed_b}: {e:e}"
+            );
+            for config in configs() {
+                let Some(got) = run_or_skip(g, (m, k, n), (&a, &b), transposed_b, ep, config)
+                else {
+                    continue;
+                };
+                let e = max_rel_error(&got, &want);
+                assert!(
+                    e < 2e-5,
+                    "{} split {} {m}x{k}x{n} transposed_b {transposed_b}: {e:e}",
+                    config.tile.name(),
+                    config.split
+                );
+            }
+        }
+    }
+}
+
+/// Environment variable that makes the next test write its outputs to a file
+/// and stop; it is how the test runs itself with the earlier raster order.
+const RASTER_DUMP: &str = "FERROTENSOR_TEST_RASTER_DUMP";
+
+/// The bits of the router's pick and of a tile of each size on the raster
+/// shapes, both layouts, K whole and split.
+fn raster_output_bytes(g: &Gpu) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for (seed, &(m, k, n)) in RASTER_SHAPES.iter().enumerate() {
+        let a = f16_round(&rand_vec(m * k, 800 + seed as u64));
+        let b = f16_round(&rand_vec(k * n, 810 + seed as u64));
+        let old = rand_vec(m * n, 820 + seed as u64);
+        let ep = (
+            Epilogue {
+                alpha: 0.5,
+                beta: 0.25,
+            },
+            old.as_slice(),
+        );
+        for transposed_b in [false, true] {
+            let mut outputs = vec![run_coop(g, (m, k, n), &a, &b, transposed_b, ep)];
+            for config in configs() {
+                if let Some(got) = run_or_skip(g, (m, k, n), (&a, &b), transposed_b, ep, config) {
+                    outputs.push(got);
+                }
+            }
+            for got in outputs {
+                bytes.extend(got.iter().flat_map(|v| v.to_bits().to_le_bytes()));
+            }
+        }
+    }
+    bytes
+}
+
+/// Any one-to-one map of workgroups to tiles leaves every tile's arithmetic
+/// alone, so the grouped raster must give the very bits that group size 1 (the
+/// column-fastest order of before) gives. The group size is read once per
+/// process, so the test runs itself again with `FERROTENSOR_RASTER_GROUP=1`.
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn coop_grouped_raster_is_bit_identical_to_the_column_fastest_order() {
+    let name = "coop_grouped_raster_is_bit_identical_to_the_column_fastest_order";
+    let Some(g) = coop_gpu(name) else {
+        return;
+    };
+    let bytes = raster_output_bytes(g);
+    if let Ok(path) = std::env::var(RASTER_DUMP) {
+        std::fs::write(path, &bytes).unwrap();
+        return;
+    }
+    if std::env::var("FERROTENSOR_RASTER_GROUP").is_ok_and(|v| v == "1") {
+        eprintln!("{name}: skipped, this run already uses group size 1");
+        return;
+    }
+    let dump = std::env::temp_dir().join(format!("ferrotensor-raster-{}.bin", std::process::id()));
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            name,
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env("FERROTENSOR_RASTER_GROUP", "1")
+        .env(RASTER_DUMP, &dump)
+        .status()
+        .unwrap();
+    assert!(status.success(), "the child run with group size 1 failed");
+    let column_fastest = std::fs::read(&dump).unwrap();
+    std::fs::remove_file(&dump).unwrap();
+    assert_eq!(column_fastest.len(), bytes.len());
+    let differing = column_fastest
+        .iter()
+        .zip(&bytes)
+        .filter(|(x, y)| x != y)
+        .count();
+    assert_eq!(differing, 0, "{differing} bytes differ from group size 1");
+    eprintln!("{name}: {} bytes identical", bytes.len());
+}
