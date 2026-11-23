@@ -456,6 +456,15 @@ fn cases(only: Option<&str>) -> Vec<Case> {
             qkv,
             hidden,
         );
+        // The same product with `a` as one packed matrix: what the qkv backward
+        // costs if the gradients of q, k, v and U were written side by side
+        // (notes/qkv-dx-plain-design-2026-11-23.md, step 0). Measurement only.
+        add(
+            "qkv dX plain",
+            Op::Plain { transposed_b: true },
+            qkv,
+            hidden,
+        );
         if gate_up {
             let gu = 2 * inter + 2 * RANK;
             let widths = vec![inter, inter, 2 * RANK];

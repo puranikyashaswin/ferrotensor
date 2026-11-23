@@ -201,6 +201,13 @@ const SHAPES: &[(usize, usize, usize)] = &[
     (100, 37, 70),
     (130, 576, 200),
     (65, 1000, 17),
+    // More than 8 row tiles of 128, so the grouped raster has a last group of
+    // 3 and of 1 row tiles.
+    (1352, 64, 72),
+    (1100, 40, 33),
+    // 6100 columns is 48 column tiles of 128 and more of the narrower tiles,
+    // so a plain a@bT product is grouped with every tile (see `grouped_raster`).
+    (290, 24, 6100),
 ];
 
 /// What the product ends with, over the `[M, N]` matrix `base`.
@@ -320,6 +327,7 @@ const SOURCE_WIDTHS: &[&[usize]] = &[
     &[13, 7, 5, 3],
     &[33, 17],
     &[1, 1, 1, 1],
+    &[48, 16],
 ];
 
 #[test]
@@ -334,6 +342,7 @@ fn sources_loader_reads_the_matrices_side_by_side() {
             (100, 70),
             (65, 17),
             (31, 9),
+            (1352, 40),
         ]) {
             let k: usize = widths.iter().sum();
             let parts: Vec<Vec<f32>> = widths
@@ -470,6 +479,7 @@ const SPLIT_WIDTHS: &[(usize, usize, &[usize])] = &[
     (256, 576, &[576, 192, 192, 48]),
     (77, 50, &[33, 17, 17, 9]),
     (130, 37, &[40, 13, 8, 1]),
+    (1352, 64, &[40, 24, 8, 4]),
 ];
 
 /// The fused QKV and gate/up products: the columns of one product go to up to
