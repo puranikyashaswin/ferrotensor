@@ -16,9 +16,22 @@
 //! with the fewest timings so far as the real dispatch, since all candidates
 //! compute the same product, and tags it so the context reads its GPU time
 //! back from timestamp queries (see `kernel_timing`), at the wait the trainer
-//! already does. After [`TIMINGS`] timings of each candidate the key settles
-//! on the one with the lowest median, unless the static pick is within
-//! [`MARGIN`] of it. Settled keys cost one hash lookup per product.
+//! already does.
+//!
+//! The candidates of a key run on different occurrences, and those have
+//! different row counts (a batch of 1 pads each micro-batch to its own
+//! length), while the time of a product does not grow with its rows inside a
+//! small bucket: a 32-row timing is 0.5 to 1.0 times a 64-row one, by tile.
+//! So no scale by rows is right. Each candidate is timed as a ratio to the
+//! static pick, which the tuner times again in the same row group (the rows
+//! rounded up to the smallest tile height of the key's candidates, so every
+//! candidate has the same grid there) and again after [`ROUND_MAX`]
+//! candidate timings. After [`TIMINGS`] ratios of each candidate the key
+//! settles on the one with the lowest median, unless the static pick is
+//! within [`MARGIN`] of it. Candidates within [`TIE`] of the best take the one
+//! with the fewest K slices, since a split costs a reduction dispatch and a
+//! partial-sum buffer that the timing charges only in part. Settled keys
+//! cost one hash lookup per product.
 //!
 //! The settled choices are saved to a cache file (see
 //! [`autotune_cache`](super::autotune_cache)), so a later run on the same
@@ -37,7 +50,7 @@
 use super::autotune_cache::{self, Choice, Platform};
 use super::epilogue::EpilogueKind;
 use super::loader::LoaderKind;
-use super::plan::{grid_fits, split_k, split_to_fill, ROW_STEP};
+use super::plan::{grid_fits, split_k, split_to_fill};
 use super::{CoopConfig, CoopTile};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -52,6 +65,16 @@ pub const AUTOTUNE_ENV: &str = "FERROTENSOR_AUTOTUNE";
 /// number).
 const BUDGET_ENV: &str = "FERROTENSOR_AUTOTUNE_BUDGET";
 
+/// Environment variable that sets the split margin (a number from 0 to 1;
+/// 0 is the default). For benchmarks that ask whether a general rule can
+/// stand where the `M64_PINS` stand now: see [`winner`].
+const SPLIT_MARGIN_ENV: &str = "FERROTENSOR_SPLIT_MARGIN";
+
+/// Rows up to which the split margin applies: the first row bucket, where the
+/// time of a product does not grow with its rows and the isolated timing of a
+/// candidate with many K slices is the least like its time in a step.
+const SPLIT_MARGIN_ROWS: u32 = 64;
+
 /// Tuning time after which no new key starts a trial.
 const DEFAULT_BUDGET: Duration = Duration::from_secs(30);
 
@@ -60,6 +83,19 @@ const TIMINGS: usize = 3;
 
 /// How much faster than the static pick a candidate must be to replace it.
 const MARGIN: f64 = 0.03;
+
+/// Candidate timings of a row group before the static pick is timed there
+/// again, which bounds how far the clock can drift between a candidate and the
+/// timing it is compared with.
+const ROUND_MAX: usize = 8;
+
+/// How close to the best median a candidate must be to count as tied with it;
+/// of the tied candidates the one with the fewest K slices wins.
+const TIE: f64 = 0.01;
+
+/// A candidate's time as parts per million of the static pick's time, timed in
+/// the same row group.
+const UNIT: u64 = 1_000_000;
 
 /// Most candidates per key above 256 rows, the static pick included.
 const MAX_CANDIDATES: usize = 8;
@@ -336,51 +372,191 @@ fn median(times: &[u64]) -> u64 {
     sorted.get(sorted.len() / 2).copied().unwrap_or(u64::MAX)
 }
 
-/// `nanos` that a dispatch of `rows` rows took, as it would take at the
-/// `bucket`'s rows if the time grew with the rows. The candidates of a key are
-/// timed on different steps, whose row counts differ by up to a factor of two
-/// inside a bucket; comparing the raw times made a candidate that happened to
-/// run on a short step look the fastest.
-fn nanos_at_bucket_rows(nanos: u64, rows: u32, bucket: u32) -> u64 {
-    let rows = u128::from(rows.div_ceil(ROW_STEP).max(1) * ROW_STEP);
-    let reference = u128::from(bucket).max(rows);
-    u64::try_from(u128::from(nanos) * reference / rows).unwrap_or(u64::MAX)
+/// A candidate's time as parts per million ([`UNIT`]) of its anchor's, the
+/// static pick timed in the same row group; `u64::MAX` when either time is
+/// unusable or the anchor took no time.
+fn ratio(nanos: u64, anchor: Anchored) -> u64 {
+    let Anchored::Nanos(anchor) = anchor else {
+        return u64::MAX;
+    };
+    (u128::from(nanos) * u128::from(UNIT))
+        .checked_div(u128::from(anchor))
+        .and_then(|r| u64::try_from(r).ok())
+        .unwrap_or(u64::MAX)
 }
 
-/// The index of the candidate to settle on and its median time in
-/// nanoseconds, once every candidate has [`TIMINGS`] timings (`u64::MAX` for
-/// a timing that was unusable). Candidate 0 is the static pick: another
-/// candidate wins only with a median at least [`MARGIN`] below its.
-fn winner(times: &[Vec<u64>]) -> Option<(usize, u64)> {
+/// The index of the candidate to settle on and its median, once every
+/// candidate has [`TIMINGS`] timings (`u64::MAX` for a timing that was
+/// unusable). `slices[i]` is how many slices of K candidate `i` runs. Each
+/// median counts as `split_margin` slower for every slice of K past the
+/// first, since a timing of a product on its own favours many slices more than
+/// the step does. Candidate 0 is the static pick: another candidate wins only
+/// with a counted median at least [`MARGIN`] below its. Of the candidates that
+/// clear the margin and are within [`TIE`] of the best counted median, the one
+/// with the fewest slices wins, then the one that comes first. With a
+/// `split_margin` of 0 the counted medians are the medians.
+fn winner(times: &[Vec<u64>], slices: &[u32], split_margin: f64) -> Option<(usize, u64)> {
     if times.is_empty() || times.iter().any(|t| t.len() < TIMINGS) {
         return None;
     }
     let medians: Vec<u64> = times.iter().map(|t| median(t)).collect();
     let static_median = *medians.first()?;
-    let (best, &best_median) = medians.iter().enumerate().min_by_key(|&(i, &m)| (m, i))?;
-    let faster = (best_median as f64) < (static_median as f64) * (1.0 - MARGIN);
-    Some(if faster {
-        (best, best_median)
-    } else {
-        (0, static_median)
-    })
+    let counted: Vec<f64> = medians
+        .iter()
+        .enumerate()
+        .map(|(i, &m)| {
+            if m == u64::MAX {
+                return f64::INFINITY;
+            }
+            let extra = slices.get(i).copied().unwrap_or(1).saturating_sub(1);
+            m as f64 * (1.0 + split_margin).powi(i32::try_from(extra).unwrap_or(i32::MAX))
+        })
+        .collect();
+    let best = counted.iter().copied().fold(f64::INFINITY, f64::min);
+    let band = best * (1.0 + TIE);
+    let clear = counted.first().copied()? * (1.0 - MARGIN);
+    counted
+        .iter()
+        .enumerate()
+        .filter(|&(_, &c)| c.is_finite() && c <= band && c < clear)
+        .min_by_key(|&(i, _)| (slices.get(i).copied().unwrap_or(u32::MAX), i))
+        .and_then(|(i, _)| medians.get(i).map(|&m| (i, m)))
+        .or(Some((0, static_median)))
+}
+
+/// The split margin [`SPLIT_MARGIN_ENV`] sets: a number from 0 to 1, else 0.
+fn split_margin_from(get: &dyn Fn(&str) -> Option<String>) -> f64 {
+    get(SPLIT_MARGIN_ENV)
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|m| (0.0..=1.0).contains(m))
+        .unwrap_or(0.0)
+}
+
+/// What the timing of an anchor came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Anchored {
+    Nanos(u64),
+    Unusable,
+}
+
+/// The anchor a row group is compared against now.
+struct GroupAnchor {
+    sample: u64,
+    /// Candidate timings paired with it so far.
+    uses: usize,
 }
 
 /// A key's candidates and what has been timed so far.
 struct Trial {
     candidates: Vec<CoopConfig>,
-    /// Dispatches of each candidate so far.
+    /// Dispatches of each candidate so far. The static pick, candidate 0, has
+    /// all of them from the start: it runs as an anchor, not as a candidate.
     dispatched: Vec<usize>,
-    /// Timings of each candidate in nanoseconds.
+    /// Timings of each candidate as parts per million of the static pick's
+    /// time in the same row group. The static pick's own are all [`UNIT`].
     times: Vec<Vec<u64>>,
+    /// Rows are grouped by this many: the greatest common divisor of the
+    /// candidates' tile heights, so a group's rows give every candidate the
+    /// same number of row tiles.
+    group_size: u32,
+    /// The anchor each row group compares against now.
+    groups: HashMap<u32, GroupAnchor>,
+    /// The anchors that have reported, by sample id.
+    anchored: HashMap<u64, Anchored>,
+    /// Candidate timings whose anchor has not reported yet: the candidate,
+    /// the anchor's sample id and the nanoseconds.
+    waiting: Vec<(usize, u64, u64)>,
+    /// The anchors' raw times, for the median the cache file keeps.
+    anchor_nanos: Vec<u64>,
+}
+
+impl Trial {
+    fn new(candidates: Vec<CoopConfig>) -> Self {
+        let count = candidates.len();
+        let group_size = candidates
+            .iter()
+            .fold(0, |g, c| gcd(g, c.tile.bm))
+            .max(ROW_GROUP_MIN);
+        let mut dispatched = vec![0; count];
+        let mut times = vec![Vec::new(); count];
+        if let (Some(d), Some(t)) = (dispatched.first_mut(), times.first_mut()) {
+            *d = TIMINGS;
+            *t = vec![UNIT; TIMINGS];
+        }
+        Self {
+            candidates,
+            dispatched,
+            times,
+            group_size,
+            groups: HashMap::new(),
+            anchored: HashMap::new(),
+            waiting: Vec::new(),
+            anchor_nanos: Vec::new(),
+        }
+    }
+
+    /// Takes the time of the anchor `sample`, `None` when unusable, and pairs
+    /// the candidate timings that waited for it.
+    fn report_anchor(&mut self, sample: u64, nanos: Option<u64>) {
+        let anchored = nanos.map_or(Anchored::Unusable, Anchored::Nanos);
+        self.anchored.insert(sample, anchored);
+        self.anchor_nanos.extend(nanos);
+        for (candidate, anchor, nanos) in std::mem::take(&mut self.waiting) {
+            if anchor == sample {
+                self.push(candidate, ratio(nanos, anchored));
+            } else {
+                self.waiting.push((candidate, anchor, nanos));
+            }
+        }
+    }
+
+    /// Takes the time of `candidate` paired with the anchor `anchor`, `None`
+    /// when unusable. Timestamps are read back in dispatch order, so the
+    /// anchor has nearly always reported; one that has not is waited for.
+    fn report_candidate(&mut self, candidate: usize, anchor: u64, nanos: Option<u64>) {
+        let Some(nanos) = nanos else {
+            self.push(candidate, u64::MAX);
+            return;
+        };
+        match self.anchored.get(&anchor).copied() {
+            Some(anchored) => self.push(candidate, ratio(nanos, anchored)),
+            None => self.waiting.push((candidate, anchor, nanos)),
+        }
+    }
+
+    fn push(&mut self, candidate: usize, value: u64) {
+        if let Some(times) = self.times.get_mut(candidate) {
+            times.push(value);
+        }
+    }
+}
+
+/// The smallest rows a group holds: the fragment row, as in the router.
+const ROW_GROUP_MIN: u32 = 16;
+
+/// The greatest common divisor of `a` and `b`, `a` when `b` is 0.
+fn gcd(a: u32, b: u32) -> u32 {
+    if b == 0 {
+        a
+    } else {
+        gcd(b, a % b)
+    }
+}
+
+/// What a timed dispatch is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Role {
+    /// The static pick, timed to be compared against.
+    Anchor,
+    /// A candidate, to be compared with the anchor of this sample id.
+    Candidate { anchor: u64 },
 }
 
 /// A dispatch (or two, with K split) whose timestamps have not all arrived.
 struct Open {
     key: TuneKey,
     candidate: usize,
-    /// Rows of the product this dispatch ran.
-    rows: u32,
+    role: Role,
     /// Dispatches still to report: 2 with K split (the product and its
     /// reduction), else 1.
     parts_left: u32,
@@ -416,6 +592,8 @@ pub(super) struct Tuner {
     tuned: usize,
     cached: usize,
     budget_hit: bool,
+    /// The margin of [`winner`] for keys of up to [`SPLIT_MARGIN_ROWS`] rows.
+    split_margin: f64,
 }
 
 impl Tuner {
@@ -441,6 +619,32 @@ impl Tuner {
             tuned: 0,
             cached: 0,
             budget_hit: false,
+            split_margin: 0.0,
+        }
+    }
+
+    /// This tuner with the split margin of [`winner`] for keys of up to
+    /// [`SPLIT_MARGIN_ROWS`] rows.
+    pub(super) fn with_split_margin(mut self, margin: f64) -> Self {
+        self.split_margin = margin;
+        self
+    }
+
+    /// Makes `config` what `key` runs, whatever the cache or a trial would
+    /// say, and records it in the cache file as pinned. It is not timed.
+    pub(super) fn pin(&mut self, key: TuneKey, config: CoopConfig) {
+        if self.settled.get(&key) == Some(&config) {
+            return;
+        }
+        self.trials.remove(&key);
+        self.settled.insert(key, config);
+        let pinned = Choice {
+            config,
+            median_us: 0.0,
+            pinned: true,
+        };
+        if self.entries.insert(key.line_key(), pinned) != Some(pinned) {
+            self.dirty = true;
         }
     }
 
@@ -470,7 +674,8 @@ impl Tuner {
             (Some(path), Mode::On) => autotune_cache::load(path, &header),
             _ => BTreeMap::new(),
         };
-        Some(Self::new(mode, file, header, entries, budget_from(get)))
+        let tuner = Self::new(mode, file, header, entries, budget_from(get));
+        Some(tuner.with_split_margin(split_margin_from(get)))
     }
 
     /// Whether timings are waiting to be read back.
@@ -504,7 +709,10 @@ impl Tuner {
             return known(config);
         }
         if !self.trials.contains_key(&key) {
-            if let Some(choice) = self.entries.get(&key.line_key()).copied() {
+            // A pinned line is the router's, not a timing: without the pin the
+            // key is timed.
+            let cached = self.entries.get(&key.line_key()).copied();
+            if let Some(choice) = cached.filter(|c| !c.pinned) {
                 self.settled.insert(key, choice.config);
                 self.cached += 1;
                 return known(choice.config);
@@ -524,15 +732,7 @@ impl Tuner {
                 self.settled.insert(key, static_cfg);
                 return run(static_cfg);
             }
-            let count = list.len();
-            self.trials.insert(
-                key,
-                Trial {
-                    candidates: list,
-                    dispatched: vec![0; count],
-                    times: vec![Vec::new(); count],
-                },
-            );
+            self.trials.insert(key, Trial::new(list));
         }
         let Some(trial) = self.trials.get_mut(&key) else {
             return run(static_cfg);
@@ -548,24 +748,46 @@ impl Tuner {
             // Every candidate has its dispatches; the timings are on their way.
             return run(static_cfg);
         };
-        let Some(&config) = trial.candidates.get(candidate) else {
+        // A candidate is timed against the static pick in its own row group:
+        // the anchor runs first there, and again after ROUND_MAX timings.
+        let group = rows.div_ceil(trial.group_size).max(1);
+        let anchor = trial
+            .groups
+            .get(&group)
+            .filter(|g| g.uses < ROUND_MAX)
+            .map(|g| g.sample);
+        let (index, role) = match anchor {
+            Some(anchor) => (candidate, Role::Candidate { anchor }),
+            None => (0, Role::Anchor),
+        };
+        let Some(&config) = trial.candidates.get(index) else {
             return run(static_cfg);
         };
         if !usable(config) {
             return run(static_cfg);
         }
-        if let Some(count) = trial.dispatched.get_mut(candidate) {
-            *count += 1;
-        }
         let sample = self.next_sample;
         self.next_sample += 1;
+        match role {
+            Role::Anchor => {
+                trial.groups.insert(group, GroupAnchor { sample, uses: 0 });
+            }
+            Role::Candidate { .. } => {
+                if let Some(count) = trial.dispatched.get_mut(candidate) {
+                    *count += 1;
+                }
+                if let Some(g) = trial.groups.get_mut(&group) {
+                    g.uses += 1;
+                }
+            }
+        }
         let split = split_k(key.k, config.tile.bk, config.split).0;
         self.open.insert(
             sample,
             Open {
                 key,
-                candidate,
-                rows,
+                candidate: index,
+                role,
                 parts_left: if split > 1 { 2 } else { 1 },
                 nanos: 0,
                 unusable: false,
@@ -599,14 +821,11 @@ impl Tuner {
         let Some(done) = self.open.remove(&sample) else {
             return;
         };
-        let value = if done.unusable {
-            u64::MAX
-        } else {
-            nanos_at_bucket_rows(done.nanos, done.rows, done.key.m_bucket)
-        };
+        let nanos = (!done.unusable).then_some(done.nanos);
         if let Some(trial) = self.trials.get_mut(&done.key) {
-            if let Some(times) = trial.times.get_mut(done.candidate) {
-                times.push(value);
+            match done.role {
+                Role::Anchor => trial.report_anchor(sample, nanos),
+                Role::Candidate { anchor } => trial.report_candidate(done.candidate, anchor, nanos),
             }
         }
         self.settle(done.key);
@@ -617,33 +836,53 @@ impl Tuner {
         let Some(trial) = self.trials.get(&key) else {
             return;
         };
-        let Some((best, nanos)) = winner(&trial.times) else {
+        let slices: Vec<u32> = trial
+            .candidates
+            .iter()
+            .map(|c| split_k(key.k, c.tile.bk, c.split).0)
+            .collect();
+        let margin = if key.m_bucket <= SPLIT_MARGIN_ROWS {
+            self.split_margin
+        } else {
+            0.0
+        };
+        let Some((best, ratio)) = winner(&trial.times, &slices, margin) else {
             return;
         };
         let Some(&config) = trial.candidates.get(best) else {
             return;
         };
-        if let Some((&first, times)) = trial.candidates.first().zip(trial.times.first()) {
+        // The static pick's time in nanoseconds, as the anchors measured it.
+        let anchor_nanos = median(&trial.anchor_nanos);
+        if let Some(&first) = trial.candidates.first() {
             let name = |c: CoopConfig| format!("{} split {}", c.tile.name(), c.split);
             log::info!(
-                "autotune: {} chose {} ({} ns median) over the static {} ({} ns) from {} candidates",
+                "autotune: {} chose {} ({} ppm of the static {}, {} ns) from {} candidates",
                 key.line_key(),
                 name(config),
-                nanos,
+                ratio,
                 name(first),
-                median(times),
+                anchor_nanos,
                 trial.candidates.len()
             );
         }
+        // A key whose static pick never timed usably runs the static pick
+        // this run and is not saved.
+        let usable = !trial.anchor_nanos.is_empty();
+        let median_us =
+            (u128::from(ratio) * u128::from(anchor_nanos) / u128::from(UNIT)) as f64 / 1000.0;
         self.trials.remove(&key);
         self.settled.insert(key, config);
         self.tuned += 1;
-        // A key whose timings were all unusable runs the static pick this run
-        // and is not saved.
-        if nanos != u64::MAX {
-            let median_us = nanos as f64 / 1000.0;
-            self.entries
-                .insert(key.line_key(), Choice { config, median_us });
+        if usable && ratio != u64::MAX {
+            self.entries.insert(
+                key.line_key(),
+                Choice {
+                    config,
+                    median_us,
+                    pinned: false,
+                },
+            );
             self.dirty = true;
         }
     }
@@ -709,18 +948,29 @@ mod tests {
 
     /// Runs `key` until the tuner stops asking for timings, answering each
     /// with `nanos(config)`; returns what the router runs afterwards and the
-    /// number of timed runs.
+    /// number of timed runs. Every run has the rows of `key`'s bucket.
     fn drive(
         t: &mut Tuner,
         key: TuneKey,
+        configs: (CoopConfig, &[CoopConfig]),
+        nanos: &dyn Fn(CoopConfig) -> u64,
+    ) -> (CoopConfig, usize) {
+        drive_rows(t, key, configs, &|_| key.m_bucket(), nanos)
+    }
+
+    /// As [`drive`], with `rows(n)` rows on the `n`th run.
+    fn drive_rows(
+        t: &mut Tuner,
+        key: TuneKey,
         (static_cfg, others): (CoopConfig, &[CoopConfig]),
+        rows: &dyn Fn(u32) -> u32,
         nanos: &dyn Fn(CoopConfig) -> u64,
     ) -> (CoopConfig, usize) {
         let list = || others.to_vec();
-        for timed in 0..1000 {
-            let pick = t.pick(key, key.m_bucket(), static_cfg, &any, &list);
+        for timed in 0..1000_u32 {
+            let pick = t.pick(key, rows(timed), static_cfg, &any, &list);
             let Some(sample) = pick.sample else {
-                return (pick.config, timed);
+                return (pick.config, timed as usize);
             };
             // A product with K split reports its two dispatches separately.
             let parts = split_k(key.k, pick.config.tile.bk, pick.config.split)
@@ -766,19 +1016,19 @@ mod tests {
         let mut t = tuner(BTreeMap::new(), DEFAULT_BUDGET);
         let (ran, timed) = drive(&mut t, key(), (A, &[B, C, D]), &time_of);
         assert_eq!(ran, C);
-        // 4 candidates, 3 timings each, all on real dispatches.
-        assert_eq!(timed, 12);
+        // 3 candidates besides the static pick, 3 timings each, and the
+        // static pick timed twice as the anchor: first, and again after 8
+        // candidate timings. All are real dispatches.
+        assert_eq!(timed, 9 + 2);
         let report = t.report();
         assert_eq!((report.shapes_tuned, report.shapes_open), (1, 0));
-        assert!(
-            (report.seconds - 3.0 * 3.0e-3).abs() < 1e-9,
-            "{}",
-            report.seconds
-        );
+        // The static pick twice at 1 ms, B 3 x 0.8, C 3 x 0.5, D 3 x 0.7.
+        assert!((report.seconds - 8.0e-3).abs() < 1e-9, "{}", report.seconds);
         // The key stays settled, and the file image holds it.
         assert_eq!(drive(&mut t, key(), (A, &[B, C, D]), &time_of), (C, 0));
         let entry = t.entries[&key().line_key()];
         assert_eq!(entry.config, C);
+        // C took 0.5 of the static pick's 1000 us.
         assert!((entry.median_us - 500.0).abs() < 1e-9);
         assert!(t.dirty);
     }
@@ -808,15 +1058,15 @@ mod tests {
         assert_eq!(drive(&mut t, key(), (A, &[B]), &clear).0, B);
         // The median ignores one slow timing in three.
         assert_eq!(
-            winner(&[vec![100, 100, 100], vec![10, 90, 5_000]]),
+            winner(&[vec![100, 100, 100], vec![10, 90, 5_000]], &[1, 1], 0.0),
             Some((1, 90))
         );
         assert_eq!(
-            winner(&[vec![100, 100, 100], vec![10, 99, 5_000]]),
+            winner(&[vec![100, 100, 100], vec![10, 99, 5_000]], &[1, 1], 0.0),
             Some((0, 100))
         );
-        assert_eq!(winner(&[vec![100, 100]]), None);
-        assert_eq!(winner(&[]), None);
+        assert_eq!(winner(&[vec![100, 100]], &[1], 0.0), None);
+        assert_eq!(winner(&[], &[], 0.0), None);
     }
 
     #[test]
@@ -843,28 +1093,196 @@ mod tests {
     }
 
     #[test]
-    fn a_timing_is_scaled_to_the_rows_of_the_bucket() {
-        assert_eq!(nanos_at_bucket_rows(100_000, 512, 1024), 200_000);
-        assert_eq!(nanos_at_bucket_rows(100_000, 1024, 1024), 100_000);
-        // Rows are rounded up like the router's, and a step past the
-        // bucket's last row is not scaled down.
-        assert_eq!(nanos_at_bucket_rows(100_000, 505, 512), 100_000);
-        assert_eq!(nanos_at_bucket_rows(100_000, 4000, 4096), 102_400);
-        assert_eq!(nanos_at_bucket_rows(100_000, 5000, 4096), 100_000);
+    fn paired_timings_cancel_the_row_count() {
+        // The time of the product does not depend on its rows: the static
+        // pick takes 100 us and D 90 us at 16 or at 64 rows. D is timed only
+        // at 16 rows, a group of its own (the smallest tile height is 32),
+        // after the static pick ran once at 64 rows. A scale by rows would
+        // read D as 4 x 90 us against the static 100 us and drop it.
+        let key = TuneKey::new(true, KEY, (64, 2048, 2048));
+        let flat = |c: CoopConfig| if c == D { 90_000 } else { 100_000 };
+        let rows = |n: u32| if n == 0 { 64 } else { 16 };
+        let mut t = tuner(BTreeMap::new(), DEFAULT_BUDGET);
+        let (ran, timed) = drive_rows(&mut t, key, (A, &[D]), &rows, &flat);
+        // The anchor at 64 rows, the anchor at 16 rows, three timings of D.
+        assert_eq!((ran, timed), (D, 5));
+        let entry = t.entries[&key.line_key()];
+        assert_eq!(entry.config, D);
+        // 0.9 of the anchors' 100 us.
+        assert!((entry.median_us - 90.0).abs() < 1e-9, "{}", entry.median_us);
+    }
+
+    #[test]
+    fn a_key_seen_once_per_pass_still_settles() {
+        // Nine candidates, one occurrence per pass, rows alternating between
+        // two groups of 32 rows (64 is group 2, 200 is group 7). The time
+        // does not depend on the rows; the tile D with 2 slices is fastest.
+        let fastest = cfg(D.tile, 2);
+        let others = [
+            cfg(B.tile, 2),
+            cfg(C.tile, 2),
+            fastest,
+            cfg(B.tile, 3),
+            cfg(C.tile, 3),
+            cfg(D.tile, 3),
+            cfg(A.tile, 2),
+            cfg(A.tile, 3),
+        ];
+        let time = |c: CoopConfig| if c == fastest { 600_000 } else { 900_000 };
+        let key = TuneKey::new(true, KEY, (256, 2048, 2048));
+        let rows = |n: u32| if n & 1 == 0 { 64 } else { 200 };
+        let mut t = tuner(BTreeMap::new(), DEFAULT_BUDGET);
+        let (ran, timed) = drive_rows(&mut t, key, (A, &others), &rows, &time);
+        assert_eq!(ran, fastest);
+        // 8 candidates x 3 timings, and the static pick as the anchor of each
+        // group, first and again after 8 timings: 2 groups x 2.
+        assert_eq!(timed, 24 + 4);
+    }
+
+    #[test]
+    fn the_anchor_is_timed_again_after_eight_timings() {
+        let others: Vec<CoopConfig> = (2..=10).map(|s| cfg(B.tile, s)).collect();
+        let mut t = tuner(BTreeMap::new(), DEFAULT_BUDGET);
+        let list = || others.clone();
+        let mut ran = Vec::new();
+        let mut samples = Vec::new();
+        for _ in 0..12 {
+            let pick = t.pick(key(), 256, A, &any, &list);
+            ran.push(pick.config);
+            samples.extend(pick.sample);
+        }
+        // The static pick, the first eight candidates, the static pick
+        // again, then the ninth candidate and the first once more.
+        let mut want = vec![A];
+        want.extend(others.iter().take(8));
+        want.push(A);
+        want.push(others[8]);
+        want.push(others[0]);
+        assert_eq!(ran, want);
+        assert_eq!(samples, (0..12).collect::<Vec<u64>>());
+    }
+
+    #[test]
+    fn rows_in_one_group_share_an_anchor() {
+        // A (64 rows) and D (32 rows) give groups of 32 rows: 33 and 64 are
+        // group 2, 65 is group 3.
+        let mut t = tuner(BTreeMap::new(), DEFAULT_BUDGET);
+        let list = || vec![D];
+        let role = |t: &Tuner, sample: Option<u64>| t.open[&sample.expect("a timing")].role;
+        let first = t.pick(key(), 33, A, &any, &list);
+        assert_eq!(role(&t, first.sample), Role::Anchor);
+        let second = t.pick(key(), 64, A, &any, &list);
+        let anchor = first.sample.expect("a timing");
+        assert_eq!(role(&t, second.sample), Role::Candidate { anchor });
+        assert_eq!(second.config, D);
+        let third = t.pick(key(), 65, A, &any, &list);
+        assert_eq!(role(&t, third.sample), Role::Anchor);
+        assert_ne!(third.sample, first.sample);
+        let trial = &t.trials[&key()];
+        assert_eq!(trial.group_size, 32);
+        assert_eq!(trial.groups.len(), 2);
+    }
+
+    #[test]
+    fn a_candidate_reported_before_its_anchor_still_pairs() {
+        let mut t = tuner(BTreeMap::new(), DEFAULT_BUDGET);
+        let list = || vec![D];
+        let anchor = t.pick(key(), 256, A, &any, &list).sample.expect("anchor");
+        let pair = t.pick(key(), 256, A, &any, &list).sample.expect("pair");
+        t.record(pair, Some(Duration::from_micros(90)));
+        assert_eq!(t.trials[&key()].waiting.len(), 1);
+        assert!(t.trials[&key()].times[1].is_empty());
+        t.record(anchor, Some(Duration::from_micros(120)));
+        let trial = &t.trials[&key()];
+        assert!(trial.waiting.is_empty());
+        // 90 us over 120 us.
+        assert_eq!(trial.times[1], vec![750_000]);
+    }
+
+    #[test]
+    fn an_unusable_anchor_makes_its_pairs_lose() {
+        let mut t = tuner(BTreeMap::new(), DEFAULT_BUDGET);
+        let list = || vec![D];
+        let run = |t: &mut Tuner, usable: bool| {
+            let sample = t.pick(key(), 256, A, &any, &list).sample.expect("a timing");
+            t.record(sample, usable.then(|| Duration::from_micros(10)));
+        };
+        // The anchor's timestamps ran backwards, D's are fine.
+        run(&mut t, false);
+        run(&mut t, true);
+        run(&mut t, true);
+        assert_eq!(t.trials[&key()].times[1], vec![u64::MAX, u64::MAX]);
+        run(&mut t, true);
+        // D settles to the static pick, and an unmeasured key is not saved.
+        let pick = t.pick(key(), 256, A, &any, &list);
+        assert_eq!((pick.config, pick.sample), (A, None));
+        assert_eq!(t.report().shapes_tuned, 1);
+        assert!(t.entries.is_empty());
+    }
+
+    #[test]
+    fn within_one_percent_the_fewer_slices_win() {
+        let times = |ratios: [u64; 3]| -> Vec<Vec<u64>> {
+            let mut all = vec![vec![1000; 3]];
+            all.extend(ratios.map(|r| vec![r; 3]));
+            all
+        };
+        // Candidate 1 has 4 slices, 2 has 1, 3 has 2. 900 and 905 are within
+        // 1%: the unsplit one wins.
+        assert_eq!(
+            winner(&times([900, 905, 950]), &[1, 4, 1, 2], 0.0),
+            Some((2, 905))
+        );
+        // 910 is outside the band of 900 (909).
+        assert_eq!(
+            winner(&times([900, 910, 950]), &[1, 4, 1, 2], 0.0),
+            Some((1, 900))
+        );
+        // Among equal slices, the one first in the list.
+        assert_eq!(
+            winner(&times([900, 902, 950]), &[1, 2, 2, 2], 0.0),
+            Some((1, 900))
+        );
+        // 969 is within the band of 965 and clears the margin (970).
+        assert_eq!(
+            winner(&times([965, 969, 990]), &[1, 4, 1, 2], 0.0),
+            Some((2, 969))
+        );
+        // 972 is within the band of 965 (974.65) but does not clear the
+        // margin: the one with 4 slices wins.
+        assert_eq!(
+            winner(&times([965, 972, 990]), &[1, 4, 1, 2], 0.0),
+            Some((1, 965))
+        );
+        // Nothing clears the margin: the static pick.
+        assert_eq!(
+            winner(&times([975, 980, 990]), &[1, 4, 1, 2], 0.0),
+            Some((0, 1000))
+        );
+    }
+
+    #[test]
+    fn a_ratio_is_parts_per_million_of_the_anchor() {
+        assert_eq!(ratio(90_000, Anchored::Nanos(100_000)), 900_000);
+        assert_eq!(ratio(100_000, Anchored::Nanos(100_000)), UNIT);
+        assert_eq!(ratio(1, Anchored::Nanos(0)), u64::MAX);
+        assert_eq!(ratio(1, Anchored::Unusable), u64::MAX);
+        assert_eq!(ratio(u64::MAX, Anchored::Nanos(1)), u64::MAX);
+        assert_eq!([48, 64, 96, 32].iter().fold(0, |g, &b| gcd(g, b)), 16);
     }
 
     #[test]
     fn unusable_timings_never_win() {
         let mut t = tuner(BTreeMap::new(), DEFAULT_BUDGET);
         let list = || vec![B];
-        for _ in 0..TIMINGS {
-            for _ in 0..2 {
-                let pick = t.pick(key(), 256, A, &any, &list);
-                let sample = pick.sample.expect("a timing");
-                // B's timestamps ran backwards; A's are fine.
-                let time = (pick.config == A).then(|| Duration::from_micros(10));
-                t.record(sample, time);
-            }
+        for _ in 0..1000 {
+            let pick = t.pick(key(), 256, A, &any, &list);
+            let Some(sample) = pick.sample else {
+                break;
+            };
+            // B's timestamps ran backwards; A's are fine.
+            let time = (pick.config == A).then(|| Duration::from_micros(10));
+            t.record(sample, time);
         }
         let pick = t.pick(key(), 256, A, &any, &list);
         assert_eq!((pick.config, pick.sample), (A, None));
@@ -909,6 +1327,7 @@ mod tests {
             Choice {
                 config: D,
                 median_us: 321.0,
+                pinned: false,
             },
         );
         let mut t = tuner(entries, DEFAULT_BUDGET);
@@ -925,11 +1344,102 @@ mod tests {
             Choice {
                 config: D,
                 median_us: 1.0,
+                pinned: false,
             },
         );
         let mut t = tuner(entries, DEFAULT_BUDGET);
         let pick = t.pick(key(), 256, A, &|c| c != D, &Vec::new);
         assert_eq!(pick.config, A);
+    }
+
+    #[test]
+    fn a_pinned_key_keeps_its_pick_against_a_faster_cached_one() {
+        // The cache holds C, the fastest of time_of, for the key.
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            key().line_key(),
+            Choice {
+                config: C,
+                median_us: 1.0,
+                pinned: false,
+            },
+        );
+        let mut t = tuner(entries, DEFAULT_BUDGET);
+        t.pin(key(), D);
+        assert!(!t.wants_samples());
+        assert_eq!(drive(&mut t, key(), (A, &[B, C]), &time_of), (D, 0));
+        let line = Choice {
+            config: D,
+            median_us: 0.0,
+            pinned: true,
+        };
+        assert_eq!(t.entries.get(&key().line_key()), Some(&line));
+        assert!(t.dirty);
+        // The file keeps one pinned line, and pinning again changes nothing.
+        t.dirty = false;
+        t.pin(key(), D);
+        assert!(!t.dirty);
+        assert_eq!(t.entries.len(), 1);
+        assert_eq!(t.report().shapes_tuned, 0);
+        // A run without the pin does not take a pinned line for a timing: it
+        // times the key.
+        let mut free = tuner(t.entries.clone(), DEFAULT_BUDGET);
+        assert_eq!(drive(&mut free, key(), (A, &[B, C]), &time_of).0, C);
+        assert_eq!(free.report().shapes_cached, 0);
+        // The line is not a winner's: its time is not the time of a timing.
+        let timed = free.entries.get(&key().line_key()).copied();
+        assert_eq!(timed.map(|c| (c.config, c.pinned)), Some((C, false)));
+    }
+
+    #[test]
+    fn a_split_margin_prefers_fewer_slices_up_to_64_rows_only() {
+        // K = 2048 in steps of 64: a split of 5 runs 5 slices, a split of 2
+        // runs 2. In isolation 2 slices take 1.15 times as long as 5.
+        let many = cfg(CoopTile::T32X64_W16X16_K64_DB, 5);
+        let few = cfg(CoopTile::T32X64_W16X16_K64_DB, 2);
+        let time = |c: CoopConfig| if c == many { 1_000_000 } else { 1_150_000 };
+        let at = |rows: u32, margin: f64| {
+            let key = TuneKey::new(true, KEY, (rows, 2048, 2048));
+            let mut t = tuner(BTreeMap::new(), DEFAULT_BUDGET).with_split_margin(margin);
+            drive(&mut t, key, (many, &[few]), &time).0
+        };
+        assert_eq!(at(64, 0.0), many);
+        // 1.15 x 1.09 against 1.0 x 1.09^4: the 2 slices win by 19%.
+        assert_eq!(at(64, 0.09), few);
+        // A margin of 0.03 is too small: 1.15 x 1.03 against 1.03^4.
+        assert_eq!(at(64, 0.03), many);
+        // Above 64 rows the margin does not apply.
+        assert_eq!(at(256, 0.09), many);
+    }
+
+    #[test]
+    fn a_split_margin_counts_slices_past_the_first() {
+        // Slices 5, 2 and 6; the isolated times are 100, 115 and 90 per cent
+        // of the static pick's.
+        let times = [vec![1_000_000; 3], vec![1_150_000; 3], vec![900_000; 3]];
+        // No margin: the 6 slices are the fastest and clear the 3%.
+        assert_eq!(winner(&times, &[5, 2, 6], 0.0), Some((2, 900_000)));
+        // 0.09: counted 1.0 x 1.09^4, 1.15 x 1.09 and 0.9 x 1.09^5, that is
+        // 1.4116, 1.2535 and 1.3848. The 2 slices are the best by 10%.
+        assert_eq!(winner(&times, &[5, 2, 6], 0.09), Some((1, 1_150_000)));
+        // The same slices everywhere: the margin changes nothing, and a
+        // candidate within 3% of the static pick does not replace it.
+        assert_eq!(winner(&times, &[5, 5, 5], 0.09), Some((2, 900_000)));
+        assert_eq!(
+            winner(&[vec![1_000_000; 3], vec![990_000; 3]], &[5, 5], 0.09),
+            Some((0, 1_000_000))
+        );
+    }
+
+    #[test]
+    fn the_split_margin_comes_from_the_environment() {
+        let at = |v: &str| split_margin_from(&|k| (k == SPLIT_MARGIN_ENV).then(|| v.to_owned()));
+        assert_eq!(at("0.09"), 0.09);
+        assert_eq!(at(" 0.5 "), 0.5);
+        for bad in ["", "x", "-0.1", "1.5", "NaN", "inf"] {
+            assert_eq!(at(bad), 0.0, "{bad}");
+        }
+        assert_eq!(split_margin_from(&|_| None), 0.0);
     }
 
     #[test]

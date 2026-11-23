@@ -16,8 +16,10 @@ use std::path::{Path, PathBuf};
 pub(super) const CACHE_ENV: &str = "FERROTENSOR_AUTOTUNE_CACHE";
 
 /// Version of the entry format and of the keys' row buckets; a change makes
-/// older files unusable.
-const SCHEMA: u32 = 2;
+/// older files unusable. Schema 3 keeps the winner's median ratio to the static
+/// pick times the static pick's median time; schema 2 scaled each timing by the
+/// rows of its step.
+const SCHEMA: u32 = 3;
 
 /// The configuration a key settled on and its median time.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -25,6 +27,9 @@ pub(super) struct Choice {
     pub(super) config: CoopConfig,
     /// Median GPU time of the winning configuration in training context.
     pub(super) median_us: f64,
+    /// Whether the router pinned the configuration: the key was not timed
+    /// (its time is 0), and a run without the pin does not use the line.
+    pub(super) pinned: bool,
 }
 
 /// Why a cache file was not used.
@@ -116,10 +121,11 @@ pub(super) fn render(header: &str, entries: &BTreeMap<String, Choice>) -> String
     let mut text = format!("{header}\n");
     for (key, choice) in entries {
         text.push_str(&format!(
-            "{key}\t{};split={};us={:.3}\n",
+            "{key}\t{};split={};us={:.3}{}\n",
             choice.config.tile.name(),
             choice.config.split,
-            choice.median_us
+            choice.median_us,
+            if choice.pinned { ";pinned" } else { "" }
         ));
     }
     text
@@ -157,12 +163,18 @@ pub(super) fn parse(text: &str, header: &str) -> Result<BTreeMap<String, Choice>
         let median_us: f64 = number(fields.next(), "us=")?
             .parse()
             .map_err(|_| corrupt("bad time"))?;
+        let pinned = match fields.next() {
+            None => false,
+            Some("pinned") => true,
+            Some(_) => return Err(corrupt("unknown field")),
+        };
         if split == 0 || !median_us.is_finite() || median_us < 0.0 || fields.next().is_some() {
             return Err(corrupt("value out of range"));
         }
         let choice = Choice {
             config: CoopConfig { tile, split },
             median_us,
+            pinned,
         };
         if entries.insert(key.to_owned(), choice).is_some() {
             return Err(corrupt("duplicate key"));
@@ -237,6 +249,7 @@ mod tests {
         let choice = |tile, split, median_us| Choice {
             config: CoopConfig { tile, split },
             median_us,
+            pinned: false,
         };
         [
             (
@@ -269,7 +282,7 @@ mod tests {
             h.starts_with("adapter=NVIDIA A10G;vendor=4318;device=8759;driver=NVIDIA 535.104.05;")
         );
         assert!(h.ends_with(&format!(
-            ";backend=Vulkan;ferrotensor={};schema=2",
+            ";backend=Vulkan;ferrotensor={};schema=3",
             env!("CARGO_PKG_VERSION")
         )));
         let messy = header_text(("a;b\nc", 1, 2), ("d\te", "f\r"), "g;h");
@@ -292,6 +305,33 @@ mod tests {
     }
 
     #[test]
+    fn a_pinned_line_round_trips_and_a_line_without_the_field_is_not_pinned() {
+        let key = "layout=a@b;variant=Plain/AlphaBeta;m=64;n=2048;k=2048".to_owned();
+        let pinned = Choice {
+            config: CoopConfig {
+                tile: CoopTile::T32X64_W16X16_K64_DB,
+                split: 2,
+            },
+            median_us: 0.0,
+            pinned: true,
+        };
+        let entries: BTreeMap<String, Choice> = [(key.clone(), pinned)].into_iter().collect();
+        let text = render(&header(), &entries);
+        assert!(
+            text.ends_with("\t32x64/w16x16/k64/db;split=2;us=0.000;pinned\n"),
+            "{text}"
+        );
+        assert_eq!(parse(&text, &header()).expect("parse"), entries);
+        let plain = text.replace(";pinned", "");
+        let back = parse(&plain, &header()).expect("parse");
+        assert!(!back[&key].pinned);
+        let odd = text.replace(";pinned", ";pinned;x");
+        assert!(parse(&odd, &header()).is_err());
+        let other = text.replace(";pinned", ";fixed");
+        assert!(parse(&other, &header()).is_err());
+    }
+
+    #[test]
     fn a_header_of_another_device_discards_the_file() {
         let text = render(&header(), &entries());
         for other in [
@@ -310,7 +350,7 @@ mod tests {
                 ("NVIDIA", "535.104.05"),
                 "Dx12",
             ),
-            header().replace("schema=2", "schema=3"),
+            header().replace("schema=3", "schema=4"),
             header().replace(env!("CARGO_PKG_VERSION"), "0.0.1"),
         ] {
             let err = parse(&text, &other).expect_err("a different header");
