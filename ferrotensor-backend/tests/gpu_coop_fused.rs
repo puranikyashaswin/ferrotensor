@@ -205,6 +205,9 @@ const SHAPES: &[(usize, usize, usize)] = &[
     // 3 and of 1 row tiles.
     (1352, 64, 72),
     (1100, 40, 33),
+    // 6100 columns is 48 column tiles of 128 and more of the narrower tiles,
+    // so a plain a@bT product is grouped with every tile (see `grouped_raster`).
+    (290, 24, 6100),
 ];
 
 /// What the product ends with, over the `[M, N]` matrix `base`.

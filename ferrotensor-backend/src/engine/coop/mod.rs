@@ -72,8 +72,27 @@ const UNCHECKED_MIN_ROWS: u32 = 256;
 /// the next column block starts (see the tile map in [`source`]).
 const RASTER_GROUP: u32 = 8;
 
+/// Column tiles from which a product walks the grid in groups. On an A10G
+/// (notes/raster-2026-11-23.md) the grouped walk was 8 to 9% faster for the
+/// gate products at 8192 columns (64 tiles of 128 columns) and 25% faster for
+/// the head at 49152 columns, and no faster at 2048 columns (16 to 32 tiles).
+/// With few column tiles a wave already spans all of them, so the order has
+/// nothing to share. 48 lies between 32 and 64.
+const GROUPED_MIN_TILES_N: u32 = 48;
+
+/// Whether the kernel of a product walks the grid in groups of row tiles
+/// (see [`RASTER_GROUP`]). Only a forward product against a wide weight stored
+/// `[N, K]` and read by the plain loader gains from it. The `[K, N]` products
+/// were no faster and the backward ones up to 13% slower (their `n` is the
+/// model width, so the wave has little to share), and so was the fused qkv
+/// backward, which reads its `a` through a fused loader. Those keep the
+/// column-fastest order.
+fn grouped_raster(loader: LoaderKind, transposed_b: bool, tile: CoopTile, n: u32) -> bool {
+    loader == LoaderKind::Plain && transposed_b && n.div_ceil(tile.bn) >= GROUPED_MIN_TILES_N
+}
+
 /// [`RASTER_GROUP`], or the value of `FERROTENSOR_RASTER_GROUP` (read once, for
-/// bench sweeps; 1 is the earlier column-fastest order).
+/// bench sweeps; 1 is the earlier column-fastest order for every product).
 fn raster_group() -> u32 {
     static GROUP: OnceLock<u32> = OnceLock::new();
     *GROUP.get_or_init(|| {
@@ -100,6 +119,9 @@ pub(super) struct CoopKey {
     loader: LoaderKind,
     /// What happens to the accumulators.
     epilogue: EpilogueKind,
+    /// Whether workgroups walk the grid in groups of row tiles (see
+    /// [`grouped_raster`]) rather than along the columns first.
+    grouped: bool,
 }
 
 /// The cooperative-matrix kernels of a device that has them.
@@ -150,6 +172,7 @@ fn coop_key(tile: CoopTile, transposed_b: bool, (k, n): (u32, u32)) -> CoopKey {
         b_vec8: b_row.is_multiple_of(8),
         loader: LoaderKind::Plain,
         epilogue: EpilogueKind::AlphaBeta,
+        grouped: grouped_raster(LoaderKind::Plain, transposed_b, tile, n),
     }
 }
 
@@ -562,6 +585,28 @@ impl ComputeEngine {
     }
 }
 
+/// The tile of workgroup `wg` when the grid is walked along the columns first.
+const COLUMN_TILE_MAP: &str = "  let m0 = wg.y * BM;
+  let n0 = wg.x * BN;
+";
+
+/// The tile of workgroup `wg` when the grid is walked in groups of row tiles.
+const GROUPED_TILE_MAP: &str =
+    "  // The grid is tiles_n by tiles_m, x fastest. Workgroup ids are dealt out in
+  // groups of GROUP row tiles: a group walks down one column block, then moves
+  // to the next, so the workgroups that run at the same time share the weight
+  // columns they read. The last group has the row tiles that are left. This
+  // is a one-to-one map of ids to tiles.
+  let tiles_m = (m + BM - 1u) / BM;
+  let tiles_n = (n + BN - 1u) / BN;
+  let id = wg.y * tiles_n + wg.x;
+  let first = (id / (GROUP * tiles_n)) * GROUP;
+  let rows = min(tiles_m - first, GROUP);
+  let within = id % (GROUP * tiles_n);
+  let m0 = (first + within % rows) * BM;
+  let n0 = (within / rows) * BN;
+";
+
 /// The WGSL of the kernel for `key`, entry point `matmul_coop`. Params are
 /// `[M, K, N, K per slice]` and `[alpha bits, beta bits, 0, 0]`, then, for a
 /// fused loader or epilogue, its column bounds; workgroup z is the slice of
@@ -589,6 +634,18 @@ pub(super) fn source(key: CoopKey) -> String {
             "var<workgroup> sa1: array<f16, {a_len}>;\nvar<workgroup> sb1: array<f16, {b_len}>;\n"
         ));
     }
+    // A group of 1 is the column-fastest order, so that case keeps the plain
+    // text: the kernel of every ungrouped product is the one from before the
+    // raster, which the pinned hashes check.
+    let group = raster_group();
+    let (group_const, tile_map) = if key.grouped && group > 1 {
+        (
+            format!("\nconst GROUP: u32 = {group}u;"),
+            GROUPED_TILE_MAP.to_string(),
+        )
+    } else {
+        (String::new(), COLUMN_TILE_MAP.to_string())
+    };
     let extra_bindings =
         loader::bindings(key.loader, key.a_vec4) + &epilogue::bindings(key.epilogue);
     let helpers = loader::helpers(key.loader, key.a_vec4) + &epilogue::helpers(key.epilogue);
@@ -606,8 +663,7 @@ const BM: u32 = {bm}u;
 const BN: u32 = {bn}u;
 const BK: u32 = {bk}u;
 const AP: u32 = {ap}u;
-const BP: u32 = {bp}u;
-const GROUP: u32 = {group}u;
+const BP: u32 = {bp}u;{group_const}
 const F16_MAX: f32 = 65504.0;
 
 {arrays}var<workgroup> cs: array<f32, {cs_len}>;
@@ -623,20 +679,7 @@ fn matmul_coop(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_i
   let lane = li % 32u;
   let wr = (warp / {warps_n}u) * {wm}u;
   let wc = (warp % {warps_n}u) * {wn}u;
-  // The grid is tiles_n by tiles_m, x fastest. Workgroup ids are dealt out in
-  // groups of GROUP row tiles: a group walks down one column block, then moves
-  // to the next, so the workgroups that run at the same time share the weight
-  // columns they read. The last group has the row tiles that are left. This
-  // is a one-to-one map of ids to tiles.
-  let tiles_m = (m + BM - 1u) / BM;
-  let tiles_n = (n + BN - 1u) / BN;
-  let id = wg.y * tiles_n + wg.x;
-  let first = (id / (GROUP * tiles_n)) * GROUP;
-  let rows = min(tiles_m - first, GROUP);
-  let within = id % (GROUP * tiles_n);
-  let m0 = (first + within % rows) * BM;
-  let n0 = (within / rows) * BN;
-  // This workgroup's slice of K, [kb, ke), and where its sums go. Slices
+{tile_map}  // This workgroup's slice of K, [kb, ke), and where its sums go. Slices
   // are whole steps of BK, so a step never reads into the next slice.
   let kb = wg.z * params[0].w;
   let ke = min(k, kb + params[0].w);
@@ -660,7 +703,6 @@ fn matmul_coop(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_i
         bm = t.bm,
         bn = t.bn,
         bk = t.bk,
-        group = raster_group(),
         ap = t.bk + PAD,
         bp = t.bn + PAD,
         cs_len = warps * 256,
@@ -675,9 +717,18 @@ fn matmul_coop(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_i
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic)]
 mod tests {
-    use super::{immediate_source, plan, source, CoopKey, CoopTile, EpilogueKind, LoaderKind};
+    use super::{
+        grouped_raster, immediate_source, plan, source, CoopKey, CoopTile, EpilogueKind, LoaderKind,
+    };
 
+    /// Every kernel, ungrouped and grouped.
     fn keys() -> Vec<CoopKey> {
+        let mut keys = keys_with(false);
+        keys.extend(keys_with(true));
+        keys
+    }
+
+    fn keys_with(grouped: bool) -> Vec<CoopKey> {
         let mut keys = Vec::new();
         for tile in CoopTile::ALL {
             for transposed_b in [false, true] {
@@ -690,6 +741,7 @@ mod tests {
                             b_vec8,
                             loader: LoaderKind::Plain,
                             epilogue: EpilogueKind::AlphaBeta,
+                            grouped,
                         });
                     }
                 }
@@ -757,9 +809,128 @@ mod tests {
         })
     }
 
-    /// FNV-1a 64 of the WGSL of every key in [`keys`] order, taken from the
-    /// generator before it was split out of `matmul_coop.rs`.
+    /// FNV-1a 64 of the WGSL of every key of [`keys_with`]`(false)` in order,
+    /// taken from the generator before it was split out of `matmul_coop.rs`.
+    /// They are also the hashes of the kernels before the grouped raster, so an
+    /// ungrouped product runs the same WGSL as before it.
     const SOURCE_HASHES: [u64; 112] = [
+        11561312270760404045,
+        16338313531991227733,
+        9010546721910603871,
+        7214329663846250259,
+        9607423787901123493,
+        8128846506299421923,
+        7239040440319821139,
+        3412286513356263805,
+        15595660647109403214,
+        579611057845456106,
+        601902565835543782,
+        4099647960230469486,
+        12502018620123221006,
+        5459227258467642672,
+        12443708731755832342,
+        7308542388084856196,
+        4897971386158317493,
+        3297169156890725017,
+        1984468199060606420,
+        13158515166100180318,
+        7814938532924414675,
+        11530719362987660629,
+        1999278991572451510,
+        13220500856541170890,
+        6941566466834223097,
+        8836585966891193904,
+        1915243291982673644,
+        13435980326272029181,
+        15919405857711020237,
+        4359916927262016070,
+        17201816066131280700,
+        3909783345644213739,
+        8991267765447629719,
+        12874584056793892770,
+        10502676686481907884,
+        14285653725314264009,
+        3551184382933523739,
+        17457262648324930164,
+        17192545923066284116,
+        6716064907120819239,
+        5705213084781656430,
+        11196061078061873843,
+        13844279647717840859,
+        5231307273082178342,
+        14140342794670242888,
+        11761345679114077775,
+        11380179797312661621,
+        4381321902460619430,
+        5647962463574057465,
+        4695158620340452280,
+        9175515654119603634,
+        1132382089057769739,
+        15278350468023714265,
+        906434759824789146,
+        5627191109216927730,
+        7449795567811122673,
+        8847409965015831360,
+        1628376108900066209,
+        10134675602787364615,
+        5822001216917074486,
+        699834945472453194,
+        2817226727796315169,
+        2542265629306818229,
+        2475930343174372170,
+        17603989580741825145,
+        14400635087337062584,
+        3253416376929679960,
+        12421142389766028381,
+        16379276515244398249,
+        13872524082229259710,
+        12865437715842395396,
+        10758315331840950747,
+        14657062585320360824,
+        13990108799418449171,
+        16011988347940110159,
+        17992581380810958460,
+        8817136085765490806,
+        18202174108224877779,
+        6070401494196168761,
+        2075198274904942004,
+        519087706390674095,
+        18422322472158980160,
+        6322005717419358751,
+        4796521073218356314,
+        1995258627920552639,
+        17294978783991052974,
+        15576576722883854715,
+        3979962472191413516,
+        8509402793535655015,
+        15985314220800305542,
+        12372349888182113975,
+        13210012642405315192,
+        1787528791770232875,
+        11607010899401908800,
+        13160061647858470851,
+        17437721834362212862,
+        13981647278746972373,
+        7140709782510070004,
+        2564830905277548225,
+        5833933849203377918,
+        18314251420692429939,
+        3023482341568362160,
+        12407080566531949459,
+        6184908848448135830,
+        5197016299101613876,
+        11412694723498967743,
+        7844484645919387129,
+        8658057791489555218,
+        10501481690006856666,
+        9418398957548768311,
+        13147694747433239255,
+        15820869452388351058,
+    ];
+
+    /// FNV-1a 64 of the WGSL of every key of [`keys_with`]`(true)` in order,
+    /// with the default group of 8 (it is the text of the grouped raster).
+    const GROUPED_SOURCE_HASHES: [u64; 112] = [
         6409254719821465726,
         12362183355494718850,
         15724217108186389712,
@@ -876,11 +1047,14 @@ mod tests {
 
     #[test]
     fn generated_wgsl_is_what_it_was_before_the_split() {
-        let got: Vec<u64> = keys()
-            .into_iter()
-            .map(|key| fnv1a(source(key).as_bytes()))
-            .collect();
-        assert_eq!(got, SOURCE_HASHES);
+        let hashes = |grouped| -> Vec<u64> {
+            keys_with(grouped)
+                .into_iter()
+                .map(|key| fnv1a(source(key).as_bytes()))
+                .collect()
+        };
+        assert_eq!(hashes(false), SOURCE_HASHES);
+        assert_eq!(hashes(true), GROUPED_SOURCE_HASHES);
     }
 
     /// The `(k, n)` of the base-weight products of SmolLM2 135M, 360M and 1.7B,
@@ -958,5 +1132,88 @@ mod tests {
             }
         }
         assert_eq!(fnv1a(lines.as_bytes()), PLAN_HASH);
+    }
+
+    /// The 1.7B products of a training step as `(name, k, n, transposed_b,
+    /// grouped)`: `k` and `n` as the product sees them, with the layout of `b`.
+    const PRODUCTS_1_7B: [(&str, u32, u32, bool, bool); 6] = [
+        ("head fwd", 2048, 49152, true, true),
+        ("gate fwd", 2048, 8192, true, true),
+        ("head dX", 49152, 2048, false, false),
+        ("gate dX", 8192, 2048, false, false),
+        ("o dX", 2048, 2048, false, false),
+        ("down dX", 2048, 8192, false, false),
+    ];
+
+    #[test]
+    fn grouped_raster_is_for_the_wide_forward_products_of_1_7b() {
+        // The tile the router picks at the three row counts of a 1.7B step on
+        // a tuned device, and every tile of 64 or 128 columns.
+        for (name, k, n, transposed_b, want) in PRODUCTS_1_7B {
+            let mut tiles: Vec<CoopTile> = CoopTile::ALL
+                .into_iter()
+                .chain(CoopTile::PIPELINED)
+                .filter(|t| t.bn >= 64)
+                .collect();
+            for m in [896, 1024, 1352] {
+                let config = plan((m, k, n), transposed_b, (160, true), |_| true)
+                    .expect("a tile fits the product");
+                tiles.push(config.tile);
+            }
+            for tile in tiles {
+                assert_eq!(
+                    grouped_raster(LoaderKind::Plain, transposed_b, tile, n),
+                    want,
+                    "{name} with {}",
+                    tile.name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn grouped_raster_leaves_the_fused_loaders_and_the_qkv_backward_in_column_order() {
+        // qkv dX is a@bT with K = 2048 + 2 * 2048 + 24 and N = 2048, read through
+        // the Sources loader; the gate/up backward reads two sources too.
+        let tile = CoopTile::T128X64_W64X32_K32;
+        for loader in [
+            LoaderKind::Sources { count: 4 },
+            LoaderKind::Sources { count: 2 },
+            LoaderKind::SwiGlu,
+        ] {
+            // Even a width that would qualify with the plain loader stays put.
+            assert!(!grouped_raster(loader, true, tile, 2048), "{loader:?}");
+            assert!(!grouped_raster(loader, true, tile, 49152), "{loader:?}");
+        }
+        // As a plain product (the step-0 bench) it is 32 column tiles of 64.
+        assert!(!grouped_raster(LoaderKind::Plain, true, tile, 2048));
+    }
+
+    #[test]
+    fn grouped_raster_threshold_sits_between_32_and_64_column_tiles() {
+        let tile = CoopTile::T128X64_W64X32_K32;
+        assert_eq!(tile.bn, 64);
+        // 32 column tiles: N = 2048.
+        assert!(!grouped_raster(LoaderKind::Plain, true, tile, 2048));
+        // 47 and 48 column tiles (the last one partial).
+        assert!(!grouped_raster(LoaderKind::Plain, true, tile, 47 * 64));
+        assert!(grouped_raster(LoaderKind::Plain, true, tile, 47 * 64 + 1));
+        // 135M and 360M: the gate is narrow, the head is as wide as at 1.7B.
+        assert!(!grouped_raster(LoaderKind::Plain, true, tile, 1536));
+        assert!(!grouped_raster(LoaderKind::Plain, true, tile, 2560));
+        assert!(grouped_raster(LoaderKind::Plain, true, tile, 49152));
+    }
+
+    #[test]
+    fn an_ungrouped_kernel_has_the_old_tile_map_and_a_grouped_one_has_the_new() {
+        let mut key = keys_with(false)[0];
+        let ungrouped = source(key);
+        assert!(ungrouped.contains("let m0 = wg.y * BM;\n  let n0 = wg.x * BN;\n"));
+        assert!(!ungrouped.contains("const GROUP"));
+        key.grouped = true;
+        let grouped = source(key);
+        assert!(grouped.contains("const GROUP: u32 = 8u;"));
+        assert!(grouped.contains("let n0 = (within / rows) * BN;"));
+        assert!(!grouped.contains("let m0 = wg.y * BM;"));
     }
 }

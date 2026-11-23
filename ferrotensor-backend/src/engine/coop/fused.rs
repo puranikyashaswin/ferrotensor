@@ -12,7 +12,8 @@ use super::super::matmul_fused::Resolved;
 use super::super::{grid, immediate_params, uniform, ComputeEngine, Kernel};
 use super::plan::plan_fused;
 use super::{
-    epilogue, grid_fits, loader, split_k, Coop, CoopConfig, CoopKey, EpilogueKind, LoaderKind,
+    epilogue, grid_fits, grouped_raster, loader, split_k, Coop, CoopConfig, CoopKey, EpilogueKind,
+    LoaderKind,
 };
 use crate::kernel_timing::KernelLabel;
 use crate::{UnifiedTensor, WgpuContext};
@@ -217,6 +218,7 @@ impl ComputeEngine {
             b_vec8: b_row.is_multiple_of(8),
             loader: r.loader,
             epilogue,
+            grouped: grouped_raster(r.loader, transposed_b, tile, n),
         };
         let label = KernelLabel {
             entry: "matmul_coop",
@@ -353,6 +355,7 @@ mod tests {
                             b_vec8: true,
                             loader,
                             epilogue,
+                            grouped: false,
                         });
                     }
                 }
@@ -462,6 +465,7 @@ mod tests {
             b_vec8: true,
             loader,
             epilogue,
+            grouped: false,
         };
         let src = source(key(
             LoaderKind::Sources { count: 4 },

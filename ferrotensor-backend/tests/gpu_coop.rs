@@ -1279,12 +1279,18 @@ fn pipelined_tiles_apply_alpha_beta_and_count_overflow() {
 /// rows per group): 1352 rows is 11 row tiles of 128 (a last group of 3), 1100
 /// is 9 (a last group of 1), 1000 is 8 (one whole group, last tile partial in
 /// rows) and 1024 is 8 whole tiles. N is not a multiple of every tile's width,
-/// so the last column block is partial too.
+/// so the last column block is partial too. Only a plain a@bT product of at
+/// least 48 column tiles runs the grouped order (see `grouped_raster`), so the
+/// last shape has 6100 columns and 290 rows: with a transposed `b` every tile
+/// is grouped, and the row tiles are 10 of 32 (a last group of 2), 5 of 64 and
+/// 3 of 128 (one group shorter than 8). The others check that the products
+/// that keep the column order still match.
 const RASTER_SHAPES: &[(usize, usize, usize)] = &[
     (1352, 96, 264),
     (1100, 72, 136),
     (1000, 80, 200),
     (1024, 64, 1032),
+    (290, 96, 6100),
 ];
 
 #[test]

@@ -402,14 +402,17 @@ mod tests {
             for transposed_b in [false, true] {
                 for a_vec4 in [false, true] {
                     for b_vec8 in [false, true] {
-                        keys.push(CoopKey {
-                            tile,
-                            transposed_b,
-                            a_vec4,
-                            b_vec8,
-                            loader: LoaderKind::Plain,
-                            epilogue: EpilogueKind::AlphaBeta,
-                        });
+                        for grouped in [false, true] {
+                            keys.push(CoopKey {
+                                tile,
+                                transposed_b,
+                                a_vec4,
+                                b_vec8,
+                                loader: LoaderKind::Plain,
+                                epilogue: EpilogueKind::AlphaBeta,
+                                grouped,
+                            });
+                        }
                     }
                 }
             }
@@ -496,6 +499,7 @@ mod tests {
             b_vec8: true,
             loader: LoaderKind::Plain,
             epilogue: EpilogueKind::AlphaBeta,
+            grouped: false,
         };
         let src = source(key);
         let body = &src[src.find("for (var p").expect("the pair loop")..];
