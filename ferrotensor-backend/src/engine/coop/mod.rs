@@ -1148,12 +1148,14 @@ mod tests {
     #[test]
     fn grouped_raster_is_for_the_wide_forward_products_of_1_7b() {
         // The tile the router picks at the three row counts of a 1.7B step on
-        // a tuned device, and every tile of 64 or 128 columns.
+        // a tuned device, and every tile of 64 or 128 columns. A 256-column tile
+        // halves the column tile count of the gate product to 32, under the
+        // threshold, so it is left out of the sweep.
         for (name, k, n, transposed_b, want) in PRODUCTS_1_7B {
             let mut tiles: Vec<CoopTile> = CoopTile::ALL
                 .into_iter()
                 .chain(CoopTile::PIPELINED)
-                .filter(|t| t.bn >= 64)
+                .filter(|t| t.bn == 64 || t.bn == 128)
                 .collect();
             for m in [896, 1024, 1352] {
                 let config = plan((m, k, n), transposed_b, (160, true), |_| true)
