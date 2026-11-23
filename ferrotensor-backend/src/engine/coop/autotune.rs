@@ -1055,7 +1055,7 @@ mod tests {
         ];
         let time = |c: CoopConfig| if c == fastest { 600_000 } else { 900_000 };
         let key = TuneKey::new(true, KEY, (256, 2048, 2048));
-        let rows = |n: u32| if n % 2 == 0 { 64 } else { 200 };
+        let rows = |n: u32| if n & 1 == 0 { 64 } else { 200 };
         let mut t = tuner(BTreeMap::new(), DEFAULT_BUDGET);
         let (ran, timed) = drive_rows(&mut t, key, (A, &others), &rows, &time);
         assert_eq!(ran, fastest);
