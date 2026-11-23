@@ -46,6 +46,29 @@ struct TokenizerModel {
     vocab: HashMap<String, u32>,
 }
 
+/// The bytes of the `tokenizer.json` at `path` with every `model.merges` entry
+/// that is a pair `["left", "right"]` rewritten as `"left right"`, or `None`
+/// when the file has no such entry or is not JSON.
+fn merges_as_strings(path: &Path) -> Option<Vec<u8>> {
+    let mut json: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    let merges = json.pointer_mut("/model/merges")?.as_array_mut()?;
+    let mut rewritten = false;
+    for merge in merges.iter_mut() {
+        let joined = match merge.as_array().map(Vec::as_slice) {
+            Some([serde_json::Value::String(left), serde_json::Value::String(right)]) => {
+                format!("{left} {right}")
+            }
+            _ => continue,
+        };
+        *merge = serde_json::Value::String(joined);
+        rewritten = true;
+    }
+    if !rewritten {
+        return None;
+    }
+    serde_json::to_vec(&json).ok()
+}
+
 impl Tokenizer {
     /// Load tokenizer from tokenizer.json
     ///
@@ -63,7 +86,14 @@ impl Tokenizer {
             .map_err(|e| format!("Failed to read tokenizer.json: {e}"))?;
         let declared_bos = declared_bos_token(path)?;
 
-        let hf_error = match tokenizers::Tokenizer::from_file(path) {
+        // `tokenizers` 0.19 reads each merge as one "left right" string; files
+        // written by newer versions (Llama 3.2) give it as a pair of strings.
+        let hf_result =
+            tokenizers::Tokenizer::from_file(path).or_else(|first| match merges_as_strings(path) {
+                Some(bytes) => tokenizers::Tokenizer::from_bytes(bytes),
+                None => Err(first),
+            });
+        let hf_error = match hf_result {
             Ok(hf_tokenizer) => {
                 drop(file);
                 let vocab = hf_tokenizer.get_vocab(true);
@@ -882,6 +912,31 @@ mod tests {
     /// within the first 9 merges; most other pairs occur 3 times.
     const BPE_LINES: &str =
         "the cat sat on the mat.\n\tthe dog sat on the log.\n\n  naïve café, 世界\n";
+
+    #[test]
+    fn merges_written_as_pairs_load_like_merges_written_as_strings() -> TestResult {
+        // Newer `tokenizers` versions write `["a", "b"]` where 0.19 reads
+        // "a b"; Llama 3.2's tokenizer.json is of that kind.
+        let mut json = train_byte_level_bpe("ab ab ab", 261)?;
+        let pairs: Vec<serde_json::Value> = json["model"]["merges"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|m| m.as_str())
+            .map(|m| m.split(' ').collect())
+            .collect();
+        assert_eq!(
+            pairs,
+            [
+                serde_json::json!(["a", "b"]),
+                serde_json::json!(["Ġ", "ab"])
+            ]
+        );
+        json["model"]["merges"] = serde_json::Value::Array(pairs);
+        let tok = load_with_config("bpe-pair-merges", &json, None)?;
+        assert_eq!(tok.encode("ab ab")?, [259, 260]);
+        Ok(())
+    }
 
     #[test]
     fn bpe_extends_the_byte_ids_and_round_trips_any_text() -> TestResult {
