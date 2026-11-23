@@ -664,31 +664,39 @@ const M64_PINS: &[Pin] = &[
     ),
 ];
 
-/// `config`, the router's pick for an `m x k x n` product of the kernel
-/// variant `kinds`, or the [`M64_PINS`] row for the product when it has one
-/// that `fits` the device. Pins are measured on a discrete GPU, so
-/// `use_tuned` is false elsewhere and `config` stands.
-pub(super) fn pin_or(
-    config: CoopConfig,
+/// The [`M64_PINS`] row for an `m x k x n` product of the kernel variant
+/// `kinds`, when it has one that `fits` the device. Pins are measured on a
+/// discrete GPU, so `use_tuned` is false elsewhere and there is none.
+pub(super) fn pinned(
     (m, k, n): (u32, u32, u32),
     transposed_b: bool,
     kinds: (LoaderKind, EpilogueKind),
     use_tuned: bool,
     fits: impl Fn(CoopTile) -> bool,
-) -> CoopConfig {
+) -> Option<CoopConfig> {
     if !use_tuned || m > PIN_ROWS {
-        return config;
+        return None;
     }
     let pin = M64_PINS.iter().find(|p| {
         (p.transposed_b, p.loader, p.epilogue, p.k, p.n) == (transposed_b, kinds.0, kinds.1, k, n)
-    });
-    match pin {
-        Some(p) if fits(p.tile) && grid_fits(p.tile, m, n, p.split) => CoopConfig {
-            tile: p.tile,
-            split: p.split,
-        },
-        _ => config,
-    }
+    })?;
+    (fits(pin.tile) && grid_fits(pin.tile, m, n, pin.split)).then_some(CoopConfig {
+        tile: pin.tile,
+        split: pin.split,
+    })
+}
+
+/// `config`, the router's pick for the product, or its [`pinned`] row.
+#[cfg(test)]
+pub(super) fn pin_or(
+    config: CoopConfig,
+    dims: (u32, u32, u32),
+    transposed_b: bool,
+    kinds: (LoaderKind, EpilogueKind),
+    use_tuned: bool,
+    fits: impl Fn(CoopTile) -> bool,
+) -> CoopConfig {
+    pinned(dims, transposed_b, kinds, use_tuned, fits).unwrap_or(config)
 }
 
 /// `(splits, K per split)` for `requested` slices of K = `k` in steps of
@@ -802,8 +810,8 @@ pub(super) fn split_to_fill(tile: CoopTile, (m, k, n): (u32, u32, u32), target: 
 #[allow(clippy::expect_used)]
 mod tests {
     use super::{
-        bucket_of, pin_or, pins_enabled, plan, plan_fused, split_k, CoopTile, EpilogueKind,
-        LoaderKind, LARGE_M_TILES, M64_PINS, SMALL_M_TILES, STEP_TILES, TUNED,
+        bucket_of, pin_or, pinned, pins_enabled, plan, plan_fused, split_k, CoopConfig, CoopTile,
+        EpilogueKind, LoaderKind, LARGE_M_TILES, M64_PINS, SMALL_M_TILES, STEP_TILES, TUNED,
     };
 
     #[test]
@@ -1602,6 +1610,29 @@ mod tests {
         let base = routed((64, 2048, 2048), false, kinds);
         let got = pin_or(base, (64, 2048, 2048), false, kinds, true, all);
         assert_eq!(got, base);
+    }
+
+    #[test]
+    fn pinned_names_the_row_of_a_pinned_product_and_nothing_else() {
+        let all = |_: CoopTile| true;
+        let plain = (LoaderKind::Plain, EpilogueKind::AlphaBeta);
+        let want = CoopConfig {
+            tile: CoopTile::T32X64_W16X16_K64_DB,
+            split: 2,
+        };
+        assert_eq!(
+            pinned((64, 2048, 2048), false, plain, true, all),
+            Some(want)
+        );
+        assert_eq!(
+            pinned((17, 2048, 2048), false, plain, true, all),
+            Some(want)
+        );
+        assert_eq!(pinned((65, 2048, 2048), false, plain, true, all), None);
+        assert_eq!(pinned((64, 2048, 2048), false, plain, false, all), None);
+        assert_eq!(pinned((64, 576, 576), true, plain, true, all), None);
+        let none = |_: CoopTile| false;
+        assert_eq!(pinned((64, 2048, 2048), false, plain, true, none), None);
     }
 
     #[test]

@@ -65,6 +65,16 @@ pub const AUTOTUNE_ENV: &str = "FERROTENSOR_AUTOTUNE";
 /// number).
 const BUDGET_ENV: &str = "FERROTENSOR_AUTOTUNE_BUDGET";
 
+/// Environment variable that sets the split margin (a number from 0 to 1;
+/// 0 is the default). For benchmarks that ask whether a general rule can
+/// stand where the `M64_PINS` stand now: see [`winner`].
+const SPLIT_MARGIN_ENV: &str = "FERROTENSOR_SPLIT_MARGIN";
+
+/// Rows up to which the split margin applies: the first row bucket, where the
+/// time of a product does not grow with its rows and the isolated timing of a
+/// candidate with many K slices is the least like its time in a step.
+const SPLIT_MARGIN_ROWS: u32 = 64;
+
 /// Tuning time after which no new key starts a trial.
 const DEFAULT_BUDGET: Duration = Duration::from_secs(30);
 
@@ -377,27 +387,49 @@ fn ratio(nanos: u64, anchor: Anchored) -> u64 {
 
 /// The index of the candidate to settle on and its median, once every
 /// candidate has [`TIMINGS`] timings (`u64::MAX` for a timing that was
-/// unusable). `slices[i]` is how many slices of K candidate `i` runs. Candidate
-/// 0 is the static pick: another candidate wins only with a median at least
-/// [`MARGIN`] below its. Of the candidates that clear the margin and are
-/// within [`TIE`] of the best median, the one with the fewest slices wins, then
-/// the one that comes first.
-fn winner(times: &[Vec<u64>], slices: &[u32]) -> Option<(usize, u64)> {
+/// unusable). `slices[i]` is how many slices of K candidate `i` runs. Each
+/// median counts as `split_margin` slower for every slice of K past the
+/// first, since a timing of a product on its own favours many slices more than
+/// the step does. Candidate 0 is the static pick: another candidate wins only
+/// with a counted median at least [`MARGIN`] below its. Of the candidates that
+/// clear the margin and are within [`TIE`] of the best counted median, the one
+/// with the fewest slices wins, then the one that comes first. With a
+/// `split_margin` of 0 the counted medians are the medians.
+fn winner(times: &[Vec<u64>], slices: &[u32], split_margin: f64) -> Option<(usize, u64)> {
     if times.is_empty() || times.iter().any(|t| t.len() < TIMINGS) {
         return None;
     }
     let medians: Vec<u64> = times.iter().map(|t| median(t)).collect();
     let static_median = *medians.first()?;
-    let best_median = *medians.iter().min()?;
-    let band = best_median as f64 * (1.0 + TIE);
-    let clear = static_median as f64 * (1.0 - MARGIN);
-    medians
+    let counted: Vec<f64> = medians
         .iter()
         .enumerate()
-        .filter(|&(_, &m)| m != u64::MAX && (m as f64) <= band && (m as f64) < clear)
+        .map(|(i, &m)| {
+            if m == u64::MAX {
+                return f64::INFINITY;
+            }
+            let extra = slices.get(i).copied().unwrap_or(1).saturating_sub(1);
+            m as f64 * (1.0 + split_margin).powi(i32::try_from(extra).unwrap_or(i32::MAX))
+        })
+        .collect();
+    let best = counted.iter().copied().fold(f64::INFINITY, f64::min);
+    let band = best * (1.0 + TIE);
+    let clear = counted.first().copied()? * (1.0 - MARGIN);
+    counted
+        .iter()
+        .enumerate()
+        .filter(|&(_, &c)| c.is_finite() && c <= band && c < clear)
         .min_by_key(|&(i, _)| (slices.get(i).copied().unwrap_or(u32::MAX), i))
-        .map(|(i, &m)| (i, m))
+        .and_then(|(i, _)| medians.get(i).map(|&m| (i, m)))
         .or(Some((0, static_median)))
+}
+
+/// The split margin [`SPLIT_MARGIN_ENV`] sets: a number from 0 to 1, else 0.
+fn split_margin_from(get: &dyn Fn(&str) -> Option<String>) -> f64 {
+    get(SPLIT_MARGIN_ENV)
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|m| (0.0..=1.0).contains(m))
+        .unwrap_or(0.0)
 }
 
 /// What the timing of an anchor came to.
@@ -560,6 +592,8 @@ pub(super) struct Tuner {
     tuned: usize,
     cached: usize,
     budget_hit: bool,
+    /// The margin of [`winner`] for keys of up to [`SPLIT_MARGIN_ROWS`] rows.
+    split_margin: f64,
 }
 
 impl Tuner {
@@ -585,6 +619,32 @@ impl Tuner {
             tuned: 0,
             cached: 0,
             budget_hit: false,
+            split_margin: 0.0,
+        }
+    }
+
+    /// This tuner with the split margin of [`winner`] for keys of up to
+    /// [`SPLIT_MARGIN_ROWS`] rows.
+    pub(super) fn with_split_margin(mut self, margin: f64) -> Self {
+        self.split_margin = margin;
+        self
+    }
+
+    /// Makes `config` what `key` runs, whatever the cache or a trial would
+    /// say, and records it in the cache file as pinned. It is not timed.
+    pub(super) fn pin(&mut self, key: TuneKey, config: CoopConfig) {
+        if self.settled.get(&key) == Some(&config) {
+            return;
+        }
+        self.trials.remove(&key);
+        self.settled.insert(key, config);
+        let pinned = Choice {
+            config,
+            median_us: 0.0,
+            pinned: true,
+        };
+        if self.entries.insert(key.line_key(), pinned) != Some(pinned) {
+            self.dirty = true;
         }
     }
 
@@ -614,7 +674,8 @@ impl Tuner {
             (Some(path), Mode::On) => autotune_cache::load(path, &header),
             _ => BTreeMap::new(),
         };
-        Some(Self::new(mode, file, header, entries, budget_from(get)))
+        let tuner = Self::new(mode, file, header, entries, budget_from(get));
+        Some(tuner.with_split_margin(split_margin_from(get)))
     }
 
     /// Whether timings are waiting to be read back.
@@ -648,7 +709,10 @@ impl Tuner {
             return known(config);
         }
         if !self.trials.contains_key(&key) {
-            if let Some(choice) = self.entries.get(&key.line_key()).copied() {
+            // A pinned line is the router's, not a timing: without the pin the
+            // key is timed.
+            let cached = self.entries.get(&key.line_key()).copied();
+            if let Some(choice) = cached.filter(|c| !c.pinned) {
                 self.settled.insert(key, choice.config);
                 self.cached += 1;
                 return known(choice.config);
@@ -777,7 +841,12 @@ impl Tuner {
             .iter()
             .map(|c| split_k(key.k, c.tile.bk, c.split).0)
             .collect();
-        let Some((best, ratio)) = winner(&trial.times, &slices) else {
+        let margin = if key.m_bucket <= SPLIT_MARGIN_ROWS {
+            self.split_margin
+        } else {
+            0.0
+        };
+        let Some((best, ratio)) = winner(&trial.times, &slices, margin) else {
             return;
         };
         let Some(&config) = trial.candidates.get(best) else {
@@ -806,8 +875,14 @@ impl Tuner {
         self.settled.insert(key, config);
         self.tuned += 1;
         if usable && ratio != u64::MAX {
-            self.entries
-                .insert(key.line_key(), Choice { config, median_us });
+            self.entries.insert(
+                key.line_key(),
+                Choice {
+                    config,
+                    median_us,
+                    pinned: false,
+                },
+            );
             self.dirty = true;
         }
     }
@@ -983,15 +1058,15 @@ mod tests {
         assert_eq!(drive(&mut t, key(), (A, &[B]), &clear).0, B);
         // The median ignores one slow timing in three.
         assert_eq!(
-            winner(&[vec![100, 100, 100], vec![10, 90, 5_000]], &[1, 1]),
+            winner(&[vec![100, 100, 100], vec![10, 90, 5_000]], &[1, 1], 0.0),
             Some((1, 90))
         );
         assert_eq!(
-            winner(&[vec![100, 100, 100], vec![10, 99, 5_000]], &[1, 1]),
+            winner(&[vec![100, 100, 100], vec![10, 99, 5_000]], &[1, 1], 0.0),
             Some((0, 100))
         );
-        assert_eq!(winner(&[vec![100, 100]], &[1]), None);
-        assert_eq!(winner(&[], &[]), None);
+        assert_eq!(winner(&[vec![100, 100]], &[1], 0.0), None);
+        assert_eq!(winner(&[], &[], 0.0), None);
     }
 
     #[test]
@@ -1155,33 +1230,33 @@ mod tests {
         // Candidate 1 has 4 slices, 2 has 1, 3 has 2. 900 and 905 are within
         // 1%: the unsplit one wins.
         assert_eq!(
-            winner(&times([900, 905, 950]), &[1, 4, 1, 2]),
+            winner(&times([900, 905, 950]), &[1, 4, 1, 2], 0.0),
             Some((2, 905))
         );
         // 910 is outside the band of 900 (909).
         assert_eq!(
-            winner(&times([900, 910, 950]), &[1, 4, 1, 2]),
+            winner(&times([900, 910, 950]), &[1, 4, 1, 2], 0.0),
             Some((1, 900))
         );
         // Among equal slices, the one first in the list.
         assert_eq!(
-            winner(&times([900, 902, 950]), &[1, 2, 2, 2]),
+            winner(&times([900, 902, 950]), &[1, 2, 2, 2], 0.0),
             Some((1, 900))
         );
         // 969 is within the band of 965 and clears the margin (970).
         assert_eq!(
-            winner(&times([965, 969, 990]), &[1, 4, 1, 2]),
+            winner(&times([965, 969, 990]), &[1, 4, 1, 2], 0.0),
             Some((2, 969))
         );
         // 972 is within the band of 965 (974.65) but does not clear the
         // margin: the one with 4 slices wins.
         assert_eq!(
-            winner(&times([965, 972, 990]), &[1, 4, 1, 2]),
+            winner(&times([965, 972, 990]), &[1, 4, 1, 2], 0.0),
             Some((1, 965))
         );
         // Nothing clears the margin: the static pick.
         assert_eq!(
-            winner(&times([975, 980, 990]), &[1, 4, 1, 2]),
+            winner(&times([975, 980, 990]), &[1, 4, 1, 2], 0.0),
             Some((0, 1000))
         );
     }
@@ -1252,6 +1327,7 @@ mod tests {
             Choice {
                 config: D,
                 median_us: 321.0,
+                pinned: false,
             },
         );
         let mut t = tuner(entries, DEFAULT_BUDGET);
@@ -1268,11 +1344,102 @@ mod tests {
             Choice {
                 config: D,
                 median_us: 1.0,
+                pinned: false,
             },
         );
         let mut t = tuner(entries, DEFAULT_BUDGET);
         let pick = t.pick(key(), 256, A, &|c| c != D, &Vec::new);
         assert_eq!(pick.config, A);
+    }
+
+    #[test]
+    fn a_pinned_key_keeps_its_pick_against_a_faster_cached_one() {
+        // The cache holds C, the fastest of time_of, for the key.
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            key().line_key(),
+            Choice {
+                config: C,
+                median_us: 1.0,
+                pinned: false,
+            },
+        );
+        let mut t = tuner(entries, DEFAULT_BUDGET);
+        t.pin(key(), D);
+        assert!(!t.wants_samples());
+        assert_eq!(drive(&mut t, key(), (A, &[B, C]), &time_of), (D, 0));
+        let line = Choice {
+            config: D,
+            median_us: 0.0,
+            pinned: true,
+        };
+        assert_eq!(t.entries.get(&key().line_key()), Some(&line));
+        assert!(t.dirty);
+        // The file keeps one pinned line, and pinning again changes nothing.
+        t.dirty = false;
+        t.pin(key(), D);
+        assert!(!t.dirty);
+        assert_eq!(t.entries.len(), 1);
+        assert_eq!(t.report().shapes_tuned, 0);
+        // A run without the pin does not take a pinned line for a timing: it
+        // times the key.
+        let mut free = tuner(t.entries.clone(), DEFAULT_BUDGET);
+        assert_eq!(drive(&mut free, key(), (A, &[B, C]), &time_of).0, C);
+        assert_eq!(free.report().shapes_cached, 0);
+        // The line is not a winner's: its time is not the time of a timing.
+        let timed = free.entries.get(&key().line_key()).copied();
+        assert_eq!(timed.map(|c| (c.config, c.pinned)), Some((C, false)));
+    }
+
+    #[test]
+    fn a_split_margin_prefers_fewer_slices_up_to_64_rows_only() {
+        // K = 2048 in steps of 64: a split of 5 runs 5 slices, a split of 2
+        // runs 2. In isolation 2 slices take 1.15 times as long as 5.
+        let many = cfg(CoopTile::T32X64_W16X16_K64_DB, 5);
+        let few = cfg(CoopTile::T32X64_W16X16_K64_DB, 2);
+        let time = |c: CoopConfig| if c == many { 1_000_000 } else { 1_150_000 };
+        let at = |rows: u32, margin: f64| {
+            let key = TuneKey::new(true, KEY, (rows, 2048, 2048));
+            let mut t = tuner(BTreeMap::new(), DEFAULT_BUDGET).with_split_margin(margin);
+            drive(&mut t, key, (many, &[few]), &time).0
+        };
+        assert_eq!(at(64, 0.0), many);
+        // 1.15 x 1.09 against 1.0 x 1.09^4: the 2 slices win by 19%.
+        assert_eq!(at(64, 0.09), few);
+        // A margin of 0.03 is too small: 1.15 x 1.03 against 1.03^4.
+        assert_eq!(at(64, 0.03), many);
+        // Above 64 rows the margin does not apply.
+        assert_eq!(at(256, 0.09), many);
+    }
+
+    #[test]
+    fn a_split_margin_counts_slices_past_the_first() {
+        // Slices 5, 2 and 6; the isolated times are 100, 115 and 90 per cent
+        // of the static pick's.
+        let times = [vec![1_000_000; 3], vec![1_150_000; 3], vec![900_000; 3]];
+        // No margin: the 6 slices are the fastest and clear the 3%.
+        assert_eq!(winner(&times, &[5, 2, 6], 0.0), Some((2, 900_000)));
+        // 0.09: counted 1.0 x 1.09^4, 1.15 x 1.09 and 0.9 x 1.09^5, that is
+        // 1.4116, 1.2535 and 1.3848. The 2 slices are the best by 10%.
+        assert_eq!(winner(&times, &[5, 2, 6], 0.09), Some((1, 1_150_000)));
+        // The same slices everywhere: the margin changes nothing, and a
+        // candidate within 3% of the static pick does not replace it.
+        assert_eq!(winner(&times, &[5, 5, 5], 0.09), Some((2, 900_000)));
+        assert_eq!(
+            winner(&[vec![1_000_000; 3], vec![990_000; 3]], &[5, 5], 0.09),
+            Some((0, 1_000_000))
+        );
+    }
+
+    #[test]
+    fn the_split_margin_comes_from_the_environment() {
+        let at = |v: &str| split_margin_from(&|k| (k == SPLIT_MARGIN_ENV).then(|| v.to_owned()));
+        assert_eq!(at("0.09"), 0.09);
+        assert_eq!(at(" 0.5 "), 0.5);
+        for bad in ["", "x", "-0.1", "1.5", "NaN", "inf"] {
+            assert_eq!(at(bad), 0.0, "{bad}");
+        }
+        assert_eq!(split_margin_from(&|_| None), 0.0);
     }
 
     #[test]

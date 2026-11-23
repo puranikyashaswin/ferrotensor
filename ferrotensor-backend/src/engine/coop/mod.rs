@@ -53,7 +53,7 @@ use fused::params_vec4s;
 pub(super) use fused::{params_vec4s as kind_params_vec4s, reference_source};
 pub(super) use loader::{LoaderKind, MAX_SOURCES, SOURCE_BINDING};
 use mainloop::main_loop;
-use plan::{grid_fits, pin_or, plan, split_k};
+use plan::{grid_fits, pinned, plan, split_k};
 pub use tiles::{CoopConfig, CoopTile};
 use tiles::{PAD, SUBGROUP};
 
@@ -202,8 +202,8 @@ impl Coop {
     /// kernel variant `kinds` (its loader and epilogue) with when the static
     /// rules pick `static_cfg`: the tuner's pick, and the sample to tag the
     /// run with when it is a timing. Without a tuner, the static pick and no
-    /// sample. A product with a `M64_PINS` row has that row as its static
-    /// pick, which is what the tuner starts from and compares against.
+    /// sample. A product with a `M64_PINS` row runs that row and is never
+    /// timed.
     fn autotuned(
         &self,
         ctx: &WgpuContext,
@@ -212,15 +212,18 @@ impl Coop {
         dims: (u32, u32, u32),
         static_cfg: CoopConfig,
     ) -> (CoopConfig, Option<u64>) {
-        let static_cfg = if self.pins {
-            let fits = |t: CoopTile| self.fits(t, transposed_b);
-            pin_or(static_cfg, dims, transposed_b, kinds, self.tuned, fits)
-        } else {
-            static_cfg
-        };
         let Some(mut tuner) = self.tuner() else {
-            return (static_cfg, None);
+            return (
+                self.pin(dims, transposed_b, kinds).unwrap_or(static_cfg),
+                None,
+            );
         };
+        if let Some(config) = self.pin(dims, transposed_b, kinds) {
+            // A pinned row is final: the key is not timed, and the cache
+            // file records it as pinned.
+            tuner.pin(TuneKey::new(transposed_b, kinds, dims), config);
+            return (config, None);
+        }
         if tuner.wants_samples() {
             for (sample, time) in ctx.take_tune_samples() {
                 tuner.record(sample, time);
@@ -237,6 +240,21 @@ impl Coop {
         };
         let pick = tuner.pick(key, m, static_cfg, &usable, &list);
         (pick.config, pick.sample)
+    }
+
+    /// The `M64_PINS` row of the product, unless the pins are off.
+    fn pin(
+        &self,
+        dims: (u32, u32, u32),
+        transposed_b: bool,
+        kinds: (LoaderKind, EpilogueKind),
+    ) -> Option<CoopConfig> {
+        if !self.pins {
+            return None;
+        }
+        pinned(dims, transposed_b, kinds, self.tuned, |t| {
+            self.fits(t, transposed_b)
+        })
     }
 
     fn fits(&self, tile: CoopTile, transposed_b: bool) -> bool {
