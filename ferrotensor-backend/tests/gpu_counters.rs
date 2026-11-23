@@ -421,6 +421,15 @@ const COLS: usize = 10;
 #[ignore = "needs a GPU"]
 fn whole_buffer_groups_serve_tensors_of_other_lengths() {
     let ctx = pollster::block_on(WgpuContext::new());
+    // Without immediates rms_norm sets its parameters in a uniform buffer,
+    // and a bind group that holds one is not cached, so there is no hit to count.
+    if !ctx.uses_immediates() {
+        eprintln!(
+            "skipped: {} has no immediates, so the rms_norm group is not cached",
+            ctx.adapter_info()
+        );
+        return;
+    }
     let engine = ComputeEngine::new(&ctx);
     let weight = UnifiedTensor::new(&ctx, &[1.0; COLS], &[COLS]);
     let src_a = UnifiedTensor::new(&ctx, &[2.0; ROWS_A * COLS], &[ROWS_A * COLS]);
