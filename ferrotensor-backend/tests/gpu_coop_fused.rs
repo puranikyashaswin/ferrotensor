@@ -896,8 +896,8 @@ fn split_fused_product_adds_the_slices_then_runs_the_epilogue_once() {
 
 /// The input gradient of the QKV projection with the gradients in one
 /// buffer (Plain loader) equals the product that reads the same columns as
-/// six bindings (Sources loader), at the K of 135M, 360M and 1.7B (Q, K and
-/// V columns, then three rank-8 dU blocks) and at the rows of a step. Small
+/// four bindings (Sources loader), at the K of 135M, 360M and 1.7B (Q, K and
+/// V columns, then the three rank-8 dU blocks as one) and at the rows of a step. Small
 /// products are also checked against the CPU.
 #[test]
 #[ignore = "needs a GPU; run with --ignored --test-threads=1"]
@@ -909,7 +909,7 @@ fn plain_over_the_packed_gradients_equals_sources_over_the_parts() {
         (960, 320, 960),
         (2048, 2048, 2048),
     ] {
-        let widths = [q, kv, kv, 8, 8, 8];
+        let widths = [q, kv, kv, 24];
         let k: usize = widths.iter().sum();
         for mode in modes(
             g,
