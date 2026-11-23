@@ -855,7 +855,9 @@ mod split_reduce_tests {
         let full = 4 * 256 * 65_535;
         assert_eq!(split_reduce_plan(full), (true, (65_535, 1, 1)));
         assert_eq!(split_reduce_plan(full + 4), (true, (65_535, 2, 1)));
-        assert_eq!(split_reduce_plan(full + 1), (false, (65_535, 2, 1)));
+        // Without vec4 each thread is one output: 4 * 65535 + 1 workgroups,
+        // 5 rows of 65535.
+        assert_eq!(split_reduce_plan(full + 1), (false, (65_535, 5, 1)));
     }
 
     /// Deterministic pseudo-random values in [-1, 1).
