@@ -3,6 +3,8 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
+use super::epilogue::EpilogueKind;
+use super::loader::LoaderKind;
 use super::{CoopConfig, CoopTile};
 
 /// Largest workgroup count per grid dimension.
@@ -547,6 +549,148 @@ const STEP_TILES: [CoopTile; 2] = [
     CoopTile::T64X64_W32X32_K32_DB,
 ];
 
+/// Environment variable that turns the [`M64_PINS`] off when it is `0`. It
+/// exists for benchmarks that compare the router with and without the pins.
+pub(super) const PINS_ENV: &str = "FERROTENSOR_M64_PINS";
+
+/// Whether the [`M64_PINS`] stand, for a value of [`PINS_ENV`].
+pub(super) fn pins_enabled(value: Option<&str>) -> bool {
+    value.map(str::trim) != Some("0")
+}
+
+/// A product of up to [`PIN_ROWS`] rows with a configuration that won in a
+/// training step.
+struct Pin {
+    transposed_b: bool,
+    loader: LoaderKind,
+    epilogue: EpilogueKind,
+    k: u32,
+    n: u32,
+    tile: CoopTile,
+    split: u32,
+}
+
+impl Pin {
+    const fn new(
+        (transposed_b, loader, epilogue): (bool, LoaderKind, EpilogueKind),
+        (k, n): (u32, u32),
+        tile: CoopTile,
+        split: u32,
+    ) -> Self {
+        Self {
+            transposed_b,
+            loader,
+            epilogue,
+            k,
+            n,
+            tile,
+            split,
+        }
+    }
+}
+
+/// Rows up to which the [`M64_PINS`] apply: the autotuner's first row bucket.
+const PIN_ROWS: u32 = 64;
+
+/// The eight SmolLM2-1.7B products of up to 64 rows (a batch of 1 at 64
+/// tokens or fewer) whose picks made the training step faster. On one A10G,
+/// a 1.7B run of batch 1 with 8 accumulation steps took 0.2536 s per step
+/// when these eight picks replaced the eight of a cache that took 0.2624 s
+/// (the other 22 picks of the cache stayed), and a `matmul_bench --tiles`
+/// sweep of the products alone did not show the difference. The picks use
+/// 2, 2, 1, 2, 2, 8, 2 and 2 slices of K where the cache had 5, 5, 1, 3, 4,
+/// 5, 1 and 5, and on four of them another tile. The first four are
+/// `a @ b` products and the rest `a @ bT`, each as `(transposed_b, loader,
+/// epilogue)`.
+const M64_PINS: &[Pin] = &[
+    Pin::new(
+        (false, LoaderKind::Plain, EpilogueKind::AlphaBeta),
+        (2048, 2048),
+        CoopTile::T32X64_W16X16_K64_DB,
+        2,
+    ),
+    Pin::new(
+        (false, LoaderKind::Plain, EpilogueKind::AlphaBeta),
+        (8192, 2048),
+        CoopTile::T32X64_W16X16_K64_DB,
+        2,
+    ),
+    Pin::new(
+        (false, LoaderKind::Plain, EpilogueKind::AlphaBeta),
+        (2048, 8192),
+        CoopTile::T64X64_W16X32_K32_DB,
+        1,
+    ),
+    Pin::new(
+        (
+            false,
+            LoaderKind::Plain,
+            EpilogueKind::ColumnSplit {
+                segments: 4,
+                bias: false,
+            },
+        ),
+        (2048, 6168),
+        CoopTile::T64X64_W16X32_K32_DB,
+        2,
+    ),
+    Pin::new(
+        (true, LoaderKind::Plain, EpilogueKind::AlphaBeta),
+        (2048, 2048),
+        CoopTile::T32X64_W16X16_K64_DB,
+        2,
+    ),
+    Pin::new(
+        (true, LoaderKind::Plain, EpilogueKind::AlphaBeta),
+        (8192, 2048),
+        CoopTile::T64X64_W32X32_K32_PF,
+        8,
+    ),
+    Pin::new(
+        (true, LoaderKind::Plain, EpilogueKind::AlphaBeta),
+        (2048, 8192),
+        CoopTile::T64X64_W32X32_K32_PF,
+        2,
+    ),
+    Pin::new(
+        (
+            true,
+            LoaderKind::Sources { count: 4 },
+            EpilogueKind::AlphaBeta,
+        ),
+        (6168, 2048),
+        CoopTile::T32X64_W16X16_K64_DB,
+        2,
+    ),
+];
+
+/// `config`, the router's pick for an `m x k x n` product of the kernel
+/// variant `kinds`, or the [`M64_PINS`] row for the product when it has one
+/// that `fits` the device. Pins are measured on a discrete GPU, so
+/// `use_tuned` is false elsewhere and `config` stands.
+pub(super) fn pin_or(
+    config: CoopConfig,
+    (m, k, n): (u32, u32, u32),
+    transposed_b: bool,
+    kinds: (LoaderKind, EpilogueKind),
+    use_tuned: bool,
+    fits: impl Fn(CoopTile) -> bool,
+) -> CoopConfig {
+    if !use_tuned || m > PIN_ROWS {
+        return config;
+    }
+    let pin = M64_PINS.iter().find(|p| {
+        (p.transposed_b, p.loader, p.epilogue, p.k, p.n) == (transposed_b, kinds.0, kinds.1, k, n)
+    });
+    match pin {
+        Some(p) if fits(p.tile) && grid_fits(p.tile, m, n, p.split) => CoopConfig {
+            tile: p.tile,
+            split: p.split,
+        },
+        _ => config,
+    }
+}
+
 /// `(splits, K per split)` for `requested` slices of K = `k` in steps of
 /// `bk`: every slice a whole number of steps, none empty.
 pub(super) fn split_k(k: u32, bk: u32, requested: u32) -> (u32, u32) {
@@ -658,8 +802,8 @@ pub(super) fn split_to_fill(tile: CoopTile, (m, k, n): (u32, u32, u32), target: 
 #[allow(clippy::expect_used)]
 mod tests {
     use super::{
-        bucket_of, plan, plan_fused, split_k, CoopTile, LARGE_M_TILES, SMALL_M_TILES, STEP_TILES,
-        TUNED,
+        bucket_of, pin_or, pins_enabled, plan, plan_fused, split_k, CoopTile, EpilogueKind,
+        LoaderKind, LARGE_M_TILES, M64_PINS, SMALL_M_TILES, STEP_TILES, TUNED,
     };
 
     #[test]
@@ -1356,6 +1500,172 @@ mod tests {
         for row in TUNED {
             let known = all.contains(&row.tile) || CoopTile::PIPELINED.contains(&row.tile);
             assert!(known, "{:?}", row.tile);
+        }
+    }
+
+    type CachePick = (bool, LoaderKind, EpilogueKind, u32, u32, &'static str, u32);
+
+    /// The eight 1.7B products of 64 rows or fewer, as the cache of the run
+    /// that won the step keeps them: `(a @ bT, loader, epilogue, k, n)` and
+    /// the cache line's tile name and K slices.
+    fn cache_picks() -> Vec<CachePick> {
+        let plain = LoaderKind::Plain;
+        let ab = EpilogueKind::AlphaBeta;
+        let split4 = EpilogueKind::ColumnSplit {
+            segments: 4,
+            bias: false,
+        };
+        let sources = LoaderKind::Sources { count: 4 };
+        vec![
+            (false, plain, ab, 2048, 2048, "32x64/w16x16/k64/db", 2),
+            (false, plain, ab, 8192, 2048, "32x64/w16x16/k64/db", 2),
+            (false, plain, ab, 2048, 8192, "64x64/w16x32/k32/db", 1),
+            (false, plain, split4, 2048, 6168, "64x64/w16x32/k32/db", 2),
+            (true, plain, ab, 2048, 2048, "32x64/w16x16/k64/db", 2),
+            (true, plain, ab, 8192, 2048, "64x64/w32x32/k32/db/pf", 8),
+            (true, plain, ab, 2048, 8192, "64x64/w32x32/k32/db/pf", 2),
+            (true, sources, ab, 6168, 2048, "32x64/w16x16/k64/db", 2),
+        ]
+    }
+
+    /// What `Coop::autotuned` starts from without a pin: `plan` for a plain
+    /// product and `plan_fused` for a fused one.
+    fn routed(
+        (m, k, n): (u32, u32, u32),
+        transposed_b: bool,
+        kinds: (LoaderKind, EpilogueKind),
+    ) -> super::CoopConfig {
+        let all = |_: CoopTile| true;
+        let base = if kinds == (LoaderKind::Plain, EpilogueKind::AlphaBeta) {
+            plan((m, k, n), transposed_b, (160, true), all)
+        } else {
+            plan_fused((m, k, n), transposed_b, (160, true), all)
+        };
+        base.expect("a tile fits")
+    }
+
+    #[test]
+    fn the_pins_return_the_picks_of_the_cache_for_up_to_64_rows() {
+        let all = |_: CoopTile| true;
+        let picks = cache_picks();
+        assert_eq!(picks.len(), M64_PINS.len());
+        for (transposed_b, loader, epilogue, k, n, name, split) in picks {
+            for m in [1, 16, 33, 64] {
+                let kinds = (loader, epilogue);
+                let base = routed((m, k, n), transposed_b, kinds);
+                let got = pin_or(base, (m, k, n), transposed_b, kinds, true, all);
+                assert_eq!(
+                    (got.tile.name().as_str(), got.split),
+                    (name, split),
+                    "m {m} k {k} n {n} bT {transposed_b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_pin_stands_down_off_its_shape_off_a_discrete_gpu_and_off_a_tile_that_does_not_fit() {
+        let all = |_: CoopTile| true;
+        for (transposed_b, loader, epilogue, k, n, name, _) in cache_picks() {
+            let kinds = (loader, epilogue);
+            let at = |m: u32, use_tuned: bool, fits: &dyn Fn(CoopTile) -> bool| {
+                let base = routed((m, k, n), transposed_b, kinds);
+                let got = pin_or(base, (m, k, n), transposed_b, kinds, use_tuned, fits);
+                (base, got)
+            };
+            // Past 64 rows: the router's pick.
+            for m in [65, 128, 256, 1024] {
+                let (base, got) = at(m, true, &all);
+                assert_eq!(got, base, "m {m} k {k} n {n}");
+            }
+            // Where the tuned rows do not apply (Apple silicon, integrated GPUs).
+            let (base, got) = at(64, false, &all);
+            assert_eq!(got, base, "untuned k {k} n {n}");
+            // A device the pinned tile does not fit.
+            let not_pinned = |t: CoopTile| t.name() != name;
+            let (base, got) = at(64, true, &not_pinned);
+            assert_eq!(got, base, "no fit k {k} n {n}");
+            // The other layout of the same weight shape is its own product: it
+            // keeps the router's pick unless the pins name it too.
+            let other = !transposed_b;
+            let base = routed((64, k, n), other, kinds);
+            let got = pin_or(base, (64, k, n), other, kinds, true, all);
+            let named = M64_PINS.iter().any(|p| {
+                (p.transposed_b, p.loader, p.epilogue, p.k, p.n) == (other, loader, epilogue, k, n)
+            });
+            if !named {
+                assert_eq!(got, base, "other layout k {k} n {n}");
+            }
+        }
+        // The same weight with a loader or epilogue the pins do not name.
+        let kinds = (LoaderKind::Sources { count: 4 }, EpilogueKind::AlphaBeta);
+        let base = routed((64, 2048, 2048), false, kinds);
+        let got = pin_or(base, (64, 2048, 2048), false, kinds, true, all);
+        assert_eq!(got, base);
+    }
+
+    #[test]
+    fn the_135m_and_360m_products_of_64_rows_keep_their_rows() {
+        let all = |_: CoopTile| true;
+        let plain = (LoaderKind::Plain, EpilogueKind::AlphaBeta);
+        // 135M: the TUNED row of 64 rows.
+        let base = routed((64, 576, 576), true, plain);
+        assert_eq!((base.tile, base.split), (CoopTile::T32X32_W16X16_K64_DB, 5));
+        let got = pin_or(base, (64, 576, 576), true, plain, true, all);
+        assert_eq!(got, base);
+        // 135M and 360M products of 64 rows and fewer, plain and fused.
+        let shapes = [
+            (576, 576),
+            (576, 1536),
+            (1536, 576),
+            (576, 192),
+            (960, 960),
+            (960, 320),
+            (960, 2560),
+            (2560, 960),
+            (960, 49152),
+        ];
+        let fused = (
+            LoaderKind::Plain,
+            EpilogueKind::ColumnSplit {
+                segments: 4,
+                bias: false,
+            },
+        );
+        for (k, n) in shapes {
+            for m in [16, 40, 64] {
+                for transposed_b in [false, true] {
+                    for kinds in [plain, fused] {
+                        let base = routed((m, k, n), transposed_b, kinds);
+                        let got = pin_or(base, (m, k, n), transposed_b, kinds, true, all);
+                        assert_eq!(got, base, "m {m} k {k} n {n} bT {transposed_b}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_pins_come_off_with_a_zero_and_stay_on_otherwise() {
+        assert!(!pins_enabled(Some("0")));
+        assert!(!pins_enabled(Some(" 0 ")));
+        assert!(pins_enabled(None));
+        assert!(pins_enabled(Some("1")));
+        assert!(pins_enabled(Some(" 1 ")));
+        assert!(pins_enabled(Some("")));
+    }
+
+    #[test]
+    fn the_pins_are_distinct_products_with_known_tiles() {
+        let known = |t: CoopTile| CoopTile::ALL.contains(&t) || CoopTile::PIPELINED.contains(&t);
+        for (i, p) in M64_PINS.iter().enumerate() {
+            assert!(known(p.tile), "{:?}", p.tile);
+            assert!(p.split >= 1, "{i}");
+            for q in &M64_PINS[i + 1..] {
+                let same = (p.transposed_b, p.loader, p.epilogue, p.k, p.n)
+                    == (q.transposed_b, q.loader, q.epilogue, q.k, q.n);
+                assert!(!same, "pin {i} is repeated");
+            }
         }
     }
 }

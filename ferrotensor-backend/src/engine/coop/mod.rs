@@ -53,7 +53,7 @@ use fused::params_vec4s;
 pub(super) use fused::{params_vec4s as kind_params_vec4s, reference_source};
 pub(super) use loader::{LoaderKind, MAX_SOURCES, SOURCE_BINDING};
 use mainloop::main_loop;
-use plan::{grid_fits, plan, split_k};
+use plan::{grid_fits, pin_or, plan, split_k};
 pub use tiles::{CoopConfig, CoopTile};
 use tiles::{PAD, SUBGROUP};
 
@@ -102,6 +102,8 @@ pub(super) struct Coop {
     target: u32,
     /// Whether the `TUNED` table of `plan` applies: it was measured on a discrete GPU.
     tuned: bool,
+    /// Whether the `M64_PINS` of `plan` apply (on unless `FERROTENSOR_M64_PINS=0`).
+    pins: bool,
     max_bytes: u32,
     max_threads: u32,
     /// Whether the kernel reads its parameters from immediates.
@@ -180,6 +182,7 @@ impl Coop {
             routed,
             target,
             tuned: ctx.adapter.get_info().device_type == wgpu::DeviceType::DiscreteGpu,
+            pins: plan::pins_enabled(std::env::var(plan::PINS_ENV).ok().as_deref()),
             max_bytes: limits.max_compute_workgroup_storage_size,
             max_threads: limits
                 .max_compute_invocations_per_workgroup
@@ -199,7 +202,8 @@ impl Coop {
     /// kernel variant `kinds` (its loader and epilogue) with when the static
     /// rules pick `static_cfg`: the tuner's pick, and the sample to tag the
     /// run with when it is a timing. Without a tuner, the static pick and no
-    /// sample.
+    /// sample. A product with a `M64_PINS` row has that row as its static
+    /// pick, which is what the tuner starts from and compares against.
     fn autotuned(
         &self,
         ctx: &WgpuContext,
@@ -208,6 +212,12 @@ impl Coop {
         dims: (u32, u32, u32),
         static_cfg: CoopConfig,
     ) -> (CoopConfig, Option<u64>) {
+        let static_cfg = if self.pins {
+            let fits = |t: CoopTile| self.fits(t, transposed_b);
+            pin_or(static_cfg, dims, transposed_b, kinds, self.tuned, fits)
+        } else {
+            static_cfg
+        };
         let Some(mut tuner) = self.tuner() else {
             return (static_cfg, None);
         };
