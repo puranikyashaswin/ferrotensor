@@ -270,6 +270,17 @@ fn grid(groups: u32) -> (u32, u32, u32) {
     }
 }
 
+/// Whether the split-K reduction of `len` outputs runs four outputs per
+/// thread, and its workgroup grid. A slice of the partials starts at a
+/// multiple of 4 floats, which a vec4 load needs, only when `len` is one.
+fn split_reduce_plan(len: u32) -> (bool, (u32, u32, u32)) {
+    if len >= 4 && len.is_multiple_of(4) {
+        (true, grid((len / 4).div_ceil(256)))
+    } else {
+        (false, grid(len.div_ceil(256)))
+    }
+}
+
 /// Grid of 64-wide workgroups covering `n` elements.
 fn groups64(n: usize) -> (u32, u32, u32) {
     grid((n as u32).div_ceil(64))
@@ -418,6 +429,8 @@ pub struct ComputeEngine {
     flash_attn_v2_bw_dkdv: Kernel,
     flash_group_sum: Kernel,
     split_reduce: Kernel,
+    /// [`split_reduce`](Self::split_reduce) with four outputs per thread.
+    split_reduce4: Kernel,
     /// Small-M matmul kernels, compiled the first time a tile and layout run.
     small_m: Mutex<HashMap<small_m::SmallMKey, Arc<Kernel>>>,
     /// The device's workgroup memory in bytes, which bounds the small-M tiles.
@@ -440,6 +453,18 @@ pub struct ComputeEngine {
 }
 
 impl ComputeEngine {
+    /// The kernel that adds the split-K partial sums of `len` outputs, with
+    /// the grid to run it on.
+    fn split_reduce_launch(&self, len: u32) -> (&Kernel, (u32, u32, u32)) {
+        let (wide, groups) = split_reduce_plan(len);
+        let kernel = if wide {
+            &self.split_reduce4
+        } else {
+            &self.split_reduce
+        };
+        (kernel, groups)
+    }
+
     /// Compiles every kernel for `ctx`'s device, reading its parameters from
     /// immediates when [`WgpuContext::uses_immediates`] says so.
     pub fn new(ctx: &WgpuContext) -> Self {
@@ -510,6 +535,7 @@ impl ComputeEngine {
             flash_attn_v2_bw_dkdv: k("flash_bwd_dk_dv"),
             flash_group_sum: k("flash_group_sum"),
             split_reduce: k("matmul_split_reduce"),
+            split_reduce4: k("matmul_split_reduce4"),
             small_m: Mutex::new(HashMap::new()),
             small_m_max_bytes: limits.max_compute_workgroup_storage_size,
             small_m_max_threads: limits
@@ -804,5 +830,171 @@ mod shader_tests {
             "var<immediate> ft_immediate_size: array<vec4<u32>, 5>;\n\
              var<immediate> mv_params: vec4<u32>; // K, N\nfn f() {}\n"
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod split_reduce_tests {
+    use super::{grid, split_reduce_plan, uniform, ComputeEngine};
+    use crate::{UnifiedTensor, WgpuContext};
+
+    #[test]
+    fn the_plan_picks_vec4_for_a_multiple_of_four_only() {
+        assert_eq!(split_reduce_plan(0), (false, (0, 1, 1)));
+        assert_eq!(split_reduce_plan(3), (false, (1, 1, 1)));
+        assert_eq!(split_reduce_plan(4), (true, (1, 1, 1)));
+        // 1024 outputs are 256 threads, one workgroup; 1028 need a second.
+        assert_eq!(split_reduce_plan(1024), (true, (1, 1, 1)));
+        assert_eq!(split_reduce_plan(1028), (true, (2, 1, 1)));
+        assert_eq!(split_reduce_plan(1027), (false, (5, 1, 1)));
+        // SmolLM2 135M gate output at 1024 rows: 1024 x 1536 outputs.
+        assert_eq!(split_reduce_plan(1024 * 1536), (true, (1536, 1, 1)));
+        // The widest grid in x holds 65535 * 256 threads, 4 outputs each;
+        // one more thread spills into y.
+        let full = 4 * 256 * 65_535;
+        assert_eq!(split_reduce_plan(full), (true, (65_535, 1, 1)));
+        assert_eq!(split_reduce_plan(full + 4), (true, (65_535, 2, 1)));
+        assert_eq!(split_reduce_plan(full + 1), (false, (65_535, 2, 1)));
+    }
+
+    /// Deterministic pseudo-random values in [-1, 1).
+    fn rand_vec(n: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (0..n)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((s >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    /// Runs the scalar reduce and the one the engine picks for `len` on the
+    /// same partials and the same initial `out`, and returns both outputs
+    /// with the name of the kernel the engine picked.
+    fn run_both(
+        ctx: &WgpuContext,
+        engine: &ComputeEngine,
+        parts: &[f32],
+        out: &[f32],
+        split: u32,
+        (alpha, beta): (f32, f32),
+    ) -> (Vec<f32>, Vec<f32>, &'static str) {
+        let len = out.len() as u32;
+        let parts_buf = UnifiedTensor::new(ctx, parts, &[split as usize, out.len()]);
+        let scalar = UnifiedTensor::new(ctx, out, &[out.len()]);
+        let picked = UnifiedTensor::new(ctx, out, &[out.len()]);
+        let params = uniform(
+            ctx,
+            bytemuck::cast_slice(&[len, split, alpha.to_bits(), beta.to_bits()]),
+        );
+        let (kernel, groups) = engine.split_reduce_launch(len);
+        engine.run(
+            ctx,
+            &engine.split_reduce,
+            &[(0, parts_buf.buffer()), (1, scalar.buffer()), (2, &params)],
+            grid(len.div_ceil(256)),
+        );
+        engine.run(
+            ctx,
+            kernel,
+            &[(0, parts_buf.buffer()), (1, picked.buffer()), (2, &params)],
+            groups,
+        );
+        let a = pollster::block_on(scalar.to_vec(ctx)).unwrap();
+        let b = pollster::block_on(picked.to_vec(ctx)).unwrap();
+        (a, b, kernel.entry_point)
+    }
+
+    /// The vec4 reduce gives every output the bits the scalar reduce gives
+    /// it, and both match an f64 sum within the rounding of the f32 adds.
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn the_vec4_reduce_is_bit_equal_to_the_scalar_reduce() {
+        let ctx = pollster::block_on(WgpuContext::new());
+        let engine = ComputeEngine::new(&ctx);
+        // (M, N, slices): SmolLM2 135M, 360M and 1.7B widths at 1024 and 64
+        // rows, then shapes whose M * N is not a multiple of 4 (scalar
+        // fallback), N not a multiple of 4 with M * N one, and tiny ones.
+        let shapes: [(usize, usize, u32); 14] = [
+            (1024, 576, 4),
+            (128, 960, 3),
+            (1024, 960, 2),
+            (64, 2048, 8),
+            (1024, 2048, 5),
+            (256, 1536, 4),
+            (17, 576, 3),
+            (4, 7, 2),
+            (6, 10, 3),
+            (3, 5, 2),
+            (5, 9, 4),
+            (1, 3, 2),
+            (1, 4, 2),
+            (1030, 577, 3),
+        ];
+        let scales = [(1.0f32, 0.0f32), (0.625, 0.0), (1.0, 1.0), (1.5, -0.375)];
+        for (case, &(m, n, split)) in shapes.iter().enumerate() {
+            let len = m * n;
+            let parts = rand_vec(split as usize * len, 11 + case as u64);
+            let out = rand_vec(len, 101 + case as u64);
+            for &(alpha, beta) in &scales {
+                let (a, b, entry) = run_both(&ctx, &engine, &parts, &out, split, (alpha, beta));
+                let want_entry = if len.is_multiple_of(4) {
+                    "matmul_split_reduce4"
+                } else {
+                    "matmul_split_reduce"
+                };
+                assert_eq!(entry, want_entry, "{m}x{n}");
+                let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                assert_eq!(
+                    bits(&a),
+                    bits(&b),
+                    "{m}x{n} S={split} alpha={alpha} beta={beta}"
+                );
+                for (i, &got) in b.iter().enumerate() {
+                    let slices = (0..split as usize).map(|s| f64::from(parts[s * len + i]));
+                    let sum: f64 = slices.clone().sum();
+                    let mag: f64 = slices.map(f64::abs).sum();
+                    let beta_term = if beta == 0.0 {
+                        0.0
+                    } else {
+                        f64::from(beta) * f64::from(out[i])
+                    };
+                    let want = f64::from(alpha) * sum + beta_term;
+                    // Each f32 add errs by at most 2^-24 of the running sum.
+                    let tol = (f64::from(split) + 2.0)
+                        * 1.2e-7
+                        * (f64::from(alpha.abs()) * mag + beta_term.abs());
+                    let got = f64::from(got);
+                    assert!(
+                        (got - want).abs() <= tol,
+                        "{m}x{n} S={split} i={i}: got {got}, want {want}, tol {tol}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Integer partials add exactly, so the outputs are known by hand.
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn the_vec4_reduce_sums_small_integers_exactly() {
+        let ctx = pollster::block_on(WgpuContext::new());
+        let engine = ComputeEngine::new(&ctx);
+        // 4 x 7 outputs, 3 slices: partial s of output i is i + 100 * s.
+        let parts: Vec<f32> = (0..3)
+            .flat_map(|s| (0..28).map(move |i| (i + 100 * s) as f32))
+            .collect();
+        let out = vec![10.0f32; 28];
+        let (a, b, entry) = run_both(&ctx, &engine, &parts, &out, 3, (2.0, 0.5));
+        assert_eq!(entry, "matmul_split_reduce4");
+        // 2 * (3 * i + 300) + 0.5 * 10
+        let want: Vec<f32> = (0..28).map(|i| (6 * i + 605) as f32).collect();
+        assert_eq!(a, want);
+        assert_eq!(b, want);
     }
 }

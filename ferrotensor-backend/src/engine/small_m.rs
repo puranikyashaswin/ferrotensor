@@ -1,7 +1,7 @@
 //! The small-M matmul: a weight-stationary, split-K kernel for products with
 //! few rows against a wide and deep weight (see matmul_small_m.wgsl).
 
-use super::{grid, immediate_params, uniform, ComputeEngine, Epilogue, Kernel};
+use super::{immediate_params, uniform, ComputeEngine, Epilogue, Kernel};
 use crate::kernel_timing::KernelLabel;
 use crate::{DType, UnifiedTensor, WgpuContext};
 use std::sync::{Arc, PoisonError};
@@ -521,11 +521,12 @@ impl ComputeEngine {
                 ctx,
                 bytemuck::cast_slice(&[len, split, ep.alpha.to_bits(), ep.beta.to_bits()]),
             );
+            let (reduce, groups) = self.split_reduce_launch(len);
             self.run(
                 ctx,
-                &self.split_reduce,
+                reduce,
                 &[(0, parts.buffer()), (1, out.buffer()), (2, &params)],
-                grid(len.div_ceil(256)),
+                groups,
             );
         }
         SmallMLaunch { tile, split }

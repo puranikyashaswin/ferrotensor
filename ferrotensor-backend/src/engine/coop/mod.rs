@@ -27,7 +27,7 @@
 //! candidates where they run, when `FERROTENSOR_AUTOTUNE=1`. This file holds
 //! the kernel template, the cache of compiled kernels and the engine methods.
 
-use super::{grid, immediate_params, uniform, ComputeEngine, Epilogue, Kernel};
+use super::{immediate_params, uniform, ComputeEngine, Epilogue, Kernel};
 use crate::kernel_timing::KernelLabel;
 use crate::shader_checks::ShaderChecks;
 use crate::{DType, ReadbackError, UnifiedTensor, WgpuContext};
@@ -526,17 +526,18 @@ impl ComputeEngine {
                 ctx,
                 bytemuck::cast_slice(&[len, split, ep.alpha.to_bits(), ep.beta.to_bits()]),
             );
-            let reduce = KernelLabel {
-                entry: self.split_reduce.entry_point,
+            let (reduce, groups) = self.split_reduce_launch(len);
+            let label = KernelLabel {
+                entry: reduce.entry_point,
                 layout: "",
                 size_class: "",
             };
             self.run_tagged(
                 ctx,
-                &self.split_reduce,
                 reduce,
+                label,
                 &[(0, parts.buffer()), (1, out.buffer()), (2, &params)],
-                grid(len.div_ceil(256)),
+                groups,
                 tune,
             );
         }
