@@ -35,7 +35,7 @@
 //!
 //! `--tiles` runs the same products on the cooperative kernel with every
 //! tile of `CoopTile::ALL` and `CoopTile::PIPELINED` forced (see
-//! `tiles_main`).
+//! `tiles_main`). `--op NAME` keeps the products whose name contains NAME.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -51,6 +51,7 @@ struct Options {
     fused: bool,
     tiles: bool,
     model: Option<String>,
+    op: Option<String>,
     rows: Vec<usize>,
     calls: usize,
     reps: usize,
@@ -63,6 +64,7 @@ fn options() -> Options {
         fused: false,
         tiles: false,
         model: None,
+        op: None,
         rows: vec![32, 48, 64, 80, 96, 128, 1024],
         calls: 20,
         reps: 5,
@@ -75,6 +77,7 @@ fn options() -> Options {
             "--fused" => o.fused = true,
             "--tiles" => o.tiles = true,
             "--model" => o.model = Some(args.next().expect("--model takes a size")),
+            "--op" => o.op = Some(args.next().expect("--op takes a product name")),
             "--rows" => {
                 o.rows = args
                     .next()
@@ -865,6 +868,9 @@ fn tiles_main(o: &Options) {
     let wall = rig(KernelTiming::Off);
     eprintln!("adapter: {}", wall.ctx.adapter_info());
     for c in cases(o.model.as_deref()) {
+        if o.op.as_deref().is_some_and(|f| !c.name.contains(f)) {
+            continue;
+        }
         let variant = match c.op {
             Op::Plain { .. } => Variant::Coop,
             _ => Variant::Fused,
