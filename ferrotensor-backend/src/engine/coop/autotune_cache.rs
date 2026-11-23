@@ -16,8 +16,10 @@ use std::path::{Path, PathBuf};
 pub(super) const CACHE_ENV: &str = "FERROTENSOR_AUTOTUNE_CACHE";
 
 /// Version of the entry format and of the keys' row buckets; a change makes
-/// older files unusable.
-const SCHEMA: u32 = 2;
+/// older files unusable. Schema 3 keeps the winner's median ratio to the static
+/// pick times the static pick's median time; schema 2 scaled each timing by the
+/// rows of its step.
+const SCHEMA: u32 = 3;
 
 /// The configuration a key settled on and its median time.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -269,7 +271,7 @@ mod tests {
             h.starts_with("adapter=NVIDIA A10G;vendor=4318;device=8759;driver=NVIDIA 535.104.05;")
         );
         assert!(h.ends_with(&format!(
-            ";backend=Vulkan;ferrotensor={};schema=2",
+            ";backend=Vulkan;ferrotensor={};schema=3",
             env!("CARGO_PKG_VERSION")
         )));
         let messy = header_text(("a;b\nc", 1, 2), ("d\te", "f\r"), "g;h");
@@ -310,7 +312,7 @@ mod tests {
                 ("NVIDIA", "535.104.05"),
                 "Dx12",
             ),
-            header().replace("schema=2", "schema=3"),
+            header().replace("schema=3", "schema=4"),
             header().replace(env!("CARGO_PKG_VERSION"), "0.0.1"),
         ] {
             let err = parse(&text, &other).expect_err("a different header");
