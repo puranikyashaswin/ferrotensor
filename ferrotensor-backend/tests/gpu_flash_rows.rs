@@ -495,3 +495,157 @@ fn flash_rope_on_the_scalar_kernels_rotates_copies() {
         g.engine.set_flash_coop(true);
     }
 }
+
+/// Calls for the packed backward: MHA as at 1.7B (32/32), GQA as at 135M
+/// (9/3) and 360M (15/5), with lengths that leave a partial tile and two
+/// batches, so a wrong row stride lands in the next batch.
+const PACKED_CASES: &[(Case, f32, u32)] = &[
+    (case(2, (100, 100), (32, 32), true), 10_000.0, 0),
+    (case(1, (255, 255), (9, 3), true), 100_000.0, 5),
+    (case(2, (130, 130), (15, 5), true), 100_000.0, 37),
+    (case(1, (96, 96), (3, 3), true), 10_000.0, 0),
+];
+
+/// The gradients written side by side into one buffer equal, bit for bit,
+/// the three-buffer call and match the CPU reference. Columns past the three
+/// blocks keep their value.
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn packed_attention_backward_matches_the_three_buffer_call_and_the_cpu() {
+    let Some(g) = flash_gpu("packed_attention_backward_matches_the_three_buffer_call_and_the_cpu")
+    else {
+        return;
+    };
+    const CANARY: f32 = 12345.0;
+    for rows in [32, 64] {
+        g.engine.set_flash_rows(rows);
+        for (n, (c, theta, pos)) in PACKED_CASES.iter().enumerate() {
+            let name = format!("{} theta={theta} pos={pos} rows={rows}", c.name());
+            let [q, k, v, dout] = c.inputs(1300 + 4 * n as u64);
+            let (b, s, h, hkv) = (c.b, c.sq, c.h, c.hkv);
+            let rope = (*theta, *pos);
+            let (tq, tk, tv, tdo) = (
+                upload(g, &q, &[b, s, h, HEAD]),
+                upload(g, &k, &[b, s, hkv, HEAD]),
+                upload(g, &v, &[b, s, hkv, HEAD]),
+                upload(g, &dout, &[b, s, h, HEAD]),
+            );
+            let opts = c.options();
+            assert!(
+                g.engine.flash_attention_packs_backward(&tq, &tk, &opts),
+                "{name}: packs"
+            );
+            let out = zeros(g, &[b, s, h, HEAD]);
+            let stats = zeros(g, &[b, h, s, 2]);
+            g.engine.flash_attention_v2_rope_with_stats(
+                &g.ctx,
+                &tq,
+                &tk,
+                &tv,
+                &out,
+                Some(&stats),
+                &opts,
+                rope,
+            );
+            let (gq, gk, gv) = (
+                zeros(g, &[b, s, h, HEAD]),
+                zeros(g, &[b, s, hkv, HEAD]),
+                zeros(g, &[b, s, hkv, HEAD]),
+            );
+            g.engine.flash_attention_v2_rope_backward_with_stats(
+                &g.ctx,
+                &tq,
+                &tk,
+                &tv,
+                &out,
+                &tdo,
+                [&gq, &gk, &gv],
+                &stats,
+                &opts,
+                rope,
+            );
+
+            let (q_dim, kv_dim) = (h * HEAD, hkv * HEAD);
+            let used = q_dim + 2 * kv_dim;
+            // Extra columns after the blocks (the LoRA dU part of the real buffer).
+            let ld = used + 3 * 8;
+            let rows_total = b * s;
+            let packed = upload(g, &vec![CANARY; rows_total * ld], &[rows_total, ld]);
+            let done = g.engine.flash_attention_v2_rope_backward_packed(
+                &g.ctx,
+                [&tq, &tk, &tv],
+                [&out, &tdo],
+                &packed,
+                &stats,
+                &opts,
+                rope,
+            );
+            assert!(done, "{name}: packed call ran");
+            let got = read(g, &packed);
+            for (label, col0, width, want) in [
+                ("dq", 0, q_dim, read(g, &gq)),
+                ("dk", q_dim, kv_dim, read(g, &gk)),
+                ("dv", q_dim + kv_dim, kv_dim, read(g, &gv)),
+            ] {
+                for r in 0..rows_total {
+                    let have = &got[r * ld + col0..r * ld + col0 + width];
+                    let same = &want[r * width..(r + 1) * width];
+                    for (i, (a, e)) in have.iter().zip(same).enumerate() {
+                        assert_eq!(
+                            a.to_bits(),
+                            e.to_bits(),
+                            "{label} {name}: row {r} col {i}: packed {a}, separate {e}"
+                        );
+                    }
+                }
+            }
+            for r in 0..rows_total {
+                assert!(
+                    got[r * ld + used..(r + 1) * ld]
+                        .iter()
+                        .all(|&x| x == CANARY),
+                    "{name}: row {r}: columns past the gradients were written"
+                );
+            }
+
+            // And against the CPU reference that rotates first.
+            let q_rot = f16_round(&rope_host(&q, (b, s, h), rope, false));
+            let k_rot = f16_round(&rope_host(&k, (b, s, hkv), rope, false));
+            let (_, probs) = cpu_attention(&q_rot, &k_rot, &v, None, c.dims(), c.visible());
+            let (dq_rot, dk_rot, want_dv) =
+                cpu_attention_backward(&q_rot, &k_rot, &v, &dout, &probs, c.dims());
+            let want_dq = rope_host(&dq_rot, (b, s, h), rope, true);
+            let want_dk = rope_host(&dk_rot, (b, s, hkv), rope, true);
+            for (label, col0, width, want) in [
+                ("dq", 0, q_dim, want_dq),
+                ("dk", q_dim, kv_dim, want_dk),
+                ("dv", q_dim + kv_dim, kv_dim, want_dv),
+            ] {
+                let have: Vec<f32> = (0..rows_total)
+                    .flat_map(|r| got[r * ld + col0..r * ld + col0 + width].iter().copied())
+                    .collect();
+                let atol = 0.01 * max_abs(&want);
+                assert_near(&format!("cpu {label} {name}"), &have, &want, (atol, 2e-2));
+            }
+        }
+    }
+    g.engine.set_flash_rows(0);
+}
+
+/// With the packed layout switched off the call does nothing and says so.
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn packed_attention_backward_refuses_when_switched_off() {
+    let Some(g) = flash_gpu("packed_attention_backward_refuses_when_switched_off") else {
+        return;
+    };
+    let (c, _, _) = PACKED_CASES[1];
+    let (b, s, h, hkv) = (c.b, c.sq, c.h, c.hkv);
+    let (tq, tk) = (zeros(g, &[b, s, h, HEAD]), zeros(g, &[b, s, hkv, HEAD]));
+    let opts = c.options();
+    assert!(g.engine.flash_attention_packs_backward(&tq, &tk, &opts));
+    g.engine.set_qkv_packed(false);
+    let off = g.engine.flash_attention_packs_backward(&tq, &tk, &opts);
+    g.engine.set_qkv_packed(true);
+    assert!(!off, "FERROTENSOR_QKV_PACKED=0 turns the packed layout off");
+}

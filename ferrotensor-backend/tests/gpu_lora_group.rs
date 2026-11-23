@@ -9,8 +9,8 @@
 #![allow(clippy::unwrap_used)]
 
 use ferrotensor_backend::{
-    AdamParams, ComputeEngine, LoraGrad, LoraMirror, LoraProj, UnifiedTensor, WgpuContext,
-    LORA_GROUP_MAX_RANK,
+    AdamParams, ComputeEngine, LoraGrad, LoraMirror, LoraPackedGrad, LoraPackedProj, LoraProj,
+    UnifiedTensor, WgpuContext, LORA_GROUP_MAX_RANK,
 };
 use std::sync::OnceLock;
 
@@ -689,4 +689,210 @@ fn mirror_rejects_layouts_it_cannot_copy_whole_words_for() {
         .engine
         .lora_mirror_f16(&g.ctx, &dst, &[at(0), at(8)])
         .is_ok());
+}
+
+/// The packed backward buffer `[dQ | dK | dV | dU | spare]`: rows, the three
+/// block widths, the rank, the spare columns at the end and the input width.
+struct PackedCase {
+    m: usize,
+    ns: [usize; 3],
+    rank: usize,
+    spare: usize,
+    k: usize,
+}
+
+const PACKED_CASES: &[PackedCase] = &[
+    // 135M and 360M at one and four sequences, rank 8.
+    PackedCase {
+        m: 256,
+        ns: [576, 192, 192],
+        rank: 8,
+        spare: 0,
+        k: 576,
+    },
+    PackedCase {
+        m: 1024,
+        ns: [960, 320, 320],
+        rank: 8,
+        spare: 0,
+        k: 960,
+    },
+    // Rank 16, odd widths and rows, spare columns after the dU block.
+    PackedCase {
+        m: 131,
+        ns: [65, 7, 130],
+        rank: 16,
+        spare: 5,
+        k: 33,
+    },
+];
+
+const CANARY: f32 = 4321.0;
+
+impl PackedCase {
+    fn q(&self) -> usize {
+        self.ns.iter().sum()
+    }
+
+    fn ld(&self) -> usize {
+        self.q() + 3 * self.rank + self.spare
+    }
+
+    /// The first column of the `dY` block of projection `p`.
+    fn col0(&self, p: usize) -> usize {
+        self.ns[..p].iter().sum()
+    }
+
+    /// A buffer with random `dY` blocks and `dU` columns and the spare
+    /// columns set to a canary.
+    fn buffer(&self, seed: u64) -> Vec<f32> {
+        let mut v = rand_vec(self.m * self.ld(), seed);
+        for r in 0..self.m {
+            for c in self.q() + 3 * self.rank..self.ld() {
+                v[r * self.ld() + c] = CANARY;
+            }
+        }
+        v
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn packed_du_matches_cpu_and_leaves_the_other_columns() {
+    let g = gpu();
+    for (seed, c) in PACKED_CASES.iter().enumerate() {
+        let (m, rank, ld) = (c.m, c.rank, c.ld());
+        let host = c.buffer(60 + seed as u64);
+        let packed = upload(&host, &[m, ld]);
+        let b_host: Vec<Vec<f32>> = (0..3)
+            .map(|p| {
+                rand_vec(rank * c.ns[p], 70 + p as u64)
+                    .iter()
+                    .map(|x| x * 0.1)
+                    .collect()
+            })
+            .collect();
+        let b: Vec<_> = (0..3)
+            .map(|p| upload(&b_host[p], &[rank, c.ns[p]]))
+            .collect();
+        let projs: Vec<_> = (0..3)
+            .map(|p| LoraPackedProj {
+                b: &b[p],
+                col0: c.col0(p),
+                scale: scale(p),
+            })
+            .collect();
+        g.engine
+            .lora_du_packed(&g.ctx, &packed, c.q(), &projs)
+            .unwrap();
+        // dY and the spare columns keep their values; dU is s * dY @ B^T.
+        let mut want = host.clone();
+        for p in 0..3 {
+            let n = c.ns[p];
+            for i in 0..m {
+                for j in 0..rank {
+                    let mut acc = 0.0f64;
+                    for col in 0..n {
+                        acc += f64::from(host[i * ld + c.col0(p) + col])
+                            * f64::from(b_host[p][j * n + col]);
+                    }
+                    want[i * ld + c.q() + p * rank + j] = (f64::from(scale(p)) * acc) as f32;
+                }
+            }
+        }
+        assert_close("packed du", &read(&packed), &want, 1e-4, 1e-4);
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn packed_grads_match_cpu_when_accumulating_and_storing() {
+    let g = gpu();
+    for (seed, c) in PACKED_CASES.iter().enumerate() {
+        let (m, rank, ld, k) = (c.m, c.rank, c.ld(), c.k);
+        let host = c.buffer(80 + seed as u64);
+        let x_host = rand_vec(m * k, 90 + seed as u64);
+        let u_host = rand_vec(m * 3 * rank, 95 + seed as u64);
+        for beta in [1.0f32, 0.0] {
+            let packed = upload(&host, &[m, ld]);
+            let x = upload(&x_host, &[m, k]);
+            let u = upload(&u_host, &[m, 3 * rank]);
+            let old_a: Vec<Vec<f32>> = (0..3)
+                .map(|p| {
+                    if beta == 0.0 {
+                        vec![f32::NAN; k * rank]
+                    } else {
+                        rand_vec(k * rank, 900 + p as u64)
+                    }
+                })
+                .collect();
+            let old_b: Vec<Vec<f32>> = (0..3)
+                .map(|p| {
+                    if beta == 0.0 {
+                        vec![f32::NAN; rank * c.ns[p]]
+                    } else {
+                        rand_vec(rank * c.ns[p], 950 + p as u64)
+                    }
+                })
+                .collect();
+            let ga: Vec<_> = old_a.iter().map(|v| upload(v, &[k, rank])).collect();
+            let gb: Vec<_> = (0..3)
+                .map(|p| upload(&old_b[p], &[rank, c.ns[p]]))
+                .collect();
+            let projs: Vec<_> = (0..3)
+                .map(|p| LoraPackedGrad {
+                    col0: c.col0(p),
+                    grad_a: &ga[p],
+                    grad_b: &gb[p],
+                    scale: scale(p),
+                })
+                .collect();
+            g.engine
+                .lora_grads_packed(&g.ctx, [&x, &u, &packed], c.q(), &projs, beta)
+                .unwrap();
+            assert_eq!(read(&packed), host, "the packed buffer is only read");
+            let old = |v: &[f32], i: usize| if beta == 0.0 { 0.0 } else { beta * v[i] };
+            for p in 0..3 {
+                let n = c.ns[p];
+                let mut want_a = vec![0.0f32; k * rank];
+                for col in 0..k {
+                    for j in 0..rank {
+                        let mut acc = 0.0f64;
+                        for i in 0..m {
+                            acc += f64::from(x_host[i * k + col])
+                                * f64::from(host[i * ld + c.q() + p * rank + j]);
+                        }
+                        want_a[col * rank + j] = acc as f32 + old(&old_a[p], col * rank + j);
+                    }
+                }
+                let mut want_b = vec![0.0f32; rank * n];
+                for j in 0..rank {
+                    for col in 0..n {
+                        let mut acc = 0.0f64;
+                        for i in 0..m {
+                            acc += f64::from(u_host[i * 3 * rank + p * rank + j])
+                                * f64::from(host[i * ld + c.col0(p) + col]);
+                        }
+                        want_b[j * n + col] =
+                            (f64::from(scale(p)) * acc) as f32 + old(&old_b[p], j * n + col);
+                    }
+                }
+                let name = format!("m {} rank {rank} beta {beta} projection {p}", c.m);
+                assert_close(
+                    &format!("grad_A {name}"),
+                    &read(&ga[p]),
+                    &want_a,
+                    1e-3,
+                    1e-4,
+                );
+                assert_close(
+                    &format!("grad_B {name}"),
+                    &read(&gb[p]),
+                    &want_b,
+                    1e-3,
+                    1e-4,
+                );
+            }
+        }
+    }
 }

@@ -26,7 +26,8 @@
 use super::{AutogradNode, Tensor, GRAD_ENABLED};
 use ferrotensor_backend::{
     AttentionOptions, ComputeEngine, DType, FusedA, FusedOut, FusedSpec, LoraGrad, LoraMirror,
-    LoraProj, UnifiedTensor, WgpuContext, LORA_GROUP_MAX, LORA_GROUP_MAX_RANK,
+    LoraPackedGrad, LoraPackedProj, LoraProj, UnifiedTensor, WgpuContext, LORA_GROUP_MAX,
+    LORA_GROUP_MAX_RANK,
 };
 use std::cell::Cell;
 use std::sync::Arc;
@@ -59,6 +60,27 @@ fn half_bytes(halves: &[u16]) -> Vec<u8> {
     let mut bytes: Vec<u8> = halves.iter().flat_map(|h| h.to_le_bytes()).collect();
     bytes.resize(bytes.len().next_multiple_of(4).max(4), 0);
     bytes
+}
+
+/// The gradients of a group's outputs.
+#[derive(Clone, Copy)]
+enum Dys<'a> {
+    /// One `[m, width]` buffer per projection.
+    Split(&'a [&'a UnifiedTensor]),
+    /// One f32 `[m, row]` buffer with the gradients side by side in the
+    /// columns of the group's weight and, with LoRA, room after them for the
+    /// `dU` block: the layout of the weight's columns, so that the gradient
+    /// of the input is one product of the buffer with the weight.
+    Packed(&'a UnifiedTensor),
+}
+
+impl Dys<'_> {
+    fn rows(&self) -> usize {
+        match self {
+            Self::Split(dys) => dys[0].shape[0],
+            Self::Packed(packed) => packed.shape[0],
+        }
+    }
 }
 
 /// The LoRA adapters of a group of fused projections.
@@ -181,6 +203,12 @@ impl FusedProjections {
     /// The common input size.
     pub fn input_size(&self) -> usize {
         self.weight.shape[0]
+    }
+
+    /// The columns of the concatenated weight: the length of a row of the
+    /// gradients that the backward pass packs for one product with it.
+    fn packed_width(&self) -> usize {
+        self.weight.shape[1]
     }
 
     /// The output widths of the projections.
@@ -345,47 +373,81 @@ impl FusedProjections {
         ctx: &WgpuContext,
         x: &UnifiedTensor,
         u: Option<&UnifiedTensor>,
-        dys: &[&UnifiedTensor],
+        dys: Dys<'_>,
         targets: Option<(&[UnifiedTensor], f32)>,
         x_grad: Option<&Tensor>,
     ) {
         let m = x.shape[0];
         let mut du = None;
         if let (Some(l), Some(u)) = (&self.lora, u) {
-            let d = UnifiedTensor::empty(ctx, &[m, l.rank * l.a.len()]);
-            let projs: Vec<LoraProj<'_>> =
-                l.b.iter()
-                    .zip(dys)
-                    .zip(&l.scales)
-                    .map(|((b, &act), &scale)| LoraProj {
-                        b: &b.data,
-                        act,
-                        scale,
-                    })
-                    .collect();
-            must(engine.lora_du_grouped(ctx, &d, &projs));
-            if let Some((grads, beta)) = targets {
-                let count = l.a.len();
-                let projs: Vec<LoraGrad<'_>> = (0..count)
-                    .map(|g| LoraGrad {
-                        dy: dys[g],
-                        grad_a: &grads[g],
-                        grad_b: &grads[count + g],
-                        scale: l.scales[g],
-                    })
-                    .collect();
-                must(engine.lora_grads_grouped(ctx, [x, u, &d], &projs, beta));
+            let count = l.a.len();
+            match dys {
+                Dys::Split(dys) => {
+                    let d = UnifiedTensor::empty(ctx, &[m, l.rank * count]);
+                    let projs: Vec<LoraProj<'_>> =
+                        l.b.iter()
+                            .zip(dys)
+                            .zip(&l.scales)
+                            .map(|((b, &act), &scale)| LoraProj {
+                                b: &b.data,
+                                act,
+                                scale,
+                            })
+                            .collect();
+                    must(engine.lora_du_grouped(ctx, &d, &projs));
+                    if let Some((grads, beta)) = targets {
+                        let projs: Vec<LoraGrad<'_>> = (0..count)
+                            .map(|g| LoraGrad {
+                                dy: dys[g],
+                                grad_a: &grads[g],
+                                grad_b: &grads[count + g],
+                                scale: l.scales[g],
+                            })
+                            .collect();
+                        must(engine.lora_grads_grouped(ctx, [x, u, &d], &projs, beta));
+                    }
+                    du = Some(d);
+                }
+                Dys::Packed(packed) => {
+                    let base: usize = self.widths.iter().sum();
+                    let col0 = |g: usize| self.widths[..g].iter().sum::<usize>();
+                    let projs: Vec<LoraPackedProj<'_>> = (0..count)
+                        .map(|g| LoraPackedProj {
+                            b: &l.b[g].data,
+                            col0: col0(g),
+                            scale: l.scales[g],
+                        })
+                        .collect();
+                    must(engine.lora_du_packed(ctx, packed, base, &projs));
+                    if let Some((grads, beta)) = targets {
+                        let projs: Vec<LoraPackedGrad<'_>> = (0..count)
+                            .map(|g| LoraPackedGrad {
+                                col0: col0(g),
+                                grad_a: &grads[g],
+                                grad_b: &grads[count + g],
+                                scale: l.scales[g],
+                            })
+                            .collect();
+                        must(engine.lora_grads_packed(ctx, [x, u, packed], base, &projs, beta));
+                    }
+                }
             }
-            du = Some(d);
         }
         if let Some(x_tensor) = x_grad {
-            let mut sources: Vec<&UnifiedTensor> = dys.to_vec();
-            sources.extend(du.as_ref());
+            let mut sources: Vec<&UnifiedTensor> = Vec::new();
+            let a = match dys {
+                Dys::Split(dys) => {
+                    sources.extend(dys);
+                    sources.extend(du.as_ref());
+                    FusedA::Sources(&sources)
+                }
+                Dys::Packed(packed) => FusedA::Plain(packed),
+            };
             x_tensor.accumulate_grad_with(engine, |out, epilogue| {
                 must(engine.matmul_fused_into(
                     ctx,
                     &FusedSpec {
-                        a: FusedA::Sources(&sources),
+                        a,
                         b: &self.weight,
                         transposed_b: true,
                         out: FusedOut::AlphaBeta { out, epilogue },
@@ -413,9 +475,9 @@ impl FusedProjections {
         ctx: &WgpuContext,
         x: &Tensor,
         u: Option<&UnifiedTensor>,
-        dys: &[&UnifiedTensor],
+        dys: Dys<'_>,
     ) {
-        let x2 = x.data.reshaped(&[dys[0].shape[0], self.input_size()]);
+        let x2 = x.data.reshaped(&[dys.rows(), self.input_size()]);
         let params = self.adapter_tensors();
         let size = |t: &UnifiedTensor| t.shape.iter().product::<usize>();
         let in_place = !params.is_empty()
@@ -459,9 +521,9 @@ impl FusedProjections {
         ctx: &WgpuContext,
         x: &Tensor,
         u: Option<&UnifiedTensor>,
-        dys: &[&UnifiedTensor],
+        dys: Dys<'_>,
     ) -> (UnifiedTensor, Vec<UnifiedTensor>) {
-        let x2 = x.data.reshaped(&[dys[0].shape[0], self.input_size()]);
+        let x2 = x.data.reshaped(&[dys.rows(), self.input_size()]);
         let params = self.adapter_tensors();
         let targets: Vec<UnifiedTensor> = params
             .iter()
@@ -536,15 +598,38 @@ impl FusedAttentionNode {
         t.reshaped(&[self.shape[0], self.shape[1], heads, self.geom.head_dim])
     }
 
-    /// The gradients of q, k and v before RoPE, as `[m, width]` matrices.
-    fn flash_backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> [UnifiedTensor; 3] {
+    /// The gradients of q, k and v before RoPE: side by side in one buffer
+    /// when the kernels can write them so, else as `[m, width]` matrices.
+    fn flash_backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> AttentionGrads {
         let ctx = &self.x.ctx;
         let m = self.shape[0] * self.shape[1];
         let (qw, kw) = (self.q.shape[1], self.k.shape[1]);
+        let (heads, kv) = (self.geom.n_heads, self.geom.n_kv_heads);
+        let options = self.geom.options();
+        let (q4, k4, v4) = (
+            self.view4(&self.q, heads),
+            self.view4(&self.k, kv),
+            self.view4(&self.v, kv),
+        );
+        let (out4, grad4) = (self.view4(&self.out, heads), self.view4(grad, heads));
+        let rope = (self.geom.theta, self.geom.pos);
+        if engine.flash_attention_packs_backward(&q4, &k4, &options) {
+            let packed = UnifiedTensor::empty(ctx, &[m, self.proj.packed_width()]);
+            if engine.flash_attention_v2_rope_backward_packed(
+                ctx,
+                [&q4, &k4, &v4],
+                [&out4, &grad4],
+                &packed,
+                &self.stats,
+                &options,
+                rope,
+            ) {
+                return AttentionGrads::Packed(packed);
+            }
+        }
         let dq = UnifiedTensor::empty(ctx, &[m, qw]);
         let dk = UnifiedTensor::empty(ctx, &[m, kw]);
         let dv = UnifiedTensor::empty(ctx, &[m, kw]);
-        let (heads, kv) = (self.geom.n_heads, self.geom.n_kv_heads);
         let views = [
             self.view4(&dq, heads),
             self.view4(&dk, kv),
@@ -552,17 +637,34 @@ impl FusedAttentionNode {
         ];
         engine.flash_attention_v2_rope_backward_with_stats(
             ctx,
-            &self.view4(&self.q, heads),
-            &self.view4(&self.k, kv),
-            &self.view4(&self.v, kv),
-            &self.view4(&self.out, heads),
-            &self.view4(grad, heads),
+            &q4,
+            &k4,
+            &v4,
+            &out4,
+            &grad4,
             [&views[0], &views[1], &views[2]],
             &self.stats,
-            &self.geom.options(),
-            (self.geom.theta, self.geom.pos),
+            &options,
+            rope,
         );
-        [dq, dk, dv]
+        AttentionGrads::Split([dq, dk, dv])
+    }
+}
+
+/// What [`FusedAttentionNode::flash_backward`] produced.
+enum AttentionGrads {
+    Split([UnifiedTensor; 3]),
+    Packed(UnifiedTensor),
+}
+
+impl AttentionGrads {
+    /// Calls `f` with the gradients as the backward pass of the projections
+    /// takes them.
+    fn with<R>(&self, f: impl FnOnce(Dys<'_>) -> R) -> R {
+        match self {
+            Self::Split([dq, dk, dv]) => f(Dys::Split(&[dq, dk, dv])),
+            Self::Packed(packed) => f(Dys::Packed(packed)),
+        }
     }
 }
 
@@ -575,10 +677,10 @@ impl AutogradNode for FusedAttentionNode {
 
     fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
         let ctx = &self.x.ctx;
-        let [dq, dk, dv] = self.flash_backward(grad, engine);
-        let (grad_x, adapter) =
+        let (grad_x, adapter) = self.flash_backward(grad, engine).with(|dys| {
             self.proj
-                .backward_fresh(engine, ctx, &self.x, self.u.as_ref(), &[&dq, &dk, &dv]);
+                .backward_fresh(engine, ctx, &self.x, self.u.as_ref(), dys)
+        });
         let mut grads = vec![grad_x];
         grads.extend(adapter);
         grads
@@ -586,9 +688,10 @@ impl AutogradNode for FusedAttentionNode {
 
     fn backward_accumulate(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> bool {
         let ctx = &self.x.ctx;
-        let [dq, dk, dv] = self.flash_backward(grad, engine);
-        self.proj
-            .backward_into_slots(engine, ctx, &self.x, self.u.as_ref(), &[&dq, &dk, &dv]);
+        self.flash_backward(grad, engine).with(|dys| {
+            self.proj
+                .backward_into_slots(engine, ctx, &self.x, self.u.as_ref(), dys);
+        });
         true
     }
 }
@@ -627,9 +730,13 @@ impl AutogradNode for FusedGateUpNode {
     fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
         let ctx = &self.x.ctx;
         let (d_gate, d_up) = self.silu_backward(grad, engine);
-        let (grad_x, adapter) =
-            self.proj
-                .backward_fresh(engine, ctx, &self.x, self.u.as_ref(), &[&d_gate, &d_up]);
+        let (grad_x, adapter) = self.proj.backward_fresh(
+            engine,
+            ctx,
+            &self.x,
+            self.u.as_ref(),
+            Dys::Split(&[&d_gate, &d_up]),
+        );
         let mut grads = vec![grad_x];
         grads.extend(adapter);
         grads
@@ -638,8 +745,13 @@ impl AutogradNode for FusedGateUpNode {
     fn backward_accumulate(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> bool {
         let ctx = &self.x.ctx;
         let (d_gate, d_up) = self.silu_backward(grad, engine);
-        self.proj
-            .backward_into_slots(engine, ctx, &self.x, self.u.as_ref(), &[&d_gate, &d_up]);
+        self.proj.backward_into_slots(
+            engine,
+            ctx,
+            &self.x,
+            self.u.as_ref(),
+            Dys::Split(&[&d_gate, &d_up]),
+        );
         true
     }
 }

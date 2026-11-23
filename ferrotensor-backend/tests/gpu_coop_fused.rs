@@ -893,3 +893,82 @@ fn split_fused_product_adds_the_slices_then_runs_the_epilogue_once() {
         );
     }
 }
+
+/// The input gradient of the QKV projection with the gradients in one
+/// buffer (Plain loader) equals the product that reads the same columns as
+/// six bindings (Sources loader), at the K of 135M, 360M and 1.7B (Q, K and
+/// V columns, then three rank-8 dU blocks) and at the rows of a step. Small
+/// products are also checked against the CPU.
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn plain_over_the_packed_gradients_equals_sources_over_the_parts() {
+    let g = gpu();
+    // (q, kv, n): the widths of the three gradient blocks and the hidden size.
+    for (q, kv, n) in [
+        (576usize, 192usize, 576usize),
+        (960, 320, 960),
+        (2048, 2048, 2048),
+    ] {
+        let widths = [q, kv, kv, 8, 8, 8];
+        let k: usize = widths.iter().sum();
+        for mode in modes(
+            g,
+            "plain_over_the_packed_gradients_equals_sources_over_the_parts",
+        ) {
+            for m in [32usize, 256, 1024] {
+                let parts: Vec<Vec<f32>> = widths
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &w)| f16_round(&rand_vec(m * w, 50 + i as u64)))
+                    .collect();
+                let mut packed = vec![0.0f32; m * k];
+                let mut start = 0;
+                for (part, &w) in parts.iter().zip(&widths) {
+                    for r in 0..m {
+                        packed[r * k + start..r * k + start + w]
+                            .copy_from_slice(&part[r * w..(r + 1) * w]);
+                    }
+                    start += w;
+                }
+                let b = f16_round(&rand_vec(k * n, 7));
+                let b_t = weight(g, &b, k, n, true);
+                let packed_t = tensor(g, &packed, &[m, k]);
+                let tensors: Vec<UnifiedTensor> = parts
+                    .iter()
+                    .zip(&widths)
+                    .map(|(p, &w)| tensor(g, p, &[m, w]))
+                    .collect();
+                let sources: Vec<&UnifiedTensor> = tensors.iter().collect();
+                let run = |a: FusedA<'_>| {
+                    let out = garbage(g, &[m, n]);
+                    let spec = FusedSpec {
+                        a,
+                        b: &b_t,
+                        transposed_b: true,
+                        out: FusedOut::AlphaBeta {
+                            out: &out,
+                            epilogue: Epilogue {
+                                alpha: 1.0,
+                                beta: 0.0,
+                            },
+                        },
+                    };
+                    exec(g, mode, &spec);
+                    read(g, &out)
+                };
+                let plain = run(FusedA::Plain(&packed_t));
+                let split = run(FusedA::Sources(&sources));
+                let label = format!("{m}x{k}x{n} {mode:?}");
+                let want: Vec<f64> = if m * k * n <= 800_000_000 {
+                    cpu_matmul(&packed, &b, (m, k, n))
+                } else {
+                    split.iter().map(|&v| f64::from(v)).collect()
+                };
+                check(&format!("plain {label}"), &plain, &want, EXACT);
+                if m * k * n <= 800_000_000 {
+                    check(&format!("sources {label}"), &split, &want, EXACT);
+                }
+            }
+        }
+    }
+}

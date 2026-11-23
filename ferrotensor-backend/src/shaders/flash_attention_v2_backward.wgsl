@@ -52,6 +52,10 @@ struct FlashBwdParams {
     mask_stride_k: u32,
     window: u32,
     seed_hi: u32,
+    // Bit 0: the LSE is saved; bit 1: RoPE; bit 2 (set only for cooperative
+    // calls, which never have a mask): dK and dV are column blocks of one wider
+    // buffer, with its row length in mask_stride_b and their first columns in
+    // mask_stride_q and mask_stride_k, which only flash_group_sum reads then.
     lse_saved: u32,
     // 1: flash_bwd_dk_dv writes dK and dV as [batch, seq_k, num_kv_heads,
     // head_dim] (one query head per key head); 0: per-query-head partials
@@ -489,6 +493,15 @@ fn flash_group_sum(
         let o = (r * group + g) * p.head_dim + d;
         sk += fab2_dkp[o];
         sv += fab2_dvp[o];
+    }
+    if ((p.lse_saved & 4u) != 0u) {
+        // r is (batch * seq_k + key) * num_kv_heads + kv head.
+        let row = r / p.num_kv_heads;
+        let kvh = r % p.num_kv_heads;
+        let base = row * p.mask_stride_b + kvh * p.head_dim + d;
+        fab2_dk[base + p.mask_stride_q] = sk;
+        fab2_dv[base + p.mask_stride_k] = sv;
+        return;
     }
     fab2_dk[i] = sk;
     fab2_dv[i] = sv;

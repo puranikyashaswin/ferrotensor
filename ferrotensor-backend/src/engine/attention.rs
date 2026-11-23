@@ -492,6 +492,132 @@ impl ComputeEngine {
         );
     }
 
+    /// Whether [`flash_attention_v2_rope_backward_packed`](Self::flash_attention_v2_rope_backward_packed)
+    /// runs for this call: the cooperative kernels take it (no mask, dropout
+    /// or window, head size 64), it has as many keys as queries, and
+    /// `FERROTENSOR_QKV_PACKED=0` has not turned the packed layout off.
+    ///
+    /// `q` is `[batch, seq, heads, head_dim]` and `k` `[batch, seq, kv_heads, head_dim]`.
+    #[must_use]
+    pub fn flash_attention_packs_backward(
+        &self,
+        q: &UnifiedTensor,
+        k: &UnifiedTensor,
+        opts: &AttentionOptions,
+    ) -> bool {
+        let dims = AttentionDims::new(q, k);
+        dims.seq_q == dims.seq_k
+            && self.flash_coop_packs()
+            && self.flash_coop_routes(dims.shape(), opts, false)
+    }
+
+    /// The backward pass of
+    /// [`flash_attention_v2_rope_with_stats`](Self::flash_attention_v2_rope_with_stats)
+    /// with the three gradients written side by side into one buffer.
+    ///
+    /// `packed` is f32 `[batch * seq, ld]` with `ld >= (heads + 2 * kv_heads) *
+    /// head_dim`: row `r` holds `dQ[r]` in columns `0 .. heads * head_dim`,
+    /// `dK[r]` in the next `kv_heads * head_dim` and `dV[r]` in the next
+    /// ones, the layout of the fused QKV projection's columns, so one product
+    /// can read all three. Other columns are left alone. The gradients are
+    /// those of [`flash_attention_v2_rope_backward_with_stats`](Self::flash_attention_v2_rope_backward_with_stats).
+    ///
+    /// Returns false and records nothing when
+    /// [`flash_attention_packs_backward`](Self::flash_attention_packs_backward)
+    /// is false for this call; the caller then runs the call with three buffers.
+    ///
+    /// # Panics
+    ///
+    /// When `packed` has the wrong shape or dtype, or the shapes of the other
+    /// tensors do not match as for the other backward calls.
+    #[must_use]
+    pub fn flash_attention_v2_rope_backward_packed(
+        &self,
+        ctx: &WgpuContext,
+        [q, k, v]: [&UnifiedTensor; 3],
+        [out, grad_out]: [&UnifiedTensor; 2],
+        packed: &UnifiedTensor,
+        stats: &UnifiedTensor,
+        opts: &AttentionOptions,
+        (theta, pos): (f32, u32),
+    ) -> bool {
+        if !self.flash_attention_packs_backward(q, k, opts) {
+            return false;
+        }
+        let dims = AttentionDims::new(q, k);
+        dims.check_stats(stats);
+        let shape = dims.shape();
+        let (q_dim, kv_dim) = (dims.heads * dims.head_dim, dims.kv_heads * dims.head_dim);
+        let rows = (dims.batch * dims.seq_q) as usize;
+        assert!(
+            packed.dtype == DType::FP32
+                && matches!(packed.shape.as_slice(), &[r, ld] if r == rows && ld >= (q_dim + 2 * kv_dim) as usize),
+            "the packed gradients must be f32 [{rows}, >= {}], got {:?} {:?}",
+            q_dim + 2 * kv_dim,
+            packed.dtype,
+            packed.shape
+        );
+        let ld = packed.shape[1] as u32;
+        let layout = (ld, 0, q_dim, q_dim + kv_dim);
+        let group = dims.heads / dims.kv_heads;
+        let params = dims.params_bwd(ctx, opts, None, (true, group == 1, true), Some(layout));
+        let rope = Some(Rope { theta, pos });
+        self.flash_coop_dq(
+            ctx,
+            shape,
+            [q, k, v, out, grad_out, packed],
+            (stats.buffer(), &params, rope),
+        );
+        if group == 1 {
+            self.flash_coop_dkdv(
+                ctx,
+                shape,
+                [q, k, v, grad_out],
+                (packed.buffer(), packed.buffer()),
+                (stats.buffer(), &params, rope),
+            );
+            return true;
+        }
+        // As in attention_backward: per-query-head partials, then their sums
+        // go to the K and V columns of the packed buffer.
+        let partial_size = (dims.batch * dims.seq_k * dims.heads * dims.head_dim).max(1) as u64 * 4;
+        let partial = |label: &'static str| {
+            let buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: partial_size,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+            ctx.memory().count_dispatch_buffer(buffer.size());
+            Scratch(buffer)
+        };
+        let (dk_part, dv_part) = (
+            partial("Flash Bwd dK Partial"),
+            partial("Flash Bwd dV Partial"),
+        );
+        self.flash_coop_dkdv(
+            ctx,
+            shape,
+            [q, k, v, grad_out],
+            (&dk_part, &dv_part),
+            (stats.buffer(), &params, rope),
+        );
+        let elements = dims.batch * dims.seq_k * dims.kv_heads * dims.head_dim;
+        self.run(
+            ctx,
+            &self.flash_group_sum,
+            &[
+                (6, packed.buffer()),
+                (7, packed.buffer()),
+                (8, &params),
+                (11, &dk_part),
+                (12, &dv_part),
+            ],
+            grid(elements.div_ceil(256)),
+        );
+        true
+    }
+
     /// `q` and `k` rotated by `rope` into new tensors, for the kernels that
     /// do not rotate as they load.
     fn rotated_copies(
@@ -567,6 +693,7 @@ impl ComputeEngine {
             opts,
             mask,
             (saved.is_some(), group == 1, rope.is_some()),
+            None,
         );
         let dummy;
         let mask_buf: &dyn Arg = match mask {
@@ -801,8 +928,15 @@ impl AttentionDims {
         opts: &AttentionOptions,
         mask: Option<&UnifiedTensor>,
         (lse_saved, dkv_direct, rope): (bool, bool, bool),
+        layout: Option<(u32, u32, u32, u32)>,
     ) -> Params {
-        let (has_mask, s) = mask_strides(mask);
+        let (has_mask, mut s) = mask_strides(mask);
+        // The cooperative kernels have no mask: the four words of its strides
+        // say where dQ, dK and dV go when they share one buffer.
+        let packed = layout.is_some();
+        if let Some((ld, q_off, k_off, v_off)) = layout {
+            s = [ld, q_off, k_off, v_off];
+        }
         let params: [u32; 20] = [
             self.batch,
             self.heads,
@@ -822,8 +956,9 @@ impl AttentionDims {
             s[3],
             opts.window,
             (opts.seed >> 32) as u32,
-            // Bit 0: the log-sum-exp is saved; bit 1: the kernel rotates Q and K.
-            (lse_saved as u32) | ((rope as u32) << 1),
+            // Bit 0: the log-sum-exp is saved; bit 1: the kernel rotates Q and K;
+            // bit 2: the gradients share one buffer, laid out by `s`.
+            (lse_saved as u32) | ((rope as u32) << 1) | ((packed as u32) << 2),
             dkv_direct as u32,
         ];
         uniform(ctx, bytemuck::cast_slice(&params))

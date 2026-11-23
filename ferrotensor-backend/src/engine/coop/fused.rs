@@ -10,7 +10,7 @@
 
 use super::super::matmul_fused::Resolved;
 use super::super::{grid, immediate_params, uniform, ComputeEngine, Kernel};
-use super::plan::plan_fused;
+use super::plan::{plan_fused, plan_plain_fused};
 use super::{
     epilogue, grid_fits, loader, split_k, Coop, CoopConfig, CoopKey, EpilogueKind, LoaderKind,
 };
@@ -174,9 +174,13 @@ impl ComputeEngine {
                 ));
             }
             None => {
-                let Some(planned) =
-                    plan_fused(r.dims, transposed_b, (coop.target, coop.tuned), fits)
-                else {
+                let target = (coop.target, coop.tuned);
+                let planned = if r.loader == LoaderKind::Plain {
+                    plan_plain_fused(r.dims, transposed_b, target, fits)
+                } else {
+                    plan_fused(r.dims, transposed_b, target, fits)
+                };
+                let Some(planned) = planned else {
                     return Err(format!(
                         "matmul_fused: no tile fits {m} x {n} on this device"
                     ));

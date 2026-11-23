@@ -92,13 +92,19 @@ struct FlashBwdParams {
     causal: u32,
     has_mask: u32,
     causal_offset: u32,
-    mask_stride_b: u32,
-    mask_stride_h: u32,
-    mask_stride_q: u32,
-    mask_stride_k: u32,
+    // These four words hold the mask strides of the scalar kernels. The
+    // cooperative kernels never run with a mask, so with bit 2 of lse_saved
+    // set they carry where dQ, dK and dV go: the length of a row of the one
+    // buffer that holds them side by side and the column where each starts.
+    out_ld: u32,
+    q_off: u32,
+    k_off: u32,
+    v_off: u32,
     window: u32,
     seed_hi: u32,
-    lse_saved: u32,      // bit 0: the LSE is saved; bit 1: RoPE as in the forward
+    // bit 0: the LSE is saved; bit 1: RoPE as in the forward; bit 2: dQ, dK
+    // and dV are column blocks of one wider buffer (out_ld, q_off, k_off, v_off)
+    lse_saved: u32,
     dkv_direct: u32,
 };
 
@@ -371,6 +377,7 @@ fn flash_coop_bwd_dq(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invoca
     let i = qb * FC_BR + rl;
     let scale = p.scale;
     let rope = (p.lse_saved & 2u) != 0u;
+    let strided = (p.lse_saved & 4u) != 0u;
     let row_id = (b * p.num_heads + h) * p.seq_q + i;
     let cq0 = j0 * 16u;        // the columns of this subgroup's dQ accumulators
     let cq1 = cq0 + 16u;
@@ -560,7 +567,8 @@ fn flash_coop_bwd_dq(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invoca
     coopStoreT(dq3, &fc_ss[(rb * 16u) * FC_SF + cq3], FC_SF); //@64
     workgroupBarrier();
     if (i < p.seq_q) {
-        let ob = ((b * p.seq_q + i) * p.num_heads + h) * 64u;
+        var ob = ((b * p.seq_q + i) * p.num_heads + h) * 64u;
+        if (strided) { ob = (b * p.seq_q + i) * p.out_ld + p.q_off + h * 64u; }
         if (rope) {
             // The pair (c, c + 32) sits in one lane, since 32 is a multiple of FC_LPR.
             for (var e = 0u; e < FC_NC / 2u; e++) {
@@ -578,7 +586,9 @@ fn flash_coop_bwd_dq(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invoca
     storageBarrier();
     if (overflow) {
         atomicAdd(&fc_overflows2[0], 1u);
-        fc_dq[((b * p.seq_q + qb * FC_BR) * p.num_heads + h) * 64u] = bitcast<f32>(0x7fc00000u);
+        var first = ((b * p.seq_q + qb * FC_BR) * p.num_heads + h) * 64u;
+        if (strided) { first = (b * p.seq_q + qb * FC_BR) * p.out_ld + p.q_off + h * 64u; }
+        fc_dq[first] = bitcast<f32>(0x7fc00000u);
     }
 }
 
@@ -609,6 +619,7 @@ fn flash_coop_bwd_dkdv(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invo
     let kr = k0 + rl; // this lane's key
     let scale = p.scale;
     let rope = (p.lse_saved & 2u) != 0u;
+    let strided = (p.lse_saved & 4u) != 0u;
     let cq0 = j0 * 16u;
     let cq1 = cq0 + 16u;
     let cq2 = cq0 + 32u;       //@64
@@ -803,8 +814,16 @@ fn flash_coop_bwd_dkdv(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invo
         workgroupBarrier();
     }
 
-    var out_off = ((b * p.seq_k + kr) * p.num_heads + h) * 64u;
-    if (p.dkv_direct == 1u) { out_off = ((b * p.seq_k + kr) * p.num_kv_heads + kvh) * 64u; }
+    var dk_off = ((b * p.seq_k + kr) * p.num_heads + h) * 64u;
+    var dv_off = dk_off;
+    if (p.dkv_direct == 1u) {
+        dk_off = ((b * p.seq_k + kr) * p.num_kv_heads + kvh) * 64u;
+        dv_off = dk_off;
+        if (strided) {
+            dk_off = (b * p.seq_k + kr) * p.out_ld + p.k_off + kvh * 64u;
+            dv_off = (b * p.seq_k + kr) * p.out_ld + p.v_off + kvh * 64u;
+        }
+    }
     coopStoreT(dk0, &fc_ss[(rb * 16u) * FC_SF + cq0], FC_SF);
     coopStoreT(dk1, &fc_ss[(rb * 16u) * FC_SF + cq1], FC_SF);
     coopStoreT(dk2, &fc_ss[(rb * 16u) * FC_SF + cq2], FC_SF); //@64
@@ -815,12 +834,12 @@ fn flash_coop_bwd_dkdv(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invo
             for (var e = 0u; e < FC_NC / 2u; e++) {
                 let c = FC_LPR * e + q;
                 let g = fc_inv_rot(kr, c, fc_ss[rl * FC_SF + c], fc_ss[rl * FC_SF + c + 32u]);
-                fc_dk[out_off + c] = g.x;
-                fc_dk[out_off + c + 32u] = g.y;
+                fc_dk[dk_off + c] = g.x;
+                fc_dk[dk_off + c + 32u] = g.y;
             }
         } else {
             for (var e = 0u; e < FC_NC; e++) {
-                fc_dk[out_off + FC_LPR * e + q] = fc_ss[rl * FC_SF + FC_LPR * e + q];
+                fc_dk[dk_off + FC_LPR * e + q] = fc_ss[rl * FC_SF + FC_LPR * e + q];
             }
         }
     }
@@ -832,14 +851,17 @@ fn flash_coop_bwd_dkdv(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invo
     workgroupBarrier();
     if (kr < p.seq_k) {
         for (var e = 0u; e < FC_NC; e++) {
-            fc_dv[out_off + FC_LPR * e + q] = fc_ss[rl * FC_SF + FC_LPR * e + q];
+            fc_dv[dv_off + FC_LPR * e + q] = fc_ss[rl * FC_SF + FC_LPR * e + q];
         }
     }
     storageBarrier();
     if (overflow) {
         atomicAdd(&fc_overflows2[0], 1u);
         var first = ((b * p.seq_k + k0) * p.num_heads + h) * 64u;
-        if (p.dkv_direct == 1u) { first = ((b * p.seq_k + k0) * p.num_kv_heads + kvh) * 64u; }
+        if (p.dkv_direct == 1u) {
+            first = ((b * p.seq_k + k0) * p.num_kv_heads + kvh) * 64u;
+            if (strided) { first = (b * p.seq_k + k0) * p.out_ld + p.k_off + kvh * 64u; }
+        }
         fc_dk[first] = bitcast<f32>(0x7fc00000u);
     }
 }

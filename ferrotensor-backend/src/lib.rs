@@ -47,12 +47,14 @@ pub use context::{
 };
 pub use engine::{
     AdamParams, AttentionOptions, AutotuneReport, ComputeEngine, Epilogue, FlatLayout, FusedA,
-    FusedOut, FusedSpec, LoraGrad, LoraMirror, LoraProj, AUTOTUNE_ENV, FLAT_MAX_ELEMS,
-    LORA_GROUP_MAX, LORA_GROUP_MAX_RANK, MASKED_CE_SKIP, SUM_SQUARES_CHUNK,
+    FusedOut, FusedSpec, LoraGrad, LoraMirror, LoraPackedGrad, LoraPackedProj, LoraProj,
+    AUTOTUNE_ENV, FLAT_MAX_ELEMS, LORA_GROUP_MAX, LORA_GROUP_MAX_RANK, MASKED_CE_SKIP,
+    SUM_SQUARES_CHUNK,
 };
 #[doc(hidden)]
 pub use engine::{
     CoopConfig, CoopTile, MatmulPath, SkinnyTile, SmallMLaunch, SmallMTile, FLASH_COOP_ENV,
+    QKV_PACKED_ENV,
 };
 pub use kernel_timing::{KernelTime, KernelTimes, KernelTiming, KernelTimingMode};
 pub use memory::{MemoryCategory, MemorySnapshot, MemoryTracker};

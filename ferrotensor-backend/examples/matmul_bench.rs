@@ -400,6 +400,10 @@ enum Op {
     /// The fused backward: the matrices of `widths` side by side make `a`
     /// (`k` is their sum), against `w[n, k]`, accumulated into `[m, n]`.
     Sources { widths: Vec<usize> },
+    /// The fused backward over one matrix: `a[m, k]` against `w[n, k]`,
+    /// accumulated into `[m, n]`. The qkv backward runs it when the
+    /// gradients of q, k, v and `U` are written side by side.
+    Packed,
 }
 
 /// One base-weight product of a training step, at `k` and `n`.
@@ -456,6 +460,7 @@ fn cases(only: Option<&str>) -> Vec<Case> {
             qkv,
             hidden,
         );
+        add("qkv dX packed", Op::Packed, qkv, hidden);
         if gate_up {
             let gu = 2 * inter + 2 * RANK;
             let widths = vec![inter, inter, 2 * RANK];
@@ -589,7 +594,7 @@ fn prepare(rig: &Rig, c: &Case, m: usize) -> Prepared {
             },
         ),
         Op::Split { .. } => (false, [c.k, c.n]),
-        Op::Sources { .. } => (true, [c.n, c.k]),
+        Op::Sources { .. } | Op::Packed => (true, [c.n, c.k]),
     };
     let scale = 1.0 / (c.k as f32).sqrt();
     let w_data: Vec<f32> = values(c.n * c.k, 2).iter().map(|v| v * scale).collect();
@@ -655,6 +660,22 @@ fn measure_prepared(
             (Variant::Fused, Op::Sources { .. }) => {
                 let spec = FusedSpec {
                     a: FusedA::Sources(&a_refs),
+                    b: w,
+                    transposed_b,
+                    out: FusedOut::AlphaBeta {
+                        out: &outs[0],
+                        // The backward accumulates into the gradient.
+                        epilogue: Epilogue {
+                            alpha: 1.0,
+                            beta: 1.0,
+                        },
+                    },
+                };
+                run_fused(engine, ctx, &spec, forced).map(|config| ("fused", config))
+            }
+            (Variant::Fused, Op::Packed) => {
+                let spec = FusedSpec {
+                    a: FusedA::Plain(&a_parts[0]),
                     b: w,
                     transposed_b,
                     out: FusedOut::AlphaBeta {

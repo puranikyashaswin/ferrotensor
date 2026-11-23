@@ -10,6 +10,10 @@
 // Parameters, as array<vec4<u32>, 3> unless said otherwise:
 //   [0] = (rows, ..), [1] = (cols of projection 0, 1, 2, 0),
 //   [2] = (scale bits of projection 0, 1, 2, 0).
+// The kernels `du_packed` and `grads_packed` take dY and dU as column blocks
+// of one buffer and add, as array<vec4<u32>, 5>:
+//   [3] = (row length of that buffer, first column of dU, 0, 0),
+//   [4] = (first column of dY of projection 0, 1, 2, 0).
 
 //#kernel ub
 // Y_g += s_g * U[:, g * RANK ..][rows, RANK] @ B_g[RANK, n_g], for every row
@@ -124,6 +128,127 @@ fn lora_grads(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_in
     let cc = min(c0, n - 1u);
     for (var r = lane; r < m; r += 8u) {
       let p = dy$g[r * n + cc];
+      for (var j = 0u; j < RANK; j += 1u) {
+        acc[j] = fma(p, u[r * ld + $gu * RANK + j], acc[j]);
+      }
+    }
+  }
+//#end
+  for (var j = 0u; j < RANK; j += 1u) { red[j * 256u + li] = acc[j]; }
+  workgroupBarrier();
+  for (var s = 4u; s > 0u; s = s / 2u) {
+    if (lane < s) {
+      for (var j = 0u; j < RANK; j += 1u) {
+        red[j * 256u + li] += red[j * 256u + li + s * 32u];
+      }
+    }
+    workgroupBarrier();
+  }
+  if (lane == 0u) {
+//#repeat
+    if (task == $t0 && c0 < k) {
+      for (var j = 0u; j < RANK; j += 1u) {
+        let i = c0 * RANK + j;
+        var o = red[j * 256u + li];
+        if (beta != 0.0) { o = o + beta * ga$g[i]; }
+        ga$g[i] = o;
+      }
+    }
+    if (task == $t1 && c0 < params[1][$gu]) {
+      for (var j = 0u; j < RANK; j += 1u) {
+        let i = j * params[1][$gu] + c0;
+        var o = bitcast<f32>(params[2][$gu]) * red[j * 256u + li];
+        if (beta != 0.0) { o = o + beta * gb$g[i]; }
+        gb$g[i] = o;
+      }
+    }
+//#end
+  }
+}
+
+//#kernel du_packed
+// As `du`, but dY_g and dU are blocks of columns of one buffer `du` (the
+// bindings dy0, dy1 and dy2 are that buffer again: they are declared
+// writable so that one dispatch does not use a buffer as both read-only and
+// writable). dY_g[row, c] is du[row * params[3].x + params[4][g] + c] and
+// dU[row, g * RANK + j] is du[row * params[3].x + params[3].y + g * RANK + j].
+// The columns of dU are never columns of any dY, so nothing read is written.
+var<workgroup> red: array<f32, RED_LEN>;
+
+@compute @workgroup_size(256)
+fn lora_du_packed(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  let m = params[0].x;
+  let ld = params[3].x;
+  let g = wg.z;
+  let r = li / 64u;
+  let lane = li % 64u;
+  // Rows past the end read the last one; their sums are not stored.
+  let row = min(wg.y * 4u + r, m - 1u);
+  var acc: array<f32, RANK>;
+  for (var j = 0u; j < RANK; j += 1u) { acc[j] = 0.0; }
+//#repeat
+  if (g == $gu) {
+    let n = params[1][$gu];
+    let base = row * ld + params[4][$gu];
+    for (var c = lane; c < n; c += 64u) {
+      let v = dy$g[base + c];
+      for (var j = 0u; j < RANK; j += 1u) {
+        acc[j] = fma(v, b$g[j * n + c], acc[j]);
+      }
+    }
+  }
+//#end
+  for (var j = 0u; j < RANK; j += 1u) { red[j * 256u + li] = acc[j]; }
+  workgroupBarrier();
+  for (var s = 32u; s > 0u; s = s / 2u) {
+    if (lane < s) {
+      for (var j = 0u; j < RANK; j += 1u) {
+        red[j * 256u + li] += red[j * 256u + li + s];
+      }
+    }
+    workgroupBarrier();
+  }
+  let out_row = wg.y * 4u + r;
+  if (lane < RANK && out_row < m) {
+    du[out_row * ld + params[3].y + g * RANK + lane] = bitcast<f32>(params[2][g]) * red[lane * 256u + r * 64u];
+  }
+}
+
+//#kernel grads_packed
+// As `grads`, but dY_g and dU are blocks of columns of the one buffer `du`
+// (dy0, dy1 and dy2 are that buffer again, read only), laid out as for
+// `du_packed`. U keeps its own row length params[0].z.
+var<workgroup> red: array<f32, RED_LEN>;
+
+@compute @workgroup_size(256)
+fn lora_grads_packed(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  let m = params[0].x;
+  let k = params[0].y;
+  let ld = params[0].z;
+  let beta = bitcast<f32>(params[0].w);
+  let pld = params[3].x;
+  let task = wg.z;
+  let cl = li % 32u;
+  let lane = li / 32u;
+  let c0 = wg.x * 32u + cl;
+  var acc: array<f32, RANK>;
+  for (var j = 0u; j < RANK; j += 1u) { acc[j] = 0.0; }
+//#repeat
+  if (task == $t0) {
+    // Columns past the end read the last one; their sums are not stored.
+    let cc = min(c0, k - 1u);
+    for (var r = lane; r < m; r += 8u) {
+      let p = x[r * k + cc];
+      for (var j = 0u; j < RANK; j += 1u) {
+        acc[j] = fma(p, du[r * pld + params[3].y + $gu * RANK + j], acc[j]);
+      }
+    }
+  }
+  if (task == $t1) {
+    let n = params[1][$gu];
+    let cc = min(c0, n - 1u);
+    for (var r = lane; r < m; r += 8u) {
+      let p = dy$g[r * pld + params[4][$gu] + cc];
       for (var j = 0u; j < RANK; j += 1u) {
         acc[j] = fma(p, u[r * ld + $gu * RANK + j], acc[j]);
       }

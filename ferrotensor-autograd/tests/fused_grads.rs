@@ -13,7 +13,7 @@
 use std::cell::Cell;
 use std::sync::Arc;
 
-use ferrotensor_autograd::{AutogradNode, Tensor};
+use ferrotensor_autograd::{AttentionGeometry, AutogradNode, FusedLora, FusedProjections, Tensor};
 use ferrotensor_backend::{ComputeEngine, UnifiedTensor, WgpuContext};
 
 fn setup() -> (Arc<WgpuContext>, ComputeEngine) {
@@ -404,4 +404,120 @@ fn add_hands_on_its_gradient_and_a_shared_slot_is_copied_before_a_write() {
     assert_eq!(bits(&host(&ctx, &seed)), bits(&g));
     let doubled: Vec<f64> = g.iter().map(|&v| 2.0 * f64::from(v)).collect();
     assert_close("scaled a", &grad_of(&ctx, &a), &doubled);
+}
+
+/// The fused QKV attention with its gradients packed into one buffer (one
+/// product for the input gradient) against the same op with three buffers:
+/// the input gradient and every adapter gradient agree to f32 rounding.
+/// Shapes as 135M (9 heads over 3), 360M (15 over 5) and 1.7B (32 over 32),
+/// with two batches and a length that leaves a partial tile.
+#[test]
+#[ignore = "needs a GPU"]
+fn packed_attention_gradients_equal_the_three_buffer_ones() {
+    let (ctx, engine) = setup();
+    if !engine.flash_coop_available() {
+        eprintln!("skipped: no cooperative matrices (or FERROTENSOR_EXPERIMENTAL is not 1)");
+        return;
+    }
+    engine.set_flash_coop(true);
+    const HEAD: usize = 64;
+    for (n, &(heads, kv, batch, seq, rank)) in [
+        (9usize, 3usize, 2usize, 100usize, 8usize),
+        (15, 5, 1, 130, 8),
+        (4, 4, 2, 70, 16),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let hidden = heads * HEAD;
+        let (qw, kw) = (heads * HEAD, kv * HEAD);
+        let seed = 100 * n as u64;
+        let leaf = |data: &[f32], shape: &[usize]| {
+            Tensor::new(ctx.clone(), UnifiedTensor::new(&ctx, data, shape))
+        };
+        let weight = |w: usize, salt: u64| {
+            let data: Vec<f32> = rand_vec(hidden * w, seed + salt)
+                .iter()
+                .map(|v| v * 0.1)
+                .collect();
+            Tensor::frozen(
+                ctx.clone(),
+                UnifiedTensor::from_f32_as_f16(&ctx, &data, &[hidden, w]),
+            )
+        };
+        let weights = [weight(qw, 1), weight(kw, 2), weight(kw, 3)];
+        let widths = [qw, kw, kw];
+        let run = |packed: bool| {
+            engine.set_qkv_packed(packed);
+            let lora = FusedLora {
+                a: (0..3)
+                    .map(|g| leaf(&rand_vec(hidden * rank, seed + 10 + g), &[hidden, rank]))
+                    .collect(),
+                b: (0..3)
+                    .map(|g| {
+                        let b: Vec<f32> = rand_vec(rank * widths[g as usize], seed + 20 + g)
+                            .iter()
+                            .map(|v| v * 0.1)
+                            .collect();
+                        leaf(&b, &[rank, widths[g as usize]])
+                    })
+                    .collect(),
+                scales: vec![2.0, 0.5, 1.25],
+                rank,
+            };
+            let proj = std::sync::Arc::new(
+                FusedProjections::new(
+                    &ctx,
+                    &engine,
+                    &[&weights[0], &weights[1], &weights[2]],
+                    Some(lora.clone()),
+                )
+                .expect("projections"),
+            );
+            let x = leaf(
+                &rand_vec(batch * seq * hidden, seed + 30),
+                &[batch, seq, hidden],
+            );
+            let geom = AttentionGeometry {
+                n_heads: heads,
+                n_kv_heads: kv,
+                head_dim: HEAD,
+                theta: 10_000.0,
+                pos: 3,
+                dropout_prob: 0.0,
+                seed: 0,
+            };
+            let y = Tensor::fused_attention(&x, &proj, &geom, &engine);
+            let dy = UnifiedTensor::new(
+                &ctx,
+                &rand_vec(batch * seq * qw, seed + 40),
+                &[batch, seq, qw],
+            );
+            *y.grad.borrow_mut() = Some(dy);
+            y.backward(&engine);
+            let mut grads = vec![("x".to_string(), grad_of(&ctx, &x))];
+            for g in 0..3 {
+                grads.push((format!("a{g}"), grad_of(&ctx, &lora.a[g])));
+                grads.push((format!("b{g}"), grad_of(&ctx, &lora.b[g])));
+            }
+            (host(&ctx, &y.data), grads)
+        };
+        let (out_split, split) = run(false);
+        let (out_packed, packed) = run(true);
+        engine.set_qkv_packed(true);
+        assert_eq!(bits(&out_split), bits(&out_packed), "forward {heads}/{kv}");
+        for ((name, got), (_, want)) in packed.iter().zip(&split) {
+            let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            assert!(scale > 0.0, "{name}: the reference gradient is zero");
+            let worst = got
+                .iter()
+                .zip(want)
+                .map(|(g, w)| (g - w).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                worst <= 1e-3 * scale,
+                "{heads}/{kv} {name}: largest difference {worst}, gradient scale {scale}"
+            );
+        }
+    }
 }

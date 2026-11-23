@@ -14,6 +14,10 @@
 //!   to the same side-by-side layout.
 //! - [`ComputeEngine::lora_grads_grouped`]: `grad_A_g += x^T @ dU_g` and
 //!   `grad_B_g += s_g * U_g^T @ dY_g`.
+//! - [`ComputeEngine::lora_du_packed`] and
+//!   [`ComputeEngine::lora_grads_packed`]: the same two, for a `dY_g` and a
+//!   `dU` that are blocks of columns of one wider buffer, the layout in which
+//!   one product reads all of them.
 //! - [`ComputeEngine::lora_mirror_f16`]: copies each f32 `A_g` into its
 //!   columns of an f16 weight matrix, to run again after every optimizer
 //!   step, adapter load and resume, or the copy goes stale.
@@ -67,6 +71,31 @@ pub struct LoraGrad<'a> {
     pub scale: f32,
 }
 
+/// A projection of [`ComputeEngine::lora_du_packed`].
+#[derive(Clone, Copy)]
+pub struct LoraPackedProj<'a> {
+    /// `B`, f32 `[rank, n]`.
+    pub b: &'a UnifiedTensor,
+    /// The first column of the projection's `dY` in the packed buffer; the
+    /// block is `n` columns wide.
+    pub col0: usize,
+    /// The LoRA scale `s`.
+    pub scale: f32,
+}
+
+/// A projection of [`ComputeEngine::lora_grads_packed`].
+#[derive(Clone, Copy)]
+pub struct LoraPackedGrad<'a> {
+    /// The first column of the projection's `dY` in the packed buffer.
+    pub col0: usize,
+    /// `grad_A`, f32 with `k * rank` elements, laid out `[k, rank]`.
+    pub grad_a: &'a UnifiedTensor,
+    /// `grad_B`, f32 `[rank, n]`.
+    pub grad_b: &'a UnifiedTensor,
+    /// The LoRA scale `s`.
+    pub scale: f32,
+}
+
 /// A projection of [`ComputeEngine::lora_mirror_f16`].
 #[derive(Clone, Copy)]
 pub struct LoraMirror<'a> {
@@ -83,6 +112,10 @@ enum Kind {
     Du,
     Grads,
     Mirror,
+    /// `Du` over blocks of columns of one buffer.
+    DuPacked,
+    /// `Grads` over blocks of columns of one buffer.
+    GradsPacked,
 }
 
 impl Kind {
@@ -93,6 +126,8 @@ impl Kind {
             Self::Du => "du",
             Self::Grads => "grads",
             Self::Mirror => "mirror",
+            Self::DuPacked => "du_packed",
+            Self::GradsPacked => "grads_packed",
         }
     }
 
@@ -102,6 +137,8 @@ impl Kind {
             Self::Du => "lora_du",
             Self::Grads => "lora_grads",
             Self::Mirror => "lora_mirror",
+            Self::DuPacked => "lora_du_packed",
+            Self::GradsPacked => "lora_grads_packed",
         }
     }
 }
@@ -146,7 +183,14 @@ fn slots(key: Key) -> Vec<Slot> {
             s.extend(per("dy", "read", "f32"));
             s.extend(per("b", "read", "f32"));
         }
-        Kind::Grads => {
+        Kind::DuPacked => {
+            // `dy` is the buffer `du` is, so it is declared writable too: a
+            // dispatch may not use one buffer as read-only and writable.
+            s.push(slot("du".into(), "read_write", "f32"));
+            s.extend(per("dy", "read_write", "f32"));
+            s.extend(per("b", "read", "f32"));
+        }
+        Kind::Grads | Kind::GradsPacked => {
             s.push(slot("x".into(), "read", "f32"));
             s.push(slot("u".into(), "read", "f32"));
             s.push(slot("du".into(), "read", "f32"));
@@ -222,7 +266,11 @@ pub(super) fn source(key: Key) -> Result<String, String> {
             ty = s.ty,
         );
     }
-    let params_len = if key.kind == Kind::Mirror { 2 } else { 3 };
+    let params_len = match key.kind {
+        Kind::Mirror => 2,
+        Kind::DuPacked | Kind::GradsPacked => 5,
+        _ => 3,
+    };
     decls += &format!(
         "@group(0) @binding({}) var<uniform> params: array<vec4<u32>, {params_len}>;\n",
         slots.len()
@@ -321,6 +369,89 @@ impl Dims {
     }
 }
 
+/// What the projections of a packed call agree on.
+struct PackedLayout {
+    m: u32,
+    /// Row length of the packed buffer.
+    ld: u32,
+    rank: u32,
+    /// Columns of each projection, zero past the group.
+    ns: [u32; LORA_GROUP_MAX],
+    /// First column of `dU`.
+    du_col0: u32,
+    /// First column of each projection's `dY`, zero past the group.
+    dy_cols: [u32; 4],
+}
+
+impl PackedLayout {
+    fn max_n(&self) -> u32 {
+        self.ns.into_iter().max().unwrap_or(0)
+    }
+}
+
+/// Reads and checks the packed buffer `packed` (`[m, ld]`) and each
+/// projection's `(B-shaped tensor [rank, n], first column of dY)`.
+fn packed_layout(
+    what: &str,
+    packed: &UnifiedTensor,
+    du_col0: usize,
+    projs: &[(&UnifiedTensor, usize)],
+) -> Result<PackedLayout, String> {
+    let count = projs.len();
+    if count == 0 || count > LORA_GROUP_MAX {
+        return Err(format!(
+            "{what}: {count} projections, want 1 to {LORA_GROUP_MAX}"
+        ));
+    }
+    let (m, ld) = matrix(what, "the packed buffer", packed)?;
+    let mut rank = 0;
+    let mut ns = [0u32; LORA_GROUP_MAX];
+    let mut dy_cols = [0u32; 4];
+    let mut spans = Vec::new();
+    for (g, &(b, col0)) in projs.iter().enumerate() {
+        let (r, n) = matrix(what, "B", b)?;
+        if g == 0 {
+            rank = r;
+        } else if r != rank {
+            return Err(format!("{what}: ranks {rank} and {r} in one group"));
+        }
+        if col0 + n > ld {
+            return Err(format!(
+                "{what}: dY {g} ends at column {} of {ld}",
+                col0 + n
+            ));
+        }
+        ns[g] = to_u32(what, "n", n)?;
+        dy_cols[g] = to_u32(what, "col0", col0)?;
+        spans.push((col0, col0 + n));
+    }
+    if rank > LORA_GROUP_MAX_RANK {
+        return Err(format!(
+            "{what}: rank {rank} is above {LORA_GROUP_MAX_RANK}"
+        ));
+    }
+    spans.push((du_col0, du_col0 + count * rank));
+    if du_col0 + count * rank > ld {
+        return Err(format!(
+            "{what}: dU ends at column {} of {ld}",
+            du_col0 + count * rank
+        ));
+    }
+    spans.sort_unstable();
+    if spans.windows(2).any(|w| w[0].1 > w[1].0) {
+        return Err(format!("{what}: two column blocks overlap"));
+    }
+    to_u32(what, "m * ld", m * ld)?;
+    Ok(PackedLayout {
+        m: to_u32(what, "m", m)?,
+        ld: to_u32(what, "ld", ld)?,
+        rank: to_u32(what, "rank", rank)?,
+        ns,
+        du_col0: to_u32(what, "du_col0", du_col0)?,
+        dy_cols,
+    })
+}
+
 /// `[s0 bits, s1 bits, s2 bits, 0]`.
 fn scale_words(scales: impl Iterator<Item = f32>) -> [u32; 4] {
     let mut words = [0u32; 4];
@@ -377,7 +508,10 @@ impl ComputeEngine {
                 limits.max_storage_buffers_per_shader_stage
             ));
         }
-        let reduces = key.kind == Kind::Du || key.kind == Kind::Grads;
+        let reduces = matches!(
+            key.kind,
+            Kind::Du | Kind::Grads | Kind::DuPacked | Kind::GradsPacked
+        );
         if reduces
             && (THREADS > self.small_m_max_threads
                 || key.rank * THREADS * 4 > self.small_m_max_bytes)
@@ -519,6 +653,122 @@ impl ComputeEngine {
         self.lora_group_run(ctx, key, &buffers, &params, groups)
     }
 
+    /// As [`lora_du_grouped`](Self::lora_du_grouped), with `dY_g` and `dU`
+    /// blocks of columns of one f32 `[m, ld]` buffer: `dY_g` is the `n_g`
+    /// columns from `projs[g].col0`, and `dU_g` is written to the `rank`
+    /// columns from `du_col0 + g * rank`. Other columns are left alone.
+    ///
+    /// # Errors
+    ///
+    /// As [`lora_du_grouped`](Self::lora_du_grouped), or when a block runs
+    /// past `ld` or the `dU` columns overlap a `dY` block.
+    pub fn lora_du_packed(
+        &self,
+        ctx: &WgpuContext,
+        packed: &UnifiedTensor,
+        du_col0: usize,
+        projs: &[LoraPackedProj<'_>],
+    ) -> Result<(), String> {
+        let what = "lora_du_packed";
+        let layout = packed_layout(
+            what,
+            packed,
+            du_col0,
+            &projs.iter().map(|p| (p.b, p.col0)).collect::<Vec<_>>(),
+        )?;
+        let key = Key {
+            kind: Kind::DuPacked,
+            count: projs.len() as u32,
+            rank: layout.rank,
+        };
+        let mut buffers: Vec<&Buffer> = vec![packed.buffer()];
+        buffers.extend(projs.iter().map(|_| packed.buffer()));
+        buffers.extend(projs.iter().map(|p| p.b.buffer()));
+        let scales = scale_words(projs.iter().map(|p| p.scale));
+        let params = [
+            [layout.m, layout.ld, 0, 0],
+            [layout.ns[0], layout.ns[1], layout.ns[2], 0],
+            scales,
+            [layout.ld, layout.du_col0, 0, 0],
+            layout.dy_cols,
+        ]
+        .concat();
+        let groups = (1, layout.m.div_ceil(4), key.count);
+        self.lora_group_run(ctx, key, &buffers, &params, groups)
+    }
+
+    /// As [`lora_grads_grouped`](Self::lora_grads_grouped), with `dY_g` and
+    /// `dU` blocks of columns of the f32 `[m, ld]` buffer `packed`, laid out
+    /// as [`lora_du_packed`](Self::lora_du_packed) writes them. `u` is f32
+    /// `[m, ld_u]`; its projection `g` owns the columns from `g * rank`.
+    ///
+    /// # Errors
+    ///
+    /// As [`lora_grads_grouped`](Self::lora_grads_grouped) and
+    /// [`lora_du_packed`](Self::lora_du_packed).
+    pub fn lora_grads_packed(
+        &self,
+        ctx: &WgpuContext,
+        [x, u, packed]: [&UnifiedTensor; 3],
+        du_col0: usize,
+        projs: &[LoraPackedGrad<'_>],
+        beta: f32,
+    ) -> Result<(), String> {
+        let what = "lora_grads_packed";
+        let layout = packed_layout(
+            what,
+            packed,
+            du_col0,
+            &projs.iter().map(|p| (p.grad_b, p.col0)).collect::<Vec<_>>(),
+        )?;
+        let (um, ld_u) = matrix(what, "u", u)?;
+        let (xm, k) = matrix(what, "x", x)?;
+        if um != layout.m as usize || xm != layout.m as usize {
+            return Err(format!(
+                "{what}: x has {xm} rows and u {um}, the buffer {}",
+                layout.m
+            ));
+        }
+        if ld_u < projs.len() * layout.rank as usize {
+            return Err(format!(
+                "{what}: u has rows of {ld_u}, {} projections of rank {} need more",
+                projs.len(),
+                layout.rank
+            ));
+        }
+        let k32 = to_u32(what, "k", k)?;
+        to_u32(what, "m * k", xm * k)?;
+        to_u32(what, "m * ld", um * ld_u)?;
+        for p in projs {
+            sized(what, "grad_A", p.grad_a, k * layout.rank as usize)?;
+        }
+        let key = Key {
+            kind: Kind::GradsPacked,
+            count: projs.len() as u32,
+            rank: layout.rank,
+        };
+        let mut buffers: Vec<&Buffer> = vec![x.buffer(), u.buffer(), packed.buffer()];
+        buffers.extend(projs.iter().map(|_| packed.buffer()));
+        buffers.extend(projs.iter().map(|p| p.grad_a.buffer()));
+        buffers.extend(projs.iter().map(|p| p.grad_b.buffer()));
+        let scales = scale_words(projs.iter().map(|p| p.scale));
+        let params = [
+            [
+                layout.m,
+                k32,
+                to_u32(what, "ld of u", ld_u)?,
+                beta.to_bits(),
+            ],
+            [layout.ns[0], layout.ns[1], layout.ns[2], 0],
+            scales,
+            [layout.ld, layout.du_col0, 0, 0],
+            layout.dy_cols,
+        ]
+        .concat();
+        let groups = (k32.max(layout.max_n()).div_ceil(32), 1, 2 * key.count);
+        self.lora_group_run(ctx, key, &buffers, &params, groups)
+    }
+
     /// Copies each f32 `A_g` (`[rows, rank]`) into columns `col0 ..
     /// col0 + rank` of the f16 matrix `dst` (`[rows, ld]`, the layout of
     /// [`UnifiedTensor::from_f32_as_f16`]) in one dispatch, rounding to
@@ -628,7 +878,14 @@ mod tests {
 
     fn keys() -> Vec<Key> {
         let mut keys = Vec::new();
-        for kind in [Kind::Ub, Kind::Du, Kind::Grads, Kind::Mirror] {
+        for kind in [
+            Kind::Ub,
+            Kind::Du,
+            Kind::Grads,
+            Kind::Mirror,
+            Kind::DuPacked,
+            Kind::GradsPacked,
+        ] {
             for count in 1..=LORA_GROUP_MAX as u32 {
                 for rank in [1, 2, 3, 4, 8, 12, LORA_GROUP_MAX_RANK as u32] {
                     let key = Key { kind, count, rank };
@@ -715,6 +972,8 @@ mod tests {
             assert_eq!(n(Kind::Du), 1 + 2 * count);
             assert_eq!(n(Kind::Grads), 3 + 3 * count);
             assert_eq!(n(Kind::Mirror), 1 + count);
+            assert_eq!(n(Kind::DuPacked), 1 + 2 * count);
+            assert_eq!(n(Kind::GradsPacked), 3 + 3 * count);
         }
         let names: Vec<_> = slots(Key {
             kind: Kind::Grads,

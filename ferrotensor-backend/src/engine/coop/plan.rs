@@ -612,6 +612,43 @@ pub(super) fn plan_fused(
     plan_with(dims, transposed_b, target, small, fits)
 }
 
+/// The rows of 1.7B's qkv input gradient with the Plain loader, for the
+/// packed backward that writes `[dQ | dK | dV | dU]` side by side. The
+/// `Sources` loader reads the same four blocks as four bindings and runs the
+/// [`TUNED`] row for the key. The Plain loader takes the register-prefetch
+/// loop, and its fastest configuration at 1024 rows on an A10G (a
+/// `matmul_bench --tiles` run, K 6168 by N 2048) is this one with K split 3.
+/// The router rows of 135M and 360M have no Plain entry: they run the table.
+const PLAIN_QKV_DX: Tuned = Tuned::new(1024, true, 6168, 2048, CoopTile::T128X128_W64X64_K32_PF, 3);
+
+/// Rows from which the [`PLAIN_QKV_DX`] configuration stands, and the last
+/// row of the buckets the sweep measured it in (320 to 1408).
+const PLAIN_QKV_DX_ROWS: std::ops::RangeInclusive<u32> = 320..=1408;
+
+/// The [`PLAIN_QKV_DX`] configuration for this product, when it is that one.
+fn plain_row(m: u32, transposed_b: bool, k: u32, n: u32) -> Option<CoopConfig> {
+    let row = &PLAIN_QKV_DX;
+    let is_it = transposed_b == row.transposed_b && k == row.k && n == row.n;
+    (is_it && PLAIN_QKV_DX_ROWS.contains(&m)).then_some(CoopConfig {
+        tile: row.tile,
+        split: row.split,
+    })
+}
+
+/// The configuration a fused product with the Plain loader runs with: the
+/// [`PLAIN_QKV_DX`] row where it applies, else as [`plan_fused`].
+pub(super) fn plan_plain_fused(
+    dims: (u32, u32, u32),
+    transposed_b: bool,
+    target: (u32, bool),
+    fits: impl Fn(CoopTile) -> bool,
+) -> Option<CoopConfig> {
+    let (m, k, n) = dims;
+    let row = plain_row(m, transposed_b, k, n)
+        .filter(|c| target.1 && fits(c.tile) && grid_fits(c.tile, m, n, c.split));
+    row.or_else(|| plan_fused(dims, transposed_b, target, fits))
+}
+
 /// [`plan`] with `small` as the tile list of products of up to 256 rows.
 fn plan_with(
     (m, k, n): (u32, u32, u32),
@@ -658,8 +695,8 @@ pub(super) fn split_to_fill(tile: CoopTile, (m, k, n): (u32, u32, u32), target: 
 #[allow(clippy::expect_used)]
 mod tests {
     use super::{
-        bucket_of, plan, plan_fused, split_k, CoopTile, LARGE_M_TILES, SMALL_M_TILES, STEP_TILES,
-        TUNED,
+        bucket_of, plan, plan_fused, plan_plain_fused, split_k, CoopTile, LARGE_M_TILES,
+        SMALL_M_TILES, STEP_TILES, TUNED,
     };
 
     #[test]
@@ -677,6 +714,63 @@ mod tests {
                 assert!((split - 1) * per < k && split * per >= k, "{k} {s}");
             }
         }
+    }
+
+    #[test]
+    fn plain_qkv_dx_takes_its_own_row_and_leaves_the_other_loaders_alone() {
+        let all = |_: CoopTile| true;
+        let tuned = (160, true);
+        let pick = |c: Option<super::CoopConfig>| c.map(|c| (c.tile, c.split));
+        let want = Some((CoopTile::T128X128_W64X64_K32_PF, 3));
+        // 1.7B qkv dX over the packed buffer (K = 6144 + 3 x 8, N = 2048): the
+        // 896, 1024 and 1352 rows of the 1.7B steps, and both ends of the range.
+        for m in [320, 896, 1024, 1352, 1408] {
+            let dims = (m, 6168, 2048);
+            assert_eq!(pick(plan_plain_fused(dims, true, tuned, all)), want, "{m}");
+        }
+        // The Sources loader (the three-buffer path) runs what it ran before.
+        for m in [896, 1024, 1352] {
+            let dims = (m, 6168, 2048);
+            assert_eq!(
+                pick(plan_fused(dims, true, tuned, all)),
+                pick(plan(dims, true, tuned, all)),
+                "{m}"
+            );
+        }
+        // Outside the measured rows, another K or N, a plain device or one
+        // that fits no tile: as plan_fused.
+        let fused = |dims, tb, target, fits: &dyn Fn(CoopTile) -> bool| {
+            pick(plan_fused(dims, tb, target, fits))
+        };
+        let plain = |dims, tb, target, fits: &dyn Fn(CoopTile) -> bool| {
+            pick(plan_plain_fused(dims, tb, target, fits))
+        };
+        for (dims, tb) in [
+            ((256, 6168, 2048), true),
+            ((1536, 6168, 2048), true),
+            ((1024, 6168, 2048), false),
+            ((1024, 6192, 2048), true),
+            ((1024, 984, 576), true),
+            ((1024, 1624, 960), true),
+        ] {
+            assert_eq!(
+                plain(dims, tb, tuned, &all),
+                fused(dims, tb, tuned, &all),
+                "{dims:?} {tb}"
+            );
+        }
+        assert_eq!(
+            plain((1024, 6168, 2048), true, (160, false), &all),
+            fused((1024, 6168, 2048), true, (160, false), &all)
+        );
+        let none = |_: CoopTile| false;
+        assert!(plan_plain_fused((1024, 6168, 2048), true, tuned, none).is_none());
+        // A tile the device lacks: the router's pick, not the row.
+        let no_pf = |t: CoopTile| t != CoopTile::T128X128_W64X64_K32_PF;
+        assert_eq!(
+            plain((1024, 6168, 2048), true, tuned, &no_pf),
+            fused((1024, 6168, 2048), true, tuned, &no_pf)
+        );
     }
 
     #[test]

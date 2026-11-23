@@ -28,6 +28,11 @@ use wgpu::{util::DeviceExt, Buffer};
 /// [`EXPERIMENTAL_ENV`](crate::adapters::EXPERIMENTAL_ENV).
 pub const FLASH_COOP_ENV: &str = "FERROTENSOR_FLASH_COOP";
 
+/// Environment variable that turns the packed gradient layout of the
+/// attention backward off with `0` (the default is on): dQ, dK and dV then
+/// go to three buffers as before.
+pub const QKV_PACKED_ENV: &str = "FERROTENSOR_QKV_PACKED";
+
 /// Environment variable that sets the rows per workgroup of the
 /// cooperative kernels: `32` or `64`; anything else picks per call.
 const FLASH_ROWS_ENV: &str = "FERROTENSOR_FLASH_ROWS";
@@ -151,6 +156,8 @@ pub(super) struct FlashCoop {
     /// Kernels for 64 rows, then for 32.
     kernels: [OnceLock<Kernels>; 2],
     enabled: AtomicBool,
+    /// Whether the backward may write dQ, dK and dV into one buffer.
+    packed: AtomicBool,
     /// Rows per workgroup forced by the environment or a test; 0 picks per call.
     rows: AtomicU32,
     /// Calls routed to the forward kernel and to the backward pair so far.
@@ -173,6 +180,7 @@ impl FlashCoop {
                 value.as_deref(),
                 crate::adapters::experimental_opt_in(),
             )),
+            packed: AtomicBool::new(std::env::var(QKV_PACKED_ENV).ok().as_deref() != Some("0")),
             rows: AtomicU32::new(rows_from_env(rows.as_deref())),
             runs: (AtomicU64::new(0), AtomicU64::new(0)),
             narrow_runs: (AtomicU64::new(0), AtomicU64::new(0)),
@@ -300,6 +308,24 @@ impl ComputeEngine {
         if let Some(f) = self.coop.as_ref().and_then(|c| c.flash.as_ref()) {
             f.enabled.store(on, Relaxed);
         }
+    }
+
+    /// Allows or forbids the packed gradient layout of the attention
+    /// backward, overriding [`QKV_PACKED_ENV`]; a no-op on a device without
+    /// cooperative matrices.
+    #[doc(hidden)]
+    pub fn set_qkv_packed(&self, on: bool) {
+        if let Some(f) = self.coop.as_ref().and_then(|c| c.flash.as_ref()) {
+            f.packed.store(on, Relaxed);
+        }
+    }
+
+    /// Whether the packed gradient layout is allowed.
+    pub(super) fn flash_coop_packs(&self) -> bool {
+        self.coop
+            .as_ref()
+            .and_then(|c| c.flash.as_ref())
+            .is_some_and(|f| f.packed.load(Relaxed))
     }
 
     /// Forces 32 or 64 rows per workgroup in the cooperative-matrix attention

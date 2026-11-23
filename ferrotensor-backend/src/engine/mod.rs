@@ -26,8 +26,11 @@ mod training;
 pub use attention::AttentionOptions;
 pub(crate) use coop::autotune_requested;
 pub use coop::{AutotuneReport, CoopConfig, CoopTile, AUTOTUNE_ENV};
-pub use flash_coop::FLASH_COOP_ENV;
-pub use lora_group::{LoraGrad, LoraMirror, LoraProj, LORA_GROUP_MAX, LORA_GROUP_MAX_RANK};
+pub use flash_coop::{FLASH_COOP_ENV, QKV_PACKED_ENV};
+pub use lora_group::{
+    LoraGrad, LoraMirror, LoraPackedGrad, LoraPackedProj, LoraProj, LORA_GROUP_MAX,
+    LORA_GROUP_MAX_RANK,
+};
 pub use matmul::{Epilogue, MatmulPath};
 pub use matmul_fused::{FusedA, FusedOut, FusedSpec};
 pub use skinny::SkinnyTile;
