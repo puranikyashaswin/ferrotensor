@@ -26,7 +26,7 @@
 use super::{AutogradNode, Tensor, GRAD_ENABLED};
 use ferrotensor_backend::{
     AttentionOptions, ComputeEngine, DType, FusedA, FusedOut, FusedSpec, LoraGrad, LoraMirror,
-    LoraProj, UnifiedTensor, WgpuContext, LORA_GROUP_MAX, LORA_GROUP_MAX_RANK,
+    LoraProj, RopeFreqs, UnifiedTensor, WgpuContext, LORA_GROUP_MAX, LORA_GROUP_MAX_RANK,
 };
 use std::cell::Cell;
 use std::sync::Arc;
@@ -488,7 +488,7 @@ impl FusedProjections {
 }
 
 /// The geometry and options of [`Tensor::fused_attention`].
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct AttentionGeometry {
     /// Query heads.
     pub n_heads: usize,
@@ -498,6 +498,9 @@ pub struct AttentionGeometry {
     pub head_dim: usize,
     /// RoPE base frequency.
     pub theta: f32,
+    /// Inverse frequency of each rotation pair of a scaled RoPE (Llama 3),
+    /// which replaces the frequencies derived from `theta`.
+    pub inv_freq: Option<RopeFreqs>,
     /// Position of the first token.
     pub pos: u32,
     /// Attention dropout probability.
@@ -560,7 +563,7 @@ impl FusedAttentionNode {
             [&views[0], &views[1], &views[2]],
             &self.stats,
             &self.geom.options(),
-            (self.geom.theta, self.geom.pos),
+            (self.geom.theta, self.geom.pos, self.geom.inv_freq.as_ref()),
         );
         [dq, dk, dv]
     }
@@ -714,7 +717,7 @@ impl Tensor {
             &view(&out, geom.n_heads),
             record.then_some(&stats),
             &geom.options(),
-            (geom.theta, geom.pos),
+            (geom.theta, geom.pos, geom.inv_freq.as_ref()),
         );
         if !record {
             return Tensor::frozen(ctx.clone(), out);
@@ -722,7 +725,7 @@ impl Tensor {
         let node = Arc::new(FusedAttentionNode {
             x: x.clone(),
             proj: proj.clone(),
-            geom: *geom,
+            geom: geom.clone(),
             shape: [batch, seq, hidden],
             q,
             k,

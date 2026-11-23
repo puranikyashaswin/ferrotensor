@@ -4,7 +4,7 @@
 //! [`flash_attention`].
 
 use ferrotensor_autograd::Tensor;
-use ferrotensor_backend::{ComputeEngine, UnifiedTensor, WgpuContext};
+use ferrotensor_backend::{ComputeEngine, RopeFreqs, UnifiedTensor, WgpuContext};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -15,6 +15,8 @@ pub mod fused;
 /// LFM2 (Liquid foundation model) blocks.
 pub mod lfm;
 pub mod model_builder;
+/// Host-side RoPE frequency tables.
+pub mod rope;
 
 pub use classifier::{mean_pool_matrix, ClassifierHead};
 pub use flash_attention::{
@@ -318,6 +320,9 @@ pub struct Attention {
     pub dropout_prob: f32,
     /// RoPE base frequency (`rope_theta` in Hugging Face configs).
     pub rope_theta: f32,
+    /// Inverse frequency of each rotation pair (`[head_dim / 2]`) for scaled
+    /// RoPE such as Llama 3; `None` derives them from `rope_theta`.
+    pub rope_inv_freq: Option<RopeFreqs>,
     /// RMSNorm over `head_dim` applied to every query head before RoPE, one
     /// weight vector `[head_dim]` shared by all heads (Qwen3 `q_norm`).
     /// `None` for Llama-style attention.
@@ -404,8 +409,9 @@ impl Attention {
         let q = per_head_norm(self.q_norm.as_ref(), engine, q, self.head_dim);
         let k = per_head_norm(self.k_norm.as_ref(), engine, k, self.head_dim);
 
-        let q = Tensor::rope_theta(&q, self.head_dim, pos, self.rope_theta, engine);
-        let k = Tensor::rope_theta(&k, self.head_dim, pos, self.rope_theta, engine);
+        let freqs = (self.rope_theta, self.rope_inv_freq.as_ref());
+        let q = Tensor::rope_freqs(&q, self.head_dim, pos, freqs, engine);
+        let k = Tensor::rope_freqs(&k, self.head_dim, pos, freqs, engine);
 
         // Reshape for GQA [batch, seq, n_heads, head_dim]
         let batch = q.data.shape[0];

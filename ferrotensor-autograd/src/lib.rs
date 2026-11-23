@@ -14,8 +14,8 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
 use ferrotensor_backend::{
-    AdamParams, AttentionOptions, ComputeEngine, DType, Epilogue, FlatLayout, UnifiedTensor,
-    WgpuContext,
+    AdamParams, AttentionOptions, ComputeEngine, DType, Epilogue, FlatLayout, RopeFreqs,
+    UnifiedTensor, WgpuContext,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -698,6 +698,9 @@ pub struct RoPENode {
     pub pos: usize,
     /// RoPE base frequency.
     pub theta: f32,
+    /// Inverse frequency of each rotation pair, when it is not derived from
+    /// `theta` (scaled RoPE).
+    pub inv_freq: Option<RopeFreqs>,
 }
 impl AutogradNode for RoPENode {
     fn inputs(&self) -> Vec<Tensor> {
@@ -709,8 +712,9 @@ impl AutogradNode for RoPENode {
         // to a new buffer so the upstream gradient is left untouched.
         let ctx = &self.input.ctx;
         let grad_in = UnifiedTensor::empty(ctx, &self.input.data.shape);
-        let (head_dim, pos, theta) = (self.head_dim, self.pos, self.theta);
-        engine.rope_theta_inverse_to(ctx, (grad, &grad_in), head_dim, pos, theta);
+        let (head_dim, pos) = (self.head_dim, self.pos);
+        let freqs = (self.theta, self.inv_freq.as_ref());
+        engine.rope_freqs_inverse_to(ctx, (grad, &grad_in), head_dim, pos, freqs);
         vec![grad_in]
     }
 }
@@ -1426,14 +1430,28 @@ impl Tensor {
         theta: f32,
         engine: &ComputeEngine,
     ) -> Tensor {
+        Tensor::rope_freqs(input, head_dim, pos, (theta, None), engine)
+    }
+
+    /// [`rope_theta`](Tensor::rope_theta) with the inverse frequency of each
+    /// rotation pair taken from `inv_freq` (`head_dim / 2` of them), as scaled
+    /// RoPE needs; `None` derives them from `theta`.
+    pub fn rope_freqs(
+        input: &Tensor,
+        head_dim: usize,
+        pos: usize,
+        (theta, inv_freq): (f32, Option<&RopeFreqs>),
+        engine: &ComputeEngine,
+    ) -> Tensor {
         let out_data = UnifiedTensor::empty(&input.ctx, &input.data.shape);
         let io = (input.data.as_ref(), &out_data);
-        engine.rope_theta_to(&input.ctx, io, head_dim, pos, theta);
+        engine.rope_freqs_to(&input.ctx, io, head_dim, pos, (theta, inv_freq));
         let node = Arc::new(RoPENode {
             input: input.clone(),
             head_dim,
             pos,
             theta,
+            inv_freq: inv_freq.cloned(),
         });
         Tensor::with_creator(input.ctx.clone(), out_data, node)
     }

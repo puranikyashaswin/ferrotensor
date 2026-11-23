@@ -156,6 +156,16 @@ pub struct RopeConfig {
     /// Scaling factor of a scaled RoPE, if any.
     #[serde(default)]
     pub factor: Option<f64>,
+    /// Llama 3 scaling: the wavelength ratio below which a frequency is
+    /// divided by `factor`.
+    #[serde(default)]
+    pub low_freq_factor: Option<f64>,
+    /// Llama 3 scaling: the wavelength ratio above which a frequency is kept.
+    #[serde(default)]
+    pub high_freq_factor: Option<f64>,
+    /// Llama 3 scaling: the context length the model was first trained on.
+    #[serde(default)]
+    pub original_max_position_embeddings: Option<f64>,
 }
 
 impl RopeConfig {

@@ -23,7 +23,7 @@ mod skinny;
 mod small_m;
 mod training;
 
-pub use attention::AttentionOptions;
+pub use attention::{AttentionOptions, RopeFreqs};
 pub(crate) use coop::autotune_requested;
 pub use coop::{AutotuneReport, CoopConfig, CoopTile, AUTOTUNE_ENV};
 pub use flash_coop::FLASH_COOP_ENV;

@@ -55,6 +55,7 @@ fn main() {
                 num_kv_heads: 1,
                 dropout_prob: 0.0,
                 rope_theta: 10000.0,
+                rope_inv_freq: None,
                 q_norm: None,
                 k_norm: None,
                 fused: FusedSlot::default(),
