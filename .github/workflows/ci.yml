@@ -215,9 +215,8 @@ jobs:
       # made the suite take longer than the 360-minute cap. The step after the
       # sweeps runs one test with the zeroing on, as users get it. The value
       # keeps `noloop`, the user default, so only the zeroing differs. Four
-      # f16 mirror tests (gpu_lora_group, fused_projections) fail on WARP
-      # with it off and pass with it on, so the full suite skips them in the
-      # sweeps and runs them in their own step with it on.
+      # f16 mirror tests fail on WARP with or without it; the sweeps skip
+      # them on DX12 (see the comment there).
       FERROTENSOR_SHADER_CHECKS: ${{ matrix.backend == 'dx12' && 'noloop,nozeroinit' || '' }}
     defaults:
       run:
@@ -262,7 +261,10 @@ jobs:
             echo "skipping the ferrotensor-cli end-to-end tests on this backend (see the comment in ci.yml)"
             exclude=(--exclude ferrotensor-cli)
           fi
-          # The four f16 mirror tests run in the next step, with the zeroing on.
+          # On WARP these four tests fail with the zeroing on and off: the f32
+          # to f16 conversion gives 15361 where round to nearest even gives
+          # 15362 (1.0014648), and they check that bit for bit. They run on
+          # Vulkan and Metal. Why WARP rounds this way is not known.
           skip=()
           if [ "${{ matrix.backend }}" = dx12 ]; then
             skip=(
@@ -273,20 +275,6 @@ jobs:
             )
           fi
           cargo test --release --workspace "${exclude[@]}" --no-fail-fast -- --ignored --test-threads=1 "${skip[@]}"
-      # In the build without the zeroing, WARP converts f32 to f16 toward zero
-      # (1.0014648 comes out as 15361, not 15362). The tests check round to
-      # nearest even bit for bit, so they run with the zeroing on, as users
-      # get it. Why the setting changes the conversion is not known. Both
-      # commands run even if the first fails.
-      - name: f16 mirror tests with workgroup memory zeroed (DX12 full suite)
-        if: ${{ !cancelled() && matrix.backend == 'dx12' && env.FULL_SUITE == 'true' }}
-        env:
-          FERROTENSOR_SHADER_CHECKS: ""
-        run: |
-          status=0
-          cargo test --release -p ferrotensor-backend --test gpu_lora_group -- --ignored --test-threads=1 --exact mirror_equals_f16_of_a_bit_for_bit_after_each_optimizer_step mirror_rounds_ties_to_even_and_keeps_subnormals_and_signed_zero || status=1
-          cargo test --release -p ferrotensor-trainer --test fused_projections -- --ignored --test-threads=1 --exact fused_projections_train_like_the_unfused_layers the_f16_mirror_equals_f16_of_a_after_a_step_and_after_a_resume || status=1
-          exit $status
       # Pull requests on DX12: every backend kernel against its CPU reference
       # (7 min on WARP); with the zeroing step below and the two Tensor API
       # steps, which check forward values and gradients against the CPU, the
