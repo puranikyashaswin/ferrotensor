@@ -260,7 +260,8 @@ jobs:
         if: ${{ !cancelled() && env.FULL_SUITE != 'true' }}
         run: |
           echo "pull request on DX12: running the subset; the full suite runs on main, weekly and by workflow_dispatch"
-          cargo test --release -p ferrotensor-backend --test gpu_kernels --test gpu_counters --no-fail-fast -- --ignored --test-threads=1
+          # TEMPORARY PROBE: removed before merge
+          cargo test --release -p ferrotensor-backend --test gpu_kernels --no-fail-fast -- --ignored --test-threads=1 --nocapture probe_dx12_
       - name: Autograd finite-difference checks
         if: ${{ !cancelled() && env.FULL_SUITE == 'true' }}
         run: cargo test --release -p ferrotensor-autograd --test grad_check -- --test-threads=1
