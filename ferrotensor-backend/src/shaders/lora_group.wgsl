@@ -176,7 +176,8 @@ fn f16_bits_rne(x: u32) -> u32 {
   let sign = (x >> 16u) & 0x8000u;
   let mag = x & 0x7fffffffu;
   if (mag > 0x7f800000u) { return sign | 0x7e00u | ((mag >> 13u) & 0x3ffu); }
-  // The f32 exponent is 143 or more: 65520 and up, or an infinity.
+  // The f32 exponent is 143 or more: 65536 and up, or an infinity. 65520 up
+  // to 65536 reach the infinity by the carry in the normal case below.
   if (mag >= 0x47800000u) { return sign | 0x7c00u; }
   if (mag < 0x38800000u) {
     // Below the smallest f16 normal (f32 exponent 112 or less).
