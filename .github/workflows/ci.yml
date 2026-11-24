@@ -212,8 +212,9 @@ jobs:
       # zeroing on that took 6 to 10 minutes for each small-M pipeline and
       # 45 seconds for each skinny one (0.1 to 0.4 seconds without it), which
       # made the suite take longer than the 360-minute cap. The step after the
-      # sweeps runs one test with the zeroing on, as users get it.
-      FERROTENSOR_SHADER_CHECKS: ${{ matrix.backend == 'dx12' && 'nozeroinit' || '' }}
+      # sweeps runs one test with the zeroing on, as users get it. The value
+      # keeps `noloop`, the user default, so only the zeroing differs.
+      FERROTENSOR_SHADER_CHECKS: ${{ matrix.backend == 'dx12' && 'noloop,nozeroinit' || '' }}
     defaults:
       run:
         shell: bash
