@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.7.2] - unreleased
+## [0.7.2] - 2026-11-24
 
 Mostly GPU work on LoRA training: matmul, attention, the buffer pool, the optimizer and the memory planner. Read before upgrading: the readback functions of the backend now return a `Result` (under Changed), and a batch of up to two sequences is padded to 32 tokens by default (under Changed). The cooperative-matrix kernels, the fused projections and the autotuner are opt-in (under Added).
 
