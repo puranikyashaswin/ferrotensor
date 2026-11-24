@@ -1,0 +1,55 @@
+name: Probe DX12 (temporary)
+
+on:
+  push:
+    branches: [ci/dx12-warp-budget]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: probe ${{ matrix.name }}
+    runs-on: windows-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            dxc: true
+            checks: ""
+          - name: checks-none
+            dxc: true
+            checks: none
+          - name: nobounds
+            dxc: true
+            checks: nobounds
+          - name: nozeroinit
+            dxc: true
+            checks: nozeroinit
+          - name: fxc
+            dxc: false
+            checks: ""
+    env:
+      WGPU_BACKEND: dx12
+      FERROTENSOR_RUN_GPU_TESTS: "1"
+      FERROTENSOR_SHADER_CHECKS: ${{ matrix.checks }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: DXC from the Windows SDK
+        if: matrix.dxc
+        run: |
+          dll=$(ls "/c/Program Files (x86)/Windows Kits/10/bin/"10.*/x64/dxcompiler.dll | sort -V | tail -n 1)
+          dir=$(dirname "$dll")
+          cygpath -w "$dir" >> "$GITHUB_PATH"
+          echo "WGPU_DX12_COMPILER=dxc" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Probe
+        run: cargo test --release -p ferrotensor-backend --test gpu_kernels -- --ignored --test-threads=1 --nocapture probe_dx12_one

@@ -3310,3 +3310,54 @@ fn probe_dx12_smollm2() {
         }
     }
 }
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn probe_dx12_one() {
+    let g = gpu();
+    let (m, k, n) = (256, 576, 8);
+    let a = rand_vec(m * k, 3400);
+    let b = rand_vec(k * n, 3500);
+    let a_up = upload(&a, &[m, k]);
+    let b_up = upload(&b, &[k, n]);
+    let tile = SkinnyTile::ALL[10];
+    for call in 0..2 {
+        let out = zeros(&[m, n]);
+        probe_time(&format!("skinny {tile:?} call {call}"), || {
+            g.engine
+                .matmul_skinny_into(
+                    &g.ctx,
+                    false,
+                    [&a_up, &b_up, &out],
+                    Some(tile),
+                    Epilogue::STORE,
+                )
+                .unwrap();
+            read(&out)
+        });
+    }
+    for (m, k, n) in [(17, 259, 300), (256, 260, 512)] {
+        let a = rand_vec(m * k, 5000);
+        let a_up = upload(&a, &[m, k]);
+        let b_up = upload(&rand_vec(k * n, 5100), &[k, n]);
+        for call in 0..2 {
+            let out = zeros(&[m, n]);
+            probe_time(&format!("small_m f32 a@b {m}x{k}x{n} call {call}"), || {
+                g.engine
+                    .matmul_with_path(
+                        &g.ctx,
+                        false,
+                        &a_up,
+                        &b_up,
+                        &out,
+                        MatmulPath::SmallM {
+                            tile: None,
+                            split: None,
+                        },
+                    )
+                    .unwrap();
+                read(&out)
+            });
+        }
+    }
+}
