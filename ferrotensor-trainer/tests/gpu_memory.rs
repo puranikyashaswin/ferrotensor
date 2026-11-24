@@ -16,7 +16,7 @@ mod common;
 use common::*;
 use ferrotensor_backend::memory::{wgpu_buffer_size, MemorySnapshot};
 use ferrotensor_backend::pool::DEFAULT_MAX_POOLED_BYTES;
-use ferrotensor_backend::{MemoryCategory, UnifiedTensor};
+use ferrotensor_backend::{FlatLayout, MemoryCategory, UnifiedTensor};
 use ferrotensor_trainer::memory::{tag_trainable, MemoryRecorder};
 use std::io::Write as _;
 
@@ -71,8 +71,12 @@ fn tiny_lora_bytes() -> u64 {
 
 fn assert_consistent(s: &MemorySnapshot) {
     let sum: u64 = s.categories.iter().map(|c| c.allocated_bytes).sum();
-    assert_eq!(sum, s.live_bytes, "categories must add up to the total");
-    assert!(s.logical_bytes <= s.live_bytes);
+    assert_eq!(
+        sum + s.pool_slack_bytes,
+        s.live_bytes,
+        "categories and pool slack must add up to the total"
+    );
+    assert!(s.logical_bytes <= sum);
 }
 
 fn print(text: &str) {
@@ -109,9 +113,21 @@ fn memory_report_adds_up_and_does_not_change_training() {
         assert_eq!(b.f16_bytes, base_f16, "frozen f16 weights");
         assert_eq!(s.category(MemoryCategory::Trainable).allocated_bytes, lora);
     }
-    assert_eq!(load.live.live_bytes, base + lora);
+    assert_eq!(
+        load.live.live_bytes - load.live.pool_slack_bytes,
+        base + lora
+    );
     assert!(!load.peak.largest.is_empty());
 
+    // The AdamW moments live in two flat buffers with every tensor padded to
+    // a chunk boundary (see `FlatLayout`), so they are larger than the
+    // adapters; the 16 toy tensors are far smaller than a chunk.
+    let sizes: Vec<usize> = params
+        .iter()
+        .map(|p| p.data.shape.iter().product())
+        .collect();
+    let layout = FlatLayout::new(&sizes).expect("fits one buffer");
+    let moments = 2 * f32_bytes(layout.total());
     let mut trainer_on = trainer(&gpu_on, model, 1e-2);
     let mut losses_on = Vec::new();
     for step in 1..=2 {
@@ -143,15 +159,14 @@ fn memory_report_adds_up_and_does_not_change_training() {
         assert!(r.overall_peak_total_bytes >= r.peak_total_bytes);
         assert_eq!(r.live.awaiting_gpu_bytes, 0, "record waits for the GPU");
         assert_eq!(r.pool_cap_bytes, DEFAULT_MAX_POOLED_BYTES);
-        for c in [
-            MemoryCategory::Activations,
-            MemoryCategory::Loss,
-            MemoryCategory::BackwardScratch,
-        ] {
+        // The peak of this toy model falls in the optimizer step, where the
+        // padded gradient and weight buffers are live with the moments, after
+        // the backward scratch is gone, so scratch is not checked here.
+        for c in [MemoryCategory::Activations, MemoryCategory::Loss] {
             assert!(r.peak.category(c).allocated_bytes > 0, "{c:?} at the peak");
         }
-        // Between steps only the weights, adapters and AdamW moments
-        // (m and v, f32, one pair per adapter tensor) stay live.
+        // Between steps only the weights, adapters and the two flat AdamW
+        // moment buffers stay live.
         let live = &r.live;
         assert_eq!(
             live.category(MemoryCategory::BaseWeights).allocated_bytes,
@@ -164,11 +179,11 @@ fn memory_report_adds_up_and_does_not_change_training() {
         assert_eq!(
             live.category(MemoryCategory::OptimizerState)
                 .allocated_bytes,
-            2 * lora
+            moments
         );
         assert_eq!(
-            live.live_bytes,
-            base + 3 * lora,
+            live.live_bytes - live.pool_slack_bytes,
+            base + lora + moments,
             "something else stayed live"
         );
     }
@@ -240,14 +255,16 @@ fn dropped_buffers_await_the_gpu_until_synchronize() {
     assert_eq!(mem.awaiting_gpu_bytes(), bytes, "dropped past the cap");
     assert_eq!(mem.live_bytes(), live - 2 * bytes);
 
-    // A dispatch's uniform buffer is counted from the start.
+    // A dispatch's uniform buffer is counted from the start. With
+    // immediates the scale goes with the dispatch and there is none.
+    let uniform = if ctx.uses_immediates() { 0 } else { 4 };
     gpu.engine.gradient_scale(ctx, &src, 1.0);
-    assert_eq!(mem.awaiting_gpu_bytes(), bytes + 4);
+    assert_eq!(mem.awaiting_gpu_bytes(), bytes + uniform);
 
     ctx.flush();
     assert_eq!(
         mem.awaiting_gpu_bytes(),
-        bytes + 4,
+        bytes + uniform,
         "counted until the submission is known to have finished"
     );
     ctx.synchronize();
@@ -256,14 +273,14 @@ fn dropped_buffers_await_the_gpu_until_synchronize() {
         0,
         "synchronize lets wgpu free them"
     );
-    assert_eq!(mem.peak_awaiting_gpu_bytes(), bytes + 4);
+    assert_eq!(mem.peak_awaiting_gpu_bytes(), bytes + uniform);
     // Live + idle + awaiting stayed at `live + idle` through the drops,
-    // then the uniform added 4 bytes.
-    assert_eq!(mem.peak_total_bytes(), live + idle + 4);
+    // then the uniform buffer, if any, added its bytes.
+    assert_eq!(mem.peak_total_bytes(), live + idle + uniform);
 
     // The readback copy is staging while it runs, then awaits the GPU.
     let staging_before = mem.current().category(MemoryCategory::Staging).buffers;
-    let values = pollster::block_on(src.to_vec(ctx));
+    let values = pollster::block_on(src.to_vec(ctx)).expect("GPU readback");
     assert_eq!(values.len(), 1024);
     assert_eq!(
         mem.current().category(MemoryCategory::Staging).buffers,

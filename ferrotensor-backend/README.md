@@ -17,7 +17,7 @@ pollster::block_on(async {
     let b = UnifiedTensor::new(&ctx, &[5., 6., 7., 8.], &[4]);
     let out = UnifiedTensor::empty(&ctx, &[4]);
     engine.add(&ctx, &a, &b, &out);
-    println!("{:?}", out.to_vec(&ctx).await); // [6.0, 8.0, 10.0, 12.0]
+    println!("{:?}", out.to_vec(&ctx).await); // Ok([6.0, 8.0, 10.0, 12.0])
 });
 ```
 

@@ -5,6 +5,7 @@ use crate::kernel_timing::{
 };
 use crate::pool::BufferPool;
 use crate::profile::{GpuCounterSnapshot, GpuCounters};
+use crate::shader_checks::ShaderChecks;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,10 +16,36 @@ use wgpu::{Adapter, BindGroup, CommandEncoder, ComputePipeline, Device, Instance
 /// starts on long sequences without waiting for a sync point.
 const MAX_PENDING_OPS: u32 = 128;
 
-/// Queued dispatches are encoded into a pass once this many are waiting. A
-/// long pass delays GPU work: on an A10G (16 Nov 2026) passes of up to 32
-/// dispatches made SmolLM2-1.7B steps slower than one pass per dispatch.
-const MAX_PASS_DISPATCHES: usize = 8;
+/// Queued dispatches are encoded into a pass once this many are waiting. On
+/// an A10G (20 Nov 2026) a step of SmolLM2-135M ran faster the longer the
+/// pass, up to this many, which is the pending-ops cap: each pass costs host
+/// time in the driver, and a longer pass gave 1.7B no GPU slowdown.
+const MAX_PASS_DISPATCHES: usize = 128;
+
+/// Environment variable that replaces `MAX_PENDING_OPS` when the context is
+/// created (a positive integer), to tune submission on a given GPU.
+pub const PENDING_OPS_ENV: &str = "FERROTENSOR_PENDING_OPS";
+
+/// Environment variable that replaces `MAX_PASS_DISPATCHES` when the context
+/// is created (a positive integer).
+pub const PASS_DISPATCHES_ENV: &str = "FERROTENSOR_PASS_DISPATCHES";
+
+/// Environment variable that, set to `1` when the context is created, passes
+/// kernel parameters in uniform buffers even on a device with immediates (see
+/// [`WgpuContext::uses_immediates`]).
+pub const UNIFORM_PARAMS_ENV: &str = "FERROTENSOR_UNIFORM_PARAMS";
+
+/// A positive integer limit from an environment variable's `value`, or
+/// `default` when it is unset, zero or not a number.
+fn limit_from_env_value<T>(value: Option<&str>, default: T) -> T
+where
+    T: std::str::FromStr + PartialEq + From<u8>,
+{
+    match value.map(|v| v.trim().parse::<T>()) {
+        Some(Ok(n)) if n != T::from(0) => n,
+        _ => default,
+    }
+}
 
 /// Uploaded bytes after which [`WgpuContext::note_upload`] waits for the
 /// staging copies to finish so wgpu can free them.
@@ -62,8 +89,17 @@ pub struct WgpuContext {
     /// Bytes uploaded since staging buffers were last released.
     staged: AtomicU64,
     pub(crate) counters: GpuCounters,
+    /// Whether kernel parameters go through immediates.
+    immediates: bool,
     /// Timestamp queries, with [`KernelTiming::On`] on an adapter that has them.
     timer: Option<KernelTimer>,
+    /// Ops recorded before a submit, from [`PENDING_OPS_ENV`].
+    max_pending_ops: u32,
+    /// Dispatches per compute pass, from [`PASS_DISPATCHES_ENV`].
+    max_pass_dispatches: usize,
+    /// Runtime checks for the built-in kernels, from
+    /// [`SHADER_CHECKS_ENV`](crate::SHADER_CHECKS_ENV).
+    shader_checks: ShaderChecks,
 }
 
 /// Recorded work not yet submitted: the encoder, and the dispatches not yet
@@ -91,6 +127,24 @@ pub(crate) struct Dispatch {
     pub(crate) bind_group: BindGroup,
     pub(crate) groups: (u32, u32, u32),
     pub(crate) label: KernelLabel,
+    /// The autotuner's sample this dispatch is part of: its GPU time is
+    /// read back for the tuner (see `engine::coop::autotune`).
+    pub(crate) tune: Option<u64>,
+    /// The kernel's parameters, when they go through immediates.
+    pub(crate) immediates: Option<Vec<u8>>,
+}
+
+impl Dispatch {
+    /// Binds this dispatch's buffers and parameters in `pass`, whose pipeline
+    /// is already set, and dispatches it.
+    pub(crate) fn encode(&self, pass: &mut wgpu::ComputePass<'_>) {
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        if let Some(bytes) = &self.immediates {
+            pass.set_immediates(0, bytes);
+        }
+        let (x, y, z) = self.groups;
+        pass.dispatch_workgroups(x, y, z);
+    }
 }
 
 /// Why [`WgpuContext::try_new_with_options`] could not open a GPU.
@@ -219,40 +273,43 @@ impl WgpuContext {
         timing: KernelTiming,
     ) -> Result<Self, ContextError> {
         let backends = crate::adapters::backends();
-        let instance = Instance::new(wgpu::InstanceDescriptor {
-            backends,
-            dx12_shader_compiler: wgpu::util::dx12_shader_compiler_from_env().unwrap_or_default(),
-            ..Default::default()
-        });
+        let instance = crate::adapters::instance(backends);
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference,
                 force_fallback_adapter,
                 compatible_surface: None,
+                apply_limit_buckets: false,
             })
             .await
-            .ok_or(ContextError::NoAdapter {
+            .map_err(|_| ContextError::NoAdapter {
                 backends,
                 force_fallback_adapter,
             })?;
 
+        // The autotuner times the dispatches it tags, so it needs timestamps
+        // even when kernel timing is off.
+        let tuning = crate::engine::autotune_requested();
         let timing_mode = match timing {
-            KernelTiming::Off => None,
-            KernelTiming::On => KernelTimingMode::for_features(adapter.features()),
+            KernelTiming::Off if !tuning => None,
+            KernelTiming::Off | KernelTiming::On => {
+                KernelTimingMode::for_features(adapter.features())
+            }
         };
+        let required_features = timing_mode
+            .map_or(wgpu::Features::empty(), KernelTimingMode::features)
+            | crate::adapters::optional_features(&adapter);
         let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("Ferrotensor Device"),
-                    required_features: timing_mode
-                        .map_or(wgpu::Features::empty(), KernelTimingMode::features),
-                    // Use what the hardware supports rather than the WebGPU
-                    // defaults (e.g. 8 storage buffers per stage, 128 MiB
-                    // bindings), which are too small for model weights.
-                    required_limits: adapter.limits(),
-                },
-                None,
-            )
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("Ferrotensor Device"),
+                required_features,
+                // Use what the hardware supports rather than the WebGPU
+                // defaults (e.g. 8 storage buffers per stage, 128 MiB
+                // bindings), which are too small for model weights.
+                required_limits: adapter.limits(),
+                experimental_features: crate::adapters::experimental_features(required_features),
+                ..Default::default()
+            })
             .await
             .map_err(|source| ContextError::DeviceRefused {
                 adapter: adapter.get_info().name,
@@ -268,7 +325,17 @@ impl WgpuContext {
                 .ok()
                 .as_deref(),
         ));
-        let timer = timing_mode.map(|mode| KernelTimer::new(mode, &queue, MAX_PENDING_OPS));
+        let env = |name: &str| std::env::var(name).ok();
+        let max_pending_ops =
+            limit_from_env_value(env(PENDING_OPS_ENV).as_deref(), MAX_PENDING_OPS);
+        let max_pass_dispatches =
+            limit_from_env_value(env(PASS_DISPATCHES_ENV).as_deref(), MAX_PASS_DISPATCHES);
+        let timer = timing_mode.map(|mode| {
+            KernelTimer::new(mode, &queue, max_pending_ops, timing == KernelTiming::On)
+        });
+        let immediates = device.features().contains(wgpu::Features::IMMEDIATES)
+            && device.limits().max_immediate_size >= crate::engine::IMMEDIATE_BYTES
+            && !env(UNIFORM_PARAMS_ENV).is_some_and(|v| v.trim() == "1");
         Ok(Self {
             instance,
             adapter,
@@ -279,7 +346,28 @@ impl WgpuContext {
             staged: AtomicU64::new(0),
             counters: GpuCounters::default(),
             timer,
+            max_pending_ops,
+            max_pass_dispatches,
+            shader_checks: ShaderChecks::from_env(),
+            immediates,
         })
+    }
+
+    /// Whether [`ComputeEngine`](crate::ComputeEngine) passes kernel
+    /// parameters as immediates, set with each dispatch, rather than in a
+    /// uniform buffer made for it. True when the device has
+    /// `wgpu::Features::IMMEDIATES` for the largest parameters and
+    /// [`UNIFORM_PARAMS_ENV`] was not `1`.
+    pub fn uses_immediates(&self) -> bool {
+        self.immediates
+    }
+
+    /// This context with kernel parameters in uniform buffers, as
+    /// [`UNIFORM_PARAMS_ENV`] asks; build engines for it after this call.
+    #[must_use]
+    pub fn with_uniform_params(mut self) -> Self {
+        self.immediates = false;
+        self
     }
 
     /// Records GPU work into the pending command encoder; it runs after
@@ -303,7 +391,7 @@ impl WgpuContext {
     pub(crate) fn record_dispatch(&self, dispatch: Dispatch) {
         let mut pending = self.pending.lock().unwrap();
         pending.dispatches.push(dispatch);
-        if pending.dispatches.len() >= MAX_PASS_DISPATCHES {
+        if pending.dispatches.len() >= self.max_pass_dispatches {
             self.encoder(&mut pending);
         }
         self.count_op(&mut pending);
@@ -311,7 +399,7 @@ impl WgpuContext {
 
     fn count_op(&self, pending: &mut Pending) {
         pending.ops += 1;
-        if pending.ops >= MAX_PENDING_OPS {
+        if pending.ops >= self.max_pending_ops {
             self.submit(pending);
         }
     }
@@ -339,7 +427,8 @@ impl WgpuContext {
         if dispatches.is_empty() {
             return encoder;
         }
-        if let Some(timer) = &self.timer {
+        let timer = self.timer.as_ref().filter(|t| t.times_any(dispatches));
+        if let Some(timer) = timer {
             let passes = timer.encode(&self.device, encoder, dispatches, times);
             self.counters
                 .compute_passes
@@ -354,9 +443,7 @@ impl WgpuContext {
                     pass.set_pipeline(&dispatch.pipeline);
                     bound = Some(&dispatch.pipeline);
                 }
-                pass.set_bind_group(0, &dispatch.bind_group, &[]);
-                let (x, y, z) = dispatch.groups;
-                pass.dispatch_workgroups(x, y, z);
+                dispatch.encode(&mut pass);
             }
             drop(pass);
             dispatches.clear();
@@ -411,24 +498,30 @@ impl WgpuContext {
 
     /// Polls the device until `done` returns true.
     ///
-    /// Never blocks in `Maintain::Wait`: wgpu-core 0.19 gives up waiting
+    /// Never blocks in a waiting poll: wgpu-core 0.19 gave up waiting
     /// there after 5 s and then frees the still-running submission's
-    /// resources as if it had finished, which crashes drivers that are still
+    /// resources as if it had finished, which crashed drivers that were still
     /// reading them (seen with long batches on lavapipe).
     pub(crate) fn poll_until(&self, done: impl Fn() -> bool) {
+        self.poll_until_done(done);
+        // Callers wait for the last submitted work, so that poll let wgpu
+        // destroy every buffer dropped before it.
+        self.memory().gpu_reclaimed();
+        self.release_idle_buffers();
+        if let Some(timer) = &self.timer {
+            timer.collect();
+        }
+    }
+
+    /// Polls the device until `done` returns true, counting the time as GPU
+    /// wait; see [`poll_until`](Self::poll_until) for why it never blocks.
+    fn poll_until_done(&self, done: impl Fn() -> bool) {
         let start = Instant::now();
         let mut polls = 0u32;
         loop {
             self.poll();
             if done() {
                 GpuCounters::add_elapsed(&self.counters.gpu_wait_nanos, start);
-                // Callers wait for the last submitted work, so that poll let
-                // wgpu destroy every buffer dropped before it.
-                self.memory().gpu_reclaimed();
-                self.release_idle_buffers();
-                if let Some(timer) = &self.timer {
-                    timer.collect();
-                }
                 return;
             }
             if polls < 100 {
@@ -438,6 +531,30 @@ impl WgpuContext {
             }
             polls += 1;
         }
+    }
+
+    /// Submits the recorded work and returns the number of the last
+    /// submission, to pass to [`wait_for_submission`](Self::wait_for_submission).
+    pub fn submission_mark(&self) -> u64 {
+        self.flush();
+        self.memory().recording_serial().saturating_sub(1)
+    }
+
+    /// Submits the recorded work, then polls until submission `mark` (from
+    /// [`submission_mark`](Self::submission_mark)) has finished on the GPU
+    /// and drops the pool's idle buffers above its cap that only that work
+    /// used.
+    ///
+    /// Work submitted after `mark` keeps running. A trainer that never reads
+    /// the GPU inside a window calls this once per micro-batch so the host
+    /// stays at most one micro-batch ahead; otherwise, on a GPU-bound model,
+    /// the pool cannot trim and holds the idle buffers of several
+    /// micro-batches at once.
+    pub fn wait_for_submission(&self, mark: u64) {
+        self.flush();
+        let memory = self.memory();
+        self.poll_until_done(|| memory.completed_serial() >= mark);
+        self.release_idle_buffers();
     }
 
     fn submit(&self, pending: &mut Pending) {
@@ -478,7 +595,11 @@ impl WgpuContext {
     /// maintenance, whose cost grows with the number of live buffers.
     fn poll(&self) {
         self.counters.device_polls.fetch_add(1, Ordering::Relaxed);
-        self.device.poll(wgpu::Maintain::Poll);
+        // `PollType::Poll` neither waits nor names a submission, so neither
+        // `PollError` (a wait timeout, a wrong submission index) can occur.
+        if let Err(e) = self.device.poll(wgpu::PollType::Poll) {
+            log::warn!("non-blocking device poll failed: {e}");
+        }
     }
 
     /// Byte counters of this context's tensors: live, peak, idle in the
@@ -492,11 +613,35 @@ impl WgpuContext {
         self.counters.snapshot()
     }
 
+    /// The runtime checks the built-in kernels are compiled with, read from
+    /// [`SHADER_CHECKS_ENV`](crate::SHADER_CHECKS_ENV) when the context was created.
+    pub fn shader_checks(&self) -> ShaderChecks {
+        self.shader_checks
+    }
+
     /// Where this context writes kernel timestamps; `None` when it was
     /// opened without [`KernelTiming::On`] or the adapter has no timestamp
     /// queries.
     pub fn kernel_timing_mode(&self) -> Option<KernelTimingMode> {
-        self.timer.as_ref().map(|timer| timer.mode)
+        self.timer
+            .as_ref()
+            .filter(|timer| timer.all)
+            .map(|timer| timer.mode)
+    }
+
+    /// Whether the context can time the dispatches the autotuner tags.
+    pub(crate) fn has_timestamps(&self) -> bool {
+        self.timer.is_some()
+    }
+
+    /// The GPU times of the autotuner's tagged dispatches that the GPU has
+    /// finished, each as its sample id and duration (`None`: unusable
+    /// timestamps); never waits.
+    pub(crate) fn take_tune_samples(&self) -> Vec<(u64, Option<Duration>)> {
+        self.timer.as_ref().map_or_else(Vec::new, |timer| {
+            timer.collect();
+            timer.take_samples()
+        })
     }
 
     /// GPU time by kernel, of the work the GPU finished before the last
@@ -504,10 +649,25 @@ impl WgpuContext {
     pub fn kernel_times(&self) -> KernelTimes {
         self.timer
             .as_ref()
+            .filter(|timer| timer.all)
             .map_or_else(KernelTimes::default, |timer| {
                 timer.collect();
                 timer.totals()
             })
+    }
+
+    /// The cooperative-matrix configurations this device can run; empty when
+    /// it was opened without cooperative matrices.
+    pub fn cooperative_matrix(&self) -> Vec<crate::adapters::CoopMatrixConfig> {
+        if self
+            .device
+            .features()
+            .contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
+        {
+            crate::adapters::cooperative_matrix_configs(&self.adapter)
+        } else {
+            Vec::new()
+        }
     }
 
     /// Adapter name and backend, e.g. `"Apple M2 (Metal)"`.
@@ -520,6 +680,16 @@ impl WgpuContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn submit_limits_take_a_positive_integer_from_the_environment() {
+        assert_eq!(limit_from_env_value(None, 128u32), 128);
+        assert_eq!(limit_from_env_value(Some(" 64 "), 128u32), 64);
+        assert_eq!(limit_from_env_value(Some("1"), 8usize), 1);
+        for bad in ["0", "-3", "eight", ""] {
+            assert_eq!(limit_from_env_value(Some(bad), 8usize), 8, "{bad:?}");
+        }
+    }
 
     #[test]
     fn no_adapter_message_names_backends_and_what_to_do() {

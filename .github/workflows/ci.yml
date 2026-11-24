@@ -183,7 +183,10 @@ jobs:
     # is real hardware and neither says anything about speed. The Qwen2
     # fixture is not generated here, so those four tests skip.
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 180
+    # 360 minutes is the most a hosted runner allows. On WARP the pull-request
+    # subset took 1 h 41 min on 0.7.1 and the 0.7.2 kernels (the skinny and
+    # epilogue tests) add well over an hour, so 180 minutes cancelled it.
+    timeout-minutes: 360
     # The full DX12 run is not reliably green yet (docs/testing-on-your-gpu.md
     # has the failure): its failures show in the job but do not fail the
     # workflow on main. The pull-request subset and Metal are blocking.

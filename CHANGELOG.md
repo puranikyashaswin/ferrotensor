@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-11-24
+
+Mostly GPU work on LoRA training: matmul, attention, the buffer pool, the optimizer and the memory planner. Read before upgrading: the readback functions of the backend now return a `Result` (under Changed), and a batch of up to two sequences is padded to 32 tokens by default (under Changed). The cooperative-matrix kernels, the fused projections and the autotuner are opt-in (under Added).
+
+### Added
+- Opt in with `FERROTENSOR_EXPERIMENTAL=1`: f16-weight matmuls on cooperative matrices (a tiled kernel with split-K, register-prefetch tiles, and fused loaders and epilogues), tensor-core flash attention forward and backward for head size 64, and fused q/k/v and gate/up projections in LoRA training with grouped LoRA kernels and an f16 copy of each A matrix. Inputs past the f16 range are clamped and counted. `FERROTENSOR_FLASH_COOP=0` keeps the scalar attention kernels and `FERROTENSOR_FLASH_ROWS` forces the rows per workgroup. A wide forward product against a transposed weight walks the cooperative grid in groups of row tiles so a wave shares its weight columns.
+- `FERROTENSOR_AUTOTUNE=1` times up to eight tile and split-K candidates for each product inside the training step and keeps the fastest in a cache file keyed by adapter, driver and Ferrotensor version. A missing, corrupt or mismatched file is ignored with a warning. `train --json` reports an `autotune` object. With the variable unset, the router's choice is unchanged.
+- `train --length-bucket N` pads every micro-batch to a multiple of N tokens, and the step profile counts pool buffers.
+- `FERROTENSOR_SHADER_CHECKS` (`noloop`, `nobounds`, `nodiv`, `nozeroinit`, `none` or a comma list) builds the kernels without some of wgpu's runtime checks. Unset means `noloop`; `default` keeps every check.
+- `FERROTENSOR_UNIFORM_PARAMS=1` and `WgpuContext::with_uniform_params` keep uniform buffers for kernel parameters.
+- Benchmark tools: `matmul-tune` times every cooperative and thin-matmul configuration on model shapes, `matmul_bench` takes `--tiles` and a plain qkv dX case, and `fused_bench` is a new example.
+
+### Changed
+- Matmuls with up to 256 rows run on a tuned tile and split-K choice, and 32 to 63 row products against f16 weights go to the cooperative kernel. The router has new rows for up to 2,048 rows of SmolLM2-360M and 1.7B and finds its rows through an index. Thin f32 products (the LoRA `x @ A` and its gradients) run on a new skinny kernel with a fixed-order reduction. The coop matmul is built without shader bounds checks at 256 rows or more.
+- Attention: 32-row workgroups, RoPE applied inside the kernels, and dK and dV computed for each query head and summed over the head group in head order.
+- The buffer pool rounds a request up to a size class and serves it from a larger idle buffer before it creates one. Bind groups are cached by buffers instead of tensor length, 32,768 are kept, and only those of freed buffers are evicted. Up to 128 dispatches share a compute pass, up from 8. The memory report counts the extra bytes of a larger pooled buffer as `pool slack` (`pool_slack_bytes` in `memory_report.json`, `MemorySnapshot` and `BufferRecord`). Results are unchanged.
+- Kernel parameters are passed as immediates when the device has them, with a uniform-buffer fallback. DX12 keeps uniform buffers.
+- The optimizer steps over one gradient arena: gradients are packed into one flat buffer, the clip norm matches the per-tensor path bit for bit, and the arena is cleared on the GPU.
+- A micro-batch of up to two sequences is padded to 32 tokens by default; larger batches pad to the longest sequence. `--length-bucket` or `Trainer::with_length_bucket` forces one bucket. `lm_head` runs only on supervised rows.
+- `finetune` and `plan` plan memory for the dataset's real padded length and require the longest batch to fit the budget. Gate and up are fused under `auto` up to a summed width of 8,192.
+- Smaller kernel work: RoPE rotates out of place, the RMSNorm weight gradient is skipped when the weight is frozen, the residual gradient is added inside the RMSNorm backward kernel, an add passes its gradient on without a copy, a window's losses are read back once with the loss gradient seeded in the kernel, and a training embedding table is gathered on the GPU.
+- The backend moves to wgpu 30.0.2. `UnifiedTensor::to_vec`, `read_many` and `adapters::self_check` return `ReadbackError` when wgpu cannot map the staging buffer instead of panicking, and device loss is named in readback errors. `info --json` lists each adapter's cooperative-matrix shapes.
+
 ## [0.7.1] - 2026-11-21
 
 Five GPU kernel changes to LoRA training, in attention, matmul and the LoRA scale. One library change can break code: `FlashAttentionNode` has two new public fields, so code that builds it with a struct literal must set them (under Changed).
@@ -235,7 +258,8 @@ First public version.
 - Renamed the project from Rusty to Ferrotensor; crates are now `ferrotensor-*` and the CLI binary is `ferrotensor`.
 - Licensed under MIT OR Apache-2.0 (previously MIT only).
 
-[Unreleased]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.7.2...HEAD
+[0.7.2]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.5.0...v0.6.0

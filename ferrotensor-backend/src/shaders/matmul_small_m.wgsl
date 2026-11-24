@@ -13,7 +13,9 @@
 // a pass of up to 128 rows, so each weight element is read once per pass;
 // the K split gives the grid enough workgroups to fill the GPU. With more
 // than one slice each workgroup writes its partial sums to slice z of an
-// [S, M, N] buffer, which matmul_split_reduce adds in a fixed order.
+// [S, M, N] buffer, which matmul_split_reduce adds in a fixed order. With one
+// slice it stores alpha * sum + beta * out (alpha and beta are the bits of
+// params[1].xy; beta = 0 never reads out); with more, the reduction does.
 //
 // Each thread keeps TM x TN outputs in registers: rows ty + i * TY, and
 // columns tx + j * TX (a@bT) or (tx + j * TX) * 4 + 0..3 (a@b). K advances
@@ -46,7 +48,15 @@ const SKM_B_HALF: u32 = %B_HALF%u;
 @group(0) @binding(0) var<storage, read> skm_a: array<f32>;
 @group(0) @binding(1) var<storage, read> skm_b: array<%B_ELEM%>;
 @group(0) @binding(2) var<storage, read_write> skm_out: array<f32>;
-@group(0) @binding(3) var<uniform> skm_params: vec4<u32>; // M, K, N, K per slice
+@group(0) @binding(3) var<uniform> skm_params: array<vec4<u32>, 2>; // [M, K, N, K per slice], [alpha, beta, 0, 0]
+
+// Stores alpha * v + beta * out[i] to out[i].
+fn skm_store(i: u32, v: f32) {
+    let beta = bitcast<f32>(skm_params[1].y);
+    var o = bitcast<f32>(skm_params[1].x) * v;
+    if (beta != 0.0) { o = o + beta * skm_out[i]; }
+    skm_out[i] = o;
+}
 
 var<workgroup> skm_as: array<vec4<f32>, %A_LEN%>;
 var<workgroup> skm_bs: array<vec4<f32>, %B_LEN%>;
@@ -76,11 +86,11 @@ fn matmul_small_m(
     @builtin(local_invocation_index) lidx: u32,
     @builtin(workgroup_id) wg: vec3<u32>,
 ) {
-    let m = skm_params.x;
-    let k = skm_params.y;
-    let n = skm_params.z;
-    let k_begin = wg.z * skm_params.w;
-    let k_end = min(k, k_begin + skm_params.w);
+    let m = skm_params[0].x;
+    let k = skm_params[0].y;
+    let n = skm_params[0].z;
+    let k_begin = wg.z * skm_params[0].w;
+    let k_end = min(k, k_begin + skm_params[0].w);
     let tiles = (k_end - k_begin + SKM_BK - 1u) / SKM_BK;
     let row0 = wg.x * SKM_BM;
     let col0 = wg.y * SKM_BN;

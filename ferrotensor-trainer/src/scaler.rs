@@ -1,18 +1,17 @@
 //! Dynamic loss scaling.
 //!
 //! Scales the loss before the backward pass and unscales the gradients before
-//! the optimizer step, adjusting the scale when gradients overflow. Nothing in
-//! the CLI uses it, and training runs in f32 (only frozen weights can be f16),
-//! so there is no f16 gradient underflow for it to guard against today.
+//! the optimizer step, adjusting the scale when gradients overflow. The CLI
+//! turns it on when matmuls run on cooperative matrices, which round their
+//! f32 inputs (activations and gradients) to f16.
 
 use ferrotensor_backend::{ComputeEngine, UnifiedTensor, WgpuContext};
 
 /// Dynamic gradient scaler.
 ///
 /// Scales the loss, then unscales gradients before the optimizer step, and
-/// adjusts the scale based on whether gradients contain inf/nan. This is the
-/// technique used to keep f16 gradients from underflowing, but Ferrotensor has
-/// no f16 gradient path, so the CLI does not use it.
+/// adjusts the scale based on whether gradients contain inf/nan. This keeps
+/// gradients that a matmul rounds to f16 from underflowing.
 ///
 /// # Example
 /// ```no_run
@@ -49,6 +48,8 @@ pub struct GradScaler {
     found_overflow: bool,
     /// Whether the scaler is enabled
     enabled: bool,
+    /// Optimizer steps skipped because the gradients overflowed.
+    skipped_steps: u64,
 }
 
 /// Serialized [`GradScaler`] state.
@@ -68,6 +69,10 @@ pub struct GradScalerCheckpoint {
     pub found_overflow: bool,
     /// Whether scaling is on.
     pub enabled: bool,
+    /// Optimizer steps skipped so far; 0 in checkpoints written before it
+    /// was recorded.
+    #[serde(default)]
+    pub skipped_steps: u64,
 }
 
 impl GradScaler {
@@ -83,6 +88,7 @@ impl GradScaler {
             consecutive_good_steps: 0,
             found_overflow: false,
             enabled: true,
+            skipped_steps: 0,
         }
     }
 
@@ -101,6 +107,7 @@ impl GradScaler {
             consecutive_good_steps: 0,
             found_overflow: false,
             enabled: true,
+            skipped_steps: 0,
         }
     }
 
@@ -129,6 +136,10 @@ impl GradScaler {
     ///
     /// Returns true if gradients are valid (no overflow), false otherwise.
     /// If false, you should skip the optimizer step.
+    #[expect(
+        clippy::expect_used,
+        reason = "a readback fails only on device loss, and the caller has no error path"
+    )]
     pub fn unscale_and_check(
         &mut self,
         gradients: &[UnifiedTensor],
@@ -147,7 +158,8 @@ impl GradScaler {
             engine.gradient_scale(ctx, grad, inv_scale);
 
             // Check for inf/nan (CPU readback - sync point)
-            let data = pollster::block_on(grad.to_vec(ctx));
+            let data =
+                pollster::block_on(grad.to_vec(ctx)).expect("GPU device lost during readback");
             if data.iter().any(|&x| x.is_infinite() || x.is_nan()) {
                 has_overflow = true;
                 break;
@@ -156,6 +168,32 @@ impl GradScaler {
 
         self.found_overflow = has_overflow;
         !has_overflow
+    }
+
+    /// The factor that unscales gradients whose global L2 norm at the current
+    /// scale is `scaled_norm`, or `None` when that norm is not finite.
+    ///
+    /// A non-finite norm means a gradient overflowed: the caller skips the
+    /// optimizer step, and the scale backs off (halves by default). Either
+    /// way this calls [`update`](Self::update). With the scaler disabled the
+    /// factor is 1 and nothing changes.
+    pub fn unscale_factor(&mut self, scaled_norm: f32) -> Option<f32> {
+        if !self.enabled {
+            return scaled_norm.is_finite().then_some(1.0);
+        }
+        let overflowed = !scaled_norm.is_finite();
+        let factor = 1.0 / self.scale;
+        if overflowed {
+            self.skipped_steps += 1;
+        }
+        self.found_overflow = overflowed;
+        self.update();
+        (!overflowed).then_some(factor)
+    }
+
+    /// Optimizer steps skipped because the gradients overflowed.
+    pub fn skipped_steps(&self) -> u64 {
+        self.skipped_steps
     }
 
     /// Update the scale factor based on whether overflow occurred.
@@ -229,6 +267,7 @@ impl GradScaler {
             consecutive_good_steps: self.consecutive_good_steps,
             found_overflow: self.found_overflow,
             enabled: self.enabled,
+            skipped_steps: self.skipped_steps,
         }
     }
 
@@ -241,6 +280,7 @@ impl GradScaler {
         self.consecutive_good_steps = checkpoint.consecutive_good_steps;
         self.found_overflow = checkpoint.found_overflow;
         self.enabled = checkpoint.enabled;
+        self.skipped_steps = checkpoint.skipped_steps;
     }
 }
 
@@ -272,6 +312,7 @@ impl std::fmt::Display for GradScalerStats {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -307,6 +348,62 @@ mod tests {
         // Scale should have halved
         assert_eq!(scaler.scale, 512.0);
         assert_eq!(scaler.consecutive_good_steps, 0);
+    }
+
+    #[test]
+    fn overflow_skips_the_step_halves_the_scale_and_counts_it() {
+        let mut scaler = GradScaler::new();
+        assert_eq!(scaler.unscale_factor(3.0 * 65536.0), Some(1.0 / 65536.0));
+        for bad in [f32::INFINITY, f32::NAN, f32::NEG_INFINITY] {
+            assert_eq!(scaler.unscale_factor(bad), None, "{bad}");
+        }
+        assert_eq!(scaler.scale_factor(), 65536.0 / 8.0);
+        assert_eq!(scaler.skipped_steps(), 3);
+        assert_eq!(scaler.stats().consecutive_good_steps, 0);
+        // The next good step unscales by the halved scale.
+        assert_eq!(scaler.unscale_factor(1.0), Some(8.0 / 65536.0));
+        assert_eq!(scaler.stats().consecutive_good_steps, 1);
+    }
+
+    #[test]
+    fn scale_doubles_after_the_growth_interval_of_good_steps() {
+        // PyTorch GradScaler defaults: 2^16, x2 every 2000 good steps, x0.5.
+        let mut scaler = GradScaler::new();
+        for _ in 0..1999 {
+            assert!(scaler.unscale_factor(1.0).is_some());
+        }
+        assert_eq!(scaler.scale_factor(), 65536.0);
+        assert_eq!(scaler.unscale_factor(1.0), Some(1.0 / 65536.0));
+        assert_eq!(scaler.scale_factor(), 131072.0);
+        // An overflow restarts the count.
+        assert_eq!(scaler.unscale_factor(f32::INFINITY), None);
+        assert_eq!(scaler.scale_factor(), 65536.0);
+        assert_eq!(scaler.skipped_steps(), 1);
+    }
+
+    #[test]
+    fn disabled_scaler_unscales_by_one_and_still_refuses_overflow() {
+        let mut scaler = GradScaler::new();
+        scaler.set_enabled(false);
+        assert_eq!(scaler.unscale_factor(5.0), Some(1.0));
+        assert_eq!(scaler.unscale_factor(f32::NAN), None);
+        assert_eq!(scaler.skipped_steps(), 0);
+        assert_eq!(scaler.stats().scale, 65536.0);
+    }
+
+    #[test]
+    fn checkpoint_keeps_the_skipped_steps_and_reads_old_files() {
+        let mut scaler = GradScaler::new();
+        assert_eq!(scaler.unscale_factor(f32::NAN), None);
+        let mut restored = GradScaler::new();
+        restored.load_checkpoint(&scaler.checkpoint());
+        assert_eq!(restored.skipped_steps(), 1);
+        assert_eq!(restored.scale_factor(), 32768.0);
+        let old: GradScalerCheckpoint = serde_json::from_str(
+            r#"{"scale":1024.0,"growth_factor":2.0,"backoff_factor":0.5,"growth_interval":2000,"consecutive_good_steps":3,"found_overflow":false,"enabled":true}"#,
+        )
+        .unwrap();
+        assert_eq!(old.skipped_steps, 0);
     }
 
     #[test]

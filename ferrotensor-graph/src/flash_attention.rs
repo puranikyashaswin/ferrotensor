@@ -418,6 +418,53 @@ impl GroupedQueryAttention {
         output
     }
 
+    /// Forward pass on `q` and `k` before RoPE, rotated inside the kernel.
+    ///
+    /// Row `i` of `q` and of `k` is rotated as position `pos + i` with base
+    /// frequency `theta`, so the output is that of `rope_theta` on both
+    /// followed by [`forward`](Self::forward). Returns the output and the
+    /// log-sum-exp tensor that
+    /// [`ComputeEngine::flash_attention_v2_rope_backward_with_stats`] takes.
+    ///
+    /// # Panics
+    /// Panics if a tensor is not 4D.
+    #[expect(
+        clippy::panic,
+        reason = "shape precondition of an op that returns no Result"
+    )]
+    pub fn forward_rope(
+        &self,
+        (q, k, v): (&UnifiedTensor, &UnifiedTensor, &UnifiedTensor),
+        (theta, pos): (f32, u32),
+        ctx: &WgpuContext,
+        engine: &ComputeEngine,
+    ) -> (UnifiedTensor, UnifiedTensor) {
+        if q.shape.len() != 4 || k.shape.len() != 4 || v.shape.len() != 4 {
+            panic!("GroupedQueryAttention expects 4D tensors (batch, seq, heads, dim)");
+        }
+        let (batch_size, seq_q) = (q.shape[0], q.shape[1]);
+        let output = UnifiedTensor::empty(ctx, &[batch_size, seq_q, self.num_heads, self.head_dim]);
+        // Two f32 per row: the log-sum-exp the backward pass reads, and its scratch.
+        let stats = UnifiedTensor::empty(ctx, &[batch_size, self.num_heads, seq_q, 2]);
+        let opts = AttentionOptions {
+            causal: self.causal,
+            dropout_prob: self.dropout_prob,
+            seed: self.seed,
+            ..AttentionOptions::default()
+        };
+        engine.flash_attention_v2_rope_with_stats(
+            ctx,
+            q,
+            k,
+            v,
+            &output,
+            Some(&stats),
+            &opts,
+            (theta, pos),
+        );
+        (output, stats)
+    }
+
     /// Get memory savings compared to standard MHA
     pub fn memory_savings(&self) -> String {
         let mha_kv_params = 2 * self.num_heads * self.head_dim;

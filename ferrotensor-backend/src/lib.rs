@@ -9,13 +9,16 @@
 //! ```no_run
 //! use ferrotensor_backend::{ComputeEngine, UnifiedTensor, WgpuContext};
 //!
+//! # fn main() -> Result<(), ferrotensor_backend::ReadbackError> {
 //! let ctx = pollster::block_on(WgpuContext::new());
 //! let engine = ComputeEngine::new(&ctx);
 //! let a = UnifiedTensor::new(&ctx, &[1.0, 2.0, 3.0, 4.0], &[2, 2]);
 //! let b = UnifiedTensor::new(&ctx, &[1.0, 0.0, 0.0, 1.0], &[2, 2]);
 //! let c = UnifiedTensor::empty(&ctx, &[2, 2]);
 //! engine.matmul(&ctx, &a, &b, &c);
-//! assert_eq!(pollster::block_on(c.to_vec(&ctx)), vec![1.0, 2.0, 3.0, 4.0]);
+//! assert_eq!(pollster::block_on(c.to_vec(&ctx))?, vec![1.0, 2.0, 3.0, 4.0]);
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! Kernels are checked against CPU references in `tests/gpu_kernels.rs`
@@ -26,6 +29,7 @@
 pub use wgpu; // Re-export wgpu for downstream crates
 
 pub mod adapters;
+mod bind_cache;
 mod context;
 mod engine;
 mod kernel_timing;
@@ -34,13 +38,24 @@ pub mod memory;
 pub mod pool;
 mod profile;
 pub mod q4;
+mod shader_checks;
 mod tensor;
 
-pub use context::{ContextError, WgpuContext, UPLOAD_RELEASE_BYTES};
-pub use engine::{AdamParams, AttentionOptions, ComputeEngine, MASKED_CE_SKIP, SUM_SQUARES_CHUNK};
+pub use context::{
+    ContextError, WgpuContext, PASS_DISPATCHES_ENV, PENDING_OPS_ENV, UNIFORM_PARAMS_ENV,
+    UPLOAD_RELEASE_BYTES,
+};
+pub use engine::{
+    AdamParams, AttentionOptions, AutotuneReport, ComputeEngine, Epilogue, FlatLayout, FusedA,
+    FusedOut, FusedSpec, LoraGrad, LoraMirror, LoraProj, AUTOTUNE_ENV, FLAT_MAX_ELEMS,
+    LORA_GROUP_MAX, LORA_GROUP_MAX_RANK, MASKED_CE_SKIP, SUM_SQUARES_CHUNK,
+};
 #[doc(hidden)]
-pub use engine::{MatmulPath, SmallMLaunch, SmallMTile};
+pub use engine::{
+    CoopConfig, CoopTile, MatmulPath, SkinnyTile, SmallMLaunch, SmallMTile, FLASH_COOP_ENV,
+};
 pub use kernel_timing::{KernelTime, KernelTimes, KernelTiming, KernelTimingMode};
 pub use memory::{MemoryCategory, MemorySnapshot, MemoryTracker};
 pub use profile::GpuCounterSnapshot;
-pub use tensor::{DType, UnifiedTensor};
+pub use shader_checks::{ShaderChecks, SHADER_CHECKS_ENV};
+pub use tensor::{DType, ReadbackError, UnifiedTensor};

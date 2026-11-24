@@ -39,7 +39,7 @@ use ferrotensor_graph::lfm::{legacy_llama_name, Lfm2Model};
 use ferrotensor_graph::model_builder::{
     check_supported, module_matches, Lfm2ModelBuilder, LoRaConfig, Q4Selection,
 };
-use ferrotensor_graph::{KVCache, KVCacheLayer};
+use ferrotensor_graph::{FuseChoice, FusedMode, KVCache, KVCacheLayer};
 use ferrotensor_loader::{Lfm2Config, ModelLoader, Sampler, Tokenizer, WeightsContext};
 use ferrotensor_trainer::checkpoint::{
     apply_checkpoint, load_lora_checkpoint, save_lora_checkpoint, upgrade_optimizer_names,
@@ -48,7 +48,7 @@ use ferrotensor_trainer::checkpoint::{
 use ferrotensor_trainer::peft::{export_peft_adapter, is_peft_adapter_dir, load_peft_adapter};
 use ferrotensor_trainer::{
     build_sft_example, masked_cross_entropy_from_logits, DataLoader, Dataset, FileGradSyncConfig,
-    TextDataset, Trainer,
+    GradScaler, TextDataset, Trainer,
 };
 use model_id::resolve_model;
 use std::collections::HashMap;
@@ -424,6 +424,11 @@ struct TrainArgs {
     /// measured runs.
     #[arg(long)]
     checkpoint_blocks: bool,
+    /// Pad each micro-batch to a multiple of this many tokens (the padding is
+    /// left out of the loss) [default: 32 for a micro-batch of up to two
+    /// sequences, the longest sequence for a larger one].
+    #[arg(long, value_name = "TOKENS", value_parser = clap::value_parser!(u64).range(1..))]
+    length_bucket: Option<u64>,
     /// Number of processes in file-based data-parallel training (prototype).
     #[arg(long, default_value_t = 1)]
     world_size: usize,
@@ -847,6 +852,10 @@ fn restore_checkpoint(
         // The lookup of a frozen table reads a host copy made at build time.
         model.clear_host_embeddings();
     }
+    // A fused projection reads an f16 copy of each LoRA `A`.
+    model
+        .refresh_lora_mirrors(&base.engine)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(restored)
 }
 
@@ -1113,12 +1122,12 @@ async fn evaluate(
     model: &Lfm2Model,
     ds: &TextDataset,
     limit: usize,
-) -> (f32, usize) {
+) -> Result<(f32, usize)> {
     let mut loss_sum = 0.0f64;
     let mut tokens = 0usize;
     for ex in ds.examples().iter().take(limit) {
         let logits = no_grad(|| model.forward(&base.engine, &ex.input_ids, 0, None, None));
-        let host = logits.data.to_vec(&base.ctx).await;
+        let host = logits.data.to_vec(&base.ctx).await?;
         if let Some((loss, n)) = masked_cross_entropy_from_logits(
             &host,
             base.config.vocab_size,
@@ -1130,9 +1139,9 @@ async fn evaluate(
         }
     }
     if tokens == 0 {
-        (f32::NAN, 0)
+        Ok((f32::NAN, 0))
     } else {
-        ((loss_sum / tokens as f64) as f32, tokens)
+        Ok(((loss_sum / tokens as f64) as f32, tokens))
     }
 }
 
@@ -1146,7 +1155,7 @@ async fn eval(args: EvalArgs) -> Result<()> {
         eprintln!("{}", loaded_line(path, n, meta.as_ref()));
     }
     let t = Instant::now();
-    let (loss, tokens) = evaluate(&base, &model, &ds, usize::MAX).await;
+    let (loss, tokens) = evaluate(&base, &model, &ds, usize::MAX).await?;
     let summary = EvalSummary {
         examples: ds.len(),
         tokens,
@@ -1448,7 +1457,7 @@ async fn generate_tokens(
         Some(c) => c.feed(base, model, &prompt.ids[cached_tokens..]),
         None => model.forward(&base.engine, &tokens, 0, None, None),
     });
-    let mut next = sample_last_row(base, sampler, &logits.data).await;
+    let mut next = sample_last_row(base, sampler, &logits.data).await?;
     let prefill = start.elapsed();
     let after_prefill = profile_report::GpuMark::now(&base.ctx);
     let decode_start = Instant::now();
@@ -1472,7 +1481,7 @@ async fn generate_tokens(
             Some(c) => c.feed(base, model, &[next]),
             None => model.forward(&base.engine, &tokens, 0, None, None),
         });
-        next = sample_last_row(base, sampler, &logits.data).await;
+        next = sample_last_row(base, sampler, &logits.data).await?;
         decode_steps += 1;
     }
     Ok(Decoded {
@@ -1488,17 +1497,21 @@ async fn generate_tokens(
 /// The token `sampler` picks from the last row of `logits` `[.., vocab]`.
 /// Greedy decoding takes the argmax on the GPU and reads back token ids, not
 /// the logits.
-async fn sample_last_row(base: &Loaded, sampler: &mut Sampler, logits: &UnifiedTensor) -> u32 {
+async fn sample_last_row(
+    base: &Loaded,
+    sampler: &mut Sampler,
+    logits: &UnifiedTensor,
+) -> Result<u32> {
     let vocab = base.config.vocab_size;
     if sampler.is_greedy() {
         let rows = logits.shape.iter().product::<usize>() / vocab;
         let picks = UnifiedTensor::empty(&base.ctx, &[rows]);
         base.engine.argmax_rows(&base.ctx, logits, &picks);
-        let picks = picks.to_vec(&base.ctx).await;
-        return picks.last().map_or(0, |id| id.to_bits());
+        let picks = picks.to_vec(&base.ctx).await?;
+        return Ok(picks.last().map_or(0, |id| id.to_bits()));
     }
-    let host = logits.to_vec(&base.ctx).await;
-    sampler.sample(&host[host.len() - vocab..])
+    let host = logits.to_vec(&base.ctx).await?;
+    Ok(sampler.sample(&host[host.len() - vocab..]))
 }
 
 // ---------------------------------------------------------------------------
@@ -1560,6 +1573,59 @@ struct TrainSummary {
     /// The base weights stored at 4 bits; left out without `--q4-weights`.
     #[serde(skip_serializing_if = "Option::is_none")]
     q4_weights: Option<Q4Record>,
+    /// The dynamic loss scaler; left out unless matmuls ran on f16
+    /// cooperative matrices.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    loss_scaler: Option<LossScalerRecord>,
+    /// What the matmul autotuner did; left out unless `FERROTENSOR_AUTOTUNE`
+    /// turned it on for this run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    autotune: Option<AutotuneRecord>,
+}
+
+/// What the cooperative-matrix autotuner did during a run.
+#[derive(serde::Serialize, Debug, Clone, PartialEq)]
+struct AutotuneRecord {
+    /// `"on"` or `"retune"`.
+    mode: &'static str,
+    /// Time spent on trials: the host time compiling their kernels plus the
+    /// GPU time of their dispatches, which also did the step's work.
+    seconds: f64,
+    /// Products timed and settled in this run.
+    shapes_tuned: usize,
+    /// Products that took their choice from the cache file.
+    shapes_cached: usize,
+    /// Products whose trial had not settled by the end of the run.
+    shapes_open: usize,
+    /// Whether the time budget stopped a product from starting a trial.
+    budget_exhausted: bool,
+    /// The cache file; null when no location is known.
+    cache_file: Option<PathBuf>,
+}
+
+impl From<ferrotensor_backend::AutotuneReport> for AutotuneRecord {
+    fn from(report: ferrotensor_backend::AutotuneReport) -> Self {
+        Self {
+            mode: report.mode,
+            seconds: report.seconds,
+            shapes_tuned: report.shapes_tuned,
+            shapes_cached: report.shapes_cached,
+            shapes_open: report.shapes_open,
+            budget_exhausted: report.budget_exhausted,
+            cache_file: report.cache_file,
+        }
+    }
+}
+
+/// Where dynamic loss scaling ended up at the end of a run.
+#[derive(serde::Serialize, Debug, Clone, PartialEq)]
+struct LossScalerRecord {
+    /// The final loss scale.
+    scale: f32,
+    /// Optimizer steps skipped because a gradient overflowed.
+    skipped_steps: u64,
+    /// Staging threads (per workgroup) that met an input past the f16 range.
+    f16_overflows: u64,
 }
 
 /// Runs `train` and returns its summary.
@@ -1677,9 +1743,25 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
         .max(1);
     let warmup = args.warmup_steps.min(total_steps.saturating_sub(1));
 
-    let model = model.with_block_checkpointing(args.checkpoint_blocks);
+    let mut model = model.with_block_checkpointing(args.checkpoint_blocks);
     if args.checkpoint_blocks {
         eprintln!("block checkpointing: on");
+    }
+    if lora_on {
+        // The switches are read here, once, for the whole run.
+        let rows = args.batch_size * args.data.seq_len;
+        let (qkv, gate_up) = model.enable_fused_projections_with(
+            &base.engine,
+            FusedMode::Auto,
+            FuseChoice::from_env(),
+            rows,
+        )?;
+        if qkv + gate_up > 0 {
+            eprintln!(
+                "fused projections: {} groups (q/k/v {qkv}, gate/up {gate_up})",
+                qkv + gate_up
+            );
+        }
     }
     let mut optimizer = AdamW::new(base.engine.clone(), args.lr);
     optimizer.weight_decay = args.weight_decay;
@@ -1692,7 +1774,20 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
     )
     .with_grad_accum_steps(micro_per_step)
     .with_clip_grad_norm(args.grad_clip)
-    .with_lr_scheduler(Box::new(scheduler));
+    .with_lr_scheduler(Box::new(scheduler))
+    .with_deferred_loss_readback();
+    if let Some(tokens) = args.length_bucket {
+        trainer = trainer.with_length_bucket(usize::try_from(tokens).unwrap_or(usize::MAX));
+    }
+    if base.engine.coop_matmul_active() {
+        // The matmuls round activations and gradients to f16, so small
+        // gradients need the loss scaled up to stay representable.
+        eprintln!(
+            "matmuls: f16 cooperative matrices ({}=1), dynamic loss scaling on",
+            ferrotensor_backend::adapters::EXPERIMENTAL_ENV
+        );
+        trainer = trainer.with_grad_scaler(GradScaler::new());
+    }
     if distributed {
         let sync_dir = args
             .sync_dir
@@ -1732,6 +1827,11 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
                 if let Some(warning) = verdict {
                     log::warn!("{}: {warning}", resume_state.display());
                 }
+            }
+            if let (Some(scaler), Some(saved)) =
+                (trainer.scaler.as_mut(), ckpt.grad_scaler_state.as_ref())
+            {
+                scaler.load_checkpoint(saved);
             }
             start_step = ckpt.training_state.step;
             args.seed = ckpt.training_state.seed;
@@ -1781,7 +1881,7 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
 
     let eval_loss_before = match &eval_ds {
         Some(ds) => {
-            let (loss, tokens) = evaluate(&base, &trainer.model, ds, args.eval_samples).await;
+            let (loss, tokens) = evaluate(&base, &trainer.model, ds, args.eval_samples).await?;
             eprintln!(
                 "eval before: loss {loss:.4} ppl {:.3} ({tokens} tokens)",
                 loss.exp()
@@ -1834,7 +1934,7 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
         TrainingCheckpoint {
             training_state: state,
             optimizer_state: trainer.optimizer.save_state(&base.ctx, &named_params),
-            grad_scaler_state: None,
+            grad_scaler_state: trainer.scaler.as_ref().map(GradScaler::checkpoint),
         }
         .save(&state_path)?;
         Ok(())
@@ -1935,7 +2035,7 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
                         && step < total_steps
                     {
                         let (loss, _) =
-                            evaluate(&base, &trainer.model, ds, args.eval_samples).await;
+                            evaluate(&base, &trainer.model, ds, args.eval_samples).await?;
                         eprintln!("eval @ {step}: loss {loss:.4} ppl {:.3}", loss.exp());
                         writeln!(
                             metrics,
@@ -1983,7 +2083,7 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
 
     let eval_loss_after = match &eval_ds {
         Some(ds) => {
-            let (loss, tokens) = evaluate(&base, &trainer.model, ds, args.eval_samples).await;
+            let (loss, tokens) = evaluate(&base, &trainer.model, ds, args.eval_samples).await?;
             eprintln!(
                 "eval after: loss {loss:.4} ppl {:.3} ({tokens} tokens)",
                 loss.exp()
@@ -2026,6 +2126,25 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
             args.out.display()
         );
     }
+    let mut loss_scaler = None;
+    if let Some(scaler) = trainer.scaler.as_ref() {
+        loss_scaler = Some(LossScalerRecord {
+            scale: scaler.scale_factor(),
+            skipped_steps: scaler.skipped_steps(),
+            f16_overflows: base.engine.coop_f16_overflows(&base.ctx).await?,
+        });
+    }
+    // The loss readbacks above waited for the GPU, so the last timings are in.
+    let autotune = base
+        .engine
+        .autotune_finish(&base.ctx)
+        .map(AutotuneRecord::from);
+    if let Some(record) = &autotune {
+        eprintln!(
+            "autotune: {} shapes tuned, {} from the cache, {:.2} s spent tuning",
+            record.shapes_tuned, record.shapes_cached, record.seconds
+        );
+    }
     Ok(TrainSummary {
         steps: step,
         first_loss,
@@ -2037,6 +2156,8 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
         out_dir: args.out,
         adapter: is_root.then_some(adapter_path),
         q4_weights,
+        loss_scaler,
+        autotune,
     })
 }
 
@@ -2122,6 +2243,21 @@ mod tests {
         };
         assert!(checkpoint_blocks(&["--checkpoint-blocks"]));
         assert!(!checkpoint_blocks(&[]));
+    }
+
+    #[test]
+    fn train_parses_length_bucket() {
+        let bucket = |extra: &[&str]| {
+            let mut args = vec!["train", "--model", "m", "--data", "d.jsonl"];
+            args.extend_from_slice(extra);
+            parse(&args).map(|cli| match cli.command {
+                Command::Train(t) => t.length_bucket,
+                _ => panic!("expected train"),
+            })
+        };
+        assert_eq!(bucket(&[]).expect("parse"), None);
+        assert_eq!(bucket(&["--length-bucket", "16"]).expect("parse"), Some(16));
+        assert!(bucket(&["--length-bucket", "0"]).is_err());
     }
 
     #[test]
@@ -2608,6 +2744,8 @@ mod tests {
             out_dir: PathBuf::from("runs/a"),
             adapter: Some(PathBuf::from("runs/a/lora_adapters.safetensors")),
             q4_weights: None,
+            loss_scaler: None,
+            autotune: None,
         };
         assert_eq!(
             serde_json::to_value(&summary).unwrap(),
@@ -2621,6 +2759,37 @@ mod tests {
                 "seconds": 1.5,
                 "out_dir": "runs/a",
                 "adapter": "runs/a/lora_adapters.safetensors",
+            })
+        );
+        let scaled = TrainSummary {
+            loss_scaler: Some(LossScalerRecord {
+                scale: 32768.0,
+                skipped_steps: 1,
+                f16_overflows: 4,
+            }),
+            ..summary
+        };
+        assert_eq!(
+            serde_json::to_value(&scaled).unwrap()["loss_scaler"],
+            serde_json::json!({ "scale": 32768.0, "skipped_steps": 1, "f16_overflows": 4 })
+        );
+        let tuned = TrainSummary {
+            autotune: Some(AutotuneRecord {
+                mode: "on",
+                seconds: 1.25,
+                shapes_tuned: 7,
+                shapes_cached: 2,
+                shapes_open: 1,
+                budget_exhausted: false,
+                cache_file: Some(PathBuf::from("cache/autotune.txt")),
+            }),
+            ..scaled
+        };
+        assert_eq!(
+            serde_json::to_value(&tuned).unwrap()["autotune"],
+            serde_json::json!({
+                "mode": "on", "seconds": 1.25, "shapes_tuned": 7, "shapes_cached": 2,
+                "shapes_open": 1, "budget_exhausted": false, "cache_file": "cache/autotune.txt",
             })
         );
     }
@@ -2868,8 +3037,9 @@ mod tests {
     fn a_partial_step_moves_and_measures_only_the_selected_weights() {
         let dir = std::env::temp_dir().join(format!("ferrotensor-step-{}", std::process::id()));
         let base = tiny_base(&dir);
-        let host =
-            |data: &ferrotensor_backend::UnifiedTensor| pollster::block_on(data.to_vec(&base.ctx));
+        let host = |data: &ferrotensor_backend::UnifiedTensor| {
+            pollster::block_on(data.to_vec(&base.ctx)).expect("GPU readback")
+        };
         let (model, selected) = partial_model(&base, &dir, "attn");
         let params: Vec<_> = selected.values().cloned().collect();
         backward(&base, &model);

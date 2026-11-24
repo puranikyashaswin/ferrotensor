@@ -51,7 +51,7 @@ fn main() {
         engine.add(&ctx, &gpu_fp32, &gpu_c, &temp);
         engine.mul(&ctx, &temp, &gpu_c, &gpu_out);
 
-        let result = gpu_out.to_vec(&ctx).await;
+        let result = gpu_out.to_vec(&ctx).await.unwrap();
         println!("Result: {:?}", result);
         assert_eq!(result, vec![6.0, 8.0, 10.0, 12.0]);
         println!("SUCCESS: Pipeline logic verified!");
