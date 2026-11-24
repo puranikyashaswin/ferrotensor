@@ -207,6 +207,13 @@ jobs:
       WGPU_BACKEND: ${{ matrix.backend }}
       FERROTENSOR_RUN_GPU_TESTS: "1"
       FULL_SUITE: ${{ matrix.backend != 'dx12' || github.event_name != 'pull_request' }}
+      # On DX12 the kernels are built without wgpu's zeroing of workgroup
+      # memory. WARP compiles a pipeline when it first runs, and with the
+      # zeroing on that took 6 to 10 minutes for each small-M pipeline and
+      # 45 seconds for each skinny one (0.1 to 0.4 seconds without it), which
+      # made the suite take longer than the 360-minute cap. The step after the
+      # sweeps runs one test with the zeroing on, as users get it.
+      FERROTENSOR_SHADER_CHECKS: ${{ matrix.backend == 'dx12' && 'nozeroinit' || '' }}
     defaults:
       run:
         shell: bash
@@ -260,8 +267,17 @@ jobs:
         if: ${{ !cancelled() && env.FULL_SUITE != 'true' }}
         run: |
           echo "pull request on DX12: running the subset; the full suite runs on main, weekly and by workflow_dispatch"
-          # TEMPORARY PROBE: removed before merge
-          echo "probe runs in probe-dx12.yml"
+          cargo test --release -p ferrotensor-backend --test gpu_kernels --test gpu_counters --no-fail-fast -- --ignored --test-threads=1
+      # The same kernels with the zeroing of workgroup memory on, which is how
+      # a DX12 user builds them. Each pipeline costs minutes on WARP, so one
+      # test runs: one product per kernel (matrix-vector, thin, 64x64 tiles,
+      # skinny, and small-M with one and with three slices of K), in f32 and
+      # f16, with every epilogue.
+      - name: GPU kernels with workgroup memory zeroed (DX12)
+        if: ${{ !cancelled() && matrix.backend == 'dx12' }}
+        env:
+          FERROTENSOR_SHADER_CHECKS: ""
+        run: cargo test --release -p ferrotensor-backend --test gpu_kernels -- --ignored --test-threads=1 matmul_epilogue_matches_cpu_on_every_path
       - name: Autograd finite-difference checks
         if: ${{ !cancelled() && env.FULL_SUITE == 'true' }}
         run: cargo test --release -p ferrotensor-autograd --test grad_check -- --test-threads=1

@@ -240,7 +240,6 @@ impl Kernel {
     /// Builds the pipeline for `entry_point` of `module`, zeroing workgroup
     /// memory as `ctx`'s shader checks ask.
     fn new(ctx: &WgpuContext, module: &wgpu::ShaderModule, entry_point: &'static str) -> Self {
-        let probe_start = std::time::Instant::now(); // TEMPORARY PROBE
         let pipeline = Arc::new(ctx.device.create_compute_pipeline(
             &wgpu::ComputePipelineDescriptor {
                 label: Some(entry_point),
@@ -251,10 +250,6 @@ impl Kernel {
                 cache: None,
             },
         ));
-        eprintln!(
-            "PROBE create_compute_pipeline {entry_point}: {:.2}s",
-            probe_start.elapsed().as_secs_f64()
-        ); // TEMPORARY PROBE
         let layout = pipeline.get_bind_group_layout(0);
         Self {
             pipeline,
