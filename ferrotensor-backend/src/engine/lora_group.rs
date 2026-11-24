@@ -156,7 +156,8 @@ fn slots(key: Key) -> Vec<Slot> {
         }
         Kind::Mirror => {
             s.push(slot("dst".into(), "read_write", "u32"));
-            s.extend(per("a", "read", "f32"));
+            // Raw words: the kernel rounds the bits itself (see f16_bits_rne).
+            s.extend(per("a", "read", "u32"));
         }
     }
     s
@@ -521,9 +522,12 @@ impl ComputeEngine {
 
     /// Copies each f32 `A_g` (`[rows, rank]`) into columns `col0 ..
     /// col0 + rank` of the f16 matrix `dst` (`[rows, ld]`, the layout of
-    /// [`UnifiedTensor::from_f32_as_f16`]) in one dispatch, rounding to
-    /// nearest even like that function. Other columns are left alone.
-    /// Values past the f16 range are not meaningful, as for any f16 copy.
+    /// [`UnifiedTensor::from_f32_as_f16`]) in one dispatch. The result equals
+    /// that function bit for bit on every device: the kernel rounds to
+    /// nearest even with integer operations, because WGSL leaves the
+    /// rounding of `pack2x16float` to the device. Other columns are left
+    /// alone. Values past the f16 range become infinities, and a NaN stays
+    /// a NaN, as in that function.
     ///
     /// Run it after every optimizer step that changes an `A`, after an
     /// adapter load and after a resume; a copy that is not refreshed is
