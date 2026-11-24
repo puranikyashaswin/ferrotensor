@@ -657,6 +657,116 @@ fn mirror_rounds_ties_to_even_and_keeps_subnormals_and_signed_zero() {
     }
 }
 
+/// The mirror gives the f16 bits of `half::f16::from_f32` for every kind of
+/// f32: ties both ways, either side of a tie, the largest finite value and
+/// the first one that overflows, subnormals down to the smallest one, zeros,
+/// infinities and NaNs. WGSL leaves the rounding of f32 to f16 to the device
+/// (WARP rounds 1.0014648 down), so the kernel rounds the bits itself.
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn mirror_matches_the_host_conversion_for_every_kind_of_f32() {
+    let g = gpu();
+    // (f32 bits, f16 bits): the expected value is written out, and the host
+    // conversion must agree with it too.
+    #[rustfmt::skip]
+    let fixed: &[(u32, u16)] = &[
+        // 1 + 2^-11 is a tie, the even mantissa 0 wins; 1 + 3 * 2^-11 is a
+        // tie, the even mantissa 2 wins; each is a tie in the other sign too.
+        (0x3F80_1000, 0x3C00), (0x3F80_3000, 0x3C02),
+        (0xBF80_1000, 0xBC00), (0xBF80_3000, 0xBC02),
+        // One f32 step above and below the first tie.
+        (0x3F80_0FFF, 0x3C00), (0x3F80_1001, 0x3C01),
+        // 1.0014648 = 1 + 3 * 2^-11 (0x3F803000 above) is the value WARP
+        // rounded down to 0x3C01.
+        // The largest finite f16, the tie above it (even: infinity), just
+        // below that tie, and a large value.
+        (0x477F_E000, 0x7BFF), (0x477F_F000, 0x7C00), (0x477F_EFFF, 0x7BFF),
+        (0xC77F_E000, 0xFBFF), (0xC77F_F000, 0xFC00), (0x4780_0000, 0x7C00),
+        (0x7F7F_FFFF, 0x7C00), (0xFF7F_FFFF, 0xFC00),
+        // Smallest normal f16 (2^-14), the largest subnormal and the value
+        // just below the smallest normal that rounds up to it.
+        (0x3880_0000, 0x0400), (0x387F_C000, 0x03FF), (0x387F_E000, 0x0400),
+        // Smallest subnormal 2^-24 and its negative.
+        (0x3380_0000, 0x0001), (0xB380_0000, 0x8001),
+        // 2^-25 is a tie between 0 and the smallest subnormal: zero wins.
+        // Just above it rounds to the smallest subnormal, and so does 0.75
+        // of it. 3 * 2^-25 is a tie between 1 and 2 subnormals: 2 wins.
+        // 5 * 2^-25 is a tie between 2 and 3: 2 wins.
+        (0x3300_0000, 0x0000), (0xB300_0000, 0x8000), (0x3300_0001, 0x0001),
+        (0x3340_0000, 0x0001), (0x33C0_0000, 0x0002), (0x3420_0000, 0x0002),
+        // Far below the f16 range, and f32 subnormals: zeros keep the sign.
+        (0x3000_0000, 0x0000), (0xB000_0000, 0x8000),
+        (0x0000_0001, 0x0000), (0x8000_0001, 0x8000), (0x007F_FFFF, 0x0000),
+        // Zeros.
+        (0x0000_0000, 0x0000), (0x8000_0000, 0x8000),
+        // Infinities.
+        (0x7F80_0000, 0x7C00), (0xFF80_0000, 0xFC00),
+        // NaNs: quiet bit set, sign and the top ten payload bits kept.
+        (0x7FC0_0000, 0x7E00), (0xFFC0_0000, 0xFE00), (0x7F80_0001, 0x7E00),
+        (0x7FA0_0000, 0x7F00), (0xFFFF_FFFF, 0xFFFF),
+    ];
+    let mut bits: Vec<u32> = fixed.iter().map(|&(b, _)| b).collect();
+    // Every finite f16 value, the exact middle between it and the next one,
+    // and the f32 values one step either side of that middle, in both signs.
+    for h in 0..0x7BFFu16 {
+        let lo = half::f16::from_bits(h).to_f32();
+        let hi = half::f16::from_bits(h + 1).to_f32();
+        let mid = ((lo + hi) / 2.0).to_bits();
+        for b in [lo.to_bits(), mid - 1, mid, mid + 1] {
+            bits.push(b);
+            bits.push(b | 0x8000_0000);
+        }
+    }
+    // Random patterns over all of f32, and over the f16 exponent range.
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 32) as u32
+    };
+    for _ in 0..50_000 {
+        let x = next();
+        bits.push(x);
+        let exponent = 100 + next() % 45;
+        bits.push((x & 0x807F_FFFF) | (exponent << 23));
+    }
+    let (rank, ld) = (8usize, 8usize);
+    let rows = bits.len().div_ceil(rank);
+    bits.resize(rows * rank, 0);
+    let values: Vec<f32> = bits.iter().map(|&b| f32::from_bits(b)).collect();
+    let a = upload(&values, &[rows, rank]);
+    let dst = UnifiedTensor::from_f32_as_f16(&g.ctx, &vec![0.0; rows * ld], &[rows, ld]);
+    g.engine
+        .lora_mirror_f16(&g.ctx, &dst, &[LoraMirror { a: &a, col0: 0 }])
+        .unwrap();
+    let got = f16_bits(&dst);
+    for &(b, want) in fixed {
+        assert_eq!(
+            half::f16::from_f32(f32::from_bits(b)).to_bits(),
+            want,
+            "host conversion of {b:#010x}"
+        );
+    }
+    let mut wrong = Vec::new();
+    for (i, &b) in bits.iter().enumerate() {
+        let want = half::f16::from_f32(f32::from_bits(b)).to_bits();
+        if got[i] != want {
+            wrong.push(format!("{b:#010x}: got {:#06x}, want {want:#06x}", got[i]));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} of {} values differ from the host conversion, first: {:?}",
+        wrong.len(),
+        bits.len(),
+        &wrong[..wrong.len().min(8)]
+    );
+    for (i, &(b, want)) in fixed.iter().enumerate() {
+        assert_eq!(got[i], want, "fixed case {b:#010x}");
+    }
+}
+
 #[test]
 #[ignore = "needs a GPU; run with --ignored --test-threads=1"]
 fn mirror_rejects_layouts_it_cannot_copy_whole_words_for() {

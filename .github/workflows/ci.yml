@@ -214,9 +214,7 @@ jobs:
       # 45 seconds for each skinny one (0.1 to 0.4 seconds without it), which
       # made the suite take longer than the 360-minute cap. The step after the
       # sweeps runs one test with the zeroing on, as users get it. The value
-      # keeps `noloop`, the user default, so only the zeroing differs. Four
-      # f16 mirror tests fail on WARP with or without it; the sweeps skip
-      # them on DX12 (see the comment there).
+      # keeps `noloop`, the user default, so only the zeroing differs.
       FERROTENSOR_SHADER_CHECKS: ${{ matrix.backend == 'dx12' && 'noloop,nozeroinit' || '' }}
     defaults:
       run:
@@ -261,20 +259,7 @@ jobs:
             echo "skipping the ferrotensor-cli end-to-end tests on this backend (see the comment in ci.yml)"
             exclude=(--exclude ferrotensor-cli)
           fi
-          # On WARP these four tests fail with the zeroing on and off: the f32
-          # to f16 conversion gives 15361 where round to nearest even gives
-          # 15362 (1.0014648), and they check that bit for bit. They run on
-          # Vulkan and Metal. Why WARP rounds this way is not known.
-          skip=()
-          if [ "${{ matrix.backend }}" = dx12 ]; then
-            skip=(
-              --skip mirror_equals_f16_of_a_bit_for_bit_after_each_optimizer_step
-              --skip mirror_rounds_ties_to_even_and_keeps_subnormals_and_signed_zero
-              --skip fused_projections_train_like_the_unfused_layers
-              --skip the_f16_mirror_equals_f16_of_a_after_a_step_and_after_a_resume
-            )
-          fi
-          cargo test --release --workspace "${exclude[@]}" --no-fail-fast -- --ignored --test-threads=1 "${skip[@]}"
+          cargo test --release --workspace "${exclude[@]}" --no-fail-fast -- --ignored --test-threads=1
       # Pull requests on DX12: every backend kernel against its CPU reference
       # (7 min on WARP); with the zeroing step below and the two Tensor API
       # steps, which check forward values and gradients against the CPU, the

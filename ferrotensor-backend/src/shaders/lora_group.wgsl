@@ -163,12 +163,48 @@ fn lora_grads(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_in
 }
 
 //#kernel mirror
+// The f16 bits of the f32 whose bits are `x`, rounded to nearest even exactly
+// like half::f16::from_f32 (the conversion of UnifiedTensor::from_f32_as_f16):
+// ties go to the even mantissa, f16 subnormals are kept, a value that rounds
+// past 65504 and an infinity become an infinity, a zero or a value below half
+// the smallest subnormal becomes a zero of the same sign, and a NaN keeps its
+// sign and top ten payload bits with the quiet bit set. WGSL leaves the
+// rounding of f32 to f16 (pack2x16float) to the device, which may take either
+// neighbour and flush subnormals, so this works on the bits with integer
+// operations only.
+fn f16_bits_rne(x: u32) -> u32 {
+  let sign = (x >> 16u) & 0x8000u;
+  let mag = x & 0x7fffffffu;
+  if (mag > 0x7f800000u) { return sign | 0x7e00u | ((mag >> 13u) & 0x3ffu); }
+  // The f32 exponent is 143 or more: 65536 and up, or an infinity. 65520 up
+  // to 65536 reach the infinity by the carry in the normal case below.
+  if (mag >= 0x47800000u) { return sign | 0x7c00u; }
+  if (mag < 0x38800000u) {
+    // Below the smallest f16 normal (f32 exponent 112 or less).
+    let e = mag >> 23u;
+    if (e < 102u) { return sign; }
+    let man = (mag & 0x7fffffu) | 0x800000u;
+    let shift = 126u - e;
+    let round_bit = 1u << (shift - 1u);
+    var h = man >> shift;
+    if ((man & round_bit) != 0u && (man & (3u * round_bit - 1u)) != 0u) { h += 1u; }
+    return sign | h;
+  }
+  // A normal f16: rebias the exponent and drop 13 mantissa bits. A carry out
+  // of the mantissa rounds up into the exponent, and past 65504 into infinity.
+  var h = (mag - 0x38000000u) >> 13u;
+  if ((mag & 0x1000u) != 0u && (mag & 0x2fffu) != 0u) { h += 1u; }
+  return sign | h;
+}
+
 // Copies f32 A_g[rows, RANK] into the f16 columns col0_g .. col0_g + RANK of
 // the row-major f16 matrix `dst` of row length params[0].y, which is stored
 // as pairs of halves packed in u32 words (the first in the low half). The row
 // length, every col0 and RANK are even, so a thread owns one whole word and
-// no two threads share one. Rounds to nearest even, like
-// UnifiedTensor::from_f32_as_f16. Parameters, as array<vec4<u32>, 2>:
+// no two threads share one. A_g is bound as u32 words so that no float load
+// touches the bits; the rounding is f16_bits_rne, equal to
+// UnifiedTensor::from_f32_as_f16 on every device. Parameters, as
+// array<vec4<u32>, 2>:
 // [0] = (rows, row length of dst, RANK, 0), [1] = (col0 of projection 0, 1, 2, 0).
 @compute @workgroup_size(64)
 fn lora_mirror(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
@@ -184,7 +220,7 @@ fn lora_mirror(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_i
   if (g == $gu) {
     let s = row * RANK + 2u * w;
     let e = row * ld + params[1][$gu] + 2u * w;
-    dst[e / 2u] = pack2x16float(vec2<f32>(a$g[s], a$g[s + 1u]));
+    dst[e / 2u] = f16_bits_rne(a$g[s]) | (f16_bits_rne(a$g[s + 1u]) << 16u);
   }
 //#end
 }
