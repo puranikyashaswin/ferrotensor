@@ -183,9 +183,10 @@ jobs:
     # is real hardware and neither says anything about speed. The Qwen2
     # fixture is not generated here, so those four tests skip.
     runs-on: ${{ matrix.os }}
-    # 360 minutes is the most a hosted runner allows. On WARP the pull-request
-    # subset took 1 h 41 min on 0.7.1 and the 0.7.2 kernels (the skinny and
-    # epilogue tests) add well over an hour, so 180 minutes cancelled it.
+    # 360 minutes is the most a hosted runner allows. On WARP with the zeroing
+    # of workgroup memory on, the 0.7.2 kernels (the skinny and small-M tests)
+    # ran past it. With the zeroing off (see FERROTENSOR_SHADER_CHECKS below)
+    # the DX12 job took 36 minutes on a pull request and 51 on the full suite.
     timeout-minutes: 360
     # The full DX12 run is not reliably green yet (docs/testing-on-your-gpu.md
     # has the failure): its failures show in the job but do not fail the
@@ -213,7 +214,10 @@ jobs:
       # 45 seconds for each skinny one (0.1 to 0.4 seconds without it), which
       # made the suite take longer than the 360-minute cap. The step after the
       # sweeps runs one test with the zeroing on, as users get it. The value
-      # keeps `noloop`, the user default, so only the zeroing differs.
+      # keeps `noloop`, the user default, so only the zeroing differs. Four
+      # f16 mirror tests (gpu_lora_group, fused_projections) fail on WARP
+      # with it off; gpu_lora_group passes with it on. The full suite shows
+      # them.
       FERROTENSOR_SHADER_CHECKS: ${{ matrix.backend == 'dx12' && 'noloop,nozeroinit' || '' }}
     defaults:
       run:
@@ -247,9 +251,9 @@ jobs:
       # milliseconds), most trainer test binaries took about 6 minutes, and
       # each ferrotensor-cli end-to-end test, which starts the CLI as a new
       # process, took up to 14 minutes. So on DX12 the CLI's 25 GPU tests are
-      # skipped (they run on Metal and Vulkan), and the rest of the suite, 2 h
-      # 22 min on WARP, runs only on main, weekly and by hand; a pull request
-      # runs the subset in the next step.
+      # skipped (they run on Metal and Vulkan), and the rest of the suite, 17
+      # min on WARP without the zeroing, runs only on main, weekly and by
+      # hand; a pull request runs the subset in the next step.
       - name: GPU suites (ignored tests)
         if: ${{ !cancelled() && env.FULL_SUITE == 'true' }}
         run: |
@@ -260,10 +264,11 @@ jobs:
           fi
           cargo test --release --workspace "${exclude[@]}" --no-fail-fast -- --ignored --test-threads=1
       # Pull requests on DX12: every backend kernel against its CPU reference
-      # (9 min on WARP); with the two Tensor API steps below, which check
-      # forward values and gradients against the CPU, the job took 14
-      # minutes. The PyTorch gradient parity binary alone took 7 more. The
-      # GPU counter and kernel timing tests are small and run here too.
+      # (7 min on WARP); with the zeroing step below and the two Tensor API
+      # steps, which check forward values and gradients against the CPU, the
+      # job took 36 minutes. The PyTorch gradient parity binary alone took 7
+      # more. The GPU counter and kernel timing tests are small and run here
+      # too.
       - name: GPU kernels (DX12 pull-request subset)
         if: ${{ !cancelled() && env.FULL_SUITE != 'true' }}
         run: |
@@ -273,7 +278,7 @@ jobs:
       # a DX12 user builds them. Each pipeline costs minutes on WARP, so one
       # test runs: one product per kernel (matrix-vector, thin, 64x64 tiles,
       # skinny, and small-M with one and with three slices of K), in f32 and
-      # f16, with every epilogue.
+      # f16, with every epilogue. It took 26 minutes.
       - name: GPU kernels with workgroup memory zeroed (DX12)
         if: ${{ !cancelled() && matrix.backend == 'dx12' }}
         env:
