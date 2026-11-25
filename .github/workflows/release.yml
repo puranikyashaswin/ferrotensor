@@ -81,7 +81,7 @@ jobs:
       #   ferrotensor-loader                  backend
       #   ferrotensor-graph                   autograd, backend, loader
       #   ferrotensor-trainer                 autograd, backend, graph, loader
-      #   ferrotensor-hub                     autograd, backend, graph, loader
+      #   ferrotensor-hub                     none
       #   ferrotensor-monitor                 trainer
       #   ferrotensor-cli                     all of the above except ferrotensor
       CRATES: >-

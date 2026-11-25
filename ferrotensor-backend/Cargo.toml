@@ -18,11 +18,12 @@ wgpu = "=30.0.2"
 half = "2"
 pollster = "0.3"
 log = "0.4"
-env_logger = "0.11"
 bytemuck = { version = "1.14", features = ["derive"] }
 
 
 [dev-dependencies]
+# The examples log through env_logger; the library only uses `log`.
+env_logger = "0.11"
 naga = { version = "=30.0.2", features = ["wgsl-in"] }
 
 [lints]

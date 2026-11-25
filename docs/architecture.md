@@ -25,8 +25,7 @@ flowchart TD
     cli --> monitor[ferrotensor-monitor]
     cli --> hub[ferrotensor-hub]
     monitor --> trainer
-    hub --> graphc[ferrotensor-graph]
-    trainer --> graphc
+    trainer --> graphc[ferrotensor-graph]
     trainer --> autograd[ferrotensor-autograd]
     trainer --> loader[ferrotensor-loader]
     graphc --> autograd
