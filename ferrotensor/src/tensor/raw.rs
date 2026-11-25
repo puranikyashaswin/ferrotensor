@@ -301,6 +301,63 @@ impl Tensor {
         }
     }
 
+    /// `a` where `cond` is non-zero, else `b`, with the three broadcast
+    /// together. The value on the side that is not picked does not reach the
+    /// result.
+    ///
+    /// # Panics
+    /// Panics when the shapes cannot be broadcast together.
+    #[expect(
+        clippy::panic,
+        reason = "shape precondition of an op that returns no Result"
+    )]
+    pub(crate) fn where_select_raw(cond: &Tensor, a: &Tensor, b: &Tensor) -> Tensor {
+        cond.assert_same_device(a);
+        cond.assert_same_device(b);
+        let out_shape = broadcast_shapes(&cond.shape, &a.shape)
+            .and_then(|shape| broadcast_shapes(&shape, &b.shape))
+            .unwrap_or_else(|| {
+                panic!(
+                    "shapes {:?}, {:?} and {:?} cannot be broadcast together",
+                    cond.shape, a.shape, b.shape
+                )
+            });
+        let [sc, sa, sb] = [cond, a, b].map(|t| broadcast_strides(&t.shape, &out_shape));
+        let n: usize = out_shape.iter().product();
+        match (cond.gpu(), a.gpu(), b.gpu()) {
+            (Some((ctx, c)), Some((_, x)), Some((_, y))) if n > 0 => {
+                let out = alloc(ctx, n);
+                let params = Arg::Params([n as u32, out_shape.len() as u32, 0, 0]);
+                let meta = as_u32(&[&out_shape[..], &sc, &sa, &sb].concat());
+                ctx.dispatch(
+                    "where_select",
+                    &[
+                        Arg::Buffer(c),
+                        Arg::Buffer(x),
+                        Arg::Buffer(y),
+                        Arg::Buffer(&out),
+                        params,
+                        Arg::Meta(&meta),
+                    ],
+                    ComputeEngine::workgroups_1d(n),
+                );
+                cond.gpu_output(out, out_shape)
+            }
+            _ => {
+                let data = cpu::where_select(
+                    &cond.to_vec(),
+                    &sc,
+                    &a.to_vec(),
+                    &sa,
+                    &b.to_vec(),
+                    &sb,
+                    &out_shape,
+                );
+                cond.host_output(data, &out_shape)
+            }
+        }
+    }
+
     /// Reduce over `dim` (removed from the shape) with `op` (see
     /// `backend::reduce_op`).
     pub(crate) fn reduce_raw(&self, dim: usize, op: u32) -> Tensor {
