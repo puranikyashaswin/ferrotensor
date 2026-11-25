@@ -810,6 +810,23 @@ impl Tensor {
         (loss, valid)
     }
 
+    /// Negative log-likelihood of each row of these `[.., classes]`
+    /// log-probabilities for the class ids stored as `f32` in `targets` (one
+    /// per row; an id <= -1 skips its row). Returns the `[rows]` losses,
+    /// differentiable in the log-probabilities, and the `[rows]` 1/0 flags of
+    /// the rows that count.
+    ///
+    /// On a GPU both passes run on the device. There an id that is NaN or
+    /// not below `classes` gives a NaN loss; on the CPU it panics.
+    pub(crate) fn nll_rows(&self, targets: &Tensor) -> (Tensor, Tensor) {
+        let [loss, valid] = self.nll_rows_raw(targets);
+        let (shape, targets) = (self.shape.clone(), targets.detach());
+        let loss = loss.with_node("nll_loss", vec![self.clone()], move |g| {
+            vec![Some(g.nll_grad_raw(&targets, &shape))]
+        });
+        (loss, valid)
+    }
+
     // ========================================================================
     // MATRIX PRODUCT AND SOFTMAX
     // ========================================================================

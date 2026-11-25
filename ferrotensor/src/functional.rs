@@ -333,54 +333,54 @@ pub fn cross_entropy<'a>(logits: &Tensor, targets: impl Into<Targets<'a>>) -> Te
             );
             t.clone()
         }
-        Targets::Ids(ids) => {
-            assert_eq!(ids.len(), rows, "one target per row of log-probabilities");
-            for &t in ids.iter() {
-                assert!(
-                    t < classes as i64,
-                    "target class {t} out of range for {classes} classes"
-                );
-            }
-            let ids = ids.iter().map(|&t| t.max(-1) as f32).collect();
-            Tensor::from_vec(ids, &[rows], logits.device())
-        }
+        Targets::Ids(ids) => class_id_tensor(&ids, rows, classes, logits.device()),
     };
     // Mean over the rows that count; 0 when none does.
     let (losses, valid) = logits.cross_entropy_rows(&ids);
     losses.sum().div(&valid.sum().clamp(1.0, f32::INFINITY))
 }
 
+/// Host class ids as the `[rows]` tensor of `f32` ids that the per-row loss
+/// kernels read; every negative (skipped) id is stored as -1.
+///
+/// # Panics
+/// Panics unless there is one id per row and every id is below `classes`.
+fn class_id_tensor(ids: &[i64], rows: usize, classes: usize, device: &Device) -> Tensor {
+    assert_eq!(ids.len(), rows, "one target per row of log-probabilities");
+    for &t in ids {
+        assert!(
+            t < classes as i64,
+            "target class {t} out of range for {classes} classes"
+        );
+    }
+    let ids = ids.iter().map(|&t| t.max(-1) as f32).collect();
+    Tensor::from_vec(ids, &[rows], device)
+}
+
 /// Negative log-likelihood of class `targets` (see [`Targets`]) under
 /// `log_probs` (`[.., C]`), averaged over non-skipped (non-negative)
 /// targets.
+///
+/// Only each row's target log-probability is read, so a `-inf` elsewhere in
+/// the row (a class of probability 0) does not make the loss NaN.
+///
+/// On a GPU the loss and its gradient are computed on the device with no
+/// copy to the host. An id that is not below the number of classes panics,
+/// except in an id tensor when `log_probs` is on a GPU: the ids are not read
+/// back there, and the loss is NaN.
 pub fn nll_loss<'a>(log_probs: &Tensor, targets: impl Into<Targets<'a>>) -> Tensor {
-    nll_loss_indices(log_probs, &targets.into().ids())
-}
-
-fn nll_loss_indices(log_probs: &Tensor, targets: &[i64]) -> Tensor {
     let classes = log_probs.shape[log_probs.ndim() - 1];
     let rows = log_probs.numel() / classes.max(1);
-    assert_eq!(
-        targets.len(),
-        rows,
-        "one target per row of log-probabilities"
-    );
-    let kept = targets.iter().filter(|&&t| t >= 0).count();
-    let mut weights = vec![0.0f32; rows * classes];
-    if kept > 0 {
-        for (row, &t) in targets.iter().enumerate() {
-            if t >= 0 {
-                let t = t as usize;
-                assert!(
-                    t < classes,
-                    "target class {t} out of range for {classes} classes"
-                );
-                weights[row * classes + t] = -1.0 / kept as f32;
-            }
+    let ids = match targets.into() {
+        Targets::Tensor(t) => {
+            assert_eq!(t.numel(), rows, "one target per row of log-probabilities");
+            t.clone()
         }
-    }
-    let weights = Tensor::from_vec(weights, &log_probs.shape, log_probs.device());
-    log_probs.mul(&weights).sum()
+        Targets::Ids(ids) => class_id_tensor(&ids, rows, classes, log_probs.device()),
+    };
+    // Mean over the rows that count; 0 when none does.
+    let (losses, valid) = log_probs.nll_rows(&ids);
+    losses.sum().div(&valid.sum().clamp(1.0, f32::INFINITY))
 }
 
 /// Binary cross-entropy on probabilities, averaged:
@@ -511,6 +511,15 @@ mod tests {
             case("cross_entropy_indices", &[(&[3, 4], U)], |x| {
                 let t = Tensor::from_data(&[2.0, -100.0, 0.0], &[3], x[0].device());
                 cross_entropy(&x[0], &t)
+            }),
+            case("nll_indices", &[(&[3, 4], U)], |x| {
+                let t = Tensor::from_data(&[2.0, -100.0, 0.0], &[3], x[0].device());
+                nll_loss(&x[0], &t)
+            }),
+            // The per-row losses, so each row's gradient gets its own weight.
+            case("nll_rows", &[(&[4, 3], U)], |x| {
+                let t = Tensor::from_data(&[1.0, -100.0, 2.5, 0.0], &[4], x[0].device());
+                x[0].nll_rows(&t).0
             }),
             case("cross_entropy_soft", &[(&[2, 3], U)], |x| {
                 let t = Tensor::from_data(&[0.2, 0.3, 0.5, 1.0, 0.0, 0.0], &[2, 3], x[0].device());
@@ -683,6 +692,36 @@ mod tests {
         assert_eq!(logits.grad().unwrap().to_vec(), vec![0.0; 4]);
     }
 
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn nll_loss_rejects_out_of_range_tensor_targets_on_the_cpu() {
+        nll_loss(&cpu(&[0.0; 6], &[2, 3]), &cpu(&[1.0, 3.0], &[2]));
+    }
+
+    #[test]
+    fn nll_loss_with_every_row_skipped_is_zero() {
+        let log_probs = cpu(&[-1.0, -2.0, -3.0, -4.0], &[2, 2]).requires_grad_();
+        let loss = nll_loss(&log_probs, &[-100, -100]);
+        assert_eq!(loss.item(), 0.0);
+        loss.backward();
+        assert_eq!(log_probs.grad().unwrap().to_vec(), vec![0.0; 4]);
+    }
+
+    #[test]
+    fn nll_loss_reads_only_the_target_log_probability() {
+        // Probabilities [1, 0] and [0.25, 0.75]: the first row has a -inf
+        // next to its target.
+        let inf = f32::NEG_INFINITY;
+        let log_probs = cpu(&[0.0, inf, 0.25f32.ln(), 0.75f32.ln()], &[2, 2]).requires_grad_();
+        let loss = nll_loss(&log_probs, &[0, 1]);
+        assert_eq!(loss.item(), -0.75f32.ln() / 2.0);
+        loss.backward();
+        assert_eq!(
+            log_probs.grad().unwrap().to_vec(),
+            vec![-0.5, 0.0, 0.0, -0.5]
+        );
+    }
+
     /// With `FERROTENSOR_RUN_GPU_TESTS=1`: class-id cross-entropy on the GPU
     /// (loss and logits gradient) matches the CPU on wide rows, 3-D logits,
     /// skipped and fractional ids, and gives NaN for an id out of range.
@@ -734,5 +773,105 @@ mod tests {
         let x = Tensor::from_data(&[0.0; 6], &[2, 3], &gpu);
         let t = Tensor::from_data(&[1.0, 3.0], &[2], &gpu);
         assert!(cross_entropy(&x, &t).item().is_nan());
+    }
+
+    /// With `FERROTENSOR_RUN_GPU_TESTS=1`: class-id `nll_loss` on the GPU
+    /// (loss and gradient) matches an f64 reference computed on the host, on
+    /// one row, wide rows, 3-D log-probabilities, skipped and fractional
+    /// ids, and gives NaN for an id out of range.
+    #[test]
+    fn nll_loss_matches_f64_reference_on_gpu() {
+        if std::env::var("FERROTENSOR_RUN_GPU_TESTS").as_deref() != Ok("1") {
+            eprintln!("skipping GPU nll_loss; set FERROTENSOR_RUN_GPU_TESTS=1 to enable");
+            return;
+        }
+        let gpu = crate::tensor::tests::shared_gpu();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(17);
+        for shape in [
+            &[1, 7][..],
+            &[5, 3],
+            &[37, 1000],
+            &[2, 3, 300],
+            &[64, 32_000],
+        ] {
+            let classes = shape[shape.len() - 1];
+            let rows: usize = shape[..shape.len() - 1].iter().product();
+            let mut log_probs: Vec<f32> = (0..rows * classes)
+                .map(|_| rng.gen_range(-12.0..0.0))
+                .collect();
+            let mut targets: Vec<f32> = (0..rows).map(|r| ((r * 7919) % classes) as f32).collect();
+            if rows > 2 {
+                targets[0] = -100.0;
+                targets[1] += 0.5;
+                targets[2] = -0.5;
+            }
+            // The class each row reads: none for a skipped row, else the id
+            // truncated toward zero.
+            let picks: Vec<Option<usize>> = targets
+                .iter()
+                .map(|&t| (t > -1.0).then_some(t.max(0.0) as usize))
+                .collect();
+            // A -inf next to the last row's target must not reach the loss.
+            let off_target = (picks[rows - 1].unwrap() + 1) % classes;
+            if classes > 1 {
+                log_probs[(rows - 1) * classes + off_target] = f32::NEG_INFINITY;
+            }
+
+            let kept = picks.iter().flatten().count() as f64;
+            let mut want_loss = 0.0f64;
+            let mut want_grad = vec![0.0f64; rows * classes];
+            for (r, pick) in picks.iter().enumerate() {
+                if let Some(c) = pick {
+                    want_loss -= f64::from(log_probs[r * classes + c]) / kept;
+                    want_grad[r * classes + c] = -1.0 / kept;
+                }
+            }
+
+            let x = Tensor::from_data(&log_probs, shape, &gpu).requires_grad_();
+            let t = Tensor::from_data(&targets, &shape[..shape.len() - 1], &gpu);
+            let loss = nll_loss(&x, &t);
+            loss.backward();
+            let got_loss = f64::from(loss.item());
+            assert!(
+                (got_loss - want_loss).abs() <= 1e-5 * want_loss.abs(),
+                "{shape:?}: loss {got_loss} vs {want_loss}"
+            );
+            let grad = x.grad().unwrap();
+            assert_eq!(grad.shape, shape, "gradient shape");
+            for (i, (&got, &want)) in grad.to_vec().iter().zip(&want_grad).enumerate() {
+                assert!(
+                    (f64::from(got) - want).abs() <= 1e-6 * want.abs(),
+                    "{shape:?}: gradient {i} is {got}, expected {want}"
+                );
+            }
+
+            // Host ids take the same kernels.
+            let ids: Vec<i64> = picks.iter().map(|p| p.map_or(-100, |c| c as i64)).collect();
+            let from_ids = f64::from(nll_loss(&x, &ids).item());
+            assert!(
+                (from_ids - want_loss).abs() <= 1e-5 * want_loss.abs(),
+                "{shape:?}: loss from host ids {from_ids} vs {want_loss}"
+            );
+
+            // The mean hands every row the same gradient. With a weight per
+            // row, each target must get its own row's weight, negated.
+            let weights: Vec<f32> = (0..rows).map(|r| 1.0 + r as f32).collect();
+            let x = Tensor::from_data(&log_probs, shape, &gpu).requires_grad_();
+            let (losses, _) = x.nll_rows(&t);
+            losses
+                .mul(&Tensor::from_data(&weights, &[rows], &gpu))
+                .sum()
+                .backward();
+            let mut want = vec![0.0f32; rows * classes];
+            for (r, pick) in picks.iter().enumerate() {
+                if let Some(c) = pick {
+                    want[r * classes + c] = -weights[r];
+                }
+            }
+            assert_eq!(x.grad().unwrap().to_vec(), want, "{shape:?}: weighted rows");
+        }
+        let x = Tensor::from_data(&[0.0; 6], &[2, 3], &gpu);
+        let t = Tensor::from_data(&[1.0, 3.0], &[2], &gpu);
+        assert!(nll_loss(&x, &t).item().is_nan());
     }
 }
