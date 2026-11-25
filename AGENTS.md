@@ -121,9 +121,10 @@ refusing a tokenizer without ChatML tokens or a message longer than the
 model's context; and `merge`
 refusing its input (a non-empty `--out`, a quantized base, an adapter that
 does not match the base); `export-gguf` refusing its input (an `--out` that
-exists, a `model_type` other than `llama`, a config `check_supported`
-refuses such as scaled RoPE, projection biases (Qwen2), a quantized base, a tokenizer that
-is not byte-level BPE with the GPT-2 or SmolLM pre-tokenizer, an adapter that
+exists, a `model_type` other than `llama` or `qwen2`, a config `check_supported`
+refuses such as scaled RoPE, a bias other than the query, key and value biases of a
+`qwen2` model, a quantized base, a tokenizer that
+is not byte-level BPE with the GPT-2, SmolLM or Qwen2 pre-tokenizer, an adapter that
 does not match the base); and `pretrain` refusing a model size the kernels
 cannot run (`--hidden` not a multiple of `--heads`, an odd head size or one
 above 128), a `--seq-len` above `--context`, an `--out` that already holds

@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `ferrotensor export-gguf` and `ferrotensor_trainer::gguf::export_gguf` write `model_type` `qwen2` checkpoints such as Qwen2.5-0.5B-Instruct, as llama.cpp's `qwen2` architecture: the `qwen2.*` keys, the query, key and value biases as `blk.N.attn_{q,k,v}.bias`, the query and key rows in the Hugging Face order (the order llama.cpp rotates for `qwen2`), the `qwen2` pre-tokenizer name, and `tokenizer.ggml.normalizer.nfc` when the tokenizer normalizes to NFC. Any other bias and any other `model_type` are still refused with exit code 2. The f16 file of Qwen2.5-0.5B-Instruct has the 290 tensors of the file llama.cpp's `convert_hf_to_gguf.py` (commit `244640b`) writes from the same checkpoint, with the same names, types, shapes and bytes, and llama.cpp completes three prompts with the same 16 tokens from both; with `ferrotensor generate` on an NVIDIA H100 NVL, `scripts/check_gguf.sh` prints `match` for the same three prompts. (#216)
+
 ### Changed
 - `ferrotensor`: `F::nll_loss` runs on the device, as `cross_entropy` with class ids does. The new `nll_rows` kernel reads each row's target log-probability and `nll_grad` writes the gradient, so only the ids are uploaded: the `[rows, classes]` weight tensor that was built on the host is gone, and an id tensor is not read back. With `log_probs` on a GPU, an id tensor holding an id that is not below the number of classes now gives a NaN loss instead of a panic, as in `cross_entropy`. The mean is a sum divided by the count, so a loss can differ from the old one in its last bits.
 

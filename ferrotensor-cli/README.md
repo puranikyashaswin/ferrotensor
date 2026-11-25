@@ -598,18 +598,26 @@ once, to the file's type, not first to the base's). The export runs on the host 
 one row at a time, like `merge`. `--json` prints
 `{"out_file", "tensors", "merged"}`.
 
-The tokenizer must be byte-level BPE with the pre-tokenizer of GPT-2 or of
-SmolLM (llama.cpp `gpt-2` and `smollm`); SentencePiece-style tokenizers such
-as TinyLlama's are refused. An existing `--out`, a `model_type` other than
-`llama`, a scaled `rope_scaling` or `rope_parameters` (Llama 3.1 and
-later), projection biases (Qwen2), a quantized base and tensors without a
-llama.cpp name are refused too, with exit code 2. The file is written to the GGUF v3 specification.
+`model_type` `llama` and `qwen2` are written, each as the llama.cpp
+architecture of that name. A `qwen2` file also holds the query, key and value
+biases (`blk.N.attn_q.bias` and so on) and keeps the query and key rows in the
+Hugging Face order, which is the order llama.cpp rotates for `qwen2`.
+
+The tokenizer must be byte-level BPE with the pre-tokenizer of GPT-2, of
+SmolLM or of Qwen2 (llama.cpp `gpt-2`, `smollm` and `qwen2`); SentencePiece-style
+tokenizers such as TinyLlama's are refused. An existing `--out`, any other
+`model_type`, a scaled `rope_scaling` or `rope_parameters` (Llama 3.1 and
+later), any other bias (every bias of a `llama` model), a quantized base and
+tensors without a llama.cpp name are refused too, with exit code 2. The file
+is written to the GGUF v3 specification.
 On the A10G run of 16 November 2026, llama.cpp (commit `9fba51d`, CPU build,
 `llama-simple`) loaded the SmolLM2-1.7B file of 218 tensors, and its greedy
 completion of "The capital of France is" (" Paris.") matched
 `ferrotensor generate`. That compares two tokens of one prompt. `scripts/check_gguf.sh` runs this
 comparison; the numbers are in
 [benchmarks/RESULTS.md](../benchmarks/RESULTS.md#real-hardware-run-16-november-2026).
+For Qwen2.5-0.5B-Instruct the script matched 16 tokens on each of three prompts, with
+llama.cpp at `244640b` (CPU build) and `generate` on an NVIDIA H100 NVL.
 
 ## Train from scratch: `pretrain`
 
