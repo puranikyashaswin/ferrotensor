@@ -305,4 +305,28 @@ fn main() {
             row(name, d, time(|| drop(step())), sum);
         }
     }
+
+    let name = "nll_loss [4096, 32000] class ids fwd+bwd";
+    if wants(name) {
+        for d in &devices {
+            let mut rng = StdRng::seed_from_u64(10);
+            let log_probs = Tensor::randn_with(&[4096, 32_000], &mut rng, d).requires_grad_();
+            let targets: Vec<f32> = (0..4096u64)
+                .map(|i| ((i * 104_729) % 32_000) as f32)
+                .collect();
+            let targets = Tensor::from_vec(targets, &[4096], d);
+            let step = || {
+                log_probs.zero_grad();
+                let loss = F::nll_loss(&log_probs, &targets);
+                loss.backward();
+                let grad = log_probs.grad().expect("log-probability gradient");
+                // Read back the loss and one value per row, not 500 MB.
+                let mut out = vec![loss.item()];
+                out.extend(grad.narrow(1, 0, 1).to_vec());
+                out
+            };
+            let sum = checksum(&step());
+            row(name, d, time(|| drop(step())), sum);
+        }
+    }
 }
