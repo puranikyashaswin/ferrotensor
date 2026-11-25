@@ -27,9 +27,11 @@ const ALIGNMENT: usize = 32;
 
 /// `tokenizer.ggml.token_type` values (llama.cpp's `TokenType`).
 const NORMAL: i32 = 1;
+const UNKNOWN: i32 = 2;
 const CONTROL: i32 = 3;
 const USER_DEFINED: i32 = 4;
 const UNUSED: i32 = 5;
+const BYTE: i32 = 6;
 
 /// Element type of the 2-D weights in the file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,6 +87,7 @@ enum MetaValue {
     Str(String),
     Strs(Vec<String>),
     I32s(Vec<i32>),
+    F32s(Vec<f32>),
 }
 
 fn put_str(out: &mut Vec<u8>, text: &str) {
@@ -123,6 +126,14 @@ impl MetaValue {
             Self::I32s(items) => {
                 out.extend(9u32.to_le_bytes());
                 out.extend(5u32.to_le_bytes());
+                out.extend((items.len() as u64).to_le_bytes());
+                for item in items {
+                    out.extend(item.to_le_bytes());
+                }
+            }
+            Self::F32s(items) => {
+                out.extend(9u32.to_le_bytes());
+                out.extend(6u32.to_le_bytes());
                 out.extend((items.len() as u64).to_le_bytes());
                 for item in items {
                     out.extend(item.to_le_bytes());
@@ -312,6 +323,87 @@ fn pre_tokenizer_name(pre: &Json) -> Option<&'static str> {
     }
 }
 
+/// Whether a BPE `tokenizer.json` is a SentencePiece tokenizer in the one
+/// form llama.cpp's `llama` tokenizer reproduces, TinyLlama's: byte
+/// fallback, no `ignore_merges`, no pre-tokenizer, and a normalizer that puts
+/// `▁` in front of every piece of text between special tokens and turns each
+/// space into `▁`. A Metaspace pre-tokenizer does not count: it leaves out
+/// the leading `▁` when the text starts with a space, and with
+/// `prepend_scheme` `first` also after a special token, where llama.cpp
+/// puts it in.
+fn is_sentencepiece(tokenizer: &Json) -> bool {
+    let model = &tokenizer["model"];
+    let normalizer = &tokenizer["normalizer"];
+    let steps = normalizer["normalizers"].as_array().map(Vec::as_slice);
+    model["byte_fallback"] == true
+        && model["ignore_merges"] != true
+        && tokenizer["pre_tokenizer"].is_null()
+        && normalizer["type"] == "Sequence"
+        && matches!(steps, Some([prepend, replace])
+            if prepend["type"] == "Prepend"
+                && prepend["prepend"] == "\u{2581}"
+                && replace["type"] == "Replace"
+                && replace["pattern"]["String"] == " "
+                && replace["content"] == "\u{2581}")
+}
+
+/// Whether `token` is a byte token of a SentencePiece vocabulary, `<0x41>`.
+fn is_byte_token(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    bytes.len() == 6
+        && token.starts_with("<0x")
+        && token.ends_with('>')
+        && bytes[3..5].iter().all(u8::is_ascii_hexdigit)
+}
+
+/// The text a merge of `tokenizer.json` makes: `"a b"` or `["a", "b"]` give
+/// `ab`.
+fn merged_text(merge: &Json) -> Option<String> {
+    match merge {
+        Json::String(pair) => pair
+            .split_once(' ')
+            .map(|(left, right)| left.to_string() + right),
+        Json::Array(pair) => match pair.as_slice() {
+            [Json::String(left), Json::String(right)] => Some(left.clone() + right),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `tokenizer.ggml.scores` of a SentencePiece vocabulary. `tokenizer.json`
+/// keeps no scores, but its merges are listed from the highest SentencePiece
+/// score down, so a normal token scores minus one more than the rank of the
+/// first merge that makes it. llama.cpp merges the pair whose token scores
+/// highest first, so it merges in the order of the list. A normal token no
+/// merge makes, a single character, scores below all of them. Byte tokens
+/// and the unknown token score 0, added tokens -1000 and padding -10000, the
+/// numbers llama.cpp's converter writes for them.
+fn sentencepiece_scores(tokens: &[String], token_types: &[i32], merges: &[Json]) -> Vec<f32> {
+    let ids: HashMap<&str, usize> = tokens
+        .iter()
+        .enumerate()
+        .map(|(id, token)| (token.as_str(), id))
+        .collect();
+    let mut from_merges = vec![None; tokens.len()];
+    for (rank, merge) in merges.iter().enumerate() {
+        if let Some(&id) = merged_text(merge).and_then(|text| ids.get(text.as_str())) {
+            from_merges[id].get_or_insert(-((rank + 1) as f32));
+        }
+    }
+    let unmerged = -((merges.len() + 1) as f32);
+    token_types
+        .iter()
+        .zip(from_merges)
+        .map(|(&token_type, score)| match token_type {
+            NORMAL => score.unwrap_or(unmerged),
+            CONTROL | USER_DEFINED => -1000.0,
+            UNUSED => -10_000.0,
+            _ => 0.0,
+        })
+        .collect()
+}
+
 /// Whether the `normalizer` of a `tokenizer.json` applies NFC, alone or as a
 /// step of a sequence.
 fn normalizes_nfc(normalizer: &Json) -> bool {
@@ -322,8 +414,9 @@ fn normalizes_nfc(normalizer: &Json) -> bool {
                 .is_some_and(|steps| steps.iter().any(normalizes_nfc)))
 }
 
-/// The `tokenizer.*` metadata of the byte-level BPE tokenizer in
-/// `model_dir`, padded with unused tokens to the `n_vocab` embedding rows.
+/// The `tokenizer.*` metadata of the byte-level BPE or SentencePiece
+/// tokenizer in `model_dir`, padded with unused tokens to the `n_vocab`
+/// embedding rows.
 fn tokenizer_metadata(
     model_dir: &Path,
     config: &Lfm2Config,
@@ -339,18 +432,24 @@ fn tokenizer_metadata(
     let model = &tokenizer["model"];
     if model["type"] != "BPE" {
         return Err(format!(
-            "tokenizer.json has a {} model; export-gguf needs a byte-level BPE tokenizer",
+            "tokenizer.json has a {} model; export-gguf needs a BPE tokenizer, byte-level or \
+             SentencePiece",
             model["type"]
         )
         .into());
     }
-    let pre = pre_tokenizer_name(&tokenizer["pre_tokenizer"]).ok_or_else(|| {
-        format!(
-            "tokenizer.json has the pre-tokenizer {}; export-gguf knows the byte-level ones of \
-             GPT-2, SmolLM and Qwen2 (llama.cpp `gpt-2`, `smollm` and `qwen2`)",
-            tokenizer["pre_tokenizer"]
+    let pre = pre_tokenizer_name(&tokenizer["pre_tokenizer"]);
+    let sentencepiece = pre.is_none() && is_sentencepiece(&tokenizer);
+    if pre.is_none() && !sentencepiece {
+        return Err(format!(
+            "tokenizer.json has the pre-tokenizer {} and the normalizer {}; export-gguf knows the \
+             byte-level ones of GPT-2, SmolLM and Qwen2 (llama.cpp `gpt-2`, `smollm` and `qwen2`) \
+             and SentencePiece with byte fallback, no pre-tokenizer and a normalizer that puts \
+             \u{2581} in front and turns spaces into \u{2581}, as TinyLlama's (llama.cpp `llama`)",
+            tokenizer["pre_tokenizer"], tokenizer["normalizer"]
         )
-    })?;
+        .into());
+    }
 
     let mut slots: Vec<Option<(String, i32)>> = vec![None; n_vocab];
     let mut place = |token: &str, id: &Json, token_type: i32| -> Result<()> {
@@ -370,7 +469,16 @@ fn tokenizer_metadata(
         .as_object()
         .ok_or("tokenizer.json has no model.vocab")?;
     for (token, id) in vocab {
-        place(token, id, NORMAL)?;
+        let token_type = if !sentencepiece {
+            NORMAL
+        } else if is_byte_token(token) {
+            BYTE
+        } else if model["unk_token"] == token.as_str() {
+            UNKNOWN
+        } else {
+            NORMAL
+        };
+        place(token, id, token_type)?;
     }
     for added in tokenizer["added_tokens"].as_array().into_iter().flatten() {
         let token = added["content"]
@@ -390,9 +498,10 @@ fn tokenizer_metadata(
         .map(|(id, slot)| slot.unwrap_or_else(|| (format!("[PAD{id}]"), UNUSED)))
         .unzip();
 
-    let merges = model["merges"]
+    let merge_list = model["merges"]
         .as_array()
-        .ok_or("tokenizer.json has no model.merges")?
+        .ok_or("tokenizer.json has no model.merges")?;
+    let merges = merge_list
         .iter()
         .map(|merge| match merge {
             Json::String(pair) => Some(pair.clone()),
@@ -428,22 +537,29 @@ fn tokenizer_metadata(
             special_ids.push((format!("tokenizer.ggml.{key}"), MetaValue::U32(id)));
         }
     }
+    // llama.cpp's SentencePiece tokenizer reads scores and no merges.
+    let scores = sentencepiece.then(|| sentencepiece_scores(&tokens, &token_types, merge_list));
     let mut metadata = vec![
         (
             "tokenizer.ggml.model".to_string(),
-            MetaValue::Str("gpt2".to_string()),
+            MetaValue::Str(if sentencepiece { "llama" } else { "gpt2" }.to_string()),
         ),
         (
             "tokenizer.ggml.pre".to_string(),
-            MetaValue::Str(pre.to_string()),
+            MetaValue::Str(pre.unwrap_or("default").to_string()),
         ),
         ("tokenizer.ggml.tokens".to_string(), MetaValue::Strs(tokens)),
-        (
-            "tokenizer.ggml.token_type".to_string(),
-            MetaValue::I32s(token_types),
-        ),
-        ("tokenizer.ggml.merges".to_string(), MetaValue::Strs(merges)),
     ];
+    if let Some(scores) = scores {
+        metadata.push(("tokenizer.ggml.scores".to_string(), MetaValue::F32s(scores)));
+    }
+    metadata.push((
+        "tokenizer.ggml.token_type".to_string(),
+        MetaValue::I32s(token_types),
+    ));
+    if !sentencepiece {
+        metadata.push(("tokenizer.ggml.merges".to_string(), MetaValue::Strs(merges)));
+    }
     metadata.extend(special_ids);
     for key in ["add_bos_token", "add_eos_token"] {
         if let Some(add) = tokenizer_config[key].as_bool() {
@@ -755,6 +871,9 @@ mod tests {
                         8 => MetaValue::Strs((0..len).map(|_| self.string()).collect()),
                         5 => MetaValue::I32s(
                             (0..len).map(|_| i32::from_le_bytes(self.take())).collect(),
+                        ),
+                        6 => MetaValue::F32s(
+                            (0..len).map(|_| f32::from_le_bytes(self.take())).collect(),
                         ),
                         other => panic!("array of value type {other}"),
                     }
@@ -1262,7 +1381,8 @@ mod tests {
         });
         assert_eq!(
             err,
-            "tokenizer.json has a \"WordLevel\" model; export-gguf needs a byte-level BPE tokenizer"
+            "tokenizer.json has a \"WordLevel\" model; export-gguf needs a BPE tokenizer, byte-level \
+             or SentencePiece"
         );
 
         let err = refusal("quantized", |dir| {
@@ -1509,5 +1629,170 @@ mod tests {
         );
         assert!(!out.exists());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A SentencePiece tokenizer in TinyLlama's form, with `<unk>` known to
+    /// the model only, `<s>` and `</s>` added, one byte token, and `▁▁` with
+    /// a small id but the last merge, as Llama 2's runs of `▁` have.
+    fn sentencepiece_tokenizer() -> Json {
+        serde_json::json!({
+            "added_tokens": [
+                { "id": 1, "content": "<s>", "special": true },
+                { "id": 2, "content": "</s>", "special": true }
+            ],
+            "normalizer": {
+                "type": "Sequence",
+                "normalizers": [
+                    { "type": "Prepend", "prepend": "\u{2581}" },
+                    { "type": "Replace", "pattern": { "String": " " }, "content": "\u{2581}" }
+                ]
+            },
+            "pre_tokenizer": null,
+            "model": {
+                "type": "BPE",
+                "unk_token": "<unk>",
+                "byte_fallback": true,
+                "vocab": {
+                    "<unk>": 0, "<s>": 1, "</s>": 2, "<0x0A>": 3,
+                    "\u{2581}\u{2581}": 4, "\u{2581}t": 5, "\u{2581}": 6, "t": 7
+                },
+                "merges": ["\u{2581} t", ["\u{2581}", "\u{2581}"]]
+            }
+        })
+    }
+
+    fn write_sentencepiece_tokenizer(dir: &Path) {
+        write_json(&dir.join("tokenizer.json"), &sentencepiece_tokenizer());
+        write_json(
+            &dir.join("tokenizer_config.json"),
+            &serde_json::json!({
+                "bos_token": "<s>",
+                "eos_token": "</s>",
+                "unk_token": "<unk>",
+                "chat_template": "{{ messages }}"
+            }),
+        );
+    }
+
+    /// The tokenizer metadata of [`write_sentencepiece_tokenizer`] for
+    /// `n_vocab` embedding rows (8 or 9), written out by hand.
+    fn sentencepiece_metadata(n_vocab: usize) -> Vec<(String, MetaValue)> {
+        let mut tokens: Vec<String> = ["<unk>", "<s>", "</s>", "<0x0A>", "\u{2581}\u{2581}"]
+            .into_iter()
+            .chain(["\u{2581}t", "\u{2581}", "t", "[PAD8]"])
+            .map(String::from)
+            .collect();
+        // `▁t` is made by merge 0 and `▁▁` by merge 1; `▁` and `t` by none.
+        let mut scores = vec![
+            0.0, -1000.0, -1000.0, 0.0, -2.0, -1.0, -3.0, -3.0, -10_000.0,
+        ];
+        let mut token_types = vec![
+            UNKNOWN, CONTROL, CONTROL, BYTE, NORMAL, NORMAL, NORMAL, NORMAL,
+        ];
+        token_types.push(UNUSED);
+        tokens.truncate(n_vocab);
+        scores.truncate(n_vocab);
+        token_types.truncate(n_vocab);
+        vec![
+            (
+                "tokenizer.ggml.model".into(),
+                MetaValue::Str("llama".into()),
+            ),
+            (
+                "tokenizer.ggml.pre".into(),
+                MetaValue::Str("default".into()),
+            ),
+            ("tokenizer.ggml.tokens".into(), MetaValue::Strs(tokens)),
+            ("tokenizer.ggml.scores".into(), MetaValue::F32s(scores)),
+            (
+                "tokenizer.ggml.token_type".into(),
+                MetaValue::I32s(token_types),
+            ),
+            ("tokenizer.ggml.bos_token_id".into(), MetaValue::U32(1)),
+            ("tokenizer.ggml.eos_token_id".into(), MetaValue::U32(2)),
+            ("tokenizer.ggml.unknown_token_id".into(), MetaValue::U32(0)),
+            (
+                "tokenizer.chat_template".into(),
+                MetaValue::Str("{{ messages }}".into()),
+            ),
+        ]
+    }
+
+    #[test]
+    fn writes_a_sentencepiece_vocabulary_with_scores_from_the_merges() {
+        let dir = write_model(
+            "sentencepiece",
+            &tiny_config(),
+            tiny_tensors(),
+            write_sentencepiece_tokenizer,
+        );
+        let config: Lfm2Config = serde_json::from_value(tiny_config()).unwrap();
+        assert_eq!(
+            tokenizer_metadata(&dir, &config, 9).unwrap(),
+            sentencepiece_metadata(9)
+        );
+
+        let out = dir.join("tiny.gguf");
+        export_gguf(&dir, "tiny", None, &out, GgufPrecision::F16).unwrap();
+        let metadata = check_export(&out, true, 0.0);
+        let mut expected = expected_metadata(1);
+        expected.retain(|(key, _)| !key.starts_with("tokenizer."));
+        expected.extend(sentencepiece_metadata(8));
+        assert_eq!(metadata, expected);
+
+        // Every written token is the one tokenizer.json gives that id.
+        let tokenizer = read_json(&dir.join("tokenizer.json")).unwrap();
+        let tokens = match &metadata
+            .iter()
+            .find(|(key, _)| key == "tokenizer.ggml.tokens")
+        {
+            Some((_, MetaValue::Strs(tokens))) => tokens.clone(),
+            other => panic!("{other:?}"),
+        };
+        for (token, id) in tokenizer["model"]["vocab"].as_object().unwrap() {
+            assert_eq!(&tokens[id.as_u64().unwrap() as usize], token);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn refuses_a_metaspace_pre_tokenizer_and_bpe_without_byte_fallback() {
+        let refused = |tag: &str, change: fn(&mut Json)| {
+            refusal(tag, |dir| {
+                write_sentencepiece_tokenizer(dir);
+                let mut tokenizer = sentencepiece_tokenizer();
+                change(&mut tokenizer);
+                write_json(&dir.join("tokenizer.json"), &tokenizer);
+            })
+        };
+        let tail = "export-gguf knows the byte-level ones of GPT-2, SmolLM and Qwen2 (llama.cpp \
+                    `gpt-2`, `smollm` and `qwen2`) and SentencePiece with byte fallback, no \
+                    pre-tokenizer and a normalizer that puts \u{2581} in front and turns spaces \
+                    into \u{2581}, as TinyLlama's (llama.cpp `llama`)";
+        // A Metaspace pre-tokenizer leaves out the `▁` that llama.cpp puts
+        // in front of " Hello".
+        let err = refused("metaspace", |tokenizer| {
+            tokenizer["normalizer"] = Json::Null;
+            tokenizer["pre_tokenizer"] = serde_json::json!({
+                "type": "Metaspace", "replacement": "\u{2581}", "prepend_scheme": "always",
+                "split": false
+            });
+        });
+        assert!(
+            err.starts_with("tokenizer.json has the pre-tokenizer {"),
+            "{err}"
+        );
+        assert!(err.ends_with(tail), "{err}");
+        let err = refused("no-byte-fallback", |tokenizer| {
+            tokenizer["model"]["byte_fallback"] = false.into();
+        });
+        assert!(err.ends_with(tail), "{err}");
+        let err = refused("no-prepend", |tokenizer| {
+            let steps = tokenizer["normalizer"]["normalizers"]
+                .as_array_mut()
+                .unwrap();
+            steps.remove(0);
+        });
+        assert!(err.ends_with(tail), "{err}");
     }
 }

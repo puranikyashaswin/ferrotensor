@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `ferrotensor export-gguf` writes SentencePiece tokenizers in the form of TinyLlama's `tokenizer.json` (BPE with byte fallback, no pre-tokenizer, a normalizer that prepends `▁` and turns spaces into `▁`) as llama.cpp's `llama` tokenizer, from `tokenizer.json` alone: tokens, scores, token types and the special token ids. The file has no scores, so each token scores minus one more than the rank of the first merge that makes it, and llama.cpp merges in the order of the merge list, as `tokenizers` does. A Metaspace pre-tokenizer is refused with exit code 2. For TinyLlama-1.1B-Chat-v1.0 the tokens, token types and 201 tensors equal those of the file llama.cpp's `convert_hf_to_gguf.py` (commit `244640b`) writes; llama.cpp gives the token ids of `tokenizers` for all 1,464 texts tried (1,443 fields of the cleaned Alpaca set and 21 made-up cases with spaces, tabs, special tokens and characters outside the vocabulary), and `scripts/check_gguf.sh` matches on three prompts on lavapipe. (#217)
+
 ### Fixed
 - `ferrotensor`: `Tensor::where_cond` (`ft.where` in Python) returned NaN wherever the side it did not pick held an infinity or a NaN, because it computed `a * mask + b * (1 - mask)`: `where_cond(x > 0, x.log(), 0)` was NaN where `x` is 0. A `where_select` kernel now copies the picked value, and an element's gradient goes only to the side that supplied it.
 

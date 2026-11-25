@@ -124,7 +124,8 @@ does not match the base); `export-gguf` refusing its input (an `--out` that
 exists, a `model_type` other than `llama` or `qwen2`, a config `check_supported`
 refuses such as scaled RoPE, a bias other than the query, key and value biases of a
 `qwen2` model, a quantized base, a tokenizer that
-is not byte-level BPE with the GPT-2, SmolLM or Qwen2 pre-tokenizer, an adapter that
+is neither byte-level BPE with the GPT-2, SmolLM or Qwen2 pre-tokenizer nor SentencePiece in
+TinyLlama's form, an adapter that
 does not match the base); and `pretrain` refusing a model size the kernels
 cannot run (`--hidden` not a multiple of `--heads`, an odd head size or one
 above 128), a `--seq-len` above `--context`, an `--out` that already holds

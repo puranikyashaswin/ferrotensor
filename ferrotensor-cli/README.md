@@ -604,8 +604,16 @@ biases (`blk.N.attn_q.bias` and so on) and keeps the query and key rows in the
 Hugging Face order, which is the order llama.cpp rotates for `qwen2`.
 
 The tokenizer must be byte-level BPE with the pre-tokenizer of GPT-2, of
-SmolLM or of Qwen2 (llama.cpp `gpt-2`, `smollm` and `qwen2`); SentencePiece-style
-tokenizers such as TinyLlama's are refused. An existing `--out`, any other
+SmolLM or of Qwen2 (llama.cpp `gpt-2`, `smollm` and `qwen2`), or SentencePiece
+in the form of TinyLlama's `tokenizer.json`: BPE with byte fallback, no
+pre-tokenizer, and a normalizer that puts `▁` in front of the text and turns
+each space into `▁` (llama.cpp `llama`). `tokenizer.json` keeps no
+SentencePiece scores, so the export gives each token minus one more than the
+rank of the first merge that makes it; llama.cpp then merges in the order of
+the merge list, as `tokenizers` does. A Metaspace pre-tokenizer is refused: it
+leaves out the leading `▁` where llama.cpp puts one, before text that starts
+with a space and, with `prepend_scheme` `first`, after a special token. An
+existing `--out`, any other
 `model_type`, a scaled `rope_scaling` or `rope_parameters` (Llama 3.1 and
 later), `use_sliding_window: true`, any other bias (every bias of a `llama`
 model), a quantized base and tensors without a llama.cpp name are refused too,
