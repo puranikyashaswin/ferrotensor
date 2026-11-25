@@ -4,6 +4,7 @@
 
 <p align="center">
   <a href="https://github.com/puranikyashaswin/ferrotensor/actions/workflows/ci.yml"><img src="https://github.com/puranikyashaswin/ferrotensor/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://ferrotensor.dev"><img src="https://img.shields.io/badge/website-ferrotensor.dev-blue" alt="Website"></a>
   <a href="https://crates.io/crates/ferrotensor"><img src="https://img.shields.io/crates/v/ferrotensor.svg" alt="crates.io"></a>
   <a href="https://docs.rs/ferrotensor"><img src="https://img.shields.io/docsrs/ferrotensor" alt="docs.rs"></a>
   <img src="https://img.shields.io/badge/rust-1.88+-orange" alt="Rust 1.88+">
@@ -29,8 +30,7 @@ Arithmetic and trainable parameters are f32; the CLI stores frozen LoRA base
 weights as f16 by default to save memory (`--f32-weights` keeps them f32).
 
 - [The commands](#the-commands) · [Install](#install) · [Quickstart](#quickstart) · [Python](#python) · [Features](#feature-matrix) · [Architecture](#architecture) · [Compared with candle, burn and tch](#compared-with-candle-burn-and-tch) · [Roadmap](#roadmap)
-<!-- Switch the how-to guide link back to https://ferrotensor.dev/guide/ once the domain's DNS points at GitHub Pages. -->
-- Docs: [how-to guide](https://puranikyashaswin.github.io/ferrotensor/guide/) · [architecture](docs/architecture.md) · [writing a kernel](docs/writing-a-kernel.md) · [use cases](docs/use-cases.md) · [CLI reference](ferrotensor-cli/README.md) · [LoRA SFT walkthrough](docs/examples/lora-sft.md) · [adapters in PyTorch (PEFT)](docs/examples/peft-export.md) · [benchmarks](benchmarks/RESULTS.md) · [testing on your GPU](docs/testing-on-your-gpu.md) · [Mac benchmark harness](docs/benchmarks-mac.md) · [API docs](https://docs.rs/ferrotensor)
+- Docs: [how-to guide](https://ferrotensor.dev/guide/) · [architecture](docs/architecture.md) · [writing a kernel](docs/writing-a-kernel.md) · [use cases](docs/use-cases.md) · [CLI reference](ferrotensor-cli/README.md) · [LoRA SFT walkthrough](docs/examples/lora-sft.md) · [adapters in PyTorch (PEFT)](docs/examples/peft-export.md) · [benchmarks](benchmarks/RESULTS.md) · [testing on your GPU](docs/testing-on-your-gpu.md) · [Mac benchmark harness](docs/benchmarks-mac.md) · [API docs](https://docs.rs/ferrotensor)
 
 
 ## The commands

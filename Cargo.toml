@@ -19,6 +19,7 @@ edition = "2021"
 version = "0.7.2"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/puranikyashaswin/ferrotensor"
+homepage = "https://ferrotensor.dev"
 authors = ["Yashaswin Sharma Puranik <puranikyashaswinsharma@gmail.com>"]
 rust-version = "1.88"
 

@@ -6,6 +6,7 @@ description = "Neural network modules and transformer building blocks for Ferrot
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 rust-version.workspace = true
 documentation = "https://docs.rs/ferrotensor-graph"
 readme = "README.md"

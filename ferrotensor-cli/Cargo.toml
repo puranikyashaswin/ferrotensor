@@ -6,6 +6,7 @@ description = "Command-line interface for training and running models with Ferro
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 rust-version.workspace = true
 documentation = "https://docs.rs/ferrotensor-cli"
 readme = "README.md"
