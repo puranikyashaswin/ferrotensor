@@ -81,6 +81,31 @@ python examples/mlp.py
 python examples/mlp.py --device gpu
 ```
 
+`examples/transformer_block.py` trains one pre-norm transformer block
+(`LayerNorm`, `MultiHeadAttention`, a GELU MLP and two residual connections)
+to reverse short sequences of token ids, and prints the loss at the start and
+at the end:
+
+```bash
+python examples/transformer_block.py
+python examples/transformer_block.py --device gpu
+```
+
+Output on the CPU of an AWS m6i.xlarge (Linux x86_64), in 2.3 s; the same
+losses printed on software Vulkan (Mesa lavapipe) in 19 s:
+
+```
+device=Device('cpu') parameters=13352
+step    0  loss 2.6390
+step   50  loss 0.0037
+step  100  loss 0.0016
+step  150  loss 0.0011
+step  200  loss 0.0008
+step  250  loss 0.0006
+step  299  loss 0.0005
+loss 2.6390 -> 0.0005  held-out token accuracy 1.000
+```
+
 ## Devices
 
 Tensors and layers take a `device=` argument: a `ft.Device`, `"cpu"`,
