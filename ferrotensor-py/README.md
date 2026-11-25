@@ -6,6 +6,15 @@ optimizers that run on the CPU or on a GPU through wgpu (Metal, Vulkan, DX12)
 with hand-written WGSL kernels. No CUDA, no NumPy, no other runtime
 dependencies.
 
+This package is the tensor and autograd API. LoRA fine-tuning of language
+models, with `plan`, `finetune`, `eval`, `chat` and `merge`, is in the
+`ferrotensor` command and cannot be called from Python yet
+([proposal](https://github.com/puranikyashaswin/ferrotensor/issues/220)).
+Install the command with `cargo install ferrotensor-cli` or from a
+[release binary](https://github.com/puranikyashaswin/ferrotensor/releases);
+the main README lists
+[the commands](https://github.com/puranikyashaswin/ferrotensor#the-commands).
+
 ## Install
 
 Wheels are built for macOS arm64 and Linux x86_64 (manylinux), as abi3
