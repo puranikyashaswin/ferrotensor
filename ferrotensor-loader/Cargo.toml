@@ -6,6 +6,7 @@ description = "Safetensors model loading and tokenizer support for Ferrotensor"
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 rust-version.workspace = true
 documentation = "https://docs.rs/ferrotensor-loader"
 readme = "README.md"

@@ -6,6 +6,7 @@ description = "Optimizers, LoRA fine-tuning and training loops for Ferrotensor"
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 rust-version.workspace = true
 documentation = "https://docs.rs/ferrotensor-trainer"
 readme = "README.md"

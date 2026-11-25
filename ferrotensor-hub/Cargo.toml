@@ -6,6 +6,7 @@ description = "HuggingFace Hub integration for the Ferrotensor ML framework"
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 rust-version.workspace = true
 documentation = "https://docs.rs/ferrotensor-hub"
 readme = "README.md"

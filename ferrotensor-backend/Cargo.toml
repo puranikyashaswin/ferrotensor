@@ -6,6 +6,7 @@ description = "wgpu compute backend with hand-written WGSL kernels for the Ferro
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 rust-version.workspace = true
 documentation = "https://docs.rs/ferrotensor-backend"
 readme = "README.md"
