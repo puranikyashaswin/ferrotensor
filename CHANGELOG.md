@@ -7,7 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- `ferrotensor`: `F::nll_loss` runs on the device, as `cross_entropy` with class ids does. The new `nll_rows` kernel reads each row's target log-probability and `nll_grad` writes the gradient, so only the ids are uploaded: the `[rows, classes]` weight tensor that was built on the host is gone, and an id tensor is not read back. With `log_probs` on a GPU, an id tensor holding an id that is not below the number of classes now gives a NaN loss instead of a panic, as in `cross_entropy`. The mean is a sum divided by the count, so a loss can differ from the old one in its last bits.
+
 ### Fixed
+- `ferrotensor`: `F::nll_loss` returned NaN when a log-probability away from the target was `-inf` (a class of probability 0), because it multiplied that value by a zero weight. It now reads only the target's log-probability.
 - The f16 copy of each LoRA A matrix (`lora_mirror_f16`) rounds f32 to f16 with integer operations, so it equals `UnifiedTensor::from_f32_as_f16` bit for bit on every device. WGSL leaves the rounding of `pack2x16float` to the device, and WARP on DX12 rounded some values down instead of to nearest even. Values past the f16 range now become infinities.
 
 ## [0.7.2] - 2026-11-24

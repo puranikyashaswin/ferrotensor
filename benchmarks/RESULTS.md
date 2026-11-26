@@ -242,10 +242,8 @@ Inputs are seeded `randn`; each case ends with a read back.
   per dispatch (about 9-13 µs each, serialised within the pass), plus one
   round trip to read the result. Fusing element-wise chains
   into one kernel would be the next step.
-- `F::nll_loss` with class ids still reads tensor targets back and builds a
-  dense weight tensor on the host, as `cross_entropy` did. `cross_entropy`
-  with soft labels uses `log_softmax`, whose kernel gives each row one
-  thread: slow on wide rows such as a 32000-token vocabulary.
+- `cross_entropy` with soft labels uses `log_softmax`, whose kernel gives
+  each row one thread: slow on wide rows such as a 32000-token vocabulary.
 - The `Embedding` sort uses one dispatch per bitonic step (78 for 4096 ids,
   136 for 65536); sorting blocks of 512 in workgroup memory would cut that
   to a handful.

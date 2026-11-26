@@ -360,6 +360,33 @@ pub(crate) fn cross_entropy_grad(
     out
 }
 
+/// Per row of `x` (`[rows, classes]` log-probabilities): the negative
+/// log-likelihood of the class in `targets` (0 for a skipped row), and 1 or 0
+/// for whether the row counts.
+pub(crate) fn nll_rows(x: &[f32], targets: &[f32], classes: usize) -> (Vec<f32>, Vec<f32>) {
+    let rows = targets.len();
+    let (mut loss, mut valid) = (vec![0.0; rows], vec![0.0; rows]);
+    for (r, &f) in targets.iter().enumerate() {
+        if let Some(t) = target_class(f, classes) {
+            loss[r] = -x[r * classes + t];
+            valid[r] = 1.0;
+        }
+    }
+    (loss, valid)
+}
+
+/// Gradient of [`nll_rows`]'s loss with respect to its `[rows, classes]`
+/// input, given the gradient `grad` of each row's loss.
+pub(crate) fn nll_grad(targets: &[f32], grad: &[f32], classes: usize) -> Vec<f32> {
+    let mut out = vec![0.0; targets.len() * classes];
+    for (r, &f) in targets.iter().enumerate() {
+        if let Some(t) = target_class(f, classes) {
+            out[r * classes + t] = -grad[r];
+        }
+    }
+    out
+}
+
 /// Concatenate `parts` (values, block length), each viewed as
 /// `[outer, block]`, along the block dim.
 pub(crate) fn cat(parts: &[(&[f32], usize)], outer: usize) -> Vec<f32> {

@@ -872,4 +872,58 @@ fn cross_entropy_grad(@builtin(global_invocation_id) gid: vec3<u32>,
     let hit = f < f32(ceg_p.classes) && i % ceg_p.classes == u32(max(f, 0.0));
     ceg_out[i] = (p - select(0.0, 1.0, hit)) * ceg_grad[r];
 }
+
+// --- Negative log-likelihood with class-id targets ----------------------------
+// Log-probabilities are viewed as [rows, classes]; targets hold one f32 class
+// id per row and follow the cross-entropy rules above: a target <= -1 skips
+// its row, any other id is truncated to an integer, and one that is not below
+// `classes` (or NaN) gives a NaN loss.
+// nll_rows: one thread per row writes the row's loss (-log_prob[target]) and
+// whether it counts. Only the target's element of each row is read.
+// nll_grad: d loss[r] / d log_prob[r, c] = -[c == target], times the incoming
+// gradient of the row's loss.
+
+@group(0) @binding(0) var<storage, read> nll_log_probs: array<f32>;
+@group(0) @binding(1) var<storage, read> nll_targets: array<f32>;
+@group(0) @binding(2) var<storage, read_write> nll_loss: array<f32>;
+@group(0) @binding(3) var<storage, read_write> nll_valid: array<f32>;
+@group(0) @binding(4) var<uniform> nll_p: CeParams;
+
+@compute @workgroup_size(256)
+fn nll_rows(@builtin(global_invocation_id) gid: vec3<u32>,
+            @builtin(num_workgroups) nwg: vec3<u32>) {
+    let r = flat_index(gid, nwg);
+    if (r >= nll_p.rows) { return; }
+    let f = nll_targets[r];
+    if (f <= -1.0) {
+        nll_loss[r] = 0.0;
+        nll_valid[r] = 0.0;
+        return;
+    }
+    nll_valid[r] = 1.0;
+    if (f < f32(nll_p.classes)) {
+        nll_loss[r] = -nll_log_probs[r * nll_p.classes + u32(max(f, 0.0))];
+    } else {
+        nll_loss[r] = bitcast<f32>(0x7fc00000u);
+    }
+}
+
+@group(0) @binding(0) var<storage, read> nllg_targets: array<f32>;
+@group(0) @binding(1) var<storage, read> nllg_grad: array<f32>;
+@group(0) @binding(2) var<storage, read_write> nllg_out: array<f32>;
+@group(0) @binding(3) var<uniform> nllg_p: CeParams;
+
+@compute @workgroup_size(256)
+fn nll_grad(@builtin(global_invocation_id) gid: vec3<u32>,
+            @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = flat_index(gid, nwg);
+    if (i >= nllg_p.rows * nllg_p.classes) { return; }
+    let r = i / nllg_p.classes;
+    let f = nllg_targets[r];
+    var g = 0.0;
+    if (f > -1.0 && f < f32(nllg_p.classes) && i % nllg_p.classes == u32(max(f, 0.0))) {
+        g = -nllg_grad[r];
+    }
+    nllg_out[i] = g;
+}
 "#;

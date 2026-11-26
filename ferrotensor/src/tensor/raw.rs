@@ -665,6 +665,66 @@ impl Tensor {
         }
     }
 
+    /// Negative log-likelihood of each row of these `[.., classes]`
+    /// log-probabilities for the class ids stored as `f32` in `targets` (one
+    /// per row): the losses and the 1/0 flags of the rows that count, each
+    /// `[rows]`.
+    pub(crate) fn nll_rows_raw(&self, targets: &Tensor) -> [Tensor; 2] {
+        let classes = self.shape[self.ndim() - 1];
+        let rows = targets.numel();
+        let targets = targets.to_device(&self.device);
+        match (self.gpu(), targets.gpu()) {
+            (Some((ctx, log_probs)), Some((_, t))) if rows > 0 && classes > 0 => {
+                let [loss, valid] = [0; 2].map(|_| alloc(ctx, rows));
+                ctx.dispatch(
+                    "nll_rows",
+                    &[
+                        Arg::Buffer(log_probs),
+                        Arg::Buffer(t),
+                        Arg::Buffer(&loss),
+                        Arg::Buffer(&valid),
+                        Arg::Params([rows as u32, classes as u32, 0, 0]),
+                    ],
+                    ComputeEngine::workgroups_1d(rows),
+                );
+                [loss, valid].map(|b| self.gpu_output(b, vec![rows]))
+            }
+            _ => {
+                let (loss, valid) = cpu::nll_rows(&self.to_vec(), &targets.to_vec(), classes);
+                [loss, valid].map(|v| self.host_output(v, &[rows]))
+            }
+        }
+    }
+
+    /// Gradient of [`Tensor::nll_rows_raw`]'s losses with respect to its
+    /// log-probabilities of shape `shape` (`[.., classes]`), given this
+    /// gradient of each row's loss.
+    pub(crate) fn nll_grad_raw(&self, targets: &Tensor, shape: &[usize]) -> Tensor {
+        let classes = shape[shape.len() - 1];
+        let rows = targets.numel();
+        let targets = targets.to_device(&self.device);
+        match (self.gpu(), targets.gpu()) {
+            (Some((ctx, grad)), Some((_, t))) if rows * classes > 0 => {
+                let out = alloc(ctx, rows * classes);
+                ctx.dispatch(
+                    "nll_grad",
+                    &[
+                        Arg::Buffer(t),
+                        Arg::Buffer(grad),
+                        Arg::Buffer(&out),
+                        Arg::Params([rows as u32, classes as u32, 0, 0]),
+                    ],
+                    ComputeEngine::workgroups_1d(rows * classes),
+                );
+                self.gpu_output(out, shape.to_vec())
+            }
+            _ => {
+                let data = cpu::nll_grad(&targets.to_vec(), &self.to_vec(), classes);
+                self.host_output(data, shape)
+            }
+        }
+    }
+
     /// Concatenate `tensors` along `dim`; the shapes are already checked.
     pub(crate) fn cat_raw(tensors: &[Tensor], dim: usize) -> Tensor {
         let first = &tensors[0];
