@@ -41,6 +41,12 @@ jobs:
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
       - name: Build the landing page and the guide
         run: site/build.sh "$RUNNER_TEMP/site"
+      # The site lives at ferrotensor.dev now. Pages cannot send a 301, so every
+      # page gets a canonical link and a meta refresh to its new URL.
+      - name: Test the redirect script
+        run: python3 -m unittest discover -s site -p 'test_*.py' -v
+      - name: Point every page at ferrotensor.dev
+        run: python3 site/redirect_to_new_site.py "$RUNNER_TEMP/site"
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: ${{ runner.temp }}/site
