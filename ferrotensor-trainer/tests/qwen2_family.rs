@@ -313,7 +313,7 @@ fn lora_gradients_match_transformers_with_frozen_biases() {
             .borrow()
             .clone()
             .unwrap_or_else(|| panic!("{name}: B has no gradient"));
-        let actual = pollster::block_on(grad.to_vec(&gpu.ctx));
+        let actual = pollster::block_on(grad.to_vec(&gpu.ctx)).expect("GPU readback");
         assert!(
             expected.iter().any(|v| v.abs() > 1e-3),
             "{name}: expected gradient is too small to test"

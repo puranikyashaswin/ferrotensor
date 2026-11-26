@@ -360,7 +360,8 @@ pub fn predict_probs(
     let (padded, lengths) = pad_right(rows, pad_token)?;
     let refs: Vec<&[u32]> = padded.iter().map(Vec::as_slice).collect();
     let logits = no_grad(|| head.forward(engine, model, &refs, &lengths));
-    let host = pollster::block_on(logits.data.to_vec(&logits.ctx));
+    let host = pollster::block_on(logits.data.to_vec(&logits.ctx))
+        .map_err(|e| TrainError(e.to_string()))?;
     Ok(softmax_rows(&host, head.classes()))
 }
 

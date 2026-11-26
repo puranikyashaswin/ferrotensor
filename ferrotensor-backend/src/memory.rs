@@ -29,6 +29,11 @@
 //!
 //! Sizes are what Ferrotensor asked wgpu for, after wgpu rounds every buffer
 //! up to a multiple of 4 bytes (see [`memory::wgpu_buffer_size`](crate::memory::wgpu_buffer_size)).
+//! A pooled buffer can be larger than the tensor in it (a size class's
+//! rounding, or an idle buffer of a larger class that served the request);
+//! a category counts what its tensors asked for, and the extra bytes of
+//! those buffers are counted on their own as pool slack, so the categories
+//! plus the slack add up to the bytes of the live buffers.
 //! The driver and its allocator add their own alignment and block overhead,
 //! and pipelines, bind groups and wgpu's own upload staging copies are not
 //! counted, so the totals are lower than what `nvidia-smi` or Activity
@@ -126,7 +131,9 @@ pub fn wgpu_buffer_size(requested: u64) -> u64 {
 /// Bytes held by one category.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CategoryBytes {
-    /// Bytes allocated (after wgpu's rounding).
+    /// Bytes the tensors asked for (after wgpu's rounding); the extra bytes
+    /// of a pooled buffer larger than its tensor are in
+    /// [`MemorySnapshot::pool_slack_bytes`], not here.
     pub allocated_bytes: u64,
     /// Bytes the tensors' shapes and dtypes need.
     pub logical_bytes: u64,
@@ -149,18 +156,25 @@ pub struct BufferRecord {
     pub shape: Vec<usize>,
     /// Bytes the shape and dtype need.
     pub logical_bytes: u64,
-    /// Bytes allocated.
+    /// Bytes the tensor asked for (after wgpu's rounding).
     pub allocated_bytes: u64,
+    /// Bytes its buffer has beyond that.
+    pub pool_slack_bytes: u64,
     id: u64,
 }
 
 /// Bytes held at one moment.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MemorySnapshot {
-    /// Bytes allocated to live tensors (the sum over `categories`).
+    /// Bytes of the live tensors' buffers: the sum over `categories` plus
+    /// `pool_slack_bytes`.
     pub live_bytes: u64,
     /// Bytes the live tensors' shapes and dtypes need.
     pub logical_bytes: u64,
+    /// Bytes the live tensors' buffers have beyond what the tensors asked
+    /// for: a buffer of the pool is larger than its tensor when it was
+    /// rounded up to a size class or reused from a larger class.
+    pub pool_slack_bytes: u64,
     /// Bytes of freed buffers the pool keeps for reuse.
     pub pool_idle_bytes: u64,
     /// Bytes of buffers dropped but possibly not yet destroyed by wgpu
@@ -209,6 +223,8 @@ pub struct MemoryTracker {
     current: AtomicU8,
     categories: [Counters; MemoryCategory::COUNT],
     live: AtomicU64,
+    /// Part of `live` that is no category's: see [`MemorySnapshot::pool_slack_bytes`].
+    slack: AtomicU64,
     peak_live: AtomicU64,
     pool_idle: AtomicU64,
     peak_held: AtomicU64,
@@ -232,6 +248,7 @@ impl Default for MemoryTracker {
             current: AtomicU8::new(MemoryCategory::Other as u8),
             categories: Default::default(),
             live: AtomicU64::new(0),
+            slack: AtomicU64::new(0),
             peak_live: AtomicU64::new(0),
             pool_idle: AtomicU64::new(0),
             peak_held: AtomicU64::new(0),
@@ -284,6 +301,8 @@ pub(crate) struct Allocation {
     dtype: DType,
     logical: u64,
     allocated: u64,
+    /// Bytes of the buffer beyond `allocated`.
+    slack: u64,
     /// Count the bytes as awaiting GPU once released (the buffer is
     /// dropped rather than kept by the pool).
     awaits_gpu: bool,
@@ -355,9 +374,16 @@ impl MemoryTracker {
         self.detailed.load(Relaxed)
     }
 
-    /// Bytes allocated to live tensors.
+    /// Bytes of the live tensors' buffers, pool slack included.
     pub fn live_bytes(&self) -> u64 {
         self.live.load(Relaxed)
+    }
+
+    /// Bytes the live tensors' buffers have beyond what the tensors asked
+    /// for (see [`MemorySnapshot::pool_slack_bytes`]); part of
+    /// [`live_bytes`](Self::live_bytes).
+    pub fn pool_slack_bytes(&self) -> u64 {
+        self.slack.load(Relaxed)
     }
 
     /// Highest [`live_bytes`](Self::live_bytes) since the last
@@ -443,6 +469,8 @@ impl MemoryTracker {
 
     fn snapshot(&self, reg: &Registry) -> MemorySnapshot {
         let mut snap = MemorySnapshot {
+            pool_slack_bytes: self.pool_slack_bytes(),
+            live_bytes: self.pool_slack_bytes(),
             pool_idle_bytes: self.pool_idle_bytes(),
             awaiting_gpu_bytes: self.awaiting_gpu_bytes(),
             ..MemorySnapshot::default()
@@ -500,24 +528,39 @@ impl MemoryTracker {
             .fetch_max(held + self.awaiting_gpu_bytes(), Relaxed);
     }
 
-    /// Count a new buffer of `requested` bytes (before wgpu's rounding)
-    /// holding a tensor of `shape` and `dtype` that needs `logical` bytes.
-    /// If `awaits_gpu`, its bytes move to awaiting GPU when it is released.
+    /// Count a new buffer of `buffer_bytes` bytes holding a tensor of
+    /// `shape` and `dtype` that needs `logical` bytes and asked for
+    /// `requested` bytes (before wgpu's rounding). What the buffer has
+    /// beyond the request is counted as pool slack. If `awaits_gpu`, its
+    /// bytes move to awaiting GPU when it is released.
     pub(crate) fn allocate(
         self: &Arc<Self>,
         dtype: DType,
         shape: &[usize],
         logical: u64,
         requested: u64,
+        buffer_bytes: u64,
         awaits_gpu: bool,
     ) -> Allocation {
         let category = self.current.load(Relaxed);
-        self.allocate_in(category, dtype, shape, logical, requested, awaits_gpu)
+        self.allocate_in(
+            category,
+            dtype,
+            shape,
+            logical,
+            requested,
+            buffer_bytes,
+            awaits_gpu,
+        )
     }
 
     #[expect(
         clippy::unwrap_used,
         reason = "lock poisoning means another thread panicked while holding the lock"
+    )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one call site per way to count a buffer; a struct would only rename the arguments"
     )]
     fn allocate_in(
         self: &Arc<Self>,
@@ -526,11 +569,15 @@ impl MemoryTracker {
         shape: &[usize],
         logical: u64,
         requested: u64,
+        buffer_bytes: u64,
         awaits_gpu: bool,
     ) -> Allocation {
         let allocated = wgpu_buffer_size(requested);
+        let slack = buffer_bytes.saturating_sub(allocated);
         self.adjust(category, dtype, logical, allocated, true);
-        let live = self.live.fetch_add(allocated, Relaxed) + allocated;
+        self.slack.fetch_add(slack, Relaxed);
+        let physical = allocated + slack;
+        let live = self.live.fetch_add(physical, Relaxed) + physical;
         self.note_peaks(live);
         let previous_peak = self.peak_live.fetch_max(live, Relaxed);
         let mut id = 0;
@@ -546,6 +593,7 @@ impl MemoryTracker {
                     shape: shape.to_vec(),
                     logical_bytes: logical,
                     allocated_bytes: allocated,
+                    pool_slack_bytes: slack,
                     id,
                 },
             );
@@ -561,6 +609,7 @@ impl MemoryTracker {
             dtype,
             logical,
             allocated,
+            slack,
             awaits_gpu,
         }
     }
@@ -577,6 +626,7 @@ impl MemoryTracker {
             category as u8,
             DType::FP32,
             &[requested as usize],
+            requested,
             requested,
             requested,
             true,
@@ -683,12 +733,13 @@ impl MemoryTracker {
             a.allocated,
             false,
         );
-        self.live.fetch_sub(a.allocated, Relaxed);
+        self.slack.fetch_sub(a.slack, Relaxed);
+        self.live.fetch_sub(a.allocated + a.slack, Relaxed);
         if a.id != 0 {
             self.registry.lock().unwrap().live.remove(&a.id);
         }
         if a.awaits_gpu {
-            self.gpu_dropped(a.allocated);
+            self.gpu_dropped(a.allocated + a.slack);
         }
     }
 
@@ -778,10 +829,50 @@ mod tests {
     }
 
     #[test]
+    fn a_buffer_larger_than_its_tensor_counts_the_extra_as_pool_slack() {
+        let t = tracker();
+        t.set_detailed(true);
+        // A 7,168-byte gradient served by an idle 8,192-byte buffer.
+        let g = {
+            let _scope = t.scope(MemoryCategory::Gradients);
+            t.allocate(DType::FP32, &[1792], 7168, 7168, 8192, false)
+        };
+        // A 1,000-byte tensor in a 1,024-byte class buffer, and one that fits.
+        let a = t.allocate(DType::FP32, &[250], 1000, 1000, 1024, false);
+        let b = t.allocate(DType::FP32, &[16], 64, 64, 64, false);
+        let snap = t.current();
+        assert_eq!(
+            snap.category(MemoryCategory::Gradients).allocated_bytes,
+            7168
+        );
+        assert_eq!(
+            snap.category(MemoryCategory::Other).allocated_bytes,
+            1000 + 64
+        );
+        assert_eq!(snap.pool_slack_bytes, 1024 + 24);
+        assert_eq!(snap.live_bytes, 8192 + 1024 + 64);
+        assert_eq!(sum(&snap) + snap.pool_slack_bytes, snap.live_bytes);
+        assert_eq!(t.live_bytes(), snap.live_bytes);
+        assert_eq!(t.pool_slack_bytes(), 1048);
+        assert_eq!(t.peak_live_bytes(), 9280);
+        let at_peak = t.peak().expect("detailed peak");
+        assert_eq!(at_peak.pool_slack_bytes, 1048);
+        assert_eq!(sum(&at_peak) + at_peak.pool_slack_bytes, at_peak.live_bytes);
+        assert_eq!(snap.largest[0].allocated_bytes, 7168);
+        assert_eq!(snap.largest[0].pool_slack_bytes, 1024);
+        drop(g);
+        assert_eq!(t.pool_slack_bytes(), 24);
+        assert_eq!(t.live_bytes(), 1024 + 64);
+        drop((a, b));
+        assert_eq!(t.live_bytes(), 0);
+        assert_eq!(t.pool_slack_bytes(), 0);
+    }
+
+    #[test]
     fn allocate_and_release_update_live_and_peak() {
         let t = tracker();
-        let a = t.allocate(DType::FP32, &[4], 16, 16, false);
-        let b = t.allocate(DType::FP16, &[3], 6, 6, false);
+        let a = t.allocate(DType::FP32, &[4], 16, 16, 16, false);
+        let b = t.allocate(DType::FP16, &[3], 6, 6, 6, false);
         assert_eq!(t.live_bytes(), 16 + 8);
         assert_eq!(t.peak_live_bytes(), 24);
         drop(a);
@@ -799,7 +890,7 @@ mod tests {
     #[test]
     fn pool_reuse_moves_bytes_between_live_and_idle() {
         let t = tracker();
-        let a = t.allocate(DType::FP32, &[256], 1024, 1024, false);
+        let a = t.allocate(DType::FP32, &[256], 1024, 1024, 1024, false);
         // A tensor drop releases the allocation, then the pool keeps it.
         drop(a);
         t.pool_put(1024);
@@ -807,7 +898,7 @@ mod tests {
         assert_eq!(t.peak_held_bytes(), 1024);
         // Reuse: taken from the pool, counted live again.
         t.pool_take(1024);
-        let b = t.allocate(DType::FP32, &[256], 1024, 1024, false);
+        let b = t.allocate(DType::FP32, &[256], 1024, 1024, 1024, false);
         assert_eq!((t.live_bytes(), t.pool_idle_bytes()), (1024, 0));
         assert_eq!(t.peak_held_bytes(), 1024, "reuse holds no extra bytes");
         drop(b);
@@ -819,7 +910,7 @@ mod tests {
         t.set_detailed(true);
         let w = {
             let _s = t.scope(MemoryCategory::BaseWeights);
-            let w = t.allocate(DType::FP16, &[10], 20, 20, false);
+            let w = t.allocate(DType::FP16, &[10], 20, 20, 20, false);
             {
                 let _inner = t.scope(MemoryCategory::Trainable);
                 assert_eq!(t.category(), MemoryCategory::Trainable);
@@ -830,7 +921,7 @@ mod tests {
         assert_eq!(t.category(), MemoryCategory::Other);
         let act = {
             let _s = t.scope(MemoryCategory::Activations);
-            t.allocate(DType::FP32, &[100], 400, 400, false)
+            t.allocate(DType::FP32, &[100], 400, 400, 400, false)
         };
         let snap = t.current();
         assert_eq!(
@@ -855,9 +946,9 @@ mod tests {
         t.set_detailed(true);
         let (h, q) = {
             let _s = t.scope(MemoryCategory::BaseWeights);
-            let h = t.allocate(DType::FP16, &[10], 20, 20, false);
+            let h = t.allocate(DType::FP16, &[10], 20, 20, 20, false);
             // A [64, 2] Q4 weight: 16 code words and 2 scale words.
-            let q = t.allocate(DType::Q4, &[64, 2], 72, 72, false);
+            let q = t.allocate(DType::Q4, &[64, 2], 72, 72, 72, false);
             (h, q)
         };
         let base = *t.current().category(MemoryCategory::BaseWeights);
@@ -885,8 +976,8 @@ mod tests {
     fn peak_snapshot_is_kept_and_follows_retags() {
         let t = tracker();
         t.set_detailed(true);
-        let logits = t.allocate(DType::FP32, &[2, 8], 64, 64, false);
-        let tmp = t.allocate(DType::FP32, &[32], 128, 128, false);
+        let logits = t.allocate(DType::FP32, &[2, 8], 64, 64, 64, false);
+        let tmp = t.allocate(DType::FP32, &[32], 128, 128, 128, false);
         drop(tmp);
         let peak = t.peak().expect("peak");
         assert_eq!(peak.live_bytes, 192);
@@ -919,7 +1010,7 @@ mod tests {
         let t = tracker();
         t.set_detailed(true);
         let held: Vec<_> = (1..=15u64)
-            .map(|i| t.allocate(DType::FP32, &[i as usize], i * 4, i * 4, false))
+            .map(|i| t.allocate(DType::FP32, &[i as usize], i * 4, i * 4, i * 4, false))
             .collect();
         let snap = t.current();
         assert_eq!(snap.largest.len(), LARGEST_BUFFERS);
@@ -937,7 +1028,7 @@ mod tests {
         let t = tracker();
         t.set_detailed(true);
         // Dropped outside the pool: counted until the context next waits.
-        let a = t.allocate(DType::FP32, &[256], 1024, 1024, true);
+        let a = t.allocate(DType::FP32, &[256], 1024, 1024, 1024, true);
         drop(a);
         assert_eq!((t.live_bytes(), t.awaiting_gpu_bytes()), (0, 1024));
         // Per-dispatch buffers and readback copies are counted the same way.
@@ -956,7 +1047,7 @@ mod tests {
         assert_eq!(t.peak_awaiting_gpu_bytes(), 1024 + 8 + 64);
         assert_eq!(t.peak_total_bytes(), 1024 + 8 + 64);
         // A kept buffer moves to the pool instead.
-        let b = t.allocate(DType::FP32, &[4], 16, 16, false);
+        let b = t.allocate(DType::FP32, &[4], 16, 16, 16, false);
         drop(b);
         t.pool_put(16);
         assert_eq!(t.awaiting_gpu_bytes(), 1024 + 8 + 64);
@@ -977,14 +1068,14 @@ mod tests {
     fn awaiting_gpu_drops_as_submissions_finish() {
         let t = tracker();
         // Submission 1: two buffers and a dispatch's uniform dropped.
-        let a = t.allocate(DType::FP32, &[256], 1024, 1024, true);
-        let b = t.allocate(DType::FP32, &[128], 512, 512, true);
+        let a = t.allocate(DType::FP32, &[256], 1024, 1024, 1024, true);
+        let b = t.allocate(DType::FP32, &[128], 512, 512, 512, true);
         drop((a, b));
         t.count_dispatch_buffer(16);
         assert_eq!(t.begin_submission(), 1);
         // Submission 2 is being recorded.
         t.count_dispatch_buffer(16);
-        let c = t.allocate(DType::FP32, &[64], 256, 256, true);
+        let c = t.allocate(DType::FP32, &[64], 256, 256, 256, true);
         drop(c);
         assert_eq!(t.awaiting_gpu_bytes(), 1024 + 512 + 16 + 16 + 256);
         assert_eq!(t.begin_submission(), 2);
@@ -1018,7 +1109,7 @@ mod tests {
         let per_batch = 4096u64;
         for batch in 1..=50u64 {
             for _ in 0..4 {
-                drop(t.allocate(DType::FP32, &[256], 1024, 1024, true));
+                drop(t.allocate(DType::FP32, &[256], 1024, 1024, 1024, true));
             }
             assert_eq!(t.begin_submission(), batch);
             if batch > 2 {

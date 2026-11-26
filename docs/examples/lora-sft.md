@@ -148,6 +148,33 @@ weights stored as f16 (`--f16-weights`, the default since 0.6):
 
 ### Against PyTorch + PEFT on CUDA, same GPU
 
+#### 19 November 2026: the code in 0.7.1
+
+Main at `3deacf6`, the code in 0.7.1, ran against PyTorch 2.15.0 with
+PEFT 0.21.3 and transformers 5.23.0 in eager mode (no TF32 and no
+`torch.compile`) on one NVIDIA A10G. The recipe was SmolLM2 with LoRA rank 8
+on q, k, v and o, batch 1 × 8, sequence length 256, 250 steps and the same
+Alpaca split. Each framework ran three times, interleaved. The table shows
+the median time per optimizer step in the faster precision of each
+framework, which was f32 for both.
+
+| Model | PyTorch + PEFT | Ferrotensor | Speed | Held-out loss gap |
+|---|---:|---:|---:|---:|
+| SmolLM2-135M | 0.9459 s | 0.5071 s | 1.87× | +0.0026 |
+| SmolLM2-360M | 1.0128 s | 0.5549 s | 1.83× | -0.0037 |
+| SmolLM2-1.7B | 0.7606 s | 0.6709 s | 1.13× | -0.0005 |
+
+PyTorch with `torch.compile` is faster than this code. A run on the same
+kind of machine the same day measured 120 steps and took the median of
+steps 11 to 120. For SmolLM2-135M at batch 1 × 8, PyTorch with CUDA graphs,
+TF32 and lengths padded to 32 took 0.1288 s per step, and Ferrotensor took
+0.4958 s (0.26×). At batch 8 × 1, `torch.compile` took 0.0516 s and
+Ferrotensor took 0.1769 s (0.29×). Step times leave out start-up: the
+compile warm-up took about 150 s per run on a fresh machine, and
+Ferrotensor started in about 5.5 s.
+
+#### 0.6 development build
+
 [`benchmarks/baselines/pytorch_lora.py`](../../benchmarks/baselines/pytorch_lora.py)
 runs the same recipe in PyTorch 2.15 + PEFT (CUDA 13.2): the same split,
 ChatML formatting, response-only loss, LoRA initialization, optimizer,
@@ -181,7 +208,7 @@ memory is the `nvidia-smi` peak for both.
   been profiled kernel by kernel.
 - PyTorch used less GPU memory in every configuration and fit SmolLM2-1.7B
   at batch 8, which this 0.6 build did not on a 24 GB card. There is no
-  matched comparison with PyTorch after the memory work in 0.7.
+  matched memory comparison with PyTorch after the memory work in 0.7.
 
 ## Less GPU memory (0.7)
 
@@ -197,7 +224,7 @@ with f16 base weights, sequence length 256, 8-step gradient accumulation and
 size from `/usr/bin/time -v`.
 
 **Confirmation run of merged `main`.** One session, the released v0.6.0
-(`fb6fc49`) against merged `main` (`af41068`):
+(`fb6fc49`) against `main` at `af41068`, merged before the 0.7.0 release:
 
 | Model | 0.6 GPU | 0.7 GPU | 0.7 `--checkpoint-blocks` GPU | 0.6 host | 0.7 host | Time per step 0.7 → `--checkpoint-blocks` |
 |---|---:|---:|---:|---:|---:|---:|
@@ -448,8 +475,10 @@ training normally (losses 1.4960 and 1.6540).
 
 ## Known limits
 
-- Ferrotensor is slower than PyTorch on CUDA: 0.84×, 0.32× and 0.37× of its
-  speed in the three measured runs.
+- Ferrotensor is slower than PyTorch with `torch.compile` on CUDA: 0.26× of
+  its speed for SmolLM2-135M at batch 1 × 8 and 0.29× at batch 8 × 1 on one
+  A10G (19 November 2026). It is faster than eager PyTorch + PEFT at all
+  three measured sizes.
 - Every NVIDIA number here is from one GPU, an A10G. AMD, Intel and DX12 are
   untested, and the only Apple run is the 0.4 build above.
 - The M2 run above predates moving the RMSNorm and RoPE backward passes and

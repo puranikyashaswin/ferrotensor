@@ -32,7 +32,7 @@ fn leaf(ctx: &Arc<WgpuContext>, values: &[f32], shape: &[usize], trainable: bool
 
 fn grad_of(ctx: &WgpuContext, t: &Tensor) -> Vec<f32> {
     let g = t.grad.borrow().clone().expect("tensor has a gradient");
-    pollster::block_on(g.to_vec(ctx))
+    pollster::block_on(g.to_vec(ctx)).expect("GPU readback")
 }
 
 fn assert_close(got: &[f32], want: &[f32], what: &str) {

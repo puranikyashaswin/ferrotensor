@@ -59,3 +59,11 @@ venv/
 
 # Hardware reports from scripts/hardware-report.sh
 /reports/
+
+# Local-only files (never commit)
+notes/
+plans/
+STATUS*.md
+.tmp-ignore
+*.pem
+.env*

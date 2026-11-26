@@ -25,9 +25,10 @@ jobs:
     name: Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4.2.2
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # stable
         with:
+          toolchain: stable
           components: rustfmt
       - run: cargo fmt --all -- --check
 
@@ -35,11 +36,12 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4.2.2
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # stable
         with:
+          toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
@@ -50,9 +52,11 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4.2.2
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # Hosted runners have no GPU: GPU tests are #[ignore]d and skipped here.
       - run: cargo test --workspace
       # Run the examples that need no GPU. They check their own results.
@@ -71,7 +75,7 @@ jobs:
       WGPU_BACKEND: vulkan
       FERROTENSOR_RUN_GPU_TESTS: "1"
     steps:
-      - uses: actions/checkout@v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       # Lavapipe comes from apt, and the runner has no route to the Ubuntu
       # package hosts during an outage (every one of them failed to resolve for
       # about three hours once). So the .deb files, dependencies included, are
@@ -85,7 +89,7 @@ jobs:
         id: image
         run: echo "id=${ImageOS}-${ImageVersion}" >> "$GITHUB_OUTPUT"
       - name: Cache lavapipe packages
-        uses: actions/cache@v4.3.0
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.cache/lavapipe-debs
           # Bump the v1 suffix to discard a bad cache entry.
@@ -100,8 +104,10 @@ jobs:
           else
             echo "vulkaninfo is not installed; skipping the summary"
           fi
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Adapter and kernel self-check
         run: cargo run --release -p ferrotensor-cli -- info --check
       - name: Trainer examples (tiny model, no download)
@@ -163,7 +169,7 @@ jobs:
         run: scripts/run-examples.sh --gpu
       - name: Hardware report (quick)
         run: scripts/hardware-report.sh --quick
-      - uses: actions/upload-artifact@v4.4.3
+      - uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         with:
           name: hardware-report-lavapipe
           path: reports/
@@ -177,7 +183,11 @@ jobs:
     # is real hardware and neither says anything about speed. The Qwen2
     # fixture is not generated here, so those four tests skip.
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 180
+    # 360 minutes is the most a hosted runner allows. On WARP with the zeroing
+    # of workgroup memory on, the 0.7.2 kernels (the skinny and small-M tests)
+    # ran past it. With the zeroing off (see FERROTENSOR_SHADER_CHECKS below)
+    # the DX12 job took 36 minutes on a pull request and 51 on the full suite.
+    timeout-minutes: 360
     # The full DX12 run is not reliably green yet (docs/testing-on-your-gpu.md
     # has the failure): its failures show in the job but do not fail the
     # workflow on main. The pull-request subset and Metal are blocking.
@@ -198,11 +208,19 @@ jobs:
       WGPU_BACKEND: ${{ matrix.backend }}
       FERROTENSOR_RUN_GPU_TESTS: "1"
       FULL_SUITE: ${{ matrix.backend != 'dx12' || github.event_name != 'pull_request' }}
+      # On DX12 the kernels are built without wgpu's zeroing of workgroup
+      # memory. WARP compiles a pipeline when it first runs, and with the
+      # zeroing on that took 6 to 10 minutes for each small-M pipeline and
+      # 45 seconds for each skinny one (0.1 to 0.4 seconds without it), which
+      # made the suite take longer than the 360-minute cap. The step after the
+      # sweeps runs one test with the zeroing on, as users get it. The value
+      # keeps `noloop`, the user default, so only the zeroing differs.
+      FERROTENSOR_SHADER_CHECKS: ${{ matrix.backend == 'dx12' && 'noloop,nozeroinit' || '' }}
     defaults:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       # wgpu's default DX12 shader compiler, FXC, took about 9 minutes to
       # build the engine's pipelines on WARP, so each test that opens a GPU
       # took that long. WGPU_DX12_COMPILER=dxc selects DXC, whose two DLLs
@@ -216,8 +234,10 @@ jobs:
           ls -l "$dir/dxcompiler.dll" "$dir/dxil.dll"
           cygpath -w "$dir" >> "$GITHUB_PATH"
           echo "WGPU_DX12_COMPILER=dxc" >> "$GITHUB_ENV"
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # The JSON names the adapter, backend and device type that ran the tests.
       - name: Adapter and kernel self-check
         run: cargo run --release -p ferrotensor-cli -- info --check --json
@@ -228,9 +248,9 @@ jobs:
       # milliseconds), most trainer test binaries took about 6 minutes, and
       # each ferrotensor-cli end-to-end test, which starts the CLI as a new
       # process, took up to 14 minutes. So on DX12 the CLI's 25 GPU tests are
-      # skipped (they run on Metal and Vulkan), and the rest of the suite, 2 h
-      # 22 min on WARP, runs only on main, weekly and by hand; a pull request
-      # runs the subset in the next step.
+      # skipped (they run on Metal and Vulkan), and the rest of the suite, 17
+      # min on WARP without the zeroing, runs only on main, weekly and by
+      # hand; a pull request runs the subset in the next step.
       - name: GPU suites (ignored tests)
         if: ${{ !cancelled() && env.FULL_SUITE == 'true' }}
         run: |
@@ -241,15 +261,26 @@ jobs:
           fi
           cargo test --release --workspace "${exclude[@]}" --no-fail-fast -- --ignored --test-threads=1
       # Pull requests on DX12: every backend kernel against its CPU reference
-      # (9 min on WARP); with the two Tensor API steps below, which check
-      # forward values and gradients against the CPU, the job took 14
-      # minutes. The PyTorch gradient parity binary alone took 7 more. The
-      # GPU counter and kernel timing tests are small and run here too.
+      # (7 min on WARP); with the zeroing step below and the two Tensor API
+      # steps, which check forward values and gradients against the CPU, the
+      # job took 36 minutes. The PyTorch gradient parity binary alone took 7
+      # more. The GPU counter and kernel timing tests are small and run here
+      # too.
       - name: GPU kernels (DX12 pull-request subset)
         if: ${{ !cancelled() && env.FULL_SUITE != 'true' }}
         run: |
           echo "pull request on DX12: running the subset; the full suite runs on main, weekly and by workflow_dispatch"
           cargo test --release -p ferrotensor-backend --test gpu_kernels --test gpu_counters --no-fail-fast -- --ignored --test-threads=1
+      # The same kernels with the zeroing of workgroup memory on, which is how
+      # a DX12 user builds them. Each pipeline costs minutes on WARP, so one
+      # test runs: one product per kernel (matrix-vector, thin, 64x64 tiles,
+      # skinny, and small-M with one and with three slices of K), in f32 and
+      # f16, with every epilogue. It took 26 minutes.
+      - name: GPU kernels with workgroup memory zeroed (DX12)
+        if: ${{ !cancelled() && matrix.backend == 'dx12' }}
+        env:
+          FERROTENSOR_SHADER_CHECKS: ""
+        run: cargo test --release -p ferrotensor-backend --test gpu_kernels -- --ignored --test-threads=1 matmul_epilogue_matches_cpu_on_every_path
       - name: Autograd finite-difference checks
         if: ${{ !cancelled() && env.FULL_SUITE == 'true' }}
         run: cargo test --release -p ferrotensor-autograd --test grad_check -- --test-threads=1
@@ -268,9 +299,11 @@ jobs:
     env:
       RUSTDOCFLAGS: -D rustdoc::broken_intra_doc_links
     steps:
-      - uses: actions/checkout@v4.2.2
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # The CLI's binary is also named `ferrotensor`; documented in the same
       # cargo call as the library, both write target/doc/ferrotensor and the
       # job fails now and then with a missing file. Document it afterwards.
@@ -281,14 +314,14 @@ jobs:
     name: MSRV
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Read rust-version
         id: msrv
         run: echo "version=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo check --workspace --locked
 
   # A missing file in a package, a path dependency without a version and a wrong
@@ -301,9 +334,11 @@ jobs:
     name: Package
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4.2.2
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo --version
       - run: cargo publish --workspace --dry-run --locked
 
@@ -311,7 +346,7 @@ jobs:
     name: cargo-deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4.2.2
-      - uses: EmbarkStudios/cargo-deny-action@v2.1.1
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check advisories licenses bans sources

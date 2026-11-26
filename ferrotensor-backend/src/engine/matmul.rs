@@ -1,5 +1,7 @@
 //! Matrix multiplication kernels.
 
+use super::skinny::SkinnyTile;
+use super::small_m::{self, SmallMLaunch, SmallMTile};
 use super::{grid, uniform, ComputeEngine, Kernel};
 use crate::kernel_timing::KernelLabel;
 use crate::{DType, UnifiedTensor, WgpuContext};
@@ -24,6 +26,67 @@ impl Layout {
             Self::TransposedA => "aT@b",
         }
     }
+}
+
+/// How a matmul combines its product with what `out` holds:
+/// `out = alpha * product + beta * out`.
+///
+/// The product is rounded to f32 before it is scaled and added, so `alpha`
+/// gives the same bits as scaling the stored product, and `beta = 1` the same
+/// bits as adding the stored product to `out` with [`ComputeEngine::add`].
+/// With `beta = 0` the kernels never read `out`, which may then be
+/// uninitialised.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Epilogue {
+    /// Factor on the product.
+    pub alpha: f32,
+    /// Factor on the earlier contents of `out`.
+    pub beta: f32,
+}
+
+impl Epilogue {
+    /// `out = product`.
+    pub const STORE: Self = Self {
+        alpha: 1.0,
+        beta: 0.0,
+    };
+    /// `out = product + out`.
+    pub const ACCUMULATE: Self = Self {
+        alpha: 1.0,
+        beta: 1.0,
+    };
+
+    /// `out = alpha * product`.
+    #[must_use]
+    pub fn scaled(alpha: f32) -> Self {
+        Self { alpha, beta: 0.0 }
+    }
+
+    /// `[alpha bits, beta bits]` for a kernel's params.
+    fn bits(self) -> [u32; 2] {
+        [self.alpha.to_bits(), self.beta.to_bits()]
+    }
+}
+
+/// The kernel [`ComputeEngine::matmul_with_path`] runs: the one
+/// [`ComputeEngine::matmul`] would pick, or one forced, so a benchmark or a
+/// test can compare them on the same inputs.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatmulPath {
+    /// The kernel the router picks for the shape.
+    Auto,
+    /// The kernels from before the small-M kernel: matrix-vector, thin or
+    /// 64x64 tiles.
+    Previous,
+    /// The small-M kernel.
+    SmallM {
+        /// The tile, or `None` for the default tile for M on this device.
+        tile: Option<SmallMTile>,
+        /// How many slices to split K into, or `None` for the heuristic's
+        /// count.
+        split: Option<u32>,
+    },
 }
 
 /// The operand the thin kernel reads as its thin side `t`.
@@ -53,8 +116,9 @@ fn thin_side(dtype: DType, m: u32, n: u32) -> Option<Thin> {
     (rows <= THIN_MAX_ROWS && cols.div_ceil(32) <= 65_535).then_some(thin)
 }
 
-/// The thin kernel's params, `[rows, K, cols, mode]` then the strides
-/// `[t row, t k, out row, out col]` (see matmul_thin.wgsl). With `b` thin
+/// The thin kernel's first two param rows, `[rows, K, cols, mode]` then the
+/// strides `[t row, t k, out row, out col]` (see matmul_thin.wgsl); the
+/// third row carries the epilogue. With `b` thin
 /// it computes `out^T = op(b)^T @ op(a)^T` and stores the result transposed.
 fn thin_params(layout: Layout, (m, k, n): (u32, u32, u32), thin: Thin) -> [u32; 8] {
     match (thin, layout) {
@@ -77,7 +141,7 @@ impl ComputeEngine {
         out: &UnifiedTensor,
     ) {
         let dims = (a.shape[0] as u32, a.shape[1] as u32, b.shape[1] as u32);
-        self.matmul_run(ctx, Layout::Plain, dims, a, b, out);
+        self.matmul_run(ctx, Layout::Plain, dims, [a, b, out], Epilogue::STORE);
     }
 
     /// `out[M, N] = a[M, K] @ b[N, K]^T` (e.g. the input gradient of a
@@ -90,7 +154,7 @@ impl ComputeEngine {
         out: &UnifiedTensor,
     ) {
         let dims = (a.shape[0] as u32, a.shape[1] as u32, b.shape[0] as u32);
-        self.matmul_run(ctx, Layout::TransposedB, dims, a, b, out);
+        self.matmul_run(ctx, Layout::TransposedB, dims, [a, b, out], Epilogue::STORE);
     }
 
     /// `out[M, N] = a[K, M]^T @ b[K, N]` (e.g. the weight gradient of a
@@ -103,7 +167,7 @@ impl ComputeEngine {
         out: &UnifiedTensor,
     ) {
         let dims = (a.shape[1] as u32, a.shape[0] as u32, b.shape[1] as u32);
-        self.matmul_run(ctx, Layout::TransposedA, dims, a, b, out);
+        self.matmul_run(ctx, Layout::TransposedA, dims, [a, b, out], Epilogue::STORE);
     }
 
     /// [`matmul`](Self::matmul) with `b[K, N]` stored as f16
@@ -117,7 +181,7 @@ impl ComputeEngine {
     ) {
         assert_eq!(b.dtype, DType::FP16, "matmul_f16b: b must be FP16");
         let dims = (a.shape[0] as u32, a.shape[1] as u32, b.shape[1] as u32);
-        self.matmul_run(ctx, Layout::Plain, dims, a, b, out);
+        self.matmul_run(ctx, Layout::Plain, dims, [a, b, out], Epilogue::STORE);
     }
 
     /// [`matmul_bt`](Self::matmul_bt) with `b[N, K]` stored as f16.
@@ -130,7 +194,7 @@ impl ComputeEngine {
     ) {
         assert_eq!(b.dtype, DType::FP16, "matmul_bt_f16b: b must be FP16");
         let dims = (a.shape[0] as u32, a.shape[1] as u32, b.shape[0] as u32);
-        self.matmul_run(ctx, Layout::TransposedB, dims, a, b, out);
+        self.matmul_run(ctx, Layout::TransposedB, dims, [a, b, out], Epilogue::STORE);
     }
 
     /// [`matmul`](Self::matmul) with `b[K, N]` stored in the 4-bit format
@@ -145,7 +209,7 @@ impl ComputeEngine {
     ) {
         assert_eq!(b.dtype, DType::Q4, "matmul_q4b: b must be Q4");
         let dims = (a.shape[0] as u32, a.shape[1] as u32, b.shape[1] as u32);
-        self.matmul_run(ctx, Layout::Plain, dims, a, b, out);
+        self.matmul_run(ctx, Layout::Plain, dims, [a, b, out], Epilogue::STORE);
     }
 
     /// [`matmul_bt`](Self::matmul_bt) with `b[N, K]` stored in the 4-bit
@@ -161,24 +225,252 @@ impl ComputeEngine {
     ) {
         assert_eq!(b.dtype, DType::Q4, "matmul_bt_q4b: b must be Q4");
         let dims = (a.shape[0] as u32, a.shape[1] as u32, b.shape[0] as u32);
-        self.matmul_run(ctx, Layout::TransposedB, dims, a, b, out);
+        self.matmul_run(ctx, Layout::TransposedB, dims, [a, b, out], Epilogue::STORE);
     }
 
-    /// Runs `out[M, N] = op(a) @ op(b)` with the kernel that suits the shape
-    /// and `b`'s storage: the matrix-vector kernel for one row, the thin
-    /// kernel when [`thin_side`] finds a thin operand, else the 64x64-tile
-    /// kernel.
+    /// `out = alpha * a[M, K] @ b[K, N] + beta * out`, with `b` stored as
+    /// f32, f16 or 4-bit (`ep` holds alpha and beta).
+    pub fn matmul_into(
+        &self,
+        ctx: &WgpuContext,
+        a: &UnifiedTensor,
+        b: &UnifiedTensor,
+        out: &UnifiedTensor,
+        ep: Epilogue,
+    ) {
+        let dims = (a.shape[0] as u32, a.shape[1] as u32, b.shape[1] as u32);
+        self.matmul_run(ctx, Layout::Plain, dims, [a, b, out], ep);
+    }
+
+    /// `out = alpha * a[M, K] @ b[N, K]^T + beta * out`, with `b` stored as
+    /// f32, f16 or 4-bit (`ep` holds alpha and beta).
+    pub fn matmul_bt_into(
+        &self,
+        ctx: &WgpuContext,
+        a: &UnifiedTensor,
+        b: &UnifiedTensor,
+        out: &UnifiedTensor,
+        ep: Epilogue,
+    ) {
+        let dims = (a.shape[0] as u32, a.shape[1] as u32, b.shape[0] as u32);
+        self.matmul_run(ctx, Layout::TransposedB, dims, [a, b, out], ep);
+    }
+
+    /// `out = alpha * a[K, M]^T @ b[K, N] + beta * out`, with f32 `b` (`ep`
+    /// holds alpha and beta).
+    pub fn matmul_at_into(
+        &self,
+        ctx: &WgpuContext,
+        a: &UnifiedTensor,
+        b: &UnifiedTensor,
+        out: &UnifiedTensor,
+        ep: Epilogue,
+    ) {
+        let dims = (a.shape[1] as u32, a.shape[0] as u32, b.shape[1] as u32);
+        self.matmul_run(ctx, Layout::TransposedA, dims, [a, b, out], ep);
+    }
+
+    /// [`matmul`](Self::matmul) (`transposed_b` false) or
+    /// [`matmul_bt`](Self::matmul_bt) (true) with the kernel `path` names,
+    /// returning the small-M tile and split when that kernel ran. `b` is
+    /// f32 or f16, or 4-bit for the previous kernels.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the shapes do not match, or when the small-M
+    /// kernel is asked for with a 4-bit `b`, a tile this device cannot run
+    /// or a grid past the dispatch limit.
+    #[doc(hidden)]
+    pub fn matmul_with_path(
+        &self,
+        ctx: &WgpuContext,
+        transposed_b: bool,
+        a: &UnifiedTensor,
+        b: &UnifiedTensor,
+        out: &UnifiedTensor,
+        path: MatmulPath,
+    ) -> Result<Option<SmallMLaunch>, String> {
+        self.matmul_with_path_into(ctx, transposed_b, [a, b, out], path, Epilogue::STORE)
+    }
+
+    /// [`matmul_with_path`](Self::matmul_with_path) with the epilogue `ep`
+    /// (see [`matmul_into`](Self::matmul_into)).
+    ///
+    /// # Errors
+    ///
+    /// As [`matmul_with_path`](Self::matmul_with_path).
+    #[doc(hidden)]
+    pub fn matmul_with_path_into(
+        &self,
+        ctx: &WgpuContext,
+        transposed_b: bool,
+        [a, b, out]: [&UnifiedTensor; 3],
+        path: MatmulPath,
+        ep: Epilogue,
+    ) -> Result<Option<SmallMLaunch>, String> {
+        let ([m, k], [b0, b1]) = (a.shape.as_slice(), b.shape.as_slice()) else {
+            return Err(format!(
+                "matmul_with_path: a and b must be 2-D, got {:?} and {:?}",
+                a.shape, b.shape
+            ));
+        };
+        let (b_k, n) = if transposed_b { (b1, b0) } else { (b0, b1) };
+        if b_k != k || out.shape.iter().product::<usize>() != m * n {
+            return Err(format!(
+                "matmul_with_path: a {:?}, b {:?} (transposed_b {transposed_b}) and out {:?} do not match",
+                a.shape, b.shape, out.shape
+            ));
+        }
+        let (m, k, n) = (*m as u32, *k as u32, *n as u32);
+        let layout = if transposed_b {
+            Layout::TransposedB
+        } else {
+            Layout::Plain
+        };
+        match path {
+            MatmulPath::Auto => Ok(self.matmul_run(ctx, layout, (m, k, n), [a, b, out], ep)),
+            MatmulPath::Previous => {
+                self.matmul_previous(ctx, layout, (m, k, n), [a, b, out], ep);
+                Ok(None)
+            }
+            MatmulPath::SmallM { tile, split } => {
+                if !matches!(b.dtype, DType::FP32 | DType::FP16) {
+                    return Err("matmul_with_path: the small-M kernel reads f32 or f16 b".into());
+                }
+                let tile = match tile {
+                    Some(tile) => tile,
+                    None => self.small_m_tile(m, transposed_b).ok_or_else(|| {
+                        format!("matmul_with_path: no small-M tile for {m} rows fits this device")
+                    })?,
+                };
+                if !self.small_m_fits(tile, transposed_b) {
+                    return Err(format!(
+                        "matmul_with_path: this device cannot run the small-M tile {tile:?}"
+                    ));
+                }
+                if !Self::small_m_grid_fits(tile, m, n, split) {
+                    return Err(format!(
+                        "matmul_with_path: the grid of {tile:?} over {m} x {n} with split {split:?} is past the dispatch limit"
+                    ));
+                }
+                Ok(Some(self.matmul_small_m(
+                    ctx,
+                    transposed_b,
+                    (m, k, n),
+                    [a, b, out],
+                    (tile, split),
+                    ep,
+                )))
+            }
+        }
+    }
+
+    /// Runs `out[M, N] = alpha * op(a) @ op(b) + beta * out` with the kernel
+    /// that suits the shape and `b`'s storage, trying in order: the
+    /// cooperative-matrix kernel for f16 weights when it is turned on, the
+    /// skinny kernel for f32 products with at most 64 columns, the small-M
+    /// kernel when [`small_m::routes`] takes the shape and a tile fits the
+    /// device, else [`matmul_previous`](Self::matmul_previous). Returns the
+    /// small-M tile and split when that kernel ran.
     fn matmul_run(
         &self,
         ctx: &WgpuContext,
         layout: Layout,
         (m, k, n): (u32, u32, u32),
-        a: &UnifiedTensor,
-        b: &UnifiedTensor,
-        out: &UnifiedTensor,
+        [a, b, out]: [&UnifiedTensor; 3],
+        ep: Epilogue,
+    ) -> Option<SmallMLaunch> {
+        let coop_layout = match layout {
+            Layout::Plain => Some(false),
+            Layout::TransposedB => Some(true),
+            Layout::TransposedA => None,
+        };
+        if let Some(transposed_b) = coop_layout.filter(|_| self.coop_routes(b.dtype, (m, k, n))) {
+            if self.matmul_coop(ctx, transposed_b, (m, k, n), [a, b, out], ep) {
+                return None;
+            }
+        }
+        if let Some((transposed_b, tile)) = self.skinny_route(layout, b.dtype, (m, n)) {
+            self.matmul_skinny(ctx, transposed_b, (m, k, n), [a, b, out], tile, ep);
+            return None;
+        }
+        if let Some((transposed_b, tile)) = self.small_m_route(layout, b.dtype, (m, k, n)) {
+            return Some(self.matmul_small_m(
+                ctx,
+                transposed_b,
+                (m, k, n),
+                [a, b, out],
+                (tile, None),
+                ep,
+            ));
+        }
+        self.matmul_previous(ctx, layout, (m, k, n), [a, b, out], ep);
+        None
+    }
+
+    /// Whether `b` is stored `[N, K]` and the tile, when the router sends an
+    /// `[M, N]` product of `layout` with a `dtype` weight to the skinny
+    /// kernel: f32 `b`, `a` stored `[M, K]`, and N the short side of at most
+    /// 64 columns, where the thin kernel would run the transposed product.
+    fn skinny_route(
+        &self,
+        layout: Layout,
+        dtype: DType,
+        (m, n): (u32, u32),
+    ) -> Option<(bool, SkinnyTile)> {
+        let transposed_b = match layout {
+            Layout::Plain => false,
+            Layout::TransposedB => true,
+            Layout::TransposedA => return None,
+        };
+        if dtype != DType::FP32 || thin_side(dtype, m, n) != Some(Thin::B) {
+            return None;
+        }
+        self.skinny_tile(m, n).map(|tile| (transposed_b, tile))
+    }
+
+    /// Whether `b` is stored `[N, K]` and the default tile, when the router
+    /// sends a product of `layout` with a `dtype` weight to the small-M
+    /// kernel.
+    fn small_m_route(
+        &self,
+        layout: Layout,
+        dtype: DType,
+        (m, k, n): (u32, u32, u32),
+    ) -> Option<(bool, SmallMTile)> {
+        let transposed_b = match layout {
+            Layout::Plain => false,
+            Layout::TransposedB => true,
+            Layout::TransposedA => return None,
+        };
+        if !small_m::routes(dtype, (m, k, n)) {
+            return None;
+        }
+        let tile = self
+            .small_m_tile(m, transposed_b)
+            .filter(|tile| tile.bk >= small_m::ROUTE_MIN_BK)?;
+        Self::small_m_grid_fits(tile, m, n, None).then_some((transposed_b, tile))
+    }
+
+    /// Runs `out[M, N] = alpha * op(a) @ op(b) + beta * out` with the kernels
+    /// from before the small-M kernel: the matrix-vector kernel for one row
+    /// stored plainly, the thin kernel when [`thin_side`] finds a thin
+    /// operand, else the 64x64-tile kernel.
+    fn matmul_previous(
+        &self,
+        ctx: &WgpuContext,
+        layout: Layout,
+        (m, k, n): (u32, u32, u32),
+        [a, b, out]: [&UnifiedTensor; 3],
+        ep: Epilogue,
     ) {
-        if m == 1 && matches!(layout, Layout::Plain) {
-            self.matvec(ctx, (k, n), a, b, out);
+        // The 4-bit matrix-vector kernel has no epilogue; the tile kernel
+        // takes the row when one is asked for.
+        if m == 1
+            && matches!(layout, Layout::Plain)
+            && (b.dtype != DType::Q4 || ep == Epilogue::STORE)
+        {
+            self.matvec(ctx, (k, n), [a, b, out], ep);
             return;
         }
         if let Some(thin) = thin_side(b.dtype, m, n) {
@@ -192,6 +484,7 @@ impl ComputeEngine {
             };
             let params = thin_params(layout, (m, k, n), thin);
             let (rows, cols) = (params[0], params[2]);
+            let [alpha, beta] = ep.bits();
             let label = KernelLabel {
                 entry: kernel.entry_point,
                 layout: layout.name(),
@@ -200,7 +493,10 @@ impl ComputeEngine {
                     Thin::B => "n<=64",
                 },
             };
-            let params = uniform(ctx, bytemuck::cast_slice(&params));
+            let mut padded = [0u32; 12];
+            padded[..8].copy_from_slice(&params);
+            padded[8..10].copy_from_slice(&[alpha, beta]);
+            let params = uniform(ctx, bytemuck::cast_slice(&padded));
             // One 16x16 workgroup per 8 rows by 32 columns of the thin product.
             self.run_labeled(
                 ctx,
@@ -223,7 +519,11 @@ impl ComputeEngine {
         };
         // The 4-bit kernel reads log2 of the group size above the layout.
         let mode = layout as u32 | b.q4_group().map_or(0, |g| g.size().trailing_zeros() << 8);
-        let params = uniform(ctx, bytemuck::cast_slice(&[m, k, n, mode]));
+        let [alpha, beta] = ep.bits();
+        let params = uniform(
+            ctx,
+            bytemuck::cast_slice(&[m, k, n, mode, alpha, beta, 0, 0]),
+        );
         // One 16x16 workgroup per 64x64 output tile.
         self.run_labeled(
             ctx,
@@ -239,16 +539,16 @@ impl ComputeEngine {
         );
     }
 
-    /// `out[1, N] = a[1, K] @ b[K, N]`, the shape of every linear layer when
-    /// decoding one token: the threads of a workgroup split K, where the
-    /// 64x64-tile kernel would compute one useful row of 64.
+    /// `out[1, N] = alpha * a[1, K] @ b[K, N] + beta * out` (`ep`), the shape
+    /// of every linear layer when decoding one token: the threads of a
+    /// workgroup split K, where the 64x64-tile kernel would compute one
+    /// useful row of 64. The 4-bit kernel takes only `Epilogue::STORE`.
     fn matvec(
         &self,
         ctx: &WgpuContext,
         (k, n): (u32, u32),
-        a: &UnifiedTensor,
-        b: &UnifiedTensor,
-        out: &UnifiedTensor,
+        [a, b, out]: [&UnifiedTensor; 3],
+        ep: Epilogue,
     ) {
         let (kernel, columns_per_group, log2_group) = match b.dtype {
             DType::FP32 => (&self.matvec, 32, 0),
@@ -259,7 +559,14 @@ impl ComputeEngine {
                 b.q4_group().map_or(0, |g| g.size().trailing_zeros()),
             ),
         };
-        let params = uniform(ctx, bytemuck::cast_slice(&[k, n, log2_group, 0]));
+        // The f32 and f16 kernels read the epilogue where the 4-bit one reads
+        // the group size; the 4-bit kernel only runs with Epilogue::STORE.
+        let [alpha, beta] = ep.bits();
+        let tail = match b.dtype {
+            DType::Q4 => [log2_group, 0],
+            DType::FP32 | DType::FP16 => [alpha, beta],
+        };
+        let params = uniform(ctx, bytemuck::cast_slice(&[k, n, tail[0], tail[1]]));
         self.run(
             ctx,
             kernel,

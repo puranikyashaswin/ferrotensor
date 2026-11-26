@@ -245,7 +245,7 @@ fn build(gpu: &Gpu, dir: &Path, f16: bool) -> (Lfm2Model, WeightsContext) {
 
 /// The raw bytes of a GPU tensor.
 fn gpu_bytes(ctx: &WgpuContext, t: &UnifiedTensor) -> Vec<u8> {
-    let words = pollster::block_on(t.to_vec(ctx));
+    let words = pollster::block_on(t.to_vec(ctx)).expect("GPU readback");
     words.iter().flat_map(|w| w.to_ne_bytes()).collect()
 }
 
@@ -379,7 +379,7 @@ fn q4_load_keeps_the_tied_head_and_host_table_unquantised_without_the_file() {
     assert_eq!(attn.q_proj.weight.data.dtype, DType::Q4);
 
     let logits = model.forward(&gpu.engine, &[1, 2, 3], 0, None, None);
-    let values = pollster::block_on(logits.data.to_vec(&gpu.ctx));
+    let values = pollster::block_on(logits.data.to_vec(&gpu.ctx)).expect("GPU readback");
     assert!(!values.is_empty() && values.len().is_multiple_of(VOCAB));
     assert!(values.iter().all(|v| v.is_finite()), "non-finite logits");
 }

@@ -11,9 +11,12 @@
 
 #![allow(clippy::unwrap_used)]
 
+mod common;
+
+use common::attention::{causal_rule, cpu_attention, cpu_attention_backward, cpu_attention_lse};
 use ferrotensor_backend::{
-    q4, AdamParams, AttentionOptions, ComputeEngine, DType, MemoryCategory, UnifiedTensor,
-    WgpuContext, MASKED_CE_SKIP, SUM_SQUARES_CHUNK,
+    q4, AdamParams, AttentionOptions, ComputeEngine, DType, Epilogue, MatmulPath, MemoryCategory,
+    SkinnyTile, SmallMTile, UnifiedTensor, WgpuContext, MASKED_CE_SKIP, SUM_SQUARES_CHUNK,
 };
 use q4::Q4Group;
 use std::io::Write as _;
@@ -29,6 +32,8 @@ fn gpu() -> &'static Gpu {
     GPU.get_or_init(|| {
         let ctx = pollster::block_on(WgpuContext::new());
         let engine = ComputeEngine::new(&ctx);
+        // The f32 tolerances below are for the scalar attention kernels.
+        engine.set_flash_coop(false);
         Gpu { ctx, engine }
     })
 }
@@ -57,7 +62,7 @@ fn zeros(shape: &[usize]) -> UnifiedTensor {
 }
 
 fn read(t: &UnifiedTensor) -> Vec<f32> {
-    pollster::block_on(t.to_vec(&gpu().ctx))
+    pollster::block_on(t.to_vec(&gpu().ctx)).unwrap()
 }
 
 #[track_caller]
@@ -125,108 +130,6 @@ fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
-/// Reference attention for [batch, seq, heads, dim] tensors with GQA, an
-/// optional additive mask of shape [batch, heads, seq_q, seq_k] and a
-/// visibility rule `visible(i, j)` for query i and key j.
-#[allow(clippy::too_many_arguments)]
-fn cpu_attention(
-    q: &[f32],
-    k: &[f32],
-    v: &[f32],
-    mask: Option<&[f32]>,
-    (b, sq, sk, h, hkv, d): (usize, usize, usize, usize, usize, usize),
-    visible: impl Fn(usize, usize) -> bool,
-) -> (Vec<f32>, Vec<Vec<f32>>) {
-    let scale = 1.0 / (d as f32).sqrt();
-    let mut out = vec![0.0f32; b * sq * h * d];
-    // Attention probabilities per (b, h, i), used by the backward reference.
-    let mut probs = Vec::new();
-    for bi in 0..b {
-        for hi in 0..h {
-            let kh = hi / (h / hkv);
-            for i in 0..sq {
-                let qo = ((bi * sq + i) * h + hi) * d;
-                let mut s = vec![f32::NEG_INFINITY; sk];
-                for (j, sj) in s.iter_mut().enumerate() {
-                    if !visible(i, j) {
-                        continue;
-                    }
-                    let ko = ((bi * sk + j) * hkv + kh) * d;
-                    let mut dot = 0.0;
-                    for x in 0..d {
-                        dot += q[qo + x] * k[ko + x];
-                    }
-                    *sj = dot * scale;
-                    if let Some(m) = mask {
-                        *sj += m[((bi * h + hi) * sq + i) * sk + j];
-                    }
-                }
-                let max = s.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let e: Vec<f32> = s.iter().map(|x| (x - max).exp()).collect();
-                let sum: f32 = e.iter().sum();
-                let p: Vec<f32> = e.iter().map(|x| x / sum).collect();
-                for (j, pj) in p.iter().enumerate() {
-                    let vo = ((bi * sk + j) * hkv + kh) * d;
-                    for x in 0..d {
-                        out[qo + x] += pj * v[vo + x];
-                    }
-                }
-                probs.push(p);
-            }
-        }
-    }
-    (out, probs)
-}
-
-/// Reference gradients of attention (no dropout) given dO.
-#[allow(clippy::type_complexity)]
-fn cpu_attention_backward(
-    q: &[f32],
-    k: &[f32],
-    v: &[f32],
-    dout: &[f32],
-    probs: &[Vec<f32>],
-    (b, sq, sk, h, hkv, d): (usize, usize, usize, usize, usize, usize),
-) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
-    let scale = 1.0 / (d as f32).sqrt();
-    let mut dq = vec![0.0f32; q.len()];
-    let mut dk = vec![0.0f32; k.len()];
-    let mut dv = vec![0.0f32; v.len()];
-    let mut row = 0;
-    for bi in 0..b {
-        for hi in 0..h {
-            let kh = hi / (h / hkv);
-            for i in 0..sq {
-                let p = &probs[row];
-                row += 1;
-                let qo = ((bi * sq + i) * h + hi) * d;
-                // dP_ij = dO_i . V_j ; dS = P * (dP - sum_j P_ij dP_ij)
-                let dp: Vec<f32> = (0..sk)
-                    .map(|j| {
-                        let vo = ((bi * sk + j) * hkv + kh) * d;
-                        (0..d).map(|x| dout[qo + x] * v[vo + x]).sum()
-                    })
-                    .collect();
-                let rowsum: f32 = p.iter().zip(&dp).map(|(a, b)| a * b).sum();
-                for j in 0..sk {
-                    let ko = ((bi * sk + j) * hkv + kh) * d;
-                    let ds = p[j] * (dp[j] - rowsum) * scale;
-                    for x in 0..d {
-                        dv[ko + x] += p[j] * dout[qo + x];
-                        dq[qo + x] += ds * k[ko + x];
-                        dk[ko + x] += ds * q[qo + x];
-                    }
-                }
-            }
-        }
-    }
-    (dq, dk, dv)
-}
-
-fn causal_rule(causal: bool) -> impl Fn(usize, usize) -> bool {
-    move |i, j| !causal || j <= i
-}
-
 // ---------------------------------------------------------------------------
 // Matmul
 // ---------------------------------------------------------------------------
@@ -271,6 +174,16 @@ fn f16_round(x: &[f32]) -> Vec<f32> {
     x.iter().map(|&v| half::f16::from_f32(v).to_f32()).collect()
 }
 
+/// `x` as the f16-weight matmuls see it: with the cooperative-matrix kernel
+/// routed, `a` is converted to f16, so tests feed values f16 holds exactly.
+fn maybe_f16(x: Vec<f32>) -> Vec<f32> {
+    if gpu().engine.coop_matmul_active() {
+        f16_round(&x)
+    } else {
+        x
+    }
+}
+
 #[test]
 #[ignore = "needs a GPU; run with --ignored --test-threads=1"]
 fn matmul_with_f16_b_matches_cpu() {
@@ -282,7 +195,7 @@ fn matmul_with_f16_b_matches_cpu() {
         .chain(&[(3, 5, 7), (65, 33, 129)])
         .enumerate()
     {
-        let a = rand_vec(m * k, 300 + seed as u64);
+        let a = maybe_f16(rand_vec(m * k, 300 + seed as u64));
         let b = rand_vec(k * n, 400 + seed as u64);
         let b_h = UnifiedTensor::from_f32_as_f16(&g.ctx, &b, &[k, n]);
         assert!(b_h.size_in_bytes() <= ((k * n * 2).div_ceil(4) * 4).max(4) as u64);
@@ -577,7 +490,7 @@ fn thin_matmul_matches_cpu_in_every_layout() {
     // product); f16 `b` with few columns takes the tile kernel.
     let g = gpu();
     for (seed, &(m, k, n)) in THIN_SHAPES.iter().enumerate() {
-        let a = rand_vec(m * k, 3000 + seed as u64);
+        let a = maybe_f16(rand_vec(m * k, 3000 + seed as u64));
         let b: Vec<f32> = rand_vec(k * n, 3100 + seed as u64)
             .iter()
             .map(|v| v * 0.1)
@@ -614,6 +527,532 @@ fn thin_matmul_matches_cpu_in_every_layout() {
         let out = zeros(&[m, n]);
         g.engine.matmul_bt_f16b(&g.ctx, &a_up, &bt_h, &out);
         check("matmul_bt_f16b", &out, &f16_round(&b));
+    }
+}
+
+/// `(m, k, n)` for the skinny kernel: the LoRA `x @ A` of rank 8 at 256 and
+/// 2048 rows and at the 1.7B MLP's K of 8192, then M, K and N off every
+/// tile's multiple, one column, and the widest N it takes.
+const SKINNY_SHAPES: &[(usize, usize, usize)] = &[
+    (256, 576, 8),
+    (2048, 576, 8),
+    (256, 8192, 8),
+    (200, 40, 8),
+    (77, 37, 5),
+    (300, 64, 1),
+    (130, 1000, 64),
+];
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn every_skinny_tile_matches_cpu_in_both_layouts() {
+    let g = gpu();
+    for (seed, &(m, k, n)) in SKINNY_SHAPES.iter().enumerate() {
+        let a = rand_vec(m * k, 3400 + seed as u64);
+        let b: Vec<f32> = rand_vec(k * n, 3500 + seed as u64)
+            .iter()
+            .map(|v| v * 0.1)
+            .collect();
+        let old = rand_vec(m * n, 3600 + seed as u64);
+        let product = cpu_matmul(&a, &b, m, k, n);
+        let a_up = upload(&a, &[m, k]);
+        let layouts = [
+            (false, upload(&b, &[k, n])),
+            (true, upload(&transpose(&b, k, n), &[n, k])),
+        ];
+        for (transposed_b, b_up) in &layouts {
+            for tile in SkinnyTile::ALL {
+                for (alpha, beta) in [(1.0f32, 0.0f32), (-0.5, 1.0)] {
+                    let out = upload(&old, &[m, n]);
+                    let ep = Epilogue { alpha, beta };
+                    let tensors = [&a_up, b_up, &out];
+                    let ran =
+                        g.engine
+                            .matmul_skinny_into(&g.ctx, *transposed_b, tensors, Some(tile), ep);
+                    assert_eq!(ran, Ok(tile));
+                    let want: Vec<f32> = product
+                        .iter()
+                        .zip(&old)
+                        .map(|(&p, &o)| alpha * p + beta * o)
+                        .collect();
+                    // Names the tile, shape, layout, alpha and beta.
+                    let name = format!("{tile:?} {m}x{k}x{n} {transposed_b} {alpha} {beta}");
+                    assert_close(&name, &read(&out), &want, 1e-4, 1e-4);
+                }
+            }
+        }
+    }
+}
+
+/// `(m, k, n)` of products whose `b` is stored along k: `a @ b^T` in f32 and
+/// f16, and `x @ W` with 4-bit `W`. K is off the 16 the tile kernel stages
+/// at a time and N off its 64 columns. M and N above 64 (for f16 and 4-bit
+/// `b`, M above 64 alone) take the 64x64-tile kernel; (37, 70, 45) and
+/// (1, 33, 17) take the thin and matrix-vector kernels, checked against the
+/// same reference.
+const ALONG_K_SHAPES: &[(usize, usize, usize)] = &[
+    (66, 2048, 96),
+    (67, 70, 65),
+    (129, 33, 17),
+    (65, 1, 130),
+    (100, 31, 191),
+    (37, 70, 45),
+    (1, 33, 17),
+];
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn matmul_with_b_along_k_matches_cpu_at_odd_shapes() {
+    let g = gpu();
+    for (seed, &(m, k, n)) in ALONG_K_SHAPES.iter().enumerate() {
+        let a = maybe_f16(rand_vec(m * k, 3200 + seed as u64));
+        // Weight-sized values keep the k = 2048 sums near 1, so the
+        // tolerance below measures the kernel, not f32 rounding.
+        let b: Vec<f32> = rand_vec(k * n, 3300 + seed as u64)
+            .iter()
+            .map(|v| v * 0.1)
+            .collect();
+        let check = |name: &str, out: &UnifiedTensor, b_seen: &[f32]| {
+            assert_close(
+                &format!("{name} {m}x{k}x{n}"),
+                &read(out),
+                &cpu_matmul(&a, b_seen, m, k, n),
+                1e-4,
+                1e-4,
+            );
+        };
+        let bt = transpose(&b, k, n); // [n, k]
+        let a_up = upload(&a, &[m, k]);
+
+        let out = zeros(&[m, n]);
+        g.engine
+            .matmul_bt(&g.ctx, &a_up, &upload(&bt, &[n, k]), &out);
+        check("matmul_bt", &out, &b);
+
+        let bt_h = UnifiedTensor::from_f32_as_f16(&g.ctx, &bt, &[n, k]);
+        let out = zeros(&[m, n]);
+        g.engine.matmul_bt_f16b(&g.ctx, &a_up, &bt_h, &out);
+        check("matmul_bt_f16b", &out, &f16_round(&b));
+
+        // The 4-bit format stores W[k, n] in [n, k] order, so the forward
+        // product is the one that reads it along k.
+        let w_q = UnifiedTensor::from_f32_as_q4(&g.ctx, &b, &[k, n], Q4Group::DEFAULT).unwrap();
+        let out = zeros(&[m, n]);
+        g.engine.matmul_q4b(&g.ctx, &a_up, &w_q, &out);
+        check("matmul_q4b", &out, &q4_round(&b, k, n, Q4Group::DEFAULT));
+    }
+}
+
+/// `(m, k, n)` of products the small-M kernel takes: M of one and of two row
+/// blocks, K and N off the 64 columns and 16 or 32 of K a workgroup steps by.
+const SMALL_M_SHAPES: &[(usize, usize, usize)] = &[
+    (17, 259, 300),
+    (37, 1000, 257),
+    (64, 512, 256),
+    (100, 333, 321),
+    (130, 289, 263),
+    (256, 260, 512),
+];
+
+/// `b` of a small-M test as `[K, N]` and as `[N, K]`, in f32 and in f16, with
+/// the reference product for f32 and for f16 `b`.
+struct SmallMWeights {
+    weights: Vec<(&'static str, bool, UnifiedTensor)>,
+    want: Vec<f32>,
+    want_h: Vec<f32>,
+}
+
+impl SmallMWeights {
+    fn new(a: &[f32], (m, k, n): (usize, usize, usize), seed: u64) -> Self {
+        let g = gpu();
+        let b: Vec<f32> = rand_vec(k * n, seed).iter().map(|v| v * 0.1).collect();
+        let bt = transpose(&b, k, n);
+        Self {
+            weights: vec![
+                ("f32 a@b", false, upload(&b, &[k, n])),
+                ("f32 a@bT", true, upload(&bt, &[n, k])),
+                (
+                    "f16 a@b",
+                    false,
+                    UnifiedTensor::from_f32_as_f16(&g.ctx, &b, &[k, n]),
+                ),
+                (
+                    "f16 a@bT",
+                    true,
+                    UnifiedTensor::from_f32_as_f16(&g.ctx, &bt, &[n, k]),
+                ),
+            ],
+            want: cpu_matmul(a, &b, m, k, n),
+            want_h: cpu_matmul(a, &f16_round(&b), m, k, n),
+        }
+    }
+
+    fn want(&self, b: &UnifiedTensor) -> &[f32] {
+        if b.dtype == DType::FP16 {
+            &self.want_h
+        } else {
+            &self.want
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn small_m_matmul_matches_cpu_for_every_split() {
+    // Both layouts, f32 and f16 b, the split the heuristic picks and 1, 2, 3
+    // and 7 slices of K.
+    let g = gpu();
+    for (seed, &(m, k, n)) in SMALL_M_SHAPES.iter().enumerate() {
+        let a = rand_vec(m * k, 5000 + seed as u64);
+        let a_up = upload(&a, &[m, k]);
+        let w = SmallMWeights::new(&a, (m, k, n), 5100 + seed as u64);
+        for (name, transposed_b, b) in &w.weights {
+            for split in [None, Some(1), Some(2), Some(3), Some(7)] {
+                let out = zeros(&[m, n]);
+                let launch = g
+                    .engine
+                    .matmul_with_path(
+                        &g.ctx,
+                        *transposed_b,
+                        &a_up,
+                        b,
+                        &out,
+                        MatmulPath::SmallM { tile: None, split },
+                    )
+                    .unwrap()
+                    .unwrap();
+                // K of 256 or more is at least 8 steps, so 2 slices of whole
+                // steps always cover it; 3 and 7 may round down.
+                match split {
+                    Some(1) => assert_eq!(launch.split, 1),
+                    Some(2) => assert_eq!(launch.split, 2),
+                    Some(s) => assert!((1..=s).contains(&launch.split), "{launch:?}"),
+                    None => assert!(launch.split >= 1),
+                }
+                assert_close(
+                    &format!("small_m {name} {m}x{k}x{n} {launch:?}"),
+                    &read(&out),
+                    w.want(b),
+                    1e-4,
+                    1e-4,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn small_m_matmul_matches_cpu_with_odd_tiles() {
+    // Two threads along M with K steps of 32; 5 threads along M by 8 along
+    // N with 8 columns each, whose 40 threads leave the last round of staged
+    // values short; and one thread. All fit in 16 KiB of workgroup memory.
+    let g = gpu();
+    let tiles = [
+        SmallMTile {
+            tm: 4,
+            tn: 4,
+            tx: 8,
+            ty: 2,
+            bk: 32,
+        },
+        SmallMTile {
+            tm: 3,
+            tn: 8,
+            tx: 8,
+            ty: 5,
+            bk: 16,
+        },
+        SmallMTile {
+            tm: 1,
+            tn: 4,
+            tx: 1,
+            ty: 1,
+            bk: 4,
+        },
+    ];
+    for (seed, &(m, k, n)) in [(17, 259, 300), (130, 289, 263)].iter().enumerate() {
+        let a = rand_vec(m * k, 5200 + seed as u64);
+        let a_up = upload(&a, &[m, k]);
+        let w = SmallMWeights::new(&a, (m, k, n), 5300 + seed as u64);
+        for (name, transposed_b, b) in &w.weights {
+            for tile in tiles {
+                for split in [Some(1), Some(3)] {
+                    let out = zeros(&[m, n]);
+                    let path = MatmulPath::SmallM {
+                        tile: Some(tile),
+                        split,
+                    };
+                    let launch = g
+                        .engine
+                        .matmul_with_path(&g.ctx, *transposed_b, &a_up, b, &out, path)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(launch.tile, tile);
+                    assert_close(
+                        &format!("small_m {name} {m}x{k}x{n} {launch:?}"),
+                        &read(&out),
+                        w.want(b),
+                        1e-4,
+                        1e-4,
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn small_m_matmul_is_deterministic() {
+    // The split's partial sums are added in a fixed order, so two runs give
+    // the same bits.
+    let g = gpu();
+    let (m, k, n) = (130, 1000, 263);
+    let a = rand_vec(m * k, 5400);
+    let a_up = upload(&a, &[m, k]);
+    let w = SmallMWeights::new(&a, (m, k, n), 5401);
+    for (name, transposed_b, b) in &w.weights {
+        for split in [Some(1), Some(5)] {
+            let path = MatmulPath::SmallM { tile: None, split };
+            let run = || {
+                let out = zeros(&[m, n]);
+                g.engine
+                    .matmul_with_path(&g.ctx, *transposed_b, &a_up, b, &out, path)
+                    .unwrap();
+                read(&out).iter().map(|v| v.to_bits()).collect::<Vec<u32>>()
+            };
+            assert_eq!(run(), run(), "small_m {name} split {split:?}");
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn matmul_routes_few_rows_against_wide_weights_to_small_m() {
+    let g = gpu();
+    let route = |(m, k, n): (usize, usize, usize), transposed_b: bool, dtype: DType| {
+        let a = upload(&rand_vec(m * k, 5500), &[m, k]);
+        let shape = if transposed_b { [n, k] } else { [k, n] };
+        let data = rand_vec(k * n, 5501);
+        let b = match dtype {
+            DType::FP16 => UnifiedTensor::from_f32_as_f16(&g.ctx, &data, &shape),
+            _ => upload(&data, &shape),
+        };
+        let out = zeros(&[m, n]);
+        g.engine
+            .matmul_with_path(&g.ctx, transposed_b, &a, &b, &out, MatmulPath::Auto)
+            .unwrap()
+            .map(|launch| launch.tile)
+    };
+    // 64 rows: 8 threads along M with 8 rows each, 16 along N with 4
+    // columns each. K steps of 32 need 36 KiB of workgroup memory (NVIDIA's
+    // Vulkan driver has 48), steps of 16 need 20 KiB (Metal and software
+    // Vulkan have 32); the router takes no smaller step, so with 16 KiB
+    // (DX12 on WARP) the previous kernels run.
+    let bytes = g.ctx.device.limits().max_compute_workgroup_storage_size;
+    // With the cooperative-matrix kernel routed, f16 weights with 64 or more rows go there first.
+    let coop = g.engine.coop_matmul_active();
+    let tile = |bk| SmallMTile {
+        tm: 8,
+        tn: 4,
+        tx: 16,
+        ty: 8,
+        bk,
+    };
+    let want = if bytes >= 36 * 1024 {
+        Some(tile(32))
+    } else if bytes >= 20 * 1024 {
+        Some(tile(16))
+    } else {
+        None
+    };
+    assert_eq!(route((64, 512, 256), true, DType::FP32), want, "{bytes} B");
+    assert_eq!(
+        route((64, 512, 256), false, DType::FP16),
+        if coop { None } else { want },
+        "{bytes} B"
+    );
+    // 160 rows: two row blocks of 80, with K steps of 16 in 22.5 KiB.
+    assert_eq!(
+        route((160, 256, 300), true, DType::FP16).map(SmallMTile::bm),
+        (bytes >= 23_040 && !coop).then_some(80),
+        "{bytes} B"
+    );
+    // Too narrow, too shallow, too few or too many rows: the previous kernels.
+    assert_eq!(route((64, 512, 192), true, DType::FP32), None);
+    assert_eq!(route((64, 192, 512), false, DType::FP32), None);
+    assert_eq!(route((15, 512, 512), true, DType::FP32), None);
+    assert_eq!(route((257, 512, 512), true, DType::FP32), None);
+    assert_eq!(route((64, 2048, 8), true, DType::FP32), None);
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn small_m_matmul_refuses_what_it_cannot_run() {
+    let g = gpu();
+    let (m, k, n) = (64, 256, 256);
+    let a = upload(&rand_vec(m * k, 5600), &[m, k]);
+    let data = rand_vec(k * n, 5601);
+    let out = zeros(&[m, n]);
+    let small_m = |tile| MatmulPath::SmallM { tile, split: None };
+    // A 4-bit weight.
+    let b_q4 = UnifiedTensor::from_f32_as_q4(&g.ctx, &data, &[k, n], Q4Group::DEFAULT).unwrap();
+    assert!(g
+        .engine
+        .matmul_with_path(&g.ctx, false, &a, &b_q4, &out, small_m(None))
+        .is_err());
+    let b = upload(&data, &[k, n]);
+    // Columns per thread not a multiple of 4, and more threads than a
+    // workgroup can have.
+    for tile in [
+        SmallMTile {
+            tm: 8,
+            tn: 6,
+            tx: 16,
+            ty: 8,
+            bk: 32,
+        },
+        SmallMTile {
+            tm: 1,
+            tn: 4,
+            tx: 64,
+            ty: 64,
+            bk: 4,
+        },
+    ] {
+        assert!(g
+            .engine
+            .matmul_with_path(&g.ctx, false, &a, &b, &out, small_m(Some(tile)))
+            .is_err());
+    }
+    // Shapes that do not match.
+    assert!(g
+        .engine
+        .matmul_with_path(&g.ctx, true, &a, &b, &zeros(&[m, n + 1]), small_m(None))
+        .is_err());
+}
+
+/// Linear projections of the SmolLM2 models as (name, input width, output
+/// width): the shapes a fine-tune sends through the small-M kernel in a
+/// micro-batch of one padded sequence. 135M and 1.7B are controls for 360M.
+const SMOLLM2_PROJECTIONS: &[(&str, usize, usize)] = &[
+    ("135M q/o", 576, 576),
+    ("135M k/v", 576, 192),
+    ("135M fused qkv", 576, 960),
+    ("135M gate/up", 576, 1536),
+    ("135M down", 1536, 576),
+    ("135M lm_head", 576, 49152),
+    ("360M q/o", 960, 960),
+    ("360M k/v", 960, 320),
+    ("360M fused qkv", 960, 1600),
+    ("360M gate/up", 960, 2560),
+    ("360M down", 2560, 960),
+    ("360M lm_head", 960, 49152),
+    ("1.7B q/k/v/o", 2048, 2048),
+    ("1.7B gate/up", 2048, 8192),
+    ("1.7B down", 8192, 2048),
+];
+
+/// Row counts of the micro-batches under test: one token, a decode batch,
+/// the router's lower bound, and the rows around one 32-row padding step.
+const SMOLLM2_ROWS: &[usize] = &[1, 8, 16, 31, 32, 48, 63];
+
+/// `a[M, K] @ b` in f64 for `b` stored `[N, K]` (`transposed_b`) or `[K, N]`.
+fn f64_matmul(
+    a: &[f32],
+    b: &[f32],
+    (m, k, n): (usize, usize, usize),
+    transposed_b: bool,
+) -> Vec<f32> {
+    let mut out = vec![0.0f64; m * n];
+    for (a_row, out_row) in a.chunks(k).zip(out.chunks_mut(n)) {
+        if transposed_b {
+            for (o, b_row) in out_row.iter_mut().zip(b.chunks(k)) {
+                *o = a_row
+                    .iter()
+                    .zip(b_row)
+                    .map(|(&x, &y)| f64::from(x) * f64::from(y))
+                    .sum();
+            }
+        } else {
+            for (&x, b_row) in a_row.iter().zip(b.chunks(n)) {
+                for (o, &y) in out_row.iter_mut().zip(b_row) {
+                    *o += f64::from(x) * f64::from(y);
+                }
+            }
+        }
+    }
+    out.into_iter().map(|v| v as f32).collect()
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn small_m_matmul_matches_f64_at_smollm2_shapes() {
+    // One weight W[out, in] gives both products of a linear layer: the
+    // forward a[M, in] @ W^T (b stored [N, K]) and the input gradient
+    // dy[M, out] @ W (b stored [K, N]). Each runs on the default tile with
+    // the heuristic's split, with no split, with 7 slices of K (what an A10G
+    // picks for 360M's 960-deep k/v products), and as the router sends it.
+    // The reference is f64 on the f16-rounded weight, and the tolerance of
+    // 1e-3 + 1e-4 * |want| is far above f32 summation noise (about 1e-5 at
+    // K = 8192) and far below the 0.03 a single wrong product would move
+    // an output by.
+    let g = gpu();
+    let paths = [
+        MatmulPath::SmallM {
+            tile: None,
+            split: None,
+        },
+        MatmulPath::SmallM {
+            tile: None,
+            split: Some(1),
+        },
+        MatmulPath::SmallM {
+            tile: None,
+            split: Some(7),
+        },
+        MatmulPath::Auto,
+    ];
+    for (shape_seed, &(name, d_in, d_out)) in SMOLLM2_PROJECTIONS.iter().enumerate() {
+        let shape_seed = shape_seed as u64;
+        let w: Vec<f32> = rand_vec(d_in * d_out, 7000 + shape_seed)
+            .iter()
+            .map(|v| v * 0.1)
+            .collect();
+        let mut weights = vec![(
+            "f16",
+            UnifiedTensor::from_f32_as_f16(&g.ctx, &w, &[d_out, d_in]),
+            f16_round(&w),
+        )];
+        if d_in * d_out <= 4_000_000 {
+            weights.push(("f32", upload(&w, &[d_out, d_in]), w.clone()));
+        }
+        for &m in SMOLLM2_ROWS {
+            for (product, transposed_b, k, n) in
+                [("a@bT", true, d_in, d_out), ("a@b", false, d_out, d_in)]
+            {
+                let a = rand_vec(m * k, 7100 + 16 * shape_seed + m as u64);
+                let a_up = upload(&a, &[m, k]);
+                for (dtype, b, b_ref) in &weights {
+                    let want = f64_matmul(&a, b_ref, (m, k, n), transposed_b);
+                    for path in paths {
+                        let out = zeros(&[m, n]);
+                        let launch = g
+                            .engine
+                            .matmul_with_path(&g.ctx, transposed_b, &a_up, b, &out, path)
+                            .unwrap();
+                        assert_close(
+                            &format!("{name} {dtype} {product} {m}x{k}x{n} {path:?} -> {launch:?}"),
+                            &read(&out),
+                            &want,
+                            1e-3,
+                            1e-4,
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -867,20 +1306,91 @@ fn rms_norm_backward_matches_cpu() {
         let go = rand_vec(rows * len, 72 + len as u64);
         let gx = zeros(&[rows, len]);
         let gw = zeros(&[len]);
-        g.engine.rms_norm_backward(
-            &g.ctx,
-            &upload(&x, &[rows, len]),
-            &upload(&w, &[len]),
-            &upload(&go, &[rows, len]),
-            &gx,
-            &gw,
-            eps,
+        let (tx, tw, tgo) = (
+            upload(&x, &[rows, len]),
+            upload(&w, &[len]),
+            upload(&go, &[rows, len]),
         );
+        let e = &g.engine;
+        e.rms_norm_backward(&g.ctx, &tx, &tw, &tgo, &gx, Some(&gw), eps);
         let (want_x, want_w) = cpu_rms_norm_backward(&x, &go, &w, len, eps);
         let name = format!("rms_norm_backward {rows}x{len}");
         assert_close(&format!("{name} grad_x"), &read(&gx), &want_x, 1e-4, 1e-3);
         assert_close(&format!("{name} grad_w"), &read(&gw), &want_w, 1e-4, 1e-3);
+        // A frozen weight gets no gradient: the input gradient is the same.
+        let gx_only = zeros(&[rows, len]);
+        e.rms_norm_backward(&g.ctx, &tx, &tw, &tgo, &gx_only, None, eps);
+        let bits = |t: &UnifiedTensor| read(t).iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&gx_only), bits(&gx), "{name} grad_x without grad_w");
     }
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn rms_norm_backward_beta_accumulates_into_grad_input() {
+    let g = gpu();
+    let e = &g.engine;
+    for &(rows, len, eps) in &[(1, 1, 1e-5), (5, 37, 1e-5), (3, 64, 0.1), (130, 576, 1e-5)] {
+        let x = rand_vec(rows * len, 80 + len as u64);
+        let w = rand_vec(len, 81 + len as u64);
+        let go = rand_vec(rows * len, 82 + len as u64);
+        let old = rand_vec(rows * len, 83 + len as u64);
+        let (tx, tw, tgo) = (
+            upload(&x, &[rows, len]),
+            upload(&w, &[len]),
+            upload(&go, &[rows, len]),
+        );
+        let (want_x, want_w) = cpu_rms_norm_backward(&x, &go, &w, len, eps);
+        // The unfused path: the plain kernel into a scratch buffer, then `add`.
+        let scratch = zeros(&[rows, len]);
+        e.rms_norm_backward(&g.ctx, &tx, &tw, &tgo, &scratch, None, eps);
+        let summed = zeros(&[rows, len]);
+        e.add(&g.ctx, &upload(&old, &[rows, len]), &scratch, &summed);
+        let unfused = read(&summed);
+
+        for beta in [1.0f32, 0.5, -2.0] {
+            for with_weight in [true, false] {
+                let name = format!("rms_norm_backward_beta {rows}x{len} beta {beta}");
+                let gx = upload(&old, &[rows, len]);
+                let gw = zeros(&[len]);
+                let grad_w = with_weight.then_some(&gw);
+                e.rms_norm_backward_beta(&g.ctx, &tx, &tw, &tgo, (&gx, beta), grad_w, eps);
+                let want: Vec<f32> = want_x.iter().zip(&old).map(|(n, o)| n + beta * o).collect();
+                assert_close(&format!("{name} grad_x"), &read(&gx), &want, 1e-4, 1e-3);
+                if beta == 1.0 {
+                    assert_close(&format!("{name} vs add"), &read(&gx), &unfused, 1e-6, 1e-6);
+                }
+                if with_weight {
+                    assert_close(&format!("{name} grad_w"), &read(&gw), &want_w, 1e-4, 1e-3);
+                }
+            }
+        }
+
+        // With beta = 0 the old contents are never read: NaN there is gone.
+        let nan = upload(&vec![f32::NAN; rows * len], &[rows, len]);
+        e.rms_norm_backward_beta(&g.ctx, &tx, &tw, &tgo, (&nan, 0.0), None, eps);
+        assert_close("rms_norm_backward_beta 0", &read(&nan), &want_x, 1e-4, 1e-3);
+    }
+}
+
+/// One row of two values, `eps = 0`, worked by hand: `x = [3, 4]`, `w = [1, 1]`,
+/// `g = [1, 0]`, so `inv = 1 / sqrt(12.5)`, `dot = 3`, `grad_x = [0.181019,
+/// -0.135764]` and `grad_w = [0.848528, 0]`; with `beta = 1` onto `[10, 20]`.
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn rms_norm_backward_beta_worked_row() {
+    let g = gpu();
+    let (tx, tw, tgo) = (
+        upload(&[3.0, 4.0], &[1, 2]),
+        upload(&[1.0, 1.0], &[2]),
+        upload(&[1.0, 0.0], &[1, 2]),
+    );
+    let gx = upload(&[10.0, 20.0], &[1, 2]);
+    let gw = zeros(&[2]);
+    g.engine
+        .rms_norm_backward_beta(&g.ctx, &tx, &tw, &tgo, (&gx, 1.0), Some(&gw), 0.0);
+    assert_close("grad_x", &read(&gx), &[10.181019, 19.864235], 1e-5, 1e-5);
+    assert_close("grad_w", &read(&gw), &[0.848528, 0.0], 1e-5, 1e-5);
 }
 
 #[test]
@@ -1125,6 +1635,38 @@ fn rope_inverse_matches_cpu_and_undoes_rope() {
     }
 }
 
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn rope_into_a_new_buffer_matches_in_place_and_keeps_the_input() {
+    // Against the in-place kernel bit for bit, and the CPU rotation.
+    let g = gpu();
+    let e = &g.engine;
+    let bits = |t: &UnifiedTensor| read(t).iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    for &(batch, seq, heads, hd, pos) in &[(1, 1, 1, 8, 0), (1, 5, 1, 64, 3), (2, 7, 4, 32, 11)] {
+        let x = rand_vec(batch * seq * heads * hd, 14);
+        let shape = [batch, seq, heads * hd];
+        let input = upload(&x, &shape);
+        let x_bits = bits(&input);
+        for inverse in [false, true] {
+            let name = format!("rope_to {shape:?} inverse {inverse}");
+            let in_place = upload(&x, &shape);
+            let out = zeros(&shape);
+            if inverse {
+                e.rope_theta_inverse(&g.ctx, &in_place, hd, pos, 10000.0);
+                e.rope_theta_inverse_to(&g.ctx, (&input, &out), hd, pos, 10000.0);
+            } else {
+                e.rope_theta(&g.ctx, &in_place, hd, pos, 10000.0);
+                e.rope_theta_to(&g.ctx, (&input, &out), hd, pos, 10000.0);
+            }
+            assert_eq!(bits(&out), bits(&in_place), "{name}");
+            assert_eq!(bits(&input), x_bits, "{name}: input written");
+            let dir = if inverse { -1.0 } else { 1.0 };
+            let want = cpu_rope_dir(&x, batch, seq, heads, hd, pos, dir);
+            assert_close(&name, &read(&out), &want, 1e-4, 1e-4);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Attention
 // ---------------------------------------------------------------------------
@@ -1332,6 +1874,54 @@ fn flash_attention_v2_backward_matches_cpu() {
     }
 }
 
+/// Backward with groups of 3 query heads per KV head (the 135M, 360M and
+/// 1.7B head counts, and a batch), where dK and dV go through per-head
+/// partials and the group sum.
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn flash_attention_v2_backward_sums_the_heads_of_a_group() {
+    let g = gpu();
+    // (batch, seq, heads, kv heads, head_dim)
+    let cases: &[(usize, usize, usize, usize, usize)] = &[
+        (1, 256, 9, 3, 64),
+        (1, 100, 15, 5, 64),
+        (2, 45, 6, 2, 64),
+        (1, 33, 4, 1, 128),
+        (1, 40, 8, 8, 64),
+    ];
+    for (n, &(b, s, h, hkv, d)) in cases.iter().enumerate() {
+        let dims = (b, s, s, h, hkv, d);
+        let seed = 200 + 4 * n as u64;
+        let q = rand_vec(b * s * h * d, seed);
+        let k = rand_vec(b * s * hkv * d, seed + 1);
+        let v = rand_vec(b * s * hkv * d, seed + 2);
+        let dout = rand_vec(b * s * h * d, seed + 3);
+        let (out, probs) = cpu_attention(&q, &k, &v, None, dims, causal_rule(true));
+        let (want_dq, want_dk, want_dv) = cpu_attention_backward(&q, &k, &v, &dout, &probs, dims);
+        let (gq, gk, gv) = (
+            zeros(&[b, s, h, d]),
+            zeros(&[b, s, hkv, d]),
+            zeros(&[b, s, hkv, d]),
+        );
+        g.engine.flash_attention_v2_backward(
+            &g.ctx,
+            &upload(&q, &[b, s, h, d]),
+            &upload(&k, &[b, s, hkv, d]),
+            &upload(&v, &[b, s, hkv, d]),
+            &upload(&out, &[b, s, h, d]),
+            &upload(&dout, &[b, s, h, d]),
+            &gq,
+            &gk,
+            &gv,
+            true,
+        );
+        let name = format!("b{b} s{s} h{h}/{hkv} d{d}");
+        assert_close(&format!("dq {name}"), &read(&gq), &want_dq, 1e-4, 1e-3);
+        assert_close(&format!("dk {name}"), &read(&gk), &want_dk, 1e-4, 1e-3);
+        assert_close(&format!("dv {name}"), &read(&gv), &want_dv, 1e-4, 1e-3);
+    }
+}
+
 #[test]
 #[ignore = "needs a GPU; run with --ignored --test-threads=1"]
 fn flash_attention_single_head_backward_matches_cpu() {
@@ -1360,6 +1950,199 @@ fn flash_attention_single_head_backward_matches_cpu() {
     assert_close("v1 dq", &read(&gq), &want_dq, 1e-4, 1e-3);
     assert_close("v1 dk", &read(&gk), &want_dk, 1e-4, 1e-3);
     assert_close("v1 dv", &read(&gv), &want_dv, 1e-4, 1e-3);
+}
+
+/// (batch, seq, heads, kv_heads, head_dim) for the saved-stats tests: every
+/// length is causal, lengths 17, 66 and 130 end inside a 16-row block and
+/// 256 fills its blocks exactly.
+const SAVED_STATS_CASES: &[(usize, usize, usize, usize, usize)] = &[
+    (1, 1, 2, 2, 64),
+    (1, 17, 2, 1, 64),
+    (1, 66, 4, 4, 64),
+    (2, 130, 4, 2, 64),
+    (1, 66, 2, 2, 128),
+    (1, 130, 2, 2, 96),
+    (1, 256, 2, 2, 64),
+    (1, 256, 2, 1, 128),
+];
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn flash_attention_v2_saved_stats_match_cpu_and_the_recomputing_backward() {
+    let g = gpu();
+    for (seed, &(b, s, h, hkv, d)) in SAVED_STATS_CASES.iter().enumerate() {
+        let dims = (b, s, s, h, hkv, d);
+        let seed = 60 + 4 * seed as u64;
+        let q = rand_vec(b * s * h * d, seed);
+        let k = rand_vec(b * s * hkv * d, seed + 1);
+        let v = rand_vec(b * s * hkv * d, seed + 2);
+        let dout = rand_vec(b * s * h * d, seed + 3);
+        let (want, probs) = cpu_attention(&q, &k, &v, None, dims, causal_rule(true));
+        let (want_dq, want_dk, want_dv) = cpu_attention_backward(&q, &k, &v, &dout, &probs, dims);
+        let want_lse = cpu_attention_lse(&q, &k, None, dims, causal_rule(true));
+
+        let (tq, tk, tv, tdo) = (
+            upload(&q, &[b, s, h, d]),
+            upload(&k, &[b, s, hkv, d]),
+            upload(&v, &[b, s, hkv, d]),
+            upload(&dout, &[b, s, h, d]),
+        );
+        let opts = AttentionOptions {
+            causal: true,
+            ..AttentionOptions::default()
+        };
+        let out = zeros(&[b, s, h, d]);
+        let stats = zeros(&[b, h, s, 2]);
+        g.engine
+            .flash_attention_v2_with_stats(&g.ctx, &tq, &tk, &tv, &out, &stats, &opts, None);
+        let name = format!("b{b} s{s} h{h}/{hkv} d{d}");
+        assert_close(&format!("fwd {name}"), &read(&out), &want, 1e-5, 1e-3);
+        let lse: Vec<f32> = read(&stats).iter().skip(1).step_by(2).copied().collect();
+        assert_close(&format!("lse {name}"), &lse, &want_lse, 1e-5, 1e-5);
+
+        let grads = || {
+            (
+                zeros(&[b, s, h, d]),
+                zeros(&[b, s, hkv, d]),
+                zeros(&[b, s, hkv, d]),
+            )
+        };
+        let (gq, gk, gv) = grads();
+        g.engine.flash_attention_v2_backward_with_stats(
+            &g.ctx, &tq, &tk, &tv, &out, &tdo, &gq, &gk, &gv, &stats, &opts, None,
+        );
+        let (rq, rk, rv) = grads();
+        g.engine.flash_attention_v2_backward_with(
+            &g.ctx, &tq, &tk, &tv, &out, &tdo, &rq, &rk, &rv, &opts, None,
+        );
+        let (gq, gk, gv) = (read(&gq), read(&gk), read(&gv));
+        assert_close(&format!("dq {name}"), &gq, &want_dq, 1e-4, 1e-3);
+        assert_close(&format!("dk {name}"), &gk, &want_dk, 1e-4, 1e-3);
+        assert_close(&format!("dv {name}"), &gv, &want_dv, 1e-4, 1e-3);
+        // The two backward paths differ only in how the log-sum-exp was
+        // summed, so they agree far more closely than either with the CPU.
+        assert_close(
+            &format!("dq vs recompute {name}"),
+            &gq,
+            &read(&rq),
+            1e-5,
+            1e-4,
+        );
+        assert_close(
+            &format!("dk vs recompute {name}"),
+            &gk,
+            &read(&rk),
+            1e-5,
+            1e-4,
+        );
+        assert_close(
+            &format!("dv vs recompute {name}"),
+            &gv,
+            &read(&rv),
+            1e-5,
+            1e-4,
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn flash_attention_v2_saved_stats_keep_mask_dropout_and_window() {
+    let g = gpu();
+    let (b, s, h, hkv, d) = (2, 45, 4, 2, 64);
+    let q = rand_vec(b * s * h * d, 80);
+    let k = rand_vec(b * s * hkv * d, 81);
+    let v = rand_vec(b * s * hkv * d, 82);
+    let dout = rand_vec(b * s * h * d, 83);
+    // [batch, 1, 1, seq] padding mask: batch 1 hides its last 6 keys, so
+    // its first rows still see keys and its later rows lose some.
+    let mask: Vec<f32> = (0..b * s)
+        .map(|i| {
+            if i / s == 1 && i % s >= s - 6 {
+                -1e9
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let (tq, tk, tv, tdo, tmask) = (
+        upload(&q, &[b, s, h, d]),
+        upload(&k, &[b, s, hkv, d]),
+        upload(&v, &[b, s, hkv, d]),
+        upload(&dout, &[b, s, h, d]),
+        upload(&mask, &[b, 1, 1, s]),
+    );
+    let opts = AttentionOptions {
+        causal: true,
+        window: 20,
+        dropout_prob: 0.2,
+        seed: 0x1234_5678_9ABC_DEF0,
+        ..AttentionOptions::default()
+    };
+    let out = zeros(&[b, s, h, d]);
+    let stats = zeros(&[b, h, s, 2]);
+    g.engine.flash_attention_v2_with_stats(
+        &g.ctx,
+        &tq,
+        &tk,
+        &tv,
+        &out,
+        &stats,
+        &opts,
+        Some(&tmask),
+    );
+    let plain = zeros(&[b, s, h, d]);
+    g.engine
+        .flash_attention_v2_with(&g.ctx, &tq, &tk, &tv, &plain, &opts, Some(&tmask));
+    assert_eq!(read(&out), read(&plain), "saving stats changed the output");
+
+    let mask_full: Vec<f32> = (0..b * h * s * s)
+        .map(|i| mask[(i / (h * s * s)) * s + i % s])
+        .collect();
+    let visible = |i: usize, j: usize| j <= i && i - j < 20;
+    let want_lse = cpu_attention_lse(&q, &k, Some(&mask_full), (b, s, s, h, hkv, d), visible);
+    let lse: Vec<f32> = read(&stats).iter().skip(1).step_by(2).copied().collect();
+    assert_close("lse mask window", &lse, &want_lse, 1e-5, 1e-5);
+
+    let grads = || {
+        (
+            zeros(&[b, s, h, d]),
+            zeros(&[b, s, hkv, d]),
+            zeros(&[b, s, hkv, d]),
+        )
+    };
+    let (gq, gk, gv) = grads();
+    g.engine.flash_attention_v2_backward_with_stats(
+        &g.ctx,
+        &tq,
+        &tk,
+        &tv,
+        &out,
+        &tdo,
+        &gq,
+        &gk,
+        &gv,
+        &stats,
+        &opts,
+        Some(&tmask),
+    );
+    let (rq, rk, rv) = grads();
+    g.engine.flash_attention_v2_backward_with(
+        &g.ctx,
+        &tq,
+        &tk,
+        &tv,
+        &out,
+        &tdo,
+        &rq,
+        &rk,
+        &rv,
+        &opts,
+        Some(&tmask),
+    );
+    assert_close("dq mask dropout window", &read(&gq), &read(&rq), 1e-5, 1e-4);
+    assert_close("dk mask dropout window", &read(&gk), &read(&rk), 1e-5, 1e-4);
+    assert_close("dv mask dropout window", &read(&gv), &read(&rv), 1e-5, 1e-4);
 }
 
 // ---------------------------------------------------------------------------
@@ -1898,7 +2681,7 @@ fn large_dispatches_use_a_2d_grid() {
 #[ignore = "needs a GPU; run with --ignored --test-threads=1"]
 fn self_check_passes_and_an_adapter_is_selected() {
     let g = gpu();
-    for r in pollster::block_on(ferrotensor_backend::adapters::self_check(&g.ctx)) {
+    for r in pollster::block_on(ferrotensor_backend::adapters::self_check(&g.ctx)).unwrap() {
         assert!(
             r.passed(),
             "{}: max error {} > {}",
@@ -2171,4 +2954,235 @@ fn argmax_rows_matches_the_host_argmax_including_ties() {
     let got: Vec<u32> = read(&out).iter().map(|v| v.to_bits()).collect();
     let want: Vec<u32> = x.chunks(len).map(host_argmax).collect();
     assert_eq!(got, want);
+}
+
+fn bits(x: &[f32]) -> Vec<u32> {
+    x.iter().map(|v| v.to_bits()).collect()
+}
+
+/// `alpha * op(a) @ op(b) + beta * init` on the CPU in f64, with `b` stored
+/// `[N, K]` when `transposed_b`.
+fn cpu_epilogue(
+    a: &[f32],
+    b: &[f32],
+    init: &[f32],
+    (m, k, n): (usize, usize, usize),
+    transposed_b: bool,
+    ep: Epilogue,
+) -> Vec<f32> {
+    (0..m * n)
+        .map(|i| {
+            let (r, c) = (i / n, i % n);
+            let dot: f64 = (0..k)
+                .map(|p| {
+                    let bv = if transposed_b {
+                        b[c * k + p]
+                    } else {
+                        b[p * n + c]
+                    };
+                    f64::from(a[r * k + p]) * f64::from(bv)
+                })
+                .sum();
+            let mut v = f64::from(ep.alpha) * dot;
+            if ep.beta != 0.0 {
+                v += f64::from(ep.beta) * f64::from(init[i]);
+            }
+            v as f32
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn matmul_epilogue_matches_cpu_on_every_path() {
+    let g = gpu();
+    // One shape per kernel: one row (the matrix-vector kernel for a@b, the
+    // thin kernel for a@bT), a thin a, a thin b (64x64 tiles with an f16 b),
+    // the router's skinny kernel for a thin f32 b, 64x64 tiles, and the
+    // small-M kernel with one slice of K and with three.
+    let small_m = |split| MatmulPath::SmallM {
+        tile: None,
+        split: Some(split),
+    };
+    let cases = [
+        ("one row", (1, 96, 80), MatmulPath::Previous),
+        ("thin a", (8, 96, 200), MatmulPath::Previous),
+        ("thin b", (200, 40, 8), MatmulPath::Previous),
+        ("skinny", (200, 576, 8), MatmulPath::Auto),
+        ("tiles", (100, 72, 130), MatmulPath::Previous),
+        ("small-M, 1 slice", (64, 512, 256), small_m(1)),
+        ("small-M, 3 slices", (64, 512, 256), small_m(3)),
+    ];
+    let epilogues = [
+        Epilogue::STORE,
+        Epilogue::scaled(0.375),
+        Epilogue::ACCUMULATE,
+        Epilogue {
+            alpha: -2.0,
+            beta: 0.25,
+        },
+    ];
+    for (seed, (name, (m, k, n), path)) in cases.into_iter().enumerate() {
+        let seed = 9000 + 10 * seed as u64;
+        let a = rand_vec(m * k, seed);
+        // Multiples of 1/64 in [-1, 1] are exact in f16, so the f16 weight
+        // holds the same values as the f32 one.
+        let b: Vec<f32> = rand_vec(k * n, seed + 1)
+            .iter()
+            .map(|v| (v * 64.0).round() / 64.0)
+            .collect();
+        let init = rand_vec(m * n, seed + 2);
+        let a_up = upload(&a, &[m, k]);
+        for transposed_b in [false, true] {
+            let (b_stored, shape) = if transposed_b {
+                (transpose(&b, k, n), [n, k])
+            } else {
+                (b.clone(), [k, n])
+            };
+            let weights = [
+                ("f32", upload(&b_stored, &shape)),
+                (
+                    "f16",
+                    UnifiedTensor::from_f32_as_f16(&g.ctx, &b_stored, &shape),
+                ),
+            ];
+            for (dtype, b_up) in &weights {
+                let run = |ep: Epilogue, out: &UnifiedTensor| {
+                    g.engine
+                        .matmul_with_path_into(&g.ctx, transposed_b, [&a_up, b_up, out], path, ep)
+                        .unwrap();
+                };
+                let product = zeros(&[m, n]);
+                run(Epilogue::STORE, &product);
+                let product = read(&product);
+                for ep in epilogues {
+                    let label = format!("{name} {dtype} transposed_b {transposed_b} {ep:?}");
+                    // An out of NaN shows that beta = 0 never reads it.
+                    let start = if ep.beta == 0.0 {
+                        vec![f32::NAN; m * n]
+                    } else {
+                        init.clone()
+                    };
+                    let out = upload(&start, &[m, n]);
+                    run(ep, &out);
+                    let got = read(&out);
+                    let want = cpu_epilogue(&a, &b_stored, &init, (m, k, n), transposed_b, ep);
+                    assert_close(&label, &got, &want, 1e-4, 1e-4);
+                    // The product is rounded before the epilogue, so scaling
+                    // or adding the stored product gives the same bits.
+                    let from_product: Vec<f32> = product
+                        .iter()
+                        .zip(&init)
+                        .map(|(p, i)| {
+                            let v = ep.alpha * p;
+                            if ep.beta == 0.0 {
+                                v
+                            } else {
+                                v + ep.beta * i
+                            }
+                        })
+                        .collect();
+                    assert_eq!(bits(&got), bits(&from_product), "{label}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn transposed_a_matmul_accumulates_into_out() {
+    // The weight-gradient product a^T @ b added into an earlier gradient,
+    // as a second micro-batch adds its own: the thin kernel for a LoRA-rank
+    // output and 64x64 tiles for a wide one.
+    let g = gpu();
+    for (seed, (m, k, n)) in [(8, 200, 96), (72, 50, 90)].into_iter().enumerate() {
+        let seed = 9100 + 10 * seed as u64;
+        let a = rand_vec(k * m, seed);
+        let b = rand_vec(k * n, seed + 1);
+        let init = rand_vec(m * n, seed + 2);
+        let (a_up, b_up) = (upload(&a, &[k, m]), upload(&b, &[k, n]));
+        let out = upload(&init, &[m, n]);
+        g.engine
+            .matmul_at_into(&g.ctx, &a_up, &b_up, &out, Epilogue::ACCUMULATE);
+        let got = read(&out);
+        let want = cpu_epilogue(
+            &transpose(&a, k, m),
+            &b,
+            &init,
+            (m, k, n),
+            false,
+            Epilogue::ACCUMULATE,
+        );
+        assert_close(&format!("aT@b {m}x{k}x{n}"), &got, &want, 1e-4, 1e-4);
+        // The same bits as a separate product and add.
+        let product = zeros(&[m, n]);
+        g.engine.matmul_at(&g.ctx, &a_up, &b_up, &product);
+        let sum = zeros(&[m, n]);
+        g.engine
+            .add(&g.ctx, &upload(&init, &[m, n]), &product, &sum);
+        assert_eq!(bits(&got), bits(&read(&sum)), "aT@b {m}x{k}x{n}");
+    }
+}
+
+/// The GPU embedding lookup and its gradient against the host: rows copied
+/// exactly, zeros for ids outside the table, and each table row's gradient
+/// summed in position order, so both match bit for bit. 300 x 70 spans many
+/// workgroups, and 70 does not divide 64.
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn embedding_gather_and_scatter_match_the_host_bit_for_bit() {
+    let g = gpu();
+    let (vocab, hidden) = (300usize, 70usize);
+    let table = rand_vec(vocab * hidden, 51);
+    // Repeated ids, so rows sum several positions, and ids past the table.
+    let ids: Vec<u32> = (0..192u32).map(|p| (p * 37 + p / 5) % 330).collect();
+    let n = ids.len();
+    let id_buf = UnifiedTensor::from_bytes(&g.ctx, bytemuck::cast_slice(&ids), &[n]);
+    let out = UnifiedTensor::empty(&g.ctx, &[n, hidden]);
+    g.engine
+        .embedding_gather(&g.ctx, &upload(&table, &[vocab, hidden]), &id_buf, &out);
+    let mut want = Vec::with_capacity(n * hidden);
+    for &id in &ids {
+        let start = id as usize * hidden;
+        match table.get(start..start + hidden) {
+            Some(row) => want.extend_from_slice(row),
+            None => want.extend(std::iter::repeat_n(0.0, hidden)),
+        }
+    }
+    assert!(ids.iter().any(|&id| id as usize >= vocab));
+    assert_eq!(bits(&read(&out)), bits(&want), "gather");
+
+    let grad = rand_vec(n * hidden, 52);
+    let mut want = vec![0.0f32; vocab * hidden];
+    for (&id, row_grad) in ids.iter().zip(grad.chunks_exact(hidden)) {
+        let start = id as usize * hidden;
+        if let Some(row) = want.get_mut(start..start + hidden) {
+            for (sum, g) in row.iter_mut().zip(row_grad) {
+                *sum += g;
+            }
+        }
+    }
+    let (index, slots) = ComputeEngine::embedding_scatter_index(&ids, vocab);
+    let index_buf = UnifiedTensor::from_bytes(&g.ctx, bytemuck::cast_slice(&index), &[index.len()]);
+    let table_grad = UnifiedTensor::empty(&g.ctx, &[vocab, hidden]);
+    g.engine.embedding_scatter(
+        &g.ctx,
+        &upload(&grad, &[n, hidden]),
+        &index_buf,
+        slots,
+        &table_grad,
+    );
+    assert_eq!(bits(&read(&table_grad)), bits(&want), "scatter");
+}
+
+/// The scatter index of ids [2, 0, 2, 9, 0, 2] in a 4-row table: row 2 is
+/// slot 0 (positions 0, 2, 5), row 0 slot 1 (positions 1, 4), rows 1 and 3
+/// and the id 9 have no slot.
+#[test]
+fn embedding_scatter_index_groups_positions_by_row() {
+    let (index, slots) = ComputeEngine::embedding_scatter_index(&[2, 0, 2, 9, 0, 2], 4);
+    let none = u32::MAX;
+    assert_eq!(slots, 2);
+    assert_eq!(index, [1, none, 0, none, 0, 3, 5, 0, 2, 5, 1, 4]);
 }

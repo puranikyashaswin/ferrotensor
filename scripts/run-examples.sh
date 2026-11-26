@@ -53,6 +53,9 @@ EXAMPLES=(
   "gpu|basic_tensor|ferrotensor-backend|basic_tensor||"
   "gpu|fused_op|ferrotensor-backend|fused_op||"
   "gpu|ops_test|ferrotensor-backend|ops_test||"
+  "gpu|matmul_bench (quick)|ferrotensor-backend|matmul_bench||--quick"
+  # Without cooperative matrices it says so and exits 0.
+  "gpu|fused_bench (quick)|ferrotensor-backend|fused_bench||--quick"
   "gpu|flash_attention|ferrotensor-graph|flash_attention||"
   "gpu|llama_block|ferrotensor-graph|llama_block||"
 

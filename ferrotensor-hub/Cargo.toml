@@ -1,11 +1,12 @@
 [package]
 name = "ferrotensor-hub"
-version = "0.6.0"
+version = "0.7.2"
 edition = "2021"
 description = "HuggingFace Hub integration for the Ferrotensor ML framework"
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 rust-version.workspace = true
 documentation = "https://docs.rs/ferrotensor-hub"
 readme = "README.md"
@@ -16,10 +17,10 @@ categories = ["science", "algorithms"]
 workspace = true
 
 [dependencies]
-ferrotensor-backend = { path = "../ferrotensor-backend", version = "0.6.0" }
-ferrotensor-graph = { path = "../ferrotensor-graph", version = "0.6.0" }
-ferrotensor-loader = { path = "../ferrotensor-loader", version = "0.6.0" }
-ferrotensor-autograd = { path = "../ferrotensor-autograd", version = "0.6.0" }
+ferrotensor-backend = { path = "../ferrotensor-backend", version = "0.7.2" }
+ferrotensor-graph = { path = "../ferrotensor-graph", version = "0.7.2" }
+ferrotensor-loader = { path = "../ferrotensor-loader", version = "0.7.2" }
+ferrotensor-autograd = { path = "../ferrotensor-autograd", version = "0.7.2" }
 
 # Use existing workspace dependencies
 serde = { version = "1.0", features = ["derive"] }

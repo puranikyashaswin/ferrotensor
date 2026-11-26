@@ -19,7 +19,8 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/puranikyashaswin/ferrotensor"
+Homepage = "https://ferrotensor.dev"
+Documentation = "https://ferrotensor.dev/docs/python.html"
 Repository = "https://github.com/puranikyashaswin/ferrotensor"
 
 [project.optional-dependencies]
