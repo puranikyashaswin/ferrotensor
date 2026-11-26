@@ -1,12 +1,15 @@
-//! Writing a Llama-style model as a GGUF file for llama.cpp and Ollama.
+//! Writing a Llama or Qwen2 model as a GGUF file for llama.cpp and Ollama.
 //!
 //! [`export_gguf`] writes GGUF version 3 (ggml `docs/gguf.md`) with the
 //! metadata keys, tensor names and conventions of llama.cpp's
-//! `convert_hf_to_gguf.py`: dimensions are listed innermost first, and the
-//! rows of the query and key projections are reordered from the Hugging Face
-//! rotary layout (the two halves of each head) to llama.cpp's (adjacent
-//! pairs). Like [`merge`](crate::merge) the export streams: one row of one
-//! tensor is in memory at a time, plus the adapter and the tokenizer.
+//! `convert_hf_to_gguf.py`: dimensions are listed innermost first, and for
+//! the `llama` architecture the rows of the query and key projections are
+//! reordered from the Hugging Face rotary layout (the two halves of each
+//! head) to llama.cpp's (adjacent pairs). llama.cpp rotates `qwen2` in the
+//! Hugging Face layout, so those rows stay as they are, and the query, key
+//! and value biases are written next to the weights. Like
+//! [`merge`](crate::merge) the export streams: one row of one tensor is in
+//! memory at a time, plus the adapter and the tokenizer.
 
 use crate::checkpoint::LoraCheckpoint;
 use crate::merge::{adapters_by_target, write_through_temp_file, Float, LowRank};
@@ -35,6 +38,33 @@ pub enum GgufPrecision {
     F16,
     /// f32 for every tensor (`general.file_type` 0).
     F32,
+}
+
+/// The llama.cpp architecture a checkpoint is written as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Arch {
+    /// `model_type` `llama`: no biases, query and key rows reordered.
+    Llama,
+    /// `model_type` `qwen2`: query, key and value biases, rows as stored.
+    Qwen2,
+}
+
+impl Arch {
+    fn of(model_type: Option<&str>) -> Option<Self> {
+        match model_type {
+            Some("llama") => Some(Self::Llama),
+            Some("qwen2") => Some(Self::Qwen2),
+            _ => None,
+        }
+    }
+
+    /// `general.architecture`, which is also the prefix of the model's keys.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Llama => "llama",
+            Self::Qwen2 => "qwen2",
+        }
+    }
 }
 
 /// What [`export_gguf`] wrote.
@@ -126,8 +156,9 @@ impl GgufTensor<'_> {
     }
 }
 
-/// llama.cpp's name for the Hugging Face Llama tensor `hf_name`.
-fn gguf_tensor_name(hf_name: &str) -> Option<String> {
+/// llama.cpp's name for the Hugging Face tensor `hf_name` of an `arch`
+/// model. The query, key and value biases have one for `qwen2` only.
+fn gguf_tensor_name(hf_name: &str, arch: Arch) -> Option<String> {
     let fixed = match hf_name {
         "model.embed_tokens.weight" => Some("token_embd.weight"),
         "model.norm.weight" => Some("output_norm.weight"),
@@ -142,18 +173,21 @@ fn gguf_tensor_name(hf_name: &str) -> Option<String> {
         return None;
     }
     let short = match module {
-        "input_layernorm.weight" => "attn_norm",
-        "self_attn.q_proj.weight" => "attn_q",
-        "self_attn.k_proj.weight" => "attn_k",
-        "self_attn.v_proj.weight" => "attn_v",
-        "self_attn.o_proj.weight" => "attn_output",
-        "post_attention_layernorm.weight" => "ffn_norm",
-        "mlp.gate_proj.weight" => "ffn_gate",
-        "mlp.up_proj.weight" => "ffn_up",
-        "mlp.down_proj.weight" => "ffn_down",
+        "input_layernorm.weight" => "attn_norm.weight",
+        "self_attn.q_proj.weight" => "attn_q.weight",
+        "self_attn.k_proj.weight" => "attn_k.weight",
+        "self_attn.v_proj.weight" => "attn_v.weight",
+        "self_attn.o_proj.weight" => "attn_output.weight",
+        "post_attention_layernorm.weight" => "ffn_norm.weight",
+        "mlp.gate_proj.weight" => "ffn_gate.weight",
+        "mlp.up_proj.weight" => "ffn_up.weight",
+        "mlp.down_proj.weight" => "ffn_down.weight",
+        "self_attn.q_proj.bias" if arch == Arch::Qwen2 => "attn_q.bias",
+        "self_attn.k_proj.bias" if arch == Arch::Qwen2 => "attn_k.bias",
+        "self_attn.v_proj.bias" if arch == Arch::Qwen2 => "attn_v.bias",
         _ => return None,
     };
-    Some(format!("blk.{block}.{short}.weight"))
+    Some(format!("blk.{block}.{short}"))
 }
 
 /// The output tensor for the Hugging Face tensor `hf_name`, read from
@@ -164,17 +198,21 @@ fn describe_tensor<'a>(
     source: String,
     low_rank: Option<LowRank<'a>>,
     config: &Lfm2Config,
+    arch: Arch,
     precision: GgufPrecision,
 ) -> Result<GgufTensor<'a>> {
-    if hf_name.ends_with(".bias") {
-        return Err(format!(
-            "tensor {hf_name} is a projection bias; export-gguf writes Llama weights without \
-             biases, so Qwen2-style models (q/k/v biases) are not exported"
-        )
-        .into());
-    }
-    let name = gguf_tensor_name(hf_name).ok_or_else(|| {
-        format!("tensor {hf_name} has no llama.cpp name; export-gguf writes Llama weights only")
+    let name = gguf_tensor_name(hf_name, arch).ok_or_else(|| {
+        if hf_name.ends_with(".bias") {
+            format!(
+                "tensor {hf_name} is a bias; the only biases export-gguf writes are the query, \
+                 key and value biases of model_type qwen2"
+            )
+        } else {
+            format!(
+                "tensor {hf_name} has no llama.cpp name; export-gguf writes Llama and Qwen2 \
+                 weights only"
+            )
+        }
     })?;
     let meta = weights.get_tensor_metadata(&source)?;
     let stored = Float::of(meta.dtype).ok_or_else(|| {
@@ -192,8 +230,12 @@ fn describe_tensor<'a>(
     } else {
         Float::F16
     };
+    // llama.cpp rotates adjacent pairs for `llama` and the two halves of a
+    // head, as Hugging Face stores them, for `qwen2`.
     let heads = config.num_attention_heads;
-    let rope_heads = if hf_name.ends_with(".self_attn.q_proj.weight") {
+    let rope_heads = if arch != Arch::Llama {
+        None
+    } else if hf_name.ends_with(".self_attn.q_proj.weight") {
         Some(heads)
     } else if hf_name.ends_with(".self_attn.k_proj.weight") {
         Some(config.num_key_value_heads.unwrap_or(heads))
@@ -227,8 +269,17 @@ fn read_json(path: &Path) -> Result<Json> {
     Ok(serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?)
 }
 
+/// The split of Qwen2's pre-tokenizer in `tokenizer.json`. llama.cpp's
+/// `qwen2` pre-tokenizer is this expression with the case-insensitive group
+/// spelled out.
+const QWEN2_SPLIT: &str = concat!(
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*",
+    r"|\s*[\r\n]+|\s+(?!\S)|\s+",
+);
+
 /// llama.cpp's name for a byte-level pre-tokenizer it implements: `gpt-2`
-/// for GPT-2's split, `smollm` for single digits split off first.
+/// for GPT-2's split, `smollm` for single digits split off first, `qwen2`
+/// for Qwen2's own split followed by a byte-level step without one.
 fn pre_tokenizer_name(pre: &Json) -> Option<&'static str> {
     let byte_level = |p: &Json| {
         p["type"] == "ByteLevel" && p["use_regex"] != false && p["add_prefix_space"] != true
@@ -245,8 +296,30 @@ fn pre_tokenizer_name(pre: &Json) -> Option<&'static str> {
         {
             Some("smollm")
         }
+        [split, bytes]
+            if pre["type"] == "Sequence"
+                && split["type"] == "Split"
+                && split["pattern"]["Regex"] == QWEN2_SPLIT
+                && split["behavior"] == "Isolated"
+                && split["invert"] != true
+                && bytes["type"] == "ByteLevel"
+                && bytes["use_regex"] == false
+                && bytes["add_prefix_space"] != true =>
+        {
+            Some("qwen2")
+        }
         _ => None,
     }
+}
+
+/// Whether the `normalizer` of a `tokenizer.json` applies NFC, alone or as a
+/// step of a sequence.
+fn normalizes_nfc(normalizer: &Json) -> bool {
+    normalizer["type"] == "NFC"
+        || (normalizer["type"] == "Sequence"
+            && normalizer["normalizers"]
+                .as_array()
+                .is_some_and(|steps| steps.iter().any(normalizes_nfc)))
 }
 
 /// The `tokenizer.*` metadata of the byte-level BPE tokenizer in
@@ -274,7 +347,7 @@ fn tokenizer_metadata(
     let pre = pre_tokenizer_name(&tokenizer["pre_tokenizer"]).ok_or_else(|| {
         format!(
             "tokenizer.json has the pre-tokenizer {}; export-gguf knows the byte-level ones of \
-             GPT-2 and SmolLM (llama.cpp `gpt-2` and `smollm`)",
+             GPT-2, SmolLM and Qwen2 (llama.cpp `gpt-2`, `smollm` and `qwen2`)",
             tokenizer["pre_tokenizer"]
         )
     })?;
@@ -377,6 +450,14 @@ fn tokenizer_metadata(
             metadata.push((format!("tokenizer.ggml.{key}"), MetaValue::Bool(add)));
         }
     }
+    // Written as convert_hf_to_gguf.py writes it. llama.cpp reads the key only
+    // for UGM tokenizers today, so it does not normalize a BPE `qwen2` prompt.
+    if normalizes_nfc(&tokenizer["normalizer"]) {
+        metadata.push((
+            "tokenizer.ggml.normalizer.nfc".to_string(),
+            MetaValue::Bool(true),
+        ));
+    }
     let jinja = model_dir.join("chat_template.jinja");
     let template = match tokenizer_config["chat_template"].as_str() {
         Some(template) => Some(template.to_string()),
@@ -463,18 +544,20 @@ fn write_tensor(
     out.write_all(&[0; ALIGNMENT][..len.next_multiple_of(ALIGNMENT) - len])
 }
 
-/// Write the Llama-style model in `model_dir`, with `adapter` added to its
-/// weights when given, to the new GGUF file `out`, named `name`.
+/// Write the Llama or Qwen2 model in `model_dir`, with `adapter` added to
+/// its weights when given, to the new GGUF file `out`, named `name`.
 ///
 /// # Errors
 ///
 /// Fails, before writing, when `out` exists, when `config.json` is not
-/// `model_type` `llama` or has no `max_position_embeddings`, when the base
-/// is quantized (`quantization` in `config.json`, `.scales` tensors or a
-/// tensor that is not F32, F16 or BF16), when a tensor has no llama.cpp
-/// name, when the tokenizer is not byte-level BPE with a pre-tokenizer
-/// llama.cpp knows, or when the adapter does not match the base. I/O errors
-/// while writing are returned as they occur, as `std::io::Error`.
+/// `model_type` `llama` or `qwen2` or has no `max_position_embeddings`, when
+/// the base is quantized (`quantization` in `config.json`, `.scales` tensors
+/// or a tensor that is not F32, F16 or BF16), when a tensor is not one the
+/// export writes for that architecture (a projection bias in a `llama`
+/// model, say), when the tokenizer is not byte-level BPE with a
+/// pre-tokenizer llama.cpp knows, or when the adapter does not match the
+/// base. I/O errors while writing are returned as they occur, as
+/// `std::io::Error`.
 pub fn export_gguf(
     model_dir: &Path,
     name: &str,
@@ -487,14 +570,13 @@ pub fn export_gguf(
     }
     let config_path = model_dir.join("config.json");
     let config = ModelLoader::load_config(&config_path)?;
-    if config.model_type.as_deref() != Some("llama") {
-        return Err(format!(
-            "{} has model_type {}; export-gguf writes Llama-style models only",
+    let arch = Arch::of(config.model_type.as_deref()).ok_or_else(|| {
+        format!(
+            "{} has model_type {}; export-gguf writes llama and qwen2 models only",
             config_path.display(),
             config.model_type.as_deref().unwrap_or("(none)")
         )
-        .into());
-    }
+    })?;
     // The file carries no rotary scaling, so a scaled RoPE would load and
     // give wrong logits.
     check_supported(&config).map_err(|e| format!("{}: {e}", config_path.display()))?;
@@ -538,6 +620,7 @@ pub fn export_gguf(
             hf_name.to_string(),
             low_rank,
             &config,
+            arch,
             precision,
         )?);
     }
@@ -549,6 +632,7 @@ pub fn export_gguf(
             source,
             Some(low_rank),
             &config,
+            arch,
             precision,
         )?);
     }
@@ -560,10 +644,12 @@ pub fn export_gguf(
         .copied()
         .unwrap_or(0);
     let u32_of = |key: &str, value: usize| (key.to_string(), MetaValue::U32(value as u32));
+    // The model's keys carry the architecture name as their prefix.
+    let key = |suffix: &str| format!("{}.{suffix}", arch.name());
     let mut metadata = vec![
         (
             "general.architecture".to_string(),
-            MetaValue::Str("llama".to_string()),
+            MetaValue::Str(arch.name().to_string()),
         ),
         ("general.name".to_string(), MetaValue::Str(name.to_string())),
         u32_of("general.alignment", ALIGNMENT),
@@ -571,23 +657,23 @@ pub fn export_gguf(
             "general.file_type",
             usize::from(precision == GgufPrecision::F16),
         ),
-        u32_of("llama.context_length", context_length),
-        u32_of("llama.embedding_length", config.hidden_size),
-        u32_of("llama.block_count", config.num_hidden_layers),
-        u32_of("llama.feed_forward_length", config.intermediate_size),
-        u32_of("llama.attention.head_count", heads),
+        u32_of(&key("context_length"), context_length),
+        u32_of(&key("embedding_length"), config.hidden_size),
+        u32_of(&key("block_count"), config.num_hidden_layers),
+        u32_of(&key("feed_forward_length"), config.intermediate_size),
+        u32_of(&key("attention.head_count"), heads),
         u32_of(
-            "llama.attention.head_count_kv",
+            &key("attention.head_count_kv"),
             config.num_key_value_heads.unwrap_or(heads),
         ),
-        u32_of("llama.attention.key_length", head_dim),
-        u32_of("llama.attention.value_length", head_dim),
+        u32_of(&key("attention.key_length"), head_dim),
+        u32_of(&key("attention.value_length"), head_dim),
         (
-            "llama.attention.layer_norm_rms_epsilon".to_string(),
+            key("attention.layer_norm_rms_epsilon"),
             MetaValue::F32(config.norm_eps),
         ),
         (
-            "llama.rope.freq_base".to_string(),
+            key("rope.freq_base"),
             MetaValue::F32(
                 config
                     .rope_theta
@@ -595,8 +681,8 @@ pub fn export_gguf(
                     .unwrap_or(10_000.0) as f32,
             ),
         ),
-        u32_of("llama.rope.dimension_count", head_dim),
-        u32_of("llama.vocab_size", n_vocab),
+        u32_of(&key("rope.dimension_count"), head_dim),
+        u32_of(&key("vocab_size"), n_vocab),
     ];
     metadata.extend(tokenizer_metadata(model_dir, &config, n_vocab)?);
     let header = gguf_header(&metadata, &tensors);
@@ -840,9 +926,20 @@ mod tests {
     }
 
     fn write_tiny_model(tag: &str) -> PathBuf {
+        write_model(tag, &tiny_config(), tiny_tensors(), write_tiny_tokenizer)
+    }
+
+    /// A model directory with `config`, `tensors` filled by [`tiny_values`]
+    /// in f32, and the tokenizer files `write_tokenizer` writes.
+    fn write_model(
+        tag: &str,
+        config: &Json,
+        tensors: Vec<(&'static str, Vec<usize>)>,
+        write_tokenizer: fn(&Path),
+    ) -> PathBuf {
         let dir = temp_dir(tag);
-        write_json(&dir.join("config.json"), &tiny_config());
-        let bytes: Vec<(&str, Vec<usize>, Vec<u8>)> = tiny_tensors()
+        write_json(&dir.join("config.json"), config);
+        let bytes: Vec<(&str, Vec<usize>, Vec<u8>)> = tensors
             .into_iter()
             .enumerate()
             .map(|(idx, (name, shape))| {
@@ -862,7 +959,7 @@ mod tests {
         });
         let file = safetensors::tensor::serialize(views, &None).unwrap();
         std::fs::write(dir.join("model.safetensors"), file).unwrap();
-        write_tiny_tokenizer(&dir);
+        write_tokenizer(&dir);
         dir
     }
 
@@ -882,13 +979,9 @@ mod tests {
             .collect()
     }
 
-    /// Reads the exported file and checks the tensor table against the
-    /// source: names, reversed dims, types, aligned back-to-back offsets and
-    /// bytes. Returns the metadata. `q_row0_delta` is added to the first row
-    /// of the query weight in the expectation.
+    /// Checks an export of the tiny Llama model; see [`check_tensors`]. The
+    /// row order is hand-written for llama.cpp: per head of 4 rows, 0 2 1 3.
     fn check_export(file: &Path, f16: bool, q_row0_delta: f32) -> Vec<(String, MetaValue)> {
-        let bytes = std::fs::read(file).unwrap();
-        let parsed = parse(&bytes);
         let gguf_names = [
             "output.weight",
             "token_embd.weight",
@@ -903,7 +996,38 @@ mod tests {
             "blk.0.attn_v.weight",
             "output_norm.weight",
         ];
-        let sources: Vec<(usize, (&str, Vec<usize>))> = tiny_tensors()
+        let row_order = |hf_name: &str| match hf_name {
+            "model.layers.0.self_attn.q_proj.weight" => Some(vec![0, 2, 1, 3, 4, 6, 5, 7]),
+            "model.layers.0.self_attn.k_proj.weight" => Some(vec![0, 2, 1, 3]),
+            _ => None,
+        };
+        check_tensors(
+            file,
+            f16,
+            tiny_tensors(),
+            &gguf_names,
+            row_order,
+            q_row0_delta,
+        )
+    }
+
+    /// Reads the exported file and checks the tensor table against the
+    /// source `tensors`: names, reversed dims, types, aligned back-to-back
+    /// offsets and bytes. `row_order` gives the source row of each output
+    /// row for the tensors whose rows move. Returns the metadata.
+    /// `q_row0_delta` is added to the first row of the query weight in the
+    /// expectation.
+    fn check_tensors(
+        file: &Path,
+        f16: bool,
+        tensors: Vec<(&'static str, Vec<usize>)>,
+        gguf_names: &[&str],
+        row_order: impl Fn(&str) -> Option<Vec<usize>>,
+        q_row0_delta: f32,
+    ) -> Vec<(String, MetaValue)> {
+        let bytes = std::fs::read(file).unwrap();
+        let parsed = parse(&bytes);
+        let sources: Vec<(usize, (&str, Vec<usize>))> = tensors
             .into_iter()
             .enumerate()
             .filter(|(_, (name, _))| !name.ends_with("inv_freq"))
@@ -924,16 +1048,11 @@ mod tests {
             let mut values = tiny_values(idx, shape.iter().product());
             let cols = *shape.last().unwrap();
             let rows = values.len() / cols;
-            // Hand-written llama.cpp row order: per head of 4 rows, 0 2 1 3.
-            let row_order: Vec<usize> = match hf_name {
-                "model.layers.0.self_attn.q_proj.weight" => {
-                    values[..cols].iter_mut().for_each(|v| *v += q_row0_delta);
-                    vec![0, 2, 1, 3, 4, 6, 5, 7]
-                }
-                "model.layers.0.self_attn.k_proj.weight" => vec![0, 2, 1, 3],
-                _ => (0..rows).collect(),
-            };
-            let expected = expected_bytes(&values, cols, &row_order, half);
+            if hf_name == "model.layers.0.self_attn.q_proj.weight" {
+                values[..cols].iter_mut().for_each(|v| *v += q_row0_delta);
+            }
+            let order = row_order(hf_name).unwrap_or_else(|| (0..rows).collect());
+            let expected = expected_bytes(&values, cols, &order, half);
             let start = parsed.data_start + *tensor_offset as usize;
             assert_eq!(&bytes[start..start + expected.len()], expected, "{name}");
             offset += expected.len().next_multiple_of(ALIGNMENT) as u64;
@@ -1054,14 +1173,51 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// The pre-tokenizer of Qwen2.5-0.5B-Instruct's `tokenizer.json`, as it
+    /// is spelled there.
+    fn qwen2_pre_tokenizer() -> Json {
+        serde_json::from_str(
+            r#"{"type": "Sequence", "pretokenizers": [
+                {"type": "Split", "pattern": {"Regex": "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"},
+                 "behavior": "Isolated", "invert": false},
+                {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false,
+                 "use_regex": false}]}"#,
+        )
+        .unwrap()
+    }
+
     #[test]
-    fn names_the_two_byte_level_pre_tokenizers_and_no_other() {
+    fn names_the_three_pre_tokenizers_and_no_other() {
         let byte_level = serde_json::json!({ "type": "ByteLevel", "add_prefix_space": false });
         assert_eq!(pre_tokenizer_name(&byte_level), Some("gpt-2"));
         let metaspace = serde_json::json!({ "type": "Metaspace", "replacement": "▁" });
         assert_eq!(pre_tokenizer_name(&metaspace), None);
         let no_regex = serde_json::json!({ "type": "ByteLevel", "use_regex": false });
         assert_eq!(pre_tokenizer_name(&no_regex), None);
+
+        assert_eq!(pre_tokenizer_name(&qwen2_pre_tokenizer()), Some("qwen2"));
+        // Another split, or a byte-level step that splits again, is not Qwen2's.
+        let mut other_split = qwen2_pre_tokenizer();
+        other_split["pretokenizers"][0]["pattern"]["Regex"] = "\\s+".into();
+        assert_eq!(pre_tokenizer_name(&other_split), None);
+        let mut splits_twice = qwen2_pre_tokenizer();
+        splits_twice["pretokenizers"][1]["use_regex"] = true.into();
+        assert_eq!(pre_tokenizer_name(&splits_twice), None);
+    }
+
+    #[test]
+    fn finds_nfc_alone_or_in_a_sequence_of_normalizers() {
+        assert!(normalizes_nfc(&serde_json::json!({ "type": "NFC" })));
+        assert!(normalizes_nfc(&serde_json::json!({
+            "type": "Sequence",
+            "normalizers": [{ "type": "Replace" }, { "type": "NFC" }]
+        })));
+        assert!(!normalizes_nfc(&Json::Null));
+        assert!(!normalizes_nfc(&serde_json::json!({ "type": "NFKC" })));
+        assert!(!normalizes_nfc(&serde_json::json!({
+            "type": "Sequence",
+            "normalizers": [{ "type": "Lowercase" }]
+        })));
     }
 
     /// Exports after `change` edits the tiny model and returns the error;
@@ -1094,7 +1250,7 @@ mod tests {
             write_json(&dir.join("config.json"), &config);
         });
         assert!(
-            err.ends_with("has model_type lfm2; export-gguf writes Llama-style models only"),
+            err.ends_with("has model_type lfm2; export-gguf writes llama and qwen2 models only"),
             "{err}"
         );
 
@@ -1137,7 +1293,7 @@ mod tests {
             "{err}"
         );
 
-        // A second shard, listed in the index, adds the bias.
+        // A second shard, listed in the index, adds a bias to the Llama model.
         let err = refusal("bias", |dir| {
             let bias = [0u8; 32];
             let view =
@@ -1156,8 +1312,202 @@ mod tests {
         });
         assert_eq!(
             err,
-            "tensor model.layers.0.self_attn.q_proj.bias is a projection bias; export-gguf writes \
-             Llama weights without biases, so Qwen2-style models (q/k/v biases) are not exported"
+            "tensor model.layers.0.self_attn.q_proj.bias is a bias; the only biases export-gguf \
+             writes are the query, key and value biases of model_type qwen2"
         );
+    }
+
+    /// The tiny model as a Qwen2 checkpoint: query, key and value biases,
+    /// the output tied to the embeddings (no `lm_head.weight`).
+    fn qwen2_tensors() -> Vec<(&'static str, Vec<usize>)> {
+        vec![
+            ("model.embed_tokens.weight", vec![8, 8]),
+            ("model.layers.0.input_layernorm.weight", vec![8]),
+            ("model.layers.0.mlp.down_proj.weight", vec![8, 4]),
+            ("model.layers.0.mlp.gate_proj.weight", vec![4, 8]),
+            ("model.layers.0.mlp.up_proj.weight", vec![4, 8]),
+            ("model.layers.0.post_attention_layernorm.weight", vec![8]),
+            ("model.layers.0.self_attn.k_proj.bias", vec![4]),
+            ("model.layers.0.self_attn.k_proj.weight", vec![4, 8]),
+            ("model.layers.0.self_attn.o_proj.weight", vec![8, 8]),
+            ("model.layers.0.self_attn.q_proj.bias", vec![8]),
+            ("model.layers.0.self_attn.q_proj.weight", vec![8, 8]),
+            ("model.layers.0.self_attn.v_proj.bias", vec![4]),
+            ("model.layers.0.self_attn.v_proj.weight", vec![4, 8]),
+            ("model.norm.weight", vec![8]),
+        ]
+    }
+
+    fn qwen2_config() -> Json {
+        let mut config = tiny_config();
+        config["model_type"] = "qwen2".into();
+        config["tie_word_embeddings"] = true.into();
+        config["rope_theta"] = 1_000_000.0.into();
+        config
+    }
+
+    /// [`write_tiny_tokenizer`] with Qwen2's NFC normalizer and pre-tokenizer.
+    fn write_qwen2_tokenizer(dir: &Path) {
+        write_tiny_tokenizer(dir);
+        let path = dir.join("tokenizer.json");
+        let mut tokenizer = read_json(&path).unwrap();
+        tokenizer["normalizer"] = serde_json::json!({ "type": "NFC" });
+        tokenizer["pre_tokenizer"] = qwen2_pre_tokenizer();
+        write_json(&path, &tokenizer);
+    }
+
+    /// The metadata of the tiny Qwen2 model in f16, written out by hand.
+    fn expected_qwen2_metadata() -> Vec<(String, MetaValue)> {
+        let u32_of = |key: &str, v: u32| (key.to_string(), MetaValue::U32(v));
+        let mut metadata = vec![
+            (
+                "general.architecture".to_string(),
+                MetaValue::Str("qwen2".into()),
+            ),
+            ("general.name".to_string(), MetaValue::Str("tiny".into())),
+            u32_of("general.alignment", 32),
+            u32_of("general.file_type", 1),
+            u32_of("qwen2.context_length", 64),
+            u32_of("qwen2.embedding_length", 8),
+            u32_of("qwen2.block_count", 1),
+            u32_of("qwen2.feed_forward_length", 4),
+            u32_of("qwen2.attention.head_count", 2),
+            u32_of("qwen2.attention.head_count_kv", 1),
+            u32_of("qwen2.attention.key_length", 4),
+            u32_of("qwen2.attention.value_length", 4),
+            (
+                "qwen2.attention.layer_norm_rms_epsilon".to_string(),
+                MetaValue::F32(1e-5),
+            ),
+            (
+                "qwen2.rope.freq_base".to_string(),
+                MetaValue::F32(1_000_000.0),
+            ),
+            u32_of("qwen2.rope.dimension_count", 4),
+            u32_of("qwen2.vocab_size", 8),
+        ];
+        // The tiny tokenizer's entries, with Qwen2's pre-tokenizer name and
+        // the NFC flag after `add_bos_token`.
+        for (key, value) in tiny_tokenizer_metadata() {
+            let nfc_next = key == "tokenizer.ggml.add_bos_token";
+            if key == "tokenizer.ggml.pre" {
+                metadata.push((key, MetaValue::Str("qwen2".into())));
+            } else {
+                metadata.push((key, value));
+            }
+            if nfc_next {
+                metadata.push((
+                    "tokenizer.ggml.normalizer.nfc".into(),
+                    MetaValue::Bool(true),
+                ));
+            }
+        }
+        metadata
+    }
+
+    #[test]
+    fn qwen2_export_has_its_keys_its_biases_and_the_rows_as_stored() {
+        let gguf_names = [
+            "token_embd.weight",
+            "blk.0.attn_norm.weight",
+            "blk.0.ffn_down.weight",
+            "blk.0.ffn_gate.weight",
+            "blk.0.ffn_up.weight",
+            "blk.0.ffn_norm.weight",
+            "blk.0.attn_k.bias",
+            "blk.0.attn_k.weight",
+            "blk.0.attn_output.weight",
+            "blk.0.attn_q.bias",
+            "blk.0.attn_q.weight",
+            "blk.0.attn_v.bias",
+            "blk.0.attn_v.weight",
+            "output_norm.weight",
+        ];
+        let dir = write_model(
+            "qwen2",
+            &qwen2_config(),
+            qwen2_tensors(),
+            write_qwen2_tokenizer,
+        );
+        let out = dir.join("tiny.gguf");
+        let report = export_gguf(&dir, "tiny", None, &out, GgufPrecision::F16).unwrap();
+        assert_eq!(
+            report,
+            GgufReport {
+                tensors: 14,
+                merged: 0
+            }
+        );
+        // No row moves: llama.cpp rotates qwen2 in the Hugging Face layout.
+        let metadata = check_tensors(&out, true, qwen2_tensors(), &gguf_names, |_| None, 0.0);
+        assert_eq!(metadata, expected_qwen2_metadata());
+
+        // Each bias is the checkpoint's own bytes: a 1-D tensor stays in f32.
+        let checkpoint = std::fs::read(dir.join("model.safetensors")).unwrap();
+        let checkpoint = safetensors::SafeTensors::deserialize(&checkpoint).unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+        let parsed = parse(&bytes);
+        for (proj, len) in [("q", 8), ("k", 4), ("v", 4)] {
+            let hf_name = format!("model.layers.0.self_attn.{proj}_proj.bias");
+            let gguf_name = format!("blk.0.attn_{proj}.bias");
+            let stored = checkpoint.tensor(&hf_name).unwrap();
+            assert_eq!(stored.shape(), [len], "{hf_name}");
+            let (_, dims, ggml_type, offset) = parsed
+                .tensors
+                .iter()
+                .find(|(name, ..)| *name == gguf_name)
+                .unwrap();
+            assert_eq!(dims, &[len as u64], "{gguf_name}");
+            assert_eq!(*ggml_type, 0, "{gguf_name}");
+            let start = parsed.data_start + *offset as usize;
+            assert_eq!(&bytes[start..start + 4 * len], stored.data(), "{gguf_name}");
+        }
+
+        // An adapter on the query projection lands on the same, unmoved rows.
+        let mut b = vec![0.0; 8];
+        b[0] = 1.0;
+        let adapter = LoraCheckpoint {
+            tensors: HashMap::from([
+                (
+                    "model.layers.0.self_attn.q_proj.lora_A.weight".to_string(),
+                    (vec![8, 1], vec![0.25; 8]),
+                ),
+                (
+                    "model.layers.0.self_attn.q_proj.lora_B.weight".to_string(),
+                    (vec![1, 8], b),
+                ),
+            ]),
+            metadata: Some(LoraMetadata {
+                rank: 1,
+                alpha: 1.0,
+                target_modules: vec!["q_proj".to_string()],
+                trained_modules: None,
+            }),
+        };
+        let merged = dir.join("merged.gguf");
+        let report =
+            export_gguf(&dir, "tiny", Some(&adapter), &merged, GgufPrecision::F16).unwrap();
+        assert_eq!(report.merged, 1);
+        check_tensors(&merged, true, qwen2_tensors(), &gguf_names, |_| None, 0.25);
+        std::fs::remove_dir_all(dir).unwrap();
+
+        // Any other bias is refused in a Qwen2 model too.
+        let mut tensors = qwen2_tensors();
+        tensors.push(("model.layers.0.self_attn.o_proj.bias", vec![8]));
+        let dir = write_model(
+            "qwen2-o-bias",
+            &qwen2_config(),
+            tensors,
+            write_qwen2_tokenizer,
+        );
+        let out = dir.join("tiny.gguf");
+        let err = export_gguf(&dir, "tiny", None, &out, GgufPrecision::F16).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "tensor model.layers.0.self_attn.o_proj.bias is a bias; the only biases export-gguf \
+             writes are the query, key and value biases of model_type qwen2"
+        );
+        assert!(!out.exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
