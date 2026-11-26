@@ -450,8 +450,8 @@ fn tokenizer_metadata(
             metadata.push((format!("tokenizer.ggml.{key}"), MetaValue::Bool(add)));
         }
     }
-    // llama.cpp normalizes the text to NFC first only when the file asks for
-    // it, as Qwen2's tokenizer does.
+    // Written as convert_hf_to_gguf.py writes it. llama.cpp reads the key only
+    // for UGM tokenizers today, so it does not normalize a BPE `qwen2` prompt.
     if normalizes_nfc(&tokenizer["normalizer"]) {
         metadata.push((
             "tokenizer.ggml.normalizer.nfc".to_string(),
