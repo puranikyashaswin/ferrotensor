@@ -8,9 +8,11 @@
 //!
 //! Linux only (reads `/proc/self/status`), and only meaningful where device
 //! memory is host memory too, such as Mesa lavapipe in CI: there the device
-//! copy and the staging copy both show up as resident memory. Needs a GPU
-//! adapter, so it is `#[ignore]`d; run with `--ignored`. It lives in its own
-//! test binary so no other test shares the process's peak.
+//! copy and the staging copy both show up as resident memory. A discrete GPU
+//! keeps the device copy in its own memory, so on one the test prints why it
+//! is skipped and passes. Needs a GPU adapter, so it is `#[ignore]`d; run with
+//! `--ignored`. It lives in its own test binary so no other test shares the
+//! process's peak.
 
 #![cfg(target_os = "linux")]
 #![allow(clippy::expect_used)]
@@ -36,6 +38,14 @@ fn peak_rss() -> u64 {
 #[ignore = "needs a GPU; run with --ignored"]
 fn uploads_do_not_keep_every_staging_copy() {
     let ctx = pollster::block_on(WgpuContext::new());
+    if ctx.adapter.get_info().device_type == wgpu::DeviceType::DiscreteGpu {
+        eprintln!(
+            "skipped: {} is a discrete GPU, and its memory is not part of this process's \
+             resident memory",
+            ctx.adapter_info()
+        );
+        return;
+    }
     let chunk = vec![1.0f32; (16 << 20) / 4]; // 16 MiB
     let count = 48; // 768 MiB in all
     let total = (count * chunk.len() * 4) as u64;
