@@ -19,8 +19,8 @@ url: "https://ferrotensor.dev"
 license:
   - MIT
   - Apache-2.0
-version: 0.7.2
-date-released: 2026-11-24
+version: 0.7.3
+date-released: 2026-11-26
 keywords:
   - rust
   - webgpu

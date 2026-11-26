@@ -7,16 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.3] - 2026-11-26
+
+`export-gguf` writes Qwen2 checkpoints, tokenizers that store their BPE merges as pairs (Qwen3) load, and `F::nll_loss` runs on the GPU. Nikhil Gogu contributed the GGUF export, the `nll_loss` kernels and the fusion change (#234, #235, #236).
+
 ### Added
 - `ferrotensor export-gguf` and `ferrotensor_trainer::gguf::export_gguf` write `model_type` `qwen2` checkpoints such as Qwen2.5-0.5B-Instruct, as llama.cpp's `qwen2` architecture: the `qwen2.*` keys, the query, key and value biases as `blk.N.attn_{q,k,v}.bias`, the query and key rows in the Hugging Face order (the order llama.cpp rotates for `qwen2`), the `qwen2` pre-tokenizer name, and `tokenizer.ggml.normalizer.nfc` when the tokenizer normalizes to NFC. Any other bias and any other `model_type` are still refused with exit code 2. The f16 file of Qwen2.5-0.5B-Instruct has the 290 tensors of the file llama.cpp's `convert_hf_to_gguf.py` (commit `244640b`) writes from the same checkpoint, with the same names, types, shapes and bytes, and llama.cpp completes three prompts with the same 16 tokens from both; with `ferrotensor generate` on an NVIDIA H100 NVL, `scripts/check_gguf.sh` prints `match` for the same three prompts. (#216)
 
 ### Changed
 - `ferrotensor`: `F::nll_loss` runs on the device, as `cross_entropy` with class ids does. The new `nll_rows` kernel reads each row's target log-probability and `nll_grad` writes the gradient, so only the ids are uploaded: the `[rows, classes]` weight tensor that was built on the host is gone, and an id tensor is not read back. With `log_probs` on a GPU, an id tensor holding an id that is not below the number of classes now gives a NaN loss instead of a panic, as in `cross_entropy`. The mean is a sum divided by the count, so a loss can differ from the old one in its last bits.
 - `ferrotensor`: with `FERROTENSOR_FUSION=1`, a fused group passes values between its steps in registers and writes only the results a tensor still holds. An intermediate that no tensor holds any more, as in code without autograd, is not written, needs no binding and goes back to the buffer pool at the next step, so the tensor-api benchmark's 100-op chain runs as one dispatch where it ran as 20. On an NVIDIA H100 NVL that chain on `[64]` went from 0.241 ms to 0.107 ms with fusion on. Results are unchanged bit for bit. See `docs/design/op-fusion.md`.
+- The nine crates, the Python package and `CITATION.cff` give https://ferrotensor.dev as the project's homepage. (#232)
+- The PyTorch baseline in `benchmarks/baselines/pytorch_lora.py` computes its loss on flat `[rows, vocab]` logits, so PyTorch no longer runs its spatial softmax kernels, which took 22% of a SmolLM2-1.7B step on an A10G. The loss is the same. (#170)
 
 ### Fixed
 - `ferrotensor`: `F::nll_loss` returned NaN when a log-probability away from the target was `-inf` (a class of probability 0), because it multiplied that value by a zero weight. It now reads only the target's log-probability.
 - The f16 copy of each LoRA A matrix (`lora_mirror_f16`) rounds f32 to f16 with integer operations, so it equals `UnifiedTensor::from_f32_as_f16` bit for bit on every device. WGSL leaves the rounding of `pack2x16float` to the device, and WARP on DX12 rounded some values down instead of to nearest even. Values past the f16 range now become infinities.
+- `ferrotensor-loader`: a `tokenizer.json` that stores each BPE merge as a `["left", "right"]` pair, as Qwen3's does, now loads. The pinned `tokenizers` 0.19.1 reads merges only as `"left right"` strings, so the loader rewrites the pairs and reads the file again. (#161)
 
 ## [0.7.2] - 2026-11-24
 
@@ -269,7 +276,8 @@ First public version.
 - Renamed the project from Rusty to Ferrotensor; crates are now `ferrotensor-*` and the CLI binary is `ferrotensor`.
 - Licensed under MIT OR Apache-2.0 (previously MIT only).
 
-[Unreleased]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.7.2...HEAD
+[Unreleased]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.7.3...HEAD
+[0.7.3]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/puranikyashaswin/ferrotensor/compare/v0.6.0...v0.7.0
