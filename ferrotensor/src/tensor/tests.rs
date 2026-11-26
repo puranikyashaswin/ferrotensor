@@ -162,6 +162,20 @@ pub(crate) fn cases() -> Vec<Case> {
             let cond = x[0].gt(&x[1]);
             Tensor::where_cond(&cond, &x[0].square(), &x[1].exp())
         }),
+        case("where_cond_broadcast", &[(&[2, 3], U), (&[3], U)], |x| {
+            let cond = Tensor::from_data(&[1.0, 0.0], &[2, 1], &x[0].device);
+            Tensor::where_cond(&cond, &x[0].square(), &x[1].exp())
+        }),
+        // Both sides broadcast, along different dims, under a full-size mask.
+        case(
+            "where_cond_broadcast_sides",
+            &[(&[2, 1], U), (&[3], U)],
+            |x| {
+                let mask = [1.0, 0.0, 1.0, 0.0, 1.0, 1.0];
+                let cond = Tensor::from_data(&mask, &[2, 3], &x[0].device);
+                Tensor::where_cond(&cond, &x[0].square(), &x[1].exp())
+            },
+        ),
         case("masked_fill", &[(&[3, 3], U)], |x| {
             let mask = Tensor::from_data(
                 &[0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
@@ -474,6 +488,67 @@ fn tril_needs_a_matrix() {
 fn incompatible_shapes_panic() {
     let d = Device::cpu();
     Tensor::zeros(&[2, 3], &d).add(&Tensor::zeros(&[2], &d));
+}
+
+// ============================================================================
+// WHERE
+// ============================================================================
+
+#[test]
+fn where_cond_ignores_the_side_it_does_not_pick() {
+    let d = Device::cpu();
+    let x = Tensor::from_data(&[0.0, 2.0], &[2], &d);
+    let zero = Tensor::zeros(&[], &d);
+    // log(0) = -inf is on the side that element 0 does not pick.
+    let out = Tensor::where_cond(&x.gt(&zero), &x.log(), &zero);
+    assert_eq!(out.to_vec(), vec![0.0, 2f32.ln()]);
+}
+
+/// Values and gradients of `where_cond` when both sides hold infinities and
+/// NaNs, on `device`. The picked values must come through bit for bit (a NaN
+/// with a payload and a negative zero show a copy from arithmetic), and each
+/// element's gradient must go to the side that supplied it and be exactly 0
+/// on the other, also when that gradient is infinite. In `cond`, a NaN and a
+/// negative zero count as zero and a subnormal as non-zero.
+fn check_where_cond_with_non_finite_values(device: &Device) {
+    let (inf, nan) = (f32::INFINITY, f32::NAN);
+    let payload = f32::from_bits(0x7fc0_0001);
+    let subnormal = f32::from_bits(1);
+    let cond_values = [1.0, 0.0, -2.0, 0.0, 0.5, 0.0, 1.0, nan, subnormal, -0.0];
+    let a_values = [1.0, inf, -inf, nan, payload, 4.0, -0.0, 8.0, 9.0, 10.0];
+    let b_values = [nan, 2.0, 3.0, -inf, inf, payload, 5.0, 11.0, 12.0, 13.0];
+    let cond = Tensor::from_data(&cond_values, &[10], device);
+    let a = Tensor::from_data(&a_values, &[10], device).requires_grad_();
+    let b = Tensor::from_data(&b_values, &[10], device).requires_grad_();
+    let out = Tensor::where_cond(&cond, &a, &b);
+    let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    assert_eq!(
+        bits(&out.to_vec()),
+        bits(&[1.0, 2.0, -inf, -inf, payload, payload, -0.0, 11.0, 9.0, 13.0]),
+        "values on {}",
+        device.name()
+    );
+    let seed = [inf, 2.0, 3.0, inf, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
+    out.backward_with(&Tensor::from_data(&seed, &[10], device));
+    assert_eq!(
+        a.grad().unwrap().to_vec(),
+        vec![inf, 0.0, 3.0, 0.0, 5.0, 0.0, 7.0, 0.0, 9.0, 0.0]
+    );
+    assert_eq!(
+        b.grad().unwrap().to_vec(),
+        vec![0.0, 2.0, 0.0, inf, 0.0, 6.0, 0.0, 8.0, 0.0, 10.0]
+    );
+}
+
+#[test]
+fn where_cond_copies_non_finite_values() {
+    check_where_cond_with_non_finite_values(&Device::cpu());
+}
+
+#[test]
+fn where_cond_copies_non_finite_values_on_gpu() {
+    let Some(gpu) = test_gpu() else { return };
+    check_where_cond_with_non_finite_values(&gpu);
 }
 
 // ============================================================================

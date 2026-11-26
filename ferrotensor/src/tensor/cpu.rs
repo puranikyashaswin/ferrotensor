@@ -145,6 +145,43 @@ pub(crate) fn binary(
     out
 }
 
+/// The broadcasting `where_select` kernel: `a` where `cond` is non-zero, else
+/// `b` (a NaN in `cond` counts as zero). The value that is not picked is not
+/// read into the result.
+pub(crate) fn where_select(
+    cond: &[f32],
+    c_strides: &[usize],
+    a: &[f32],
+    a_strides: &[usize],
+    b: &[f32],
+    b_strides: &[usize],
+    out_shape: &[usize],
+) -> Vec<f32> {
+    let n: usize = out_shape.iter().product();
+    let ndim = out_shape.len();
+    let mut out = Vec::with_capacity(n);
+    let mut index = vec![0usize; ndim];
+    let (mut ic, mut ia, mut ib) = (0usize, 0usize, 0usize);
+    for _ in 0..n {
+        out.push(if cond[ic].abs() > 0.0 { a[ia] } else { b[ib] });
+        // Odometer increment of the multi-index, updating the three offsets.
+        for d in (0..ndim).rev() {
+            index[d] += 1;
+            ic += c_strides[d];
+            ia += a_strides[d];
+            ib += b_strides[d];
+            if index[d] < out_shape[d] {
+                break;
+            }
+            ic -= c_strides[d] * out_shape[d];
+            ia -= a_strides[d] * out_shape[d];
+            ib -= b_strides[d] * out_shape[d];
+            index[d] = 0;
+        }
+    }
+    out
+}
+
 /// The axis `reduce` kernel over a `[outer, dim, inner]` view.
 pub(crate) fn reduce(op: u32, x: &[f32], outer: usize, dim: usize, inner: usize) -> Vec<f32> {
     let mut out = Vec::with_capacity(outer * inner);

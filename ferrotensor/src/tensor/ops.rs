@@ -174,17 +174,28 @@ impl Tensor {
 
     /// Pick `a` where `cond` is non-zero, else `b` (broadcasting).
     ///
-    /// `cond` is a 0/1 mask, e.g. from [`Tensor::gt`]. Differentiable in `a`
-    /// and `b`.
+    /// `cond` is a 0/1 mask, e.g. from [`Tensor::gt`]; a NaN in it counts as
+    /// zero. Differentiable in `a` and `b`. The value on the side that is not
+    /// picked does not reach the result, so it may be an infinity or a NaN:
+    /// `where_cond(&x.gt(&zero), &x.log(), &zero)` is 0 where `x` is 0.
     ///
     /// # Panics
     /// Panics when the shapes cannot be broadcast together.
     pub fn where_cond(cond: &Tensor, a: &Tensor, b: &Tensor) -> Tensor {
-        let zero = Tensor::zeros(&[], &cond.device);
-        let keep = cond
-            .unary_raw(unary_op::ABS, 0.0, 0.0)
-            .binary_raw(&zero, binary_op::GT);
-        a.mul(&keep).add(&b.mul(&keep.rsub_scalar(1.0)))
+        let out = Tensor::where_select_raw(cond, a, b);
+        let cond = cond.detach();
+        let (sa, sb) = (a.shape.clone(), b.shape.clone());
+        let need = (a.requires_grad, b.requires_grad);
+        out.with_node("where_cond", vec![a.clone(), b.clone()], move |g| {
+            // Each side gets the gradient of the elements it supplied.
+            let zero = Tensor::zeros(&[], &g.device);
+            vec![
+                need.0
+                    .then(|| sum_to_shape(&Tensor::where_select_raw(&cond, g, &zero), &sa)),
+                need.1
+                    .then(|| sum_to_shape(&Tensor::where_select_raw(&cond, &zero, g), &sb)),
+            ]
+        })
     }
 
     /// Replace elements where `mask` is non-zero with `value` (broadcasting).

@@ -226,6 +226,58 @@ fn binary(@builtin(global_invocation_id) gid: vec3<u32>,
     bin_out[i] = binary_apply(bin_p.op, bin_a[ia], bin_b[ib]);
 }
 
+// --- Element-wise select (where_cond) -----------------------------------------
+// out = a where cond is non-zero, else b, with all three broadcast to the
+// output shape.
+// meta = [out_shape(ndim), cond_strides(ndim), a_strides(ndim), b_strides(ndim)];
+// a broadcast dimension has stride 0.
+// Every buffer is read as u32 bits. cond is non-zero when its magnitude bits
+// are in 1..=0x7f800000 (so -0 and NaN count as zero, as in the CPU path, and
+// a device that flushes subnormals cannot disagree), and a and b are copied
+// as they are: an infinity or a NaN passes through, and a value on the side
+// that is not picked never reaches the output.
+
+struct SelectParams {
+    n: u32,
+    ndim: u32,
+    _pad0: u32,
+    _pad1: u32,
+};
+
+@group(0) @binding(0) var<storage, read> sel_cond: array<u32>;
+@group(0) @binding(1) var<storage, read> sel_a: array<u32>;
+@group(0) @binding(2) var<storage, read> sel_b: array<u32>;
+@group(0) @binding(3) var<storage, read_write> sel_out: array<u32>;
+@group(0) @binding(4) var<uniform> sel_p: SelectParams;
+@group(0) @binding(5) var<storage, read> sel_meta: array<u32>;
+
+@compute @workgroup_size(256)
+fn where_select(@builtin(global_invocation_id) gid: vec3<u32>,
+                @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = flat_index(gid, nwg);
+    if (i >= sel_p.n) { return; }
+    let nd = sel_p.ndim;
+    var rem = i;
+    var ic = 0u;
+    var ia = 0u;
+    var ib = 0u;
+    for (var d = 0u; d < nd; d = d + 1u) {
+        let axis = nd - 1u - d;
+        let size = sel_meta[axis];
+        let idx = rem % size;
+        rem = rem / size;
+        ic = ic + idx * sel_meta[nd + axis];
+        ia = ia + idx * sel_meta[2u * nd + axis];
+        ib = ib + idx * sel_meta[3u * nd + axis];
+    }
+    let magnitude = sel_cond[ic] & 0x7fffffffu;
+    if (magnitude != 0u && magnitude <= 0x7f800000u) {
+        sel_out[i] = sel_a[ia];
+    } else {
+        sel_out[i] = sel_b[ib];
+    }
+}
+
 // --- Fused element-wise chains ---------------------------------------------
 // A chain of same-size unary and non-broadcasting binary ops in one dispatch
 // (FERROTENSOR_FUSION=1, see docs/design/op-fusion.md). The program works on

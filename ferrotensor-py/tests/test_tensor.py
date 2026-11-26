@@ -271,6 +271,12 @@ def test_where_with_tensor_branches():
     assert ft.where(cond, 5.0, other).tolist() == [[5.0, 2.0], [3.0, 5.0]]
 
 
+def test_where_ignores_the_side_it_does_not_pick():
+    x = ft.tensor([0.0, 2.0])
+    # log(0) = -inf is on the side that element 0 does not pick.
+    assert ft.where(x > 0, x.log(), 0.0).tolist() == [0.0, pytest.approx(math.log(2.0))]
+
+
 def test_multi_dim_reductions():
     x = ft.arange(24).reshape(2, 3, 4)
     assert x.sum((0, 2)).tolist() == [60.0, 92.0, 124.0]

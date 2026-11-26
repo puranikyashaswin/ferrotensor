@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `ferrotensor`: `Tensor::where_cond` (`ft.where` in Python) returned NaN wherever the side it did not pick held an infinity or a NaN, because it computed `a * mask + b * (1 - mask)`: `where_cond(x > 0, x.log(), 0)` was NaN where `x` is 0. A `where_select` kernel now copies the picked value, and an element's gradient goes only to the side that supplied it.
+
 ## [0.7.3] - 2026-11-26
 
 `export-gguf` writes Qwen2 checkpoints, tokenizers that store their BPE merges as pairs (Qwen3) load, and `F::nll_loss` runs on the GPU. Nikhil Gogu contributed the GGUF export, the `nll_loss` kernels and the fusion change (#234, #235, #236).
