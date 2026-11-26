@@ -11,7 +11,7 @@ rust-version.workspace = true
 documentation = "https://docs.rs/ferrotensor-monitor"
 readme = "README.md"
 keywords = ["tui", "monitoring", "training", "machine-learning", "dashboard"]
-categories = ["science"]
+categories = ["science", "artificial-intelligence"]
 
 [dependencies]
 ratatui = "0.29.0"

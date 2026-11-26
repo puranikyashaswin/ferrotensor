@@ -11,7 +11,7 @@ rust-version.workspace = true
 documentation = "https://docs.rs/ferrotensor-cli"
 readme = "README.md"
 keywords = ["machine-learning", "cli", "lora", "llm", "gpu"]
-categories = ["science"]
+categories = ["science", "artificial-intelligence"]
 
 
 [[bin]]

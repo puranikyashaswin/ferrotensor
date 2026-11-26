@@ -11,7 +11,7 @@ rust-version.workspace = true
 documentation = "https://docs.rs/ferrotensor-graph"
 readme = "README.md"
 keywords = ["neural-networks", "transformer", "machine-learning", "gpu", "llm"]
-categories = ["science", "algorithms"]
+categories = ["science", "algorithms", "artificial-intelligence"]
 
 [dependencies]
 ferrotensor-backend = { path = "../ferrotensor-backend", version = "0.7.3" }

@@ -11,7 +11,7 @@ rust-version.workspace = true
 documentation = "https://docs.rs/ferrotensor-loader"
 readme = "README.md"
 keywords = ["safetensors", "tokenizer", "model-loading", "machine-learning", "llm"]
-categories = ["science", "algorithms"]
+categories = ["science", "algorithms", "artificial-intelligence"]
 
 [dependencies]
 safetensors = "0.4"

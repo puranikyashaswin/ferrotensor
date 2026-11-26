@@ -11,7 +11,7 @@ rust-version.workspace = true
 documentation = "https://docs.rs/ferrotensor-hub"
 readme = "README.md"
 keywords = ["huggingface", "machine-learning", "models", "download", "safetensors"]
-categories = ["science", "algorithms"]
+categories = ["science", "algorithms", "artificial-intelligence"]
 
 [lints]
 workspace = true

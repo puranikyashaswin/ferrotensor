@@ -11,7 +11,7 @@ description = "GPU-accelerated machine learning library for training and inferen
 documentation = "https://docs.rs/ferrotensor"
 readme = "README.md"
 keywords = ["machine-learning", "deep-learning", "gpu", "neural-networks", "transformer"]
-categories = ["science", "algorithms"]
+categories = ["science", "algorithms", "artificial-intelligence"]
 
 [dependencies]
 # GPU Backend
