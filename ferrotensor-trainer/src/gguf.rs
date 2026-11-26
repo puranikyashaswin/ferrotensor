@@ -432,8 +432,8 @@ fn tokenizer_metadata(
     let model = &tokenizer["model"];
     if model["type"] != "BPE" {
         return Err(format!(
-            "tokenizer.json has a {} model; export-gguf needs a BPE tokenizer, byte-level or \
-             SentencePiece",
+            "tokenizer.json has a {} model; export-gguf writes only BPE tokenizers, byte-level \
+             or SentencePiece BPE with byte fallback such as TinyLlama's",
             model["type"]
         )
         .into());
@@ -1381,8 +1381,8 @@ mod tests {
         });
         assert_eq!(
             err,
-            "tokenizer.json has a \"WordLevel\" model; export-gguf needs a BPE tokenizer, byte-level \
-             or SentencePiece"
+            "tokenizer.json has a \"WordLevel\" model; export-gguf writes only BPE tokenizers, \
+             byte-level or SentencePiece BPE with byte fallback such as TinyLlama's"
         );
 
         let err = refusal("quantized", |dir| {
