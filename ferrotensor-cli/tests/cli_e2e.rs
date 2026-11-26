@@ -1308,7 +1308,8 @@ fn export_gguf_refuses_a_word_level_tokenizer_and_an_existing_file_with_2() {
     let report: serde_json::Value = serde_json::from_slice(&run.stdout).expect("one JSON object");
     assert_eq!(
         report["error"],
-        "tokenizer.json has a \"WordLevel\" model; export-gguf needs a byte-level BPE tokenizer"
+        "tokenizer.json has a \"WordLevel\" model; export-gguf writes only BPE tokenizers, \
+         byte-level or SentencePiece BPE with byte fallback such as TinyLlama's"
     );
     assert!(!out.exists());
 
