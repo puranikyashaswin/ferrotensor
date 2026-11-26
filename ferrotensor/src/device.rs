@@ -39,6 +39,18 @@ const POOL_BYTES: u64 = 128 << 20;
 /// Tensor buffers one `fused` dispatch binds (its last binding is the program).
 const FUSED_SLOTS: usize = (FUSED_STORAGE_BINDINGS - 1) as usize;
 
+/// Registers of the `fused` kernel (its `regs` array). A register holds an
+/// input of the group or a result some tensor still holds, and each of those
+/// has a binding slot, so there are as many registers as slots.
+const FUSED_REGS: usize = FUSED_SLOTS;
+
+/// Kind of a `fused` instruction that loads an input into a register (0 and 1
+/// are the unary and binary steps).
+const FUSED_LOAD: u32 = 2;
+
+/// Last word of a `fused` instruction whose result is not stored.
+const NO_STORE: u32 = u32::MAX;
+
 /// One element-wise op for [`GpuContext::elementwise`].
 pub(crate) struct ElementwiseStep {
     /// 0 for a `unary_op`, 1 for a `binary_op`.
@@ -54,61 +66,206 @@ pub(crate) struct ElementwiseStep {
     pub(crate) n: usize,
 }
 
+/// The instructions of one `fused` dispatch.
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct GroupSummary {
+    /// Unary and binary steps.
+    pub(crate) steps: usize,
+    /// Inputs loaded from their buffers.
+    pub(crate) loads: usize,
+    /// Results written to their buffers.
+    pub(crate) stores: usize,
+}
+
+#[cfg(test)]
+impl GroupSummary {
+    fn of(program: &[u32]) -> Self {
+        let words = || program.chunks(8);
+        Self {
+            steps: words().filter(|w| w[0] != FUSED_LOAD).count(),
+            loads: words().filter(|w| w[0] == FUSED_LOAD).count(),
+            stores: words().filter(|w| w[7] != NO_STORE).count(),
+        }
+    }
+}
+
+/// What a register of an open fusion group holds.
+enum Value {
+    /// The group input bound at this slot.
+    Input(usize),
+    /// The result of the instruction that starts at this program word.
+    Result { storage: Arc<Storage>, word: usize },
+}
+
 /// Element-wise steps over the same element count, recorded as one `fused`
-/// dispatch when the group closes. Holding each slot's storage keeps its
-/// buffer out of the pool until then.
+/// dispatch when the group closes.
+///
+/// Values stay in the kernel's registers from step to step. A result is
+/// written to its buffer only when a tensor still holds it at the close: a
+/// result no tensor holds any more (an intermediate in code without
+/// autograd) is freed at the next step or at the close, never written, and
+/// its buffer goes back to the pool. Holding the storage of every input
+/// keeps its buffer out of the pool until the dispatch is recorded.
 struct FusionGroup {
     n: usize,
-    /// The storage bound to each slot, in slot order.
-    slots: Vec<Arc<Storage>>,
-    /// Eight words per step; see the `fused` kernel.
+    /// Storage the group reads, by binding slot. The results that are written
+    /// take the slots after them.
+    inputs: Vec<Arc<Storage>>,
+    /// What each register holds; `None` is free.
+    regs: [Option<Value>; FUSED_REGS],
+    /// Eight words per instruction; see the `fused` kernel.
     program: Vec<u32>,
 }
 
 impl FusionGroup {
-    fn position(&self, storage: &Arc<Storage>) -> Option<usize> {
-        self.slots.iter().position(|s| Arc::ptr_eq(s, storage))
+    fn new(n: usize) -> Self {
+        Self {
+            n,
+            inputs: Vec::new(),
+            regs: Default::default(),
+            program: Vec::new(),
+        }
     }
 
-    /// Number of slots the group would use with `step` added.
-    fn slots_with(&self, step: &ElementwiseStep) -> usize {
-        let mut added: Vec<&Arc<Storage>> = Vec::new();
-        for s in step.inputs.iter().chain(std::iter::once(&step.output)) {
-            if self.position(s).is_none() && !added.iter().any(|a| Arc::ptr_eq(a, s)) {
-                added.push(s);
+    fn holds(&self, value: &Value, storage: &Arc<Storage>) -> bool {
+        match value {
+            Value::Input(slot) => Arc::ptr_eq(&self.inputs[*slot], storage),
+            Value::Result { storage: s, .. } => Arc::ptr_eq(s, storage),
+        }
+    }
+
+    /// The register holding `storage`, if any.
+    fn register(&self, storage: &Arc<Storage>) -> Option<usize> {
+        self.regs
+            .iter()
+            .position(|r| r.as_ref().is_some_and(|v| self.holds(v, storage)))
+    }
+
+    /// Free the registers of values no tensor holds any more: no later op
+    /// can read them. A freed result is never stored, and dropping it here
+    /// returns its buffer to the pool. An input keeps its slot, since an
+    /// earlier instruction loads it.
+    fn release_dead(&mut self) {
+        for reg in &mut self.regs {
+            let dead = match reg {
+                Some(Value::Input(slot)) => Arc::strong_count(&self.inputs[*slot]) == 1,
+                Some(Value::Result { storage, .. }) => Arc::strong_count(storage) == 1,
+                None => false,
+            };
+            if dead {
+                *reg = None;
             }
         }
-        self.slots.len() + added.len()
     }
 
-    fn slot(&mut self, storage: &Arc<Storage>) -> u32 {
-        let index = match self.position(storage) {
-            Some(index) => index,
-            None => {
-                self.slots.push(Arc::clone(storage));
-                self.slots.len() - 1
+    /// Whether `step` fits: a slot for every input and for every result
+    /// that may still be stored, and a register for every value. Call
+    /// [`FusionGroup::release_dead`] first.
+    fn fits(&self, step: &ElementwiseStep) -> bool {
+        let mut loads = 0;
+        let mut new_slots = 0;
+        for (k, s) in step.inputs.iter().enumerate() {
+            if self.register(s).is_some() || step.inputs[..k].iter().any(|t| Arc::ptr_eq(t, s)) {
+                continue;
             }
-        };
-        index as u32
+            loads += 1;
+            if !self.inputs.iter().any(|t| Arc::ptr_eq(t, s)) {
+                new_slots += 1;
+            }
+        }
+        let results = self
+            .regs
+            .iter()
+            .filter(|r| matches!(r, Some(Value::Result { .. })))
+            .count();
+        let used = self.regs.iter().filter(|r| r.is_some()).count();
+        self.inputs.len() + new_slots + results < FUSED_SLOTS && used + loads < FUSED_REGS
+    }
+
+    /// A free register. [`FusionGroup::fits`] leaves one for each new value.
+    #[expect(
+        clippy::expect_used,
+        reason = "fits() is checked before a step is pushed"
+    )]
+    fn free_register(&self) -> usize {
+        self.regs
+            .iter()
+            .position(Option::is_none)
+            .expect("no free register in a fusion group")
+    }
+
+    /// Add `step` when it has the group's element count and fits.
+    fn join(&mut self, step: &ElementwiseStep) -> bool {
+        self.release_dead();
+        let fits = self.n == step.n && self.fits(step);
+        if fits {
+            self.push(step);
+        }
+        fits
     }
 
     fn push(&mut self, step: &ElementwiseStep) {
-        let src0 = self.slot(&step.inputs[0]);
-        let src1 = match step.inputs.get(1) {
-            Some(s) => self.slot(s),
-            None => 0,
-        };
-        let dst = self.slot(&step.output);
+        let mut src = [0u32; 2];
+        for (k, s) in step.inputs.iter().enumerate() {
+            let reg = match self.register(s) {
+                Some(reg) => reg,
+                None => {
+                    let slot = match self.inputs.iter().position(|t| Arc::ptr_eq(t, s)) {
+                        Some(slot) => slot,
+                        None => {
+                            self.inputs.push(Arc::clone(s));
+                            self.inputs.len() - 1
+                        }
+                    };
+                    let reg = self.free_register();
+                    self.regs[reg] = Some(Value::Input(slot));
+                    self.program.extend_from_slice(&[
+                        FUSED_LOAD,
+                        0,
+                        slot as u32,
+                        0,
+                        reg as u32,
+                        0,
+                        0,
+                        NO_STORE,
+                    ]);
+                    reg
+                }
+            };
+            src[k] = reg as u32;
+        }
+        let dst = self.free_register();
+        self.regs[dst] = Some(Value::Result {
+            storage: Arc::clone(&step.output),
+            word: self.program.len(),
+        });
         self.program.extend_from_slice(&[
             step.kind,
             step.op,
-            src0,
-            src1,
-            dst,
+            src[0],
+            src[1],
+            dst as u32,
             step.a.to_bits(),
             step.b.to_bits(),
-            0,
+            NO_STORE,
         ]);
+    }
+
+    /// The storage to bind, by slot, and the program with a store for each
+    /// result a tensor still holds. `None` when no tensor holds any result:
+    /// the dispatch would then change nothing.
+    fn finish(mut self) -> Option<(Vec<Arc<Storage>>, Vec<u32>)> {
+        self.release_dead();
+        let mut slots = self.inputs;
+        let read = slots.len();
+        for value in self.regs.into_iter().flatten() {
+            if let Value::Result { storage, word } = value {
+                self.program[word + 7] = slots.len() as u32;
+                slots.push(storage);
+            }
+        }
+        (slots.len() > read).then_some((slots, self.program))
     }
 }
 
@@ -187,6 +344,9 @@ pub(crate) struct GpuContext {
     /// Placeholders for the unused slots of a `fused` dispatch: one each, so
     /// no buffer is bound twice as read-write.
     fused_dummies: Vec<Buffer>,
+    /// The last `fused` dispatch recorded.
+    #[cfg(test)]
+    last_fused: Mutex<Option<GroupSummary>>,
 }
 
 /// Work recorded since the last submission.
@@ -239,6 +399,8 @@ impl GpuContext {
             pool: Arc::default(),
             fusion: AtomicBool::new(fusion),
             fused_dummies,
+            #[cfg(test)]
+            last_fused: Mutex::default(),
         }
     }
 
@@ -259,31 +421,30 @@ impl GpuContext {
     /// the same element count and room for the op's buffers.
     pub(crate) fn elementwise(&self, step: ElementwiseStep) {
         let mut pending = self.lock();
-        let joins = pending
-            .group
-            .as_ref()
-            .is_some_and(|g| g.n == step.n && g.slots_with(&step) <= FUSED_SLOTS);
-        if !joins {
+        if !pending.group.as_mut().is_some_and(|g| g.join(&step)) {
             self.close_group(&mut pending);
-            pending.group = Some(FusionGroup {
-                n: step.n,
-                slots: Vec::new(),
-                program: Vec::new(),
-            });
-        }
-        if let Some(group) = pending.group.as_mut() {
+            let mut group = FusionGroup::new(step.n);
             group.push(&step);
+            pending.group = Some(group);
         }
         self.count_op(&mut pending);
     }
 
-    /// Record the open fusion group, if any, as one `fused` dispatch.
+    /// Record the open fusion group, if any, as one `fused` dispatch. A
+    /// group whose results no tensor holds records nothing.
     fn close_group(&self, pending: &mut Pending) {
         let Some(group) = pending.group.take() else {
             return;
         };
-        let buffers: Vec<&Buffer> = group
-            .slots
+        let n = group.n;
+        let Some((slots, program)) = group.finish() else {
+            return;
+        };
+        #[cfg(test)]
+        if let Ok(mut last) = self.last_fused.lock() {
+            *last = Some(GroupSummary::of(&program));
+        }
+        let buffers: Vec<&Buffer> = slots
             .iter()
             .map(|s| match &**s {
                 Storage::Gpu(buffer) => &**buffer,
@@ -293,19 +454,31 @@ impl GpuContext {
         let mut args: Vec<Arg<'_>> = (0..FUSED_SLOTS)
             .map(|i| Arg::Buffer(buffers.get(i).copied().unwrap_or(&self.fused_dummies[i])))
             .collect();
-        args.push(Arg::Meta(&group.program));
-        args.push(Arg::Params([
-            group.n as u32,
-            (group.program.len() / 8) as u32,
-            0,
-            0,
-        ]));
-        self.stage(
-            pending,
-            "fused",
-            &args,
-            ComputeEngine::workgroups_1d(group.n),
-        );
+        args.push(Arg::Meta(&program));
+        args.push(Arg::Params([n as u32, (program.len() / 8) as u32, 0, 0]));
+        self.stage(pending, "fused", &args, ComputeEngine::workgroups_1d(n));
+    }
+
+    /// The last `fused` dispatch recorded since the previous call.
+    #[cfg(test)]
+    pub(crate) fn last_fused(&self) -> Option<GroupSummary> {
+        self.last_fused.lock().ok().and_then(|mut last| last.take())
+    }
+
+    /// Drop every pooled buffer.
+    #[cfg(test)]
+    pub(crate) fn clear_pool(&self) {
+        if let Ok(mut pool) = self.pool.lock() {
+            *pool = BufferPool::default();
+        }
+    }
+
+    /// Free buffers of `bytes` bytes in the pool.
+    #[cfg(test)]
+    pub(crate) fn pooled(&self, bytes: u64) -> usize {
+        self.pool
+            .lock()
+            .map_or(0, |pool| pool.free.get(&bytes).map_or(0, Vec::len))
     }
 
     /// A tensor buffer of `bytes` bytes: a freed one when available, else a
@@ -682,5 +855,147 @@ impl std::fmt::Debug for Device {
             .field("name", &self.name())
             .field("backend", &self.backend())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+
+    use super::*;
+    use std::sync::RwLock;
+
+    fn storage() -> Arc<Storage> {
+        Arc::new(Storage::Cpu(RwLock::new(Vec::new())))
+    }
+
+    fn step(inputs: &[&Arc<Storage>], output: &Arc<Storage>) -> ElementwiseStep {
+        ElementwiseStep {
+            kind: inputs.len() as u32 - 1,
+            op: 0,
+            a: 0.0,
+            b: 0.0,
+            inputs: inputs.iter().map(|s| Arc::clone(s)).collect(),
+            output: Arc::clone(output),
+            n: 4,
+        }
+    }
+
+    /// The store word of each unary or binary instruction, in order.
+    fn stores(program: &[u32]) -> Vec<u32> {
+        program
+            .chunks(8)
+            .filter(|w| w[0] != FUSED_LOAD)
+            .map(|w| w[7])
+            .collect()
+    }
+
+    #[test]
+    fn a_chain_whose_intermediates_are_dropped_stores_only_its_result() {
+        let x = storage();
+        let mut group = FusionGroup::new(4);
+        let mut y = Arc::clone(&x);
+        for _ in 0..100 {
+            let next = storage();
+            assert!(group.join(&step(&[&y], &next)));
+            y = next;
+        }
+        let (slots, program) = group.finish().expect("y holds a result");
+        assert_eq!(slots.len(), 2);
+        assert!(Arc::ptr_eq(&slots[0], &x) && Arc::ptr_eq(&slots[1], &y));
+        assert_eq!(program.len(), 101 * 8, "one load and 100 steps");
+        let mut expected = vec![NO_STORE; 100];
+        expected[99] = 1;
+        assert_eq!(stores(&program), expected);
+    }
+
+    #[test]
+    fn held_results_take_slots_and_are_all_stored() {
+        let x = storage();
+        let mut group = FusionGroup::new(4);
+        let mut kept = vec![Arc::clone(&x)];
+        for _ in 0..FUSED_SLOTS {
+            let next = storage();
+            if !group.join(&step(&[kept.last().unwrap()], &next)) {
+                break;
+            }
+            kept.push(next);
+        }
+        assert_eq!(kept.len(), FUSED_SLOTS, "x and six held results");
+
+        // Dropping a held result frees its slot for one more step, and that
+        // result is not stored.
+        drop(kept.remove(3));
+        let next = storage();
+        assert!(group.join(&step(&[kept.last().unwrap()], &next)));
+        kept.push(next);
+
+        let (slots, program) = group.finish().expect("results are held");
+        assert_eq!(slots.len(), FUSED_SLOTS);
+        let stores = stores(&program);
+        assert_eq!(stores.len(), 7);
+        assert_eq!(stores[2], NO_STORE, "the dropped result");
+        let written: Vec<&Arc<Storage>> = stores
+            .iter()
+            .filter(|&&s| s != NO_STORE)
+            .map(|&s| &slots[s as usize])
+            .collect();
+        assert_eq!(written.len(), 6);
+        for (slot, held) in written.iter().zip(&kept[1..]) {
+            assert!(Arc::ptr_eq(slot, held));
+        }
+    }
+
+    #[test]
+    fn a_dropped_input_keeps_its_slot() {
+        let mut group = FusionGroup::new(4);
+        let mut y = storage();
+        let mut steps = 0;
+        for _ in 0..FUSED_SLOTS {
+            let w = storage();
+            let next = storage();
+            if !group.join(&step(&[&y, &w], &next)) {
+                break;
+            }
+            y = next;
+            steps += 1;
+        }
+        // Slots: the first y and four w, all dropped, and the last result.
+        assert_eq!(steps, 4);
+        let (slots, program) = group.finish().expect("y holds a result");
+        assert_eq!(slots.len(), 6);
+        assert_eq!(stores(&program), [NO_STORE, NO_STORE, NO_STORE, 5]);
+    }
+
+    #[test]
+    fn an_input_on_both_sides_is_loaded_once() {
+        let x = storage();
+        let out = storage();
+        let mut group = FusionGroup::new(4);
+        assert!(group.join(&step(&[&x, &x], &out)));
+        let (slots, program) = group.finish().expect("out is held");
+        assert_eq!(slots.len(), 2);
+        assert_eq!(program.len(), 2 * 8);
+        let (load, add) = program.split_at(8);
+        assert_eq!(load[0], FUSED_LOAD);
+        assert_eq!((add[2], add[3]), (load[4], load[4]));
+    }
+
+    #[test]
+    fn a_group_whose_results_are_all_dropped_records_nothing() {
+        let x = storage();
+        let mut group = FusionGroup::new(4);
+        assert!(group.join(&step(&[&x], &storage())));
+        assert!(group.finish().is_none());
+    }
+
+    #[test]
+    fn a_step_of_another_length_does_not_join() {
+        let x = storage();
+        let out = storage();
+        let mut group = FusionGroup::new(4);
+        let mut other = step(&[&x], &out);
+        other.n = 5;
+        assert!(!group.join(&other));
     }
 }

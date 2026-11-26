@@ -1,6 +1,7 @@
 # Design: fusing chains of element-wise ops (issue #19)
 
-Status: step 1 implemented, off by default (`FERROTENSOR_FUSION=1` turns it on).
+Status: step 1 and the skipping of dead intermediates implemented, off by
+default (`FERROTENSOR_FUSION=1` turns it on).
 The remaining steps are measured against the `tensor-api` benchmark and its
 checksums.
 
@@ -70,13 +71,26 @@ reads of intermediates (each value stays in a register for the next step).
 What it does not save: the writes of intermediates, which constraint 1
 requires while they are referenced.
 
-### Later step: skipping dead intermediates
+### Skipping dead intermediates
 
-When a group is closed, an intermediate whose buffer is referenced only by
-the queue itself (no tensor holds it any more, e.g. in `no_grad` code) does
-not need to be written. Checking the buffer handle's reference count at
-encode time lets the program skip that store and return the buffer to the
-pool. This is a separate PR, measured on its own.
+Implemented after step 1 (#218). An intermediate that no tensor holds any
+more, as in code without autograd, is neither written nor bound:
+
+- The `fused` kernel keeps each element's values in seven registers. An
+  instruction loads a group input into a register or applies a step to
+  registers, and a step's result goes to a bound buffer only when the host
+  marks it for a store.
+- At each new step and when the group closes, `GpuContext` checks the
+  reference count of each value's storage. A value that only the group
+  holds can never be read again: its register is freed, a result is never
+  stored, and its buffer goes back to the pool at once, so a later step of
+  the same group can reuse it.
+- Slots go to the inputs, which keep theirs after their tensors are dropped
+  because an earlier instruction loads them, and to the results a tensor
+  still holds. A dead result takes no slot, so the `tensor-api` 100-op chain
+  is one group that loads `x` and stores only its result. Step 1 ran it as
+  20 dispatches that wrote all 100 results.
+- A group whose results are all dropped records no dispatch.
 
 ## Bit-exactness
 
@@ -96,6 +110,12 @@ measurement on Metal and Vulkan:
 
 Default plan: implement A first. If its speed-up is close to B's, keep A
 and fusion on by default; otherwise ship B as opt-in.
+
+Since dead intermediates are skipped, values pass from step to step in
+registers, as in B. The steps are still picked at run time by op codes read
+from a storage buffer, so a compiler cannot contract two steps into one FMA,
+and the tests and checksums still find fused results bit-identical to
+unfused ones.
 
 ## Plan as steps
 

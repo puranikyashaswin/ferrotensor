@@ -228,11 +228,13 @@ fn binary(@builtin(global_invocation_id) gid: vec3<u32>,
 
 // --- Fused element-wise chains ---------------------------------------------
 // A chain of same-size unary and non-broadcasting binary ops in one dispatch
-// (FERROTENSOR_FUSION=1, see docs/design/op-fusion.md). Each step is 8 words:
-// [kind, op, src0, src1, dst, a bits, b bits, 0]; kind 0 applies a unary op
-// to src0, kind 1 a binary op to src0 and src1. Sources and destinations are
-// binding slots 0..6. Every step stores its result and later steps load it
-// back, as separate dispatches would.
+// (FERROTENSOR_FUSION=1, see docs/design/op-fusion.md). The program works on
+// seven registers per element. Each instruction is 8 words:
+// [kind, op, src0, src1, dst, a bits, b bits, store]. Kind 0 applies unary op
+// `op` to register src0, kind 1 binary op `op` to registers src0 and src1,
+// kind 2 loads binding slot src0. The result goes to register dst, and to
+// binding slot `store` when that is below 7: the host stores only the results
+// a tensor still holds.
 
 struct FusedParams {
     n: u32,
@@ -282,18 +284,28 @@ fn fused(@builtin(global_invocation_id) gid: vec3<u32>,
          @builtin(num_workgroups) nwg: vec3<u32>) {
     let i = flat_index(gid, nwg);
     if (i >= fused_p.n) { return; }
+    var regs: array<f32, 7>;
     for (var k = 0u; k < fused_p.steps; k = k + 1u) {
         let w = k * 8u;
-        let x = fused_load(fused_prog[w + 2u], i);
+        let kind = fused_prog[w];
         var r = 0.0;
-        if (fused_prog[w] == 0u) {
-            let a = bitcast<f32>(fused_prog[w + 5u]);
-            let b = bitcast<f32>(fused_prog[w + 6u]);
-            r = unary_apply(fused_prog[w + 1u], x, a, b);
+        if (kind == 2u) {
+            r = fused_load(fused_prog[w + 2u], i);
         } else {
-            r = binary_apply(fused_prog[w + 1u], x, fused_load(fused_prog[w + 3u], i));
+            let x = regs[fused_prog[w + 2u]];
+            if (kind == 0u) {
+                let a = bitcast<f32>(fused_prog[w + 5u]);
+                let b = bitcast<f32>(fused_prog[w + 6u]);
+                r = unary_apply(fused_prog[w + 1u], x, a, b);
+            } else {
+                r = binary_apply(fused_prog[w + 1u], x, regs[fused_prog[w + 3u]]);
+            }
         }
-        fused_store(fused_prog[w + 4u], i, r);
+        regs[fused_prog[w + 4u]] = r;
+        let store = fused_prog[w + 7u];
+        if (store < 7u) {
+            fused_store(store, i, r);
+        }
     }
 }
 
