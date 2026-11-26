@@ -15,6 +15,7 @@
 //! --- Testing Softmax ---
 //! Softmax Result: [0.2689414, 0.7310586]
 //! ```
+#![allow(clippy::expect_used)]
 
 use ferrotensor_backend::{ComputeEngine, UnifiedTensor, WgpuContext};
 
@@ -39,7 +40,7 @@ fn main() {
         let b = UnifiedTensor::new(&ctx, &[1.0, 0.0, 0.0, 1.0], &[2, 2]); // Identity
         let out = UnifiedTensor::empty(&ctx, &[2, 2]);
         engine.matmul(&ctx, &a, &b, &out);
-        let got = out.to_vec(&ctx).await;
+        let got = out.to_vec(&ctx).await.expect("GPU readback");
         println!("MatMul Result: {:?}", got);
         assert_close(&got, &[1.0, 2.0, 3.0, 4.0]);
 
@@ -50,7 +51,7 @@ fn main() {
         let rms_w = UnifiedTensor::new(&ctx, &[1.0, 1.0, 1.0, 1.0], &[4]);
         let rms_out = UnifiedTensor::empty(&ctx, &[4]);
         engine.rms_norm(&ctx, &rms_in, &rms_w, &rms_out);
-        let got = rms_out.to_vec(&ctx).await;
+        let got = rms_out.to_vec(&ctx).await.expect("GPU readback");
         println!("RMS Result: {:?}", got);
         assert_close(&got, &[0.36514813, 0.73029625, 1.0954444, 1.4605925]);
 
@@ -59,7 +60,7 @@ fn main() {
         let silu_in = UnifiedTensor::new(&ctx, &[1.0, -1.0], &[2]);
         let silu_out = UnifiedTensor::empty(&ctx, &[2]);
         engine.silu(&ctx, &silu_in, &silu_out);
-        let got = silu_out.to_vec(&ctx).await;
+        let got = silu_out.to_vec(&ctx).await.expect("GPU readback");
         println!("SiLU Result: {:?}", got);
         assert_close(&got, &[0.7310586, -0.26894143]);
 
@@ -68,7 +69,7 @@ fn main() {
         let sm_in = UnifiedTensor::new(&ctx, &[1.0, 2.0], &[2]);
         let sm_out = UnifiedTensor::empty(&ctx, &[2]);
         engine.softmax(&ctx, &sm_in, &sm_out);
-        let got = sm_out.to_vec(&ctx).await;
+        let got = sm_out.to_vec(&ctx).await.expect("GPU readback");
         println!("Softmax Result: {:?}", got);
         assert_close(&got, &[0.2689414, 0.7310586]);
     });

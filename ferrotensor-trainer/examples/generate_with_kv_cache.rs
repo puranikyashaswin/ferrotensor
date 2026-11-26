@@ -72,7 +72,7 @@ fn greedy(
     let mut rows = Vec::with_capacity(n);
     let mut logits = model.forward(&gpu.engine, &tokens, 0, cache.as_mut(), None);
     for i in 0..n {
-        let host = pollster::block_on(logits.data.to_vec(&gpu.ctx));
+        let host = pollster::block_on(logits.data.to_vec(&gpu.ctx)).expect("GPU readback");
         let last = host[host.len() - VOCAB..].to_vec();
         let next = argmax(&last);
         rows.push(last);

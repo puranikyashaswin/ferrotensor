@@ -31,7 +31,7 @@ Building the whole workspace needs a few GB of RAM; on small machines use
 | understand how a tensor op becomes a GPU kernel | [docs/architecture.md](docs/architecture.md) |
 | add a GPU op, with tests | [docs/writing-a-kernel.md](docs/writing-a-kernel.md) |
 | see what works today | [docs/use-cases.md](docs/use-cases.md) |
-| find something to work on | [docs/good-first-issues.md](docs/good-first-issues.md) |
+| find something to work on | [good first issues](https://github.com/puranikyashaswin/ferrotensor/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) |
 
 The crates: `ferrotensor` is the tensor API (tensor, autograd, `nn`, `optim`, `data`,
 `serialize`); `ferrotensor-backend`, `ferrotensor-autograd`, `ferrotensor-graph`, `ferrotensor-loader`,
@@ -115,7 +115,7 @@ something you ran.
 
 ## Good first issues
 
-[docs/good-first-issues.md](docs/good-first-issues.md) lists concrete, small
+[the issue tracker](https://github.com/puranikyashaswin/ferrotensor/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) lists concrete, small
 tasks with the files involved. Typical entry points:
 
 - add a missing element-wise op or loss (follow

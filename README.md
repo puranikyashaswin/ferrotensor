@@ -4,6 +4,7 @@
 
 <p align="center">
   <a href="https://github.com/puranikyashaswin/ferrotensor/actions/workflows/ci.yml"><img src="https://github.com/puranikyashaswin/ferrotensor/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://ferrotensor.dev"><img src="https://img.shields.io/badge/website-ferrotensor.dev-blue" alt="Website"></a>
   <a href="https://crates.io/crates/ferrotensor"><img src="https://img.shields.io/crates/v/ferrotensor.svg" alt="crates.io"></a>
   <a href="https://docs.rs/ferrotensor"><img src="https://img.shields.io/docsrs/ferrotensor" alt="docs.rs"></a>
   <img src="https://img.shields.io/badge/rust-1.88+-orange" alt="Rust 1.88+">
@@ -29,8 +30,7 @@ Arithmetic and trainable parameters are f32; the CLI stores frozen LoRA base
 weights as f16 by default to save memory (`--f32-weights` keeps them f32).
 
 - [The commands](#the-commands) · [Install](#install) · [Quickstart](#quickstart) · [Python](#python) · [Features](#feature-matrix) · [Architecture](#architecture) · [Compared with candle, burn and tch](#compared-with-candle-burn-and-tch) · [Roadmap](#roadmap)
-<!-- Switch the how-to guide link back to https://ferrotensor.dev/guide/ once the domain's DNS points at GitHub Pages. -->
-- Docs: [how-to guide](https://puranikyashaswin.github.io/ferrotensor/guide/) · [architecture](docs/architecture.md) · [writing a kernel](docs/writing-a-kernel.md) · [use cases](docs/use-cases.md) · [CLI reference](ferrotensor-cli/README.md) · [LoRA SFT walkthrough](docs/examples/lora-sft.md) · [adapters in PyTorch (PEFT)](docs/examples/peft-export.md) · [benchmarks](benchmarks/RESULTS.md) · [testing on your GPU](docs/testing-on-your-gpu.md) · [Mac benchmark harness](docs/benchmarks-mac.md) · [API docs](https://docs.rs/ferrotensor)
+- Docs: [how-to guide](https://ferrotensor.dev/guide/) · [architecture](docs/architecture.md) · [writing a kernel](docs/writing-a-kernel.md) · [use cases](docs/use-cases.md) · [CLI reference](ferrotensor-cli/README.md) · [LoRA SFT walkthrough](docs/examples/lora-sft.md) · [adapters in PyTorch (PEFT)](docs/examples/peft-export.md) · [benchmarks](benchmarks/RESULTS.md) · [testing on your GPU](docs/testing-on-your-gpu.md) · [Mac benchmark harness](docs/benchmarks-mac.md) · [API docs](https://docs.rs/ferrotensor)
 
 
 ## The commands
@@ -73,19 +73,19 @@ sequences per optimizer step.
   A10G). It runs on every pull request
   on software Vulkan. The model is tiny, so it does not catch effects that
   only appear at scale.
-- **Held-out loss against PyTorch + PEFT on CUDA.** Same GPU, same recipe,
-  one seed per run: the held-out loss before training is identical to four
-  decimals, and after 250 steps Ferrotensor is within 0.005 of PyTorch for
-  SmolLM2-135M and SmolLM2-1.7B. Ferrotensor is slower per step: 0.84× of
-  PyTorch's speed for 135M at batch 1, 0.32× at batch 8, and 0.37× for 1.7B,
-  and PyTorch used less GPU memory in every configuration. This comparison
-  was measured on a 0.6 development build with f32 base weights, before the
-  memory work below
+- **Speed and held-out loss against PyTorch + PEFT on CUDA.** On one NVIDIA
+  A10G with the same recipe (SmolLM2, LoRA rank 8, batch 1 × 8, 250 steps,
+  median of three repeats), the code in this release trains 1.87× as fast
+  as eager PyTorch + PEFT for SmolLM2-135M, 1.83× for 360M and 1.13× for
+  1.7B. Its held-out loss is within 0.004 of PyTorch's at all three sizes.
+  PyTorch with `torch.compile` and CUDA graphs is still faster: for 135M at
+  batch 1 × 8, Ferrotensor runs at 0.26× of its speed. No matched memory
+  comparison with PyTorch has been run since 0.6
   ([comparison](docs/examples/lora-sft.md#against-pytorch--peft-on-cuda-same-gpu)).
 - **Less GPU memory for LoRA.** Peak GPU memory (`nvidia-smi`, MiB) for 30
   optimizer steps with f16 base weights, batch 1 × 8-step accumulation
   unless noted, all measured in one session on one A10G: 0.6 is the
-  released v0.6.0, 0.7 is merged `main` (`af41068`); the time column
+  released v0.6.0, 0.7 is `main` at `af41068`, merged before the 0.7.0 release; the time column
   compares median seconds per step over the 30 steps:
 
   | Model | 0.6 | 0.7 default | 0.7 `--checkpoint-blocks` | Time per step with `--checkpoint-blocks` |
@@ -396,7 +396,7 @@ against them. Kernel-level numbers for Ferrotensor alone are in
 ## Contributing
 
 Contributions are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) covers setup,
-tests and the PR process; [docs/good-first-issues.md](docs/good-first-issues.md)
+tests and the PR process; [the issue tracker](https://github.com/puranikyashaswin/ferrotensor/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)
 lists concrete starting points; [docs/writing-a-kernel.md](docs/writing-a-kernel.md)
 walks through adding a GPU op.
 

@@ -6,7 +6,7 @@
 //! cargo test --release -p ferrotensor-graph --test lfm_conv -- --ignored
 //! ```
 
-#![allow(clippy::panic)]
+#![allow(clippy::panic, clippy::expect_used)]
 
 mod common;
 
@@ -47,7 +47,7 @@ fn conv_block_backward_reaches_conv_and_input_projection() {
         let grad = grad
             .as_ref()
             .unwrap_or_else(|| panic!("{name} received no gradient"));
-        let values = pollster::block_on(grad.to_vec(&gpu.ctx));
+        let values = pollster::block_on(grad.to_vec(&gpu.ctx)).expect("GPU readback");
         assert!(
             values.iter().any(|g| *g != 0.0),
             "{name} gradient is all zeros"

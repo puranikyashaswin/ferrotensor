@@ -11,6 +11,7 @@ use std::sync::Arc;
 pub mod classifier;
 pub mod dropout;
 pub mod flash_attention;
+pub mod fused;
 /// LFM2 (Liquid foundation model) blocks.
 pub mod lfm;
 pub mod model_builder;
@@ -19,6 +20,10 @@ pub use classifier::{mean_pool_matrix, ClassifierHead};
 pub use flash_attention::{
     AttentionMask, FlashAttention, FlashAttentionGrads, GroupedQueryAttention,
     KVCache as FlashKVCache, MultiQueryAttention, SlidingWindowAttention,
+};
+pub use fused::{
+    FuseChoice, FuseKind, FuseShape, FuseSwitch, FusedMode, FusedSlot, FUSE_GATEUP_ENV,
+    FUSE_QKV_ENV,
 };
 pub use lfm::Lfm2Model;
 
@@ -110,14 +115,18 @@ pub struct Linear {
 
 impl Linear {
     fn project_2d(&self, engine: &ComputeEngine, x: &Tensor) -> Tensor {
-        let mut out = Tensor::matmul(x, &self.weight, engine);
-
-        if let Some(lora) = &self.lora {
-            let temp = Tensor::matmul(x, &lora.a, engine);
-            let lora_out = Tensor::matmul(&temp, &lora.b, engine);
-            let scaled_lora = Tensor::scale(&lora_out, lora.alpha / lora.rank as f32, engine);
-            out = Tensor::add(&out, &scaled_lora, engine);
-        }
+        let mut out = match &self.lora {
+            Some(lora) => {
+                // The scale goes on (x @ A), which is [rows, rank]. A scale
+                // within an epsilon of 1 is taken as exactly 1.
+                let mut scale = lora.alpha / lora.rank as f32;
+                if (scale - 1.0).abs() <= f32::EPSILON {
+                    scale = 1.0;
+                }
+                Tensor::lora_matmul(x, &self.weight, (&lora.a, &lora.b), scale, engine)
+            }
+            None => Tensor::matmul(x, &self.weight, engine),
+        };
 
         if let Some(bias) = &self.bias {
             // The autograd ops have no broadcasting add: `ones[rows, 1] @
@@ -220,11 +229,16 @@ impl Embedding {
     /// Looks up `input_ids` and returns `[1, seq, hidden]`. The lookup runs
     /// on the CPU (the table is read back from the GPU) and records no op,
     /// so its output is a constant and `weight` gets no gradient from it.
+    #[expect(
+        clippy::expect_used,
+        reason = "a readback fails only on device loss, and the caller has no error path"
+    )]
     pub fn forward(&self, ctx: &WgpuContext, _engine: &ComputeEngine, input_ids: &[u32]) -> Tensor {
         let hidden_dim = self.weight.data.shape[1];
         let seq_len = input_ids.len();
         let mut out_data = Vec::with_capacity(seq_len * hidden_dim);
-        let w_data = pollster::block_on(self.weight.data.to_vec(ctx));
+        let w_data = pollster::block_on(self.weight.data.to_vec(ctx))
+            .expect("GPU device lost during readback");
         for &id in input_ids {
             let start = (id as usize) * hidden_dim;
             let end = start + hidden_dim;
@@ -310,6 +324,9 @@ pub struct Attention {
     pub q_norm: Option<RMSNorm>,
     /// The same for every key head (Qwen3 `k_norm`).
     pub k_norm: Option<RMSNorm>,
+    /// The fused q, k and v group of a training run, empty unless
+    /// [`Lfm2Model::enable_fused_projections`] gave the layer one.
+    pub fused: FusedSlot,
 }
 
 /// Applies `norm` to each `head_dim`-wide head vector of `x`
@@ -367,9 +384,20 @@ impl Attention {
         mask: Option<&UnifiedTensor>,
         dropout_seed: Option<u64>,
     ) -> Tensor {
-        let q = self.q_proj.forward(engine, x);
-        let k = self.k_proj.forward(engine, x);
-        let v = self.v_proj.forward(engine, x);
+        if cache.is_none() && mask.is_none() {
+            if let Some(group) = self.fused_for(x) {
+                return self.forward_fused(engine, &group, x, pos, dropout_seed);
+            }
+        }
+        // A layer whose weights moved into a fused group gets them back here.
+        let restored = self.unfused_qkv(&x.ctx);
+        let [q_proj, k_proj, v_proj] = match &restored {
+            Some([q, k, v]) => [q, k, v],
+            None => [&self.q_proj, &self.k_proj, &self.v_proj],
+        };
+        let q = q_proj.forward(engine, x);
+        let k = k_proj.forward(engine, x);
+        let v = v_proj.forward(engine, x);
 
         // Before RoPE, as in Hugging Face Qwen3; every path below (training,
         // batched, KV-cache decoding) starts from these q and k.
@@ -491,13 +519,25 @@ pub struct MLP {
     pub up_proj: Linear,
     /// Down projection back to the hidden size.
     pub down_proj: Linear,
+    /// The fused gate and up group of a training run, empty unless
+    /// [`Lfm2Model::enable_fused_projections`] gave the layer one.
+    pub fused: FusedSlot,
 }
 
 impl MLP {
     /// Applies the feed-forward to `[tokens, hidden]` or `[batch, seq, hidden]`.
     pub fn forward(&self, engine: &ComputeEngine, input: &Tensor) -> Tensor {
-        let up = self.up_proj.forward(engine, input);
-        let gate = self.gate_proj.forward(engine, input);
+        if let Some(group) = self.fused_for(input) {
+            let fused = Tensor::fused_gate_up_silu(input, &group, engine);
+            return self.down_proj.forward(engine, &fused);
+        }
+        let restored = self.unfused_gate_up(&input.ctx);
+        let [gate_proj, up_proj] = match &restored {
+            Some([gate, up]) => [gate, up],
+            None => [&self.gate_proj, &self.up_proj],
+        };
+        let up = up_proj.forward(engine, input);
+        let gate = gate_proj.forward(engine, input);
         // silu_gate_fused(a, b) = silu(a) * b; SwiGLU applies SiLU to the gate.
         let fused = Tensor::silu_gate_fused(&gate, &up, engine);
         self.down_proj.forward(engine, &fused)

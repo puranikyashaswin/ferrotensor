@@ -9,6 +9,7 @@
 //! buffer size: 16 bytes
 //! read back: [1.0, 2.0, 3.0, 4.0]
 //! ```
+#![allow(clippy::expect_used)]
 
 use ferrotensor_backend::{UnifiedTensor, WgpuContext};
 
@@ -23,7 +24,7 @@ fn main() {
         let tensor = UnifiedTensor::new(&ctx, &data, &shape);
         println!("buffer size: {} bytes", tensor.size_in_bytes());
 
-        let back = tensor.to_vec(&ctx).await;
+        let back = tensor.to_vec(&ctx).await.expect("GPU readback");
         println!("read back: {back:?}");
         assert_eq!(back, data);
     });

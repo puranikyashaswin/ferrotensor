@@ -62,14 +62,14 @@ is `null`. On an error stdout carries `{"error": "<message>"}` instead.
 |---|---|
 | `plan` | `adapter`, `backend`, `device_type`, `budget_mib`, `budget_source`, `model`, `parameters`, `chosen`, `estimated_peak_mib`, `margin`, `fits`, `train_command`, `notes`; without `--model` the per-model keys are in a `models` array |
 | `finetune` | `chosen` (`batch_size`, `seq_len`, `rank`, `precision`, `checkpoint_blocks`), `grad_accum`, `budget_mib`, `estimated_peak_mib`, `fits`, then every `train` key |
-| `train` | `steps`, `first_loss`, `final_loss`, `eval_loss_before`, `eval_loss_after` (null without `--eval-data`), `measured_peak_mib`, `seconds`, `out_dir`, `adapter` (null on ranks above 0, which save nothing), and with `--q4-weights` only, `q4_weights` (`modules`, `skip`, `group`, `tensors`: the 4-bit selection and how many tensors it stored at 4 bits) |
+| `train` | `steps`, `first_loss`, `final_loss`, `eval_loss_before`, `eval_loss_after` (null without `--eval-data`), `measured_peak_mib`, `seconds`, `out_dir`, `adapter` (null on ranks above 0, which save nothing), and with `--q4-weights` only, `q4_weights` (`modules`, `skip`, `group`, `tensors`: the 4-bit selection and how many tensors it stored at 4 bits), and with `FERROTENSOR_EXPERIMENTAL=1` on a GPU with f16 cooperative matrices only, `loss_scaler` (`scale`, `skipped_steps`, `f16_overflows`: the dynamic loss scale at the end, the optimizer steps it skipped on overflow, and the matmul workgroups that clamped an input past the f16 range), and with `FERROTENSOR_AUTOTUNE` on in that setting only, `autotune` (`mode`, `seconds` spent on trials, `shapes_tuned`, `shapes_cached`, `shapes_open`, `budget_exhausted`, `cache_file`) |
 | `eval` | `examples`, `tokens`, `loss`, `perplexity`, `seconds` |
 | `generate` | `text`, `prompt_tokens`, `new_tokens`, `tokens_per_second` (decode speed: one-token forward passes after the prompt per second, prompt time left out; null when none ran), `prefill_seconds` (time to run the prompt), `kv_cache`, and with `--profile` only, `profile` (`kernel_timing`, `prefill` and `decode`: see [GPU time by kernel](#gpu-time-by-kernel---profile)) |
 | `chat` | one object per reply, each on its own line: `reply`, `prompt_tokens` (the whole conversation), `cached_tokens` (prompt tokens taken from the KV cache of earlier turns, not run again), `new_tokens`, `tokens_per_second` and `prefill_seconds` (as for `generate`; with the kept cache the prefill runs only the uncached tokens) |
 | `merge` | `out_dir`, `merged` (tensors with the adapter added), `copied` (tensors copied byte for byte) |
 | `export-gguf` | `out_file`, `tensors` (tensors in the GGUF file), `merged` (tensors with the `--lora` adapter added; 0 without it) |
 | `pretrain` | every `train` key, then `parameters`, `vocab_size` (259 for the byte-level tokenizer, `--vocab-size` for BPE) and `tokenizer` (`"byte"` or `"bpe"`) |
-| `info` | `ferrotensor`, `os`, `arch`, `adapters` (one object per GPU, `selected` marks the one used, `kernel_timing` the mode `--profile` would time kernels in, or null), `checks` (null without `--check`), and `error` only on failure |
+| `info` | `ferrotensor`, `os`, `arch`, `adapters` (one object per GPU, `selected` marks the one used, `kernel_timing` the mode `--profile` would time kernels in, or null, `cooperative_matrix` the cooperative-matrix shapes it offers: `m`, `n`, `k`, `ab_type`, `cr_type`, `saturating_accumulation`; the device asks for them only with `FERROTENSOR_EXPERIMENTAL=1`), `checks` (null without `--check`), and `error` only on failure |
 | `q4-report` | `model`, `group`, `tensors` (one object per 2-D weight, by name: `name`, `shape` as stored, `relative_error`, `max_abs_error`, `groups`, `outlier_groups`, `outlier_fraction`) |
 
 `chat` is the one command that prints more than one object: it reads one
@@ -171,6 +171,13 @@ and single-pass peaks; 30-step runs that accumulate passes have not reached
 their peak, and it is up to 35% above those. Other GPUs, f32 and 4-bit weights
 and LFM2 models are not calibrated.
 
+`finetune` and `plan --data` estimate for the rows the data pads to, not for
+`--seq-len`: the 99th percentile of the tokenized lengths sets the margin
+check, and a batch of the longest sequences must fit the budget without the
+margin. On the A10G, SmolLM2-1.7B at batch 8 x 1 on a 2,000-example Alpaca
+split (longest sequence 214 tokens) peaked at 19,296 MiB, and the estimate for
+8 x 214 rows is 20,409 MiB, 5.8% above it.
+
 ## 4-bit weights (experimental)
 
 `--q4-weights` still fails its quality gate: the untouched base model has a
@@ -182,6 +189,46 @@ Use it only when nothing else fits. `--q4-modules KEYS`, `--q4-skip KEYS`
 `ferrotensor q4-report --model DIR --json` measures the 4-bit error of every
 weight matrix on the host, without a GPU. See
 [ferrotensor-cli/README.md](ferrotensor-cli/README.md#finding-where-the-4-bit-loss-comes-from).
+
+## Cooperative-matrix matmuls (experimental)
+
+With `FERROTENSOR_EXPERIMENTAL=1`, on a GPU whose adapter offers 16x16x16 f16
+cooperative matrices with f32 accumulation and 32-thread subgroups, matmuls
+against f16 base weights (at least 32 rows) round their f32 input to f16 and
+run on those matrices; LoRA's thin matmuls stay in f32. `train` then turns on
+dynamic loss scaling (start 65536, x2 after 2,000 good steps, x0.5 and a
+skipped step on overflow) and reports it as `loss_scaler`. Any other value of
+the variable, or another GPU, keeps the f32 path.
+
+The tile and K split of each of those matmuls come from static rules that were
+measured on one GPU. `FERROTENSOR_AUTOTUNE=1` times candidates instead, inside
+the training step: each product (layout, kernel variant, rows rounded up to a
+bucket, N and K) runs three timed trials per candidate as real work, read back
+from GPU timestamp queries, and then keeps the fastest unless the static pick
+is within 3%. The choices are saved to `autotune.txt` in the platform's cache
+directory (`FERROTENSOR_AUTOTUNE_CACHE` sets the path), keyed by adapter,
+driver and Ferrotensor version, and a later run starts from them; a file for
+another adapter or a corrupt file is ignored with a warning on stderr.
+`FERROTENSOR_AUTOTUNE=retune` ignores the file, and
+`FERROTENSOR_AUTOTUNE_BUDGET` (seconds, default 30) stops new products from
+starting trials once that much time went into them. A trial's K split sums its
+slices in a different order, so the first steps of a tuning run differ from an
+untuned run by rounding; with a cache they do not. Any other value, no
+timestamp queries or no cooperative matrices keep the static rules exactly.
+
+Under the same setting, `train` runs the q, k and v projections of an
+attention block, and the gate and up projections of a feed-forward, as one
+matmul each when every one is a bias-free frozen f16 weight with a LoRA
+adapter. `FERROTENSOR_FUSE_QKV` and `FERROTENSOR_FUSE_GATEUP` (`on`, `off` or
+`auto`, read once at start, default `auto`) choose per kind; `auto` fuses q, k
+and v always and gate and up only when their summed width is at most 8,192
+(SmolLM2-135M and 360M; on one A10G the gate and up group was 3% to 6% faster
+than the separate projections at 360M and 5% slower at 1.7B); `off` runs the
+unfused layers of before, bit for bit, and any other value is `auto` with a
+warning. A fused group keeps the only copy of its weights, so the model holds
+them once; the adapter file, `merge` and `export-gguf` still use the original
+tensors and layout, and a pass with a KV cache copies the weights back out of
+the group once.
 
 ## Working on the code
 
@@ -201,7 +248,16 @@ weight matrix on the host, without a GPU. See
 - In library code a lint is suppressed with `#[expect(lint, reason = "...")]`.
   Test and example files carry one `#![allow(...)]` at the top, or one
   `#[allow(...)]` on `mod tests`.
-- `unsafe` is denied, except the loader's two documented memory-map sites.
+- `unsafe` is denied, except the loader's two documented memory-map sites and
+  `enable_experimental_features` in `ferrotensor-backend/src/adapters.rs`, which
+  opts in to wgpu's experimental features only with `FERROTENSOR_EXPERIMENTAL=1`,
+  and `ShaderChecks::module` in `ferrotensor-backend/src/shader_checks.rs`, which
+  builds the crate's own WGSL kernels with `create_shader_module_trusted`
+  without naga's forced loop bounding, and without the other runtime checks
+  `FERROTENSOR_SHADER_CHECKS` leaves out (`default` keeps all of wgpu's). With
+  that variable unset, the cooperative-matrix kernel of products of 256 rows or
+  more is also built without bounds checks: each of its accesses has its own
+  guard (see `Coop::kernel`).
 - A comment says why the code does something. A doc comment is one summary sentence, plus
   `# Errors`, `# Panics` or `# Safety` when they apply.
 - No new dependency without the maintainer's approval. One concern per PR.

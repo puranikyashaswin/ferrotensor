@@ -5,10 +5,11 @@
 //!
 //! Every weight is a constant, so by symmetry all four output values must be
 //! equal and finite; the example exits with an error otherwise.
+#![allow(clippy::expect_used)]
 
 use ferrotensor_autograd::Tensor;
 use ferrotensor_backend::{ComputeEngine, UnifiedTensor, WgpuContext};
-use ferrotensor_graph::{Attention, Linear, LlamaBlock, RMSNorm, MLP};
+use ferrotensor_graph::{Attention, FusedSlot, Linear, LlamaBlock, RMSNorm, MLP};
 use std::sync::Arc;
 
 fn main() {
@@ -37,6 +38,7 @@ fn main() {
             gate_proj: Linear::new(w_gate),
             up_proj: Linear::new(w_up),
             down_proj: Linear::new(w_down),
+            fused: FusedSlot::default(),
         };
 
         let mk_lin = || Linear::new(mk_tensor(vec![0.1; dim * dim], &[dim, dim]));
@@ -55,6 +57,7 @@ fn main() {
                 rope_theta: 10000.0,
                 q_norm: None,
                 k_norm: None,
+                fused: FusedSlot::default(),
             },
             norm2: RMSNorm::new(w_norm.clone(), 1e-5),
             mlp,
@@ -66,7 +69,7 @@ fn main() {
         println!("Running Llama Block...");
         let out = block.forward(&engine, &input, 0, None, None);
 
-        let result = out.data.to_vec(&ctx).await;
+        let result = out.data.to_vec(&ctx).await.expect("GPU readback");
         println!("Block Output: {:?}", result);
 
         assert_eq!(result.len(), dim);

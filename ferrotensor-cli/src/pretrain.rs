@@ -233,6 +233,7 @@ fn train_args(args: &PretrainArgs, seq_len: usize) -> TrainArgs {
         sample_prompt: None,
         lite: false,
         checkpoint_blocks: args.checkpoint_blocks,
+        length_bucket: None,
         world_size: 1,
         rank: 0,
         sync_dir: None,

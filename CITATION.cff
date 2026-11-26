@@ -15,13 +15,12 @@ authors:
     family-names: Puranik
     email: puranikyashaswinsharma@gmail.com
 repository-code: "https://github.com/puranikyashaswin/ferrotensor"
-url: "https://github.com/puranikyashaswin/ferrotensor"
+url: "https://ferrotensor.dev"
 license:
   - MIT
   - Apache-2.0
-# version, date-released and doi are set by the 0.7.0 release step.
-version: 0.6.0
-date-released: 2026-11-12
+version: 0.7.2
+date-released: 2026-11-24
 keywords:
   - rust
   - webgpu

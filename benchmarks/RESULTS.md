@@ -429,7 +429,38 @@ Other measurements with shared passes, on the same machine:
   334.6 s → 327.9 s of training, the same held-out loss 1.0612. The tracked
   peak rose by 168 MiB on that run (13,893 → 14,061 MiB).
 
-## `pretrain`, byte-level tokenizer
+### Passes of up to 128 dispatches (20 November 2026)
+
+The cap of 8 above was set before the host time per dispatch fell. On one
+NVIDIA A10G (g5.xlarge) at `perf/fused-split` `582b813`, `train` without
+`--profile`, autotune cache warmed, `FERROTENSOR_PASS_DISPATCHES` set per run,
+batch 1 × 8-step accumulation, sequence length 256, median step after the
+first 10 steps of each run, mean of two runs. SmolLM2-135M:
+
+| Dispatches per pass | 8 | 16 | 32 | 64 | 128 |
+|---|---:|---:|---:|---:|---:|
+| Median step, 60 steps | 137.0 ms | 127.7 ms | 124.9 ms | 123.1 ms | 120.8 ms |
+
+The same setting on SmolLM2-1.7B at batch 1 × 8: 279.2, 276.3, 273.6, 272.5
+and 272.4 ms (60 steps, mean of two runs). The default is
+now 128, the pending-ops cap. Step time at 8 and at 128, six cases, 120 steps, mean of
+two runs with the builds interleaved:
+
+| Case | 8 | 128 |
+|---|---:|---:|
+| 135M, 1 × 8 | 143.6 ms | 124.6 ms |
+| 135M, 8 × 1 | 38.8 ms | 37.8 ms |
+| 360M, 1 × 8 | 163.7 ms | 143.6 ms |
+| 360M, 8 × 1 | 77.6 ms | 76.8 ms |
+| 1.7B, 1 × 8 | 275.5 ms | 268.6 ms |
+| 1.7B, 8 × 1 | 253.7 ms | 251.4 ms |
+
+The loss after 250 steps of 135M is the same to every printed digit
+(held-out loss 2.4249938 before and 1.6533391 after) with 8 dispatches
+per pass and with 128 on the build that also reuses bind groups, which changes
+no result.
+Kernel timestamps were off in these runs: `--profile` turns them on, and its
+timing is of a different mode than the one measured here.
 
 The corpus is a 1 MB English text file built from the Alpaca training
 examples.
