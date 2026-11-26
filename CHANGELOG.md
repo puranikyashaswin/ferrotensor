@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - `ferrotensor`: `F::nll_loss` runs on the device, as `cross_entropy` with class ids does. The new `nll_rows` kernel reads each row's target log-probability and `nll_grad` writes the gradient, so only the ids are uploaded: the `[rows, classes]` weight tensor that was built on the host is gone, and an id tensor is not read back. With `log_probs` on a GPU, an id tensor holding an id that is not below the number of classes now gives a NaN loss instead of a panic, as in `cross_entropy`. The mean is a sum divided by the count, so a loss can differ from the old one in its last bits.
+- `ferrotensor`: with `FERROTENSOR_FUSION=1`, a fused group passes values between its steps in registers and writes only the results a tensor still holds. An intermediate that no tensor holds any more, as in code without autograd, is not written, needs no binding and goes back to the buffer pool at the next step, so the tensor-api benchmark's 100-op chain runs as one dispatch where it ran as 20. On an NVIDIA H100 NVL that chain on `[64]` went from 0.241 ms to 0.107 ms with fusion on. Results are unchanged bit for bit. See `docs/design/op-fusion.md`.
 
 ### Fixed
 - `ferrotensor`: `F::nll_loss` returned NaN when a log-probability away from the target was `-inf` (a class of probability 0), because it multiplied that value by a zero weight. It now reads only the target's log-probability.

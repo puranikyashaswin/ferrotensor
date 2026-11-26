@@ -11,6 +11,7 @@ use rand::{Rng, SeedableRng};
 
 use std::sync::OnceLock;
 
+use crate::device::GroupSummary;
 use crate::{no_grad, Device, Tensor};
 
 /// Input generator for one argument of a case.
@@ -787,6 +788,135 @@ fn fused_chains_match_unfused_on_gpu() {
         let x = seeded(&[70_000], 7, d);
         x.mul_scalar(3.0).add_scalar(-1.0).tanh().mul(&x).to_vec()
     });
+
+    // Every intermediate held, so every one is stored.
+    assert_fusion_matches("held intermediates", &gpu, |d| {
+        let x = seeded(&[333], 10, d);
+        let mut kept = vec![x.clone()];
+        for i in 0..40 {
+            let last = &kept[kept.len() - 1];
+            let next = match i % 3 {
+                0 => last.tanh(),
+                1 => last.mul(&x),
+                _ => last.add_scalar(0.5),
+            };
+            kept.push(next);
+        }
+        kept.iter().flat_map(Tensor::to_vec).collect()
+    });
+
+    // Some intermediates held and some dropped, and inputs dropped while
+    // their group is still open.
+    assert_fusion_matches("held and dropped", &gpu, |d| {
+        let x = seeded(&[500], 11, d);
+        let mut kept = Vec::new();
+        let mut y = x.sigmoid();
+        for k in 0..30 {
+            let w = seeded(&[500], 20 + k, d);
+            y = y.mul(&w).add_scalar(0.1).tanh();
+            if k % 4 == 0 {
+                kept.push(y.clone());
+            }
+        }
+        kept.push(y);
+        kept.iter().flat_map(Tensor::to_vec).collect()
+    });
+}
+
+/// Without autograd a fused chain keeps its intermediates in registers: the
+/// benchmark's 100-op chain is one dispatch that loads `x` once and stores
+/// only its result. Every step used to store its result, six steps at most to
+/// a dispatch.
+#[test]
+fn fused_chain_stores_only_its_result_on_gpu() {
+    let Some(gpu) = test_gpu() else { return };
+    let ctx = gpu.gpu_ctx().expect("GPU device");
+    let chain = |x: &Tensor| {
+        let mut y = x.clone();
+        for i in 0..25 {
+            y = y
+                .mul_scalar(1.001)
+                .add_scalar(0.01 * i as f32)
+                .tanh()
+                .add(x);
+        }
+        y.to_vec()
+    };
+    let recorded = std::cell::Cell::new(None);
+    assert_fusion_matches("stores of the op chain", &gpu, |d| {
+        let x = seeded(&[64], 1, d);
+        ctx.last_fused();
+        let y = chain(&x);
+        recorded.set(ctx.last_fused());
+        y
+    });
+    if !ctx.engine.has("fused") {
+        return;
+    }
+    let one_store = Some(GroupSummary {
+        steps: 100,
+        loads: 1,
+        stores: 1,
+    });
+    assert_eq!(recorded.into_inner(), one_store);
+
+    // The same under `no_grad`, with `x` requiring a gradient.
+    let was = ctx.fusion();
+    ctx.set_fusion(true);
+    let x = seeded(&[64], 1, &gpu).requires_grad_();
+    ctx.last_fused();
+    no_grad(|| chain(&x));
+    let recorded = ctx.last_fused();
+    ctx.set_fusion(was);
+    assert_eq!(recorded, one_store);
+}
+
+/// A result no tensor holds goes back to the pool at the next step of its
+/// group, unwritten, and a later step of the same group reuses its buffer.
+#[test]
+fn fused_dead_result_returns_to_the_pool_on_gpu() {
+    let Some(gpu) = test_gpu() else { return };
+    let ctx = gpu.gpu_ctx().expect("GPU device");
+    if !ctx.engine.has("fused") {
+        eprintln!("skipping: this GPU cannot bind enough buffers for the fused kernel");
+        return;
+    }
+    let n = 12_347;
+    let bytes = (n * 4) as u64;
+    let run = |fused: bool| {
+        let was = ctx.fusion();
+        ctx.set_fusion(fused);
+        gpu.synchronize();
+        // Empty, so it has room for a and holds no other buffer of its size.
+        ctx.clear_pool();
+        ctx.last_fused();
+        let x = seeded(&[n], 13, &gpu);
+        let a = x.tanh();
+        let b = a.exp();
+        drop(a);
+        let c = b.mul_scalar(0.5);
+        let after_c = ctx.pooled(bytes);
+        let e = c.add(&b);
+        let after_e = ctx.pooled(bytes);
+        let values = [b.to_vec(), c.to_vec(), e.to_vec()].concat();
+        ctx.set_fusion(was);
+        (after_c, after_e, ctx.last_fused(), values)
+    };
+    let (after_c, after_e, recorded, fused) = run(true);
+    assert_eq!(
+        (after_c, after_e),
+        (1, 0),
+        "a's buffer is in the pool after c and taken by e"
+    );
+    let stores_b_c_e = GroupSummary {
+        steps: 4,
+        loads: 1,
+        stores: 3,
+    };
+    assert_eq!(recorded, Some(stores_b_c_e));
+    let (_, _, _, unfused) = run(false);
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(bits(&fused), bits(&unfused));
 }
 
 #[test]
