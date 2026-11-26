@@ -161,10 +161,14 @@ Things to know when writing an op:
 
 - Do not call `queue.submit` or read a buffer yourself: go through
   `ctx.dispatch` / `ctx.copy`, or the ordering guarantee is lost.
-- An op that reads values back to the host in the middle of its work (for
-  example `cross_entropy` with class-index targets, `argmax`/`argmin`, `cat`,
-  and the backward passes of `index_select` and `Embedding`) forces a sync and
-  splits the batch. Prefer a kernel that stays on the device.
+- An op that reads values back to the host in the middle of its work forces a
+  sync and splits the batch. Prefer a kernel that stays on the device, as
+  `cross_entropy` and `nll_loss` with class ids, `argmax_dim`, `cat` and the
+  backward passes of `index_select` and `Embedding` do. What still reads back:
+  the functions that return a host value (`item`, `to_vec`, `argmax` and
+  `argmin`, which read back only the index, `F::accuracy`, and
+  `clip_grad_norm`, which reads the total norm once), and `F::one_hot` with an
+  id tensor, which reads the ids.
 - Each dispatch in a pass still costs the GPU roughly 9-13 µs on an M2, so a
   chain of 100 tiny element-wise ops is about 18x slower than on the CPU even
   though it is 13x faster than before batching. Op fusion, opt-in with
