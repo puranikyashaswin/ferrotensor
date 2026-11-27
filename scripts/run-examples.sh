@@ -11,7 +11,7 @@
 # --gpu on the software Vulkan job. The examples check their own results with
 # assert!, so a wrong result fails here too.
 #
-# The Python example (ferrotensor-py/examples/mlp.py) runs in
+# The Python examples (ferrotensor-py/examples/*.py) run in
 # .github/workflows/python.yml, against the built wheel.
 set -euo pipefail
 
