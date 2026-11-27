@@ -17,12 +17,13 @@ categories = ["science", "algorithms"]
 ferrotensor-backend = { path = "../ferrotensor-backend", version = "0.7.3" }
 ferrotensor-autograd = { path = "../ferrotensor-autograd", version = "0.7.3" }
 ferrotensor-loader = { path = "../ferrotensor-loader", version = "0.7.3" }
-env_logger = "0.11"
 pollster = "0.3"
 log = "0.4"
 bytemuck = "1.14"
 
 [dev-dependencies]
+# The examples log through env_logger; the library only uses `log`.
+env_logger = "0.11"
 safetensors = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
