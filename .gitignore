@@ -54,9 +54,6 @@ venv/
 # Documentation build
 /docs/book/
 
-# Website build output
-/site/dist/
-
 # Hardware reports from scripts/hardware-report.sh
 /reports/
 
