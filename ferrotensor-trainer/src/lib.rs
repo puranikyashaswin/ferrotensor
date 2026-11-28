@@ -393,7 +393,7 @@ impl Trainer {
                 dropout_seed,
                 head.as_ref(),
                 padded_len,
-            )
+            )?
         };
         let labels = match &head {
             Some(head) => Labels::Gathered(head),
@@ -431,18 +431,26 @@ impl Trainer {
     /// The forward pass up to the loss: the logits, or, when the head runs
     /// over row chunks, the hidden states that `lm_head` projects. `head`
     /// picks the rows as in [`forward_head_rows`](Lfm2Model::forward_head_rows);
-    /// `positions` is the number of rows without it.
+    /// `positions` is the number of rows without it. The blocks run once:
+    /// whether the head is chunked is decided before they do.
+    ///
+    /// # Errors
+    /// If the model cannot give its hidden states for a chunked head, which
+    /// [`Lfm2Model::supports_head_input`] rules out before the blocks run.
     fn forward_to_head(
         &self,
         tokens: Tokens<'_>,
         dropout_seed: Option<u64>,
         head: Option<&HeadRows>,
         positions: usize,
-    ) -> HeadOut {
+    ) -> Result<HeadOut, TrainError> {
         let rows = head.map_or(positions, |h| h.positions.len());
         let vocab = self.model.lm_head.weight.data.shape.last().copied();
         let head_rows = head.map(|h| h.positions.as_slice());
-        if let Some(chunk_rows) = vocab.and_then(|v| self.head_chunk(rows, v)) {
+        let chunk_rows = vocab
+            .filter(|_| self.model.supports_head_input())
+            .and_then(|v| self.head_chunk(rows, v));
+        if let Some(chunk_rows) = chunk_rows {
             let hidden = match tokens {
                 Tokens::One(ids) => {
                     self.model
@@ -455,9 +463,10 @@ impl Trainer {
                     head_rows,
                 ),
             };
-            if let Some(hidden) = hidden {
-                return HeadOut::Hidden { hidden, chunk_rows };
-            }
+            let hidden = hidden.ok_or_else(|| {
+                TrainError("the model gave no hidden states for the chunked head".into())
+            })?;
+            return Ok(HeadOut::Hidden { hidden, chunk_rows });
         }
         let logits = match (tokens, head_rows) {
             (Tokens::One(ids), Some(rows)) => {
@@ -477,7 +486,7 @@ impl Trainer {
                     .forward_batch_with_dropout(&self.engine, batch, dropout_seed)
             }
         };
-        HeadOut::Logits(logits)
+        Ok(HeadOut::Logits(logits))
     }
 
     /// The loss of a forward pass over `sequences` sequences of `logits`,
@@ -826,7 +835,7 @@ impl Trainer {
                 dropout_seed,
                 head.as_ref(),
                 padded_len * chunk.len(),
-            )
+            )?
         };
         let labels = match &head {
             Some(head) => Labels::Gathered(head),

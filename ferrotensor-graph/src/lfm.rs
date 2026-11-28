@@ -660,6 +660,20 @@ impl Lfm2Model {
         Tensor::gather_rows(&logits, head_rows, engine).unwrap_or(logits)
     }
 
+    /// Whether [`forward_head_input`](Self::forward_head_input) can give the
+    /// hidden states of a non-empty pass: they are always `f32` (an `f16`
+    /// table or weight is only a storage format, see
+    /// [`DType`](ferrotensor_backend::DType)), so this is true unless the
+    /// model has no hidden size. A caller that picks the chunked head asks
+    /// this before it runs the blocks, so the blocks run once.
+    pub fn supports_head_input(&self) -> bool {
+        self.embed_tokens
+            .data
+            .shape
+            .last()
+            .is_some_and(|&hidden| hidden > 0)
+    }
+
     /// What `lm_head` projects in [`forward_with_dropout`](Self::forward_with_dropout)
     /// (or in [`forward_head_rows`](Self::forward_head_rows) with `Some`
     /// `head_rows`): the final-normed hidden states `[rows, hidden]`, before
@@ -667,7 +681,8 @@ impl Lfm2Model {
     /// projects them itself and never forms all the logits at once.
     ///
     /// `None` when the rows cannot be gathered: an empty `head_rows`, or
-    /// hidden states that are not `f32`.
+    /// hidden states that are not `f32` (see
+    /// [`supports_head_input`](Self::supports_head_input)).
     pub fn forward_head_input(
         &self,
         engine: &ComputeEngine,
