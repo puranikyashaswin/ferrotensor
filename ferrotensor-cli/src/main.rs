@@ -238,9 +238,9 @@ struct ModelArgs {
     /// Store the frozen weights of the decoder blocks at 4 bits (affine,
     /// groups of 64, about 4.5 bits per weight; computation stays f32).
     /// This changes the model's outputs: it computes with the decoded
-    /// weights. lm_head stays f16; embeddings, norms and LoRA adapters stay
-    /// f32. Not allowed when base weights train. Use the same setting to
-    /// evaluate or generate with an adapter trained this way. Experimental:
+    /// weights. lm_head and the frozen embedding table stay f16; norms and
+    /// LoRA adapters stay f32. Not allowed when base weights train. Use the
+    /// same setting to evaluate or generate with an adapter trained this way. Experimental:
     /// held-out loss is worse than with f16; --q4-modules, --q4-skip and
     /// --q4-group exist to find out why.
     #[arg(long, conflicts_with = "f32_weights")]

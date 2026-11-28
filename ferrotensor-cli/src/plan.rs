@@ -118,6 +118,12 @@ impl Precision {
         }
     }
 
+    /// The frozen embedding table is stored at the same type as `lm_head`,
+    /// since a LoRA run looks it up from a host copy only.
+    fn embedding_bytes_per_weight(self) -> f64 {
+        self.lm_head_bytes_per_weight()
+    }
+
     fn train_flag(self) -> &'static str {
         match self {
             Self::F16 => "",
@@ -242,8 +248,8 @@ pub struct TrainConfig {
 /// Estimated GPU memory of a training run, by part, in MiB.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Estimate {
-    /// Frozen base weights (embedding in f32, lm_head and decoder blocks at
-    /// the chosen precision).
+    /// Frozen base weights (embedding and lm_head at the chosen precision,
+    /// f32 only with `--f32-weights`; decoder blocks at the chosen precision).
     pub weights_mib: u64,
     /// LoRA adapters, their gradients and AdamW moments.
     pub adapters_mib: u64,
@@ -263,18 +269,29 @@ fn ceil_mib(bytes: f64) -> u64 {
 
 /// Estimated peak GPU memory of LoRA training `shape` with `config`.
 pub fn estimate_peak_mib(shape: &ModelShape, config: &TrainConfig) -> Estimate {
+    estimate_with_embedding(shape, config, config.precision.embedding_bytes_per_weight())
+}
+
+/// [`estimate_peak_mib`] with the frozen embedding table at
+/// `embedding_bytes` per weight.
+fn estimate_with_embedding(
+    shape: &ModelShape,
+    config: &TrainConfig,
+    embedding_bytes: f64,
+) -> Estimate {
     let h = shape.hidden as f64;
     let vocab = shape.vocab as f64;
     let layers = shape.n_layers as f64;
     let tokens = (config.batch_size * config.padded_len) as f64;
     let precision = config.precision;
 
-    // The embedding stays f32 and lm_head gets its own copy at the chosen
-    // precision even when the checkpoint ties them; this gives the 3,648 MiB
-    // of base weights `--memory-report` shows for SmolLM2-1.7B. Norms are
-    // under 1 MiB and left out.
+    // The embedding is stored at the lm_head precision and lm_head gets its
+    // own copy even when the checkpoint ties them. Norms are under 1 MiB and
+    // left out. The frozen table was f32 before it was stored at the weight
+    // type, which gave the 3,648 MiB of base weights `--memory-report` showed
+    // for SmolLM2-1.7B; the f16 table takes 192 MiB less.
     let weights = shape.decoder_weights() as f64 * precision.decoder_bytes_per_weight()
-        + vocab * h * (4.0 + precision.lm_head_bytes_per_weight());
+        + vocab * h * (embedding_bytes + precision.lm_head_bytes_per_weight());
 
     let q_width = (shape.n_heads * shape.head_dim) as f64;
     let kv_width = (shape.n_kv_heads * shape.head_dim) as f64;
@@ -1083,7 +1100,8 @@ mod tests {
     /// step) is estimated at most 5% low, and every steady peak at most
     /// 12% high. The two 64-sequence rows are data only: 135M at batch
     /// 8 x 8 measured 9,441 MiB on af41068, against 6,331 MiB at batch
-    /// 8 x 1 on ca9630a.
+    /// 8 x 1 on ca9630a. Every measured run kept a frozen f32 embedding
+    /// table on the GPU, so it is estimated with the f32 term.
     #[test]
     fn estimate_error_on_every_measured_peak() {
         let (mut lowest, mut highest_steady, mut highest) = (0.0_f64, 0.0_f64, 0.0_f64);
@@ -1100,7 +1118,7 @@ mod tests {
                 precision: Precision::F16,
                 checkpointing,
             };
-            let estimate = estimate_peak_mib(&shape(name), &config).peak_mib;
+            let estimate = estimate_with_embedding(&shape(name), &config, 4.0).peak_mib;
             let (Steady(measured) | AtLeast(measured)) = peak;
             let error = (estimate as f64 - measured as f64) / measured as f64;
             let context = format!(
@@ -1143,7 +1161,39 @@ mod tests {
                 estimate.overhead_mib,
                 estimate.peak_mib
             ),
-            (870, 25, 4019, 384, 1600, 6898)
+            (780, 25, 4019, 384, 1600, 6808)
+        );
+    }
+
+    #[test]
+    fn the_frozen_embedding_is_stored_at_the_weight_type() {
+        // SmolLM2-360M: 49,152 x 960 weights. The embedding took 4 bytes
+        // before (180 MiB) and takes 2 bytes at f16 and 4-bit (90 MiB); with
+        // f32 weights it is still 4 bytes.
+        let shape = smollm2("SmolLM2-360M");
+        let table_weights = 49_152.0 * 960.0;
+        let mut c = config(1, Checkpointing::Off);
+        for (precision, decoder_bytes, table_bytes) in [
+            (Precision::F16, 2.0, 2.0),
+            (Precision::Q4, 4.5 / 8.0, 2.0),
+            (Precision::F32, 4.0, 4.0),
+        ] {
+            c.precision = precision;
+            // lm_head is a second table at the same type.
+            let by_hand = (shape.decoder_weights() as f64 * decoder_bytes
+                + 2.0 * table_weights * table_bytes)
+                / MIB;
+            assert_eq!(
+                estimate_peak_mib(&shape, &c).weights_mib,
+                by_hand.ceil() as u64,
+                "{precision:?}"
+            );
+        }
+        c.precision = Precision::F16;
+        assert_eq!(
+            estimate_with_embedding(&shape, &c, 4.0).weights_mib
+                - estimate_peak_mib(&shape, &c).weights_mib,
+            90
         );
     }
 
@@ -1159,10 +1209,12 @@ mod tests {
 
     #[test]
     fn base_weights_match_the_memory_report_for_smollm2_1_7b() {
-        // `train --memory-report` shows 3,648 MiB of frozen base weights and
-        // under 50 MiB for adapters, gradients and AdamW state.
+        // `train --memory-report` showed 3,648 MiB of frozen base weights
+        // and under 50 MiB for adapters, gradients and AdamW state, with an
+        // f32 embedding table. The f16 table is 49,152 x 2,048 x 2 bytes =
+        // 192 MiB smaller.
         let estimate = estimate_peak_mib(&smollm2("SmolLM2-1.7B"), &config(1, Checkpointing::Off));
-        assert_eq!(estimate.weights_mib, 3648);
+        assert_eq!(estimate.weights_mib, 3648 - 192);
         assert_eq!(estimate.adapters_mib, 48);
     }
 
@@ -1173,7 +1225,7 @@ mod tests {
         c.precision = Precision::F32;
         assert_eq!(estimate_peak_mib(&shape, &c).weights_mib, 6912);
         c.precision = Precision::Q4;
-        assert_eq!(estimate_peak_mib(&shape, &c).weights_mib, 1440);
+        assert_eq!(estimate_peak_mib(&shape, &c).weights_mib, 1440 - 192);
         assert_eq!(estimate_peak_mib(&shape, &c).activations_mib, 2597);
     }
 
@@ -1186,7 +1238,7 @@ mod tests {
 
     #[test]
     fn chooser_prefers_the_longer_sequence_then_no_checkpointing_then_batch() {
-        // Batch 8 at seq 128 (4,248 MiB) also fits, but seq 256 wins.
+        // Batch 8 at seq 128 (4,194 MiB) also fits, but seq 256 wins.
         let p = choose(
             &smollm2("SmolLM2-135M"),
             6000,
@@ -1202,18 +1254,18 @@ mod tests {
                 p.estimate.peak_mib,
                 p.fits
             ),
-            (Checkpointing::Off, 4, 256, 4625, true)
+            (Checkpointing::Off, 4, 256, 4571, true)
         );
         assert_eq!(short_seq_note("m", p.config.seq_len), None);
     }
 
     #[test]
     fn chooser_drops_to_seq_128_only_when_256_fails_with_checkpointing() {
-        // Seq 256 needs 5,554 MiB even with checkpointing at batch 1; 6,450
-        // MiB leaves 5,482 usable.
+        // Seq 256 needs 5,362 MiB even with checkpointing at batch 1; 6,200
+        // MiB leaves 5,270 usable.
         let p = choose(
             &smollm2("SmolLM2-1.7B"),
-            6450,
+            6200,
             Precision::F16,
             8,
             Pinned::default(),
@@ -1226,7 +1278,7 @@ mod tests {
                 p.estimate.peak_mib,
                 p.fits
             ),
-            (Checkpointing::Blocks, 1, 128, 5425, true)
+            (Checkpointing::Blocks, 1, 128, 5233, true)
         );
         assert_eq!(
             short_seq_note("SmolLM2-1.7B", p.config.seq_len).as_deref(),
@@ -1269,7 +1321,7 @@ mod tests {
             batch_size: NonZeroUsize::new(8),
             ..Pinned::default()
         };
-        // 8 x 160 rows: 16,596 MiB, under the 19,573 MiB an A10G's 23,028
+        // 8 x 160 rows: 16,404 MiB, under the 19,573 MiB an A10G's 23,028
         // MiB leaves after the margin.
         let with_data = choose_for(&shape, 23028, Precision::F16, 8, batch_8, Some(&lengths));
         assert_eq!(
@@ -1281,23 +1333,23 @@ mod tests {
                 with_data.estimate.peak_mib,
                 with_data.fits
             ),
-            (Checkpointing::Off, 8, 256, 160, 16596, true)
+            (Checkpointing::Off, 8, 256, 160, 16404, true)
         );
-        // A batch of the longest sequences, 8 x 224 rows, is 21,115 MiB and
+        // A batch of the longest sequences, 8 x 224 rows, is 20,923 MiB and
         // fits the 23,028 MiB budget itself.
-        assert_eq!(with_data.longest_peak_mib, 21115);
-        // On a 21,000 MiB budget 16,596 MiB is under the margin (17,850 MiB),
+        assert_eq!(with_data.longest_peak_mib, 20923);
+        // On a 20,500 MiB budget 16,404 MiB is under the margin (17,425 MiB),
         // but the longest batch does not fit, so the planner checkpoints.
-        let tight = choose_for(&shape, 21000, Precision::F16, 8, batch_8, Some(&lengths));
+        let tight = choose_for(&shape, 20500, Precision::F16, 8, batch_8, Some(&lengths));
         assert_eq!(
             (
                 tight.config.checkpointing,
-                tight.longest_peak_mib < 21000,
+                tight.longest_peak_mib < 20500,
                 tight.fits
             ),
             (Checkpointing::Blocks, true, true)
         );
-        // 8 x 256 rows (23,375 MiB) do not fit, so without the data the
+        // 8 x 256 rows (23,183 MiB) do not fit, so without the data the
         // planner checkpoints.
         let blind = choose(&shape, 23028, Precision::F16, 8, batch_8);
         assert_eq!(
@@ -1306,7 +1358,7 @@ mod tests {
                 blind.config.padded_len,
                 blind.estimate.peak_mib
             ),
-            (Checkpointing::Blocks, 256, 7139)
+            (Checkpointing::Blocks, 256, 6947)
         );
         // Unpinned, the data lets batch 8 win over batch 4 x 2.
         let unpinned = choose_for(
@@ -1362,7 +1414,7 @@ mod tests {
                 p.estimate.peak_mib,
                 p.fits
             ),
-            (Checkpointing::Blocks, 1, 256, 2656, true)
+            (Checkpointing::Blocks, 1, 256, 2566, true)
         );
     }
 
@@ -1377,7 +1429,7 @@ mod tests {
                 p.config.seq_len,
                 p.estimate.peak_mib
             ),
-            (Checkpointing::Blocks, 4, 256, 6325)
+            (Checkpointing::Blocks, 4, 256, 6133)
         );
         let seq = Pinned {
             seq_len: NonZeroUsize::new(128),
@@ -1391,7 +1443,7 @@ mod tests {
                 p.config.seq_len,
                 p.estimate.peak_mib
             ),
-            (Checkpointing::Off, 1, 128, 6643)
+            (Checkpointing::Off, 1, 128, 6451)
         );
     }
 
@@ -1407,15 +1459,15 @@ mod tests {
                 p.fits,
             )
         };
-        // Unpinned this is batch 8 at 6,516 MiB. Batch 2 by hand: weights
-        // 365 + adapters 15 + activations 1,131 + logits 192 + overhead 1,600.
+        // Unpinned this is batch 8 at 6,462 MiB. Batch 2 by hand: weights
+        // 311 + adapters 15 + activations 1,131 + logits 192 + overhead 1,600.
         let batch_2 = Pinned {
             batch_size: NonZeroUsize::new(2),
             ..Pinned::default()
         };
         assert_eq!(
             summary(choose(&shape, 8000, Precision::F16, 8, batch_2)),
-            (Checkpointing::Off, 2, 256, 3303, true)
+            (Checkpointing::Off, 2, 256, 3249, true)
         );
         let blocks = Pinned {
             checkpointing: Some(Checkpointing::Blocks),
@@ -1423,7 +1475,7 @@ mod tests {
         };
         assert_eq!(
             summary(choose(&shape, 8000, Precision::F16, 8, blocks)),
-            (Checkpointing::Blocks, 8, 256, 2998, true)
+            (Checkpointing::Blocks, 8, 256, 2944, true)
         );
         // Nothing fits 500 MiB: the smallest plan keeps the pinned batch.
         // Activations 75 and logits 192 at 512 tokens of seq 128.
@@ -1433,7 +1485,7 @@ mod tests {
         };
         assert_eq!(
             summary(choose(&shape, 500, Precision::F16, 8, batch_4)),
-            (Checkpointing::Blocks, 4, 128, 2247, false)
+            (Checkpointing::Blocks, 4, 128, 2193, false)
         );
     }
 
@@ -1454,9 +1506,9 @@ mod tests {
                 p.estimate.peak_mib,
                 p.fits
             ),
-            (Checkpointing::Blocks, 1, 128, 2047, false)
+            (Checkpointing::Blocks, 1, 128, 1993, false)
         );
-        // 1.7B on 6,000 MiB: f16 needs 5,425 MiB plus the margin; 4-bit fits.
+        // 1.7B on 6,000 MiB: f16 needs 5,233 MiB plus the margin; 4-bit fits.
         let shape = smollm2("SmolLM2-1.7B");
         assert!(!choose(&shape, 6000, Precision::F16, 8, Pinned::default()).fits);
         let q4 = choose(&shape, 6000, Precision::Q4, 8, Pinned::default());
@@ -1468,7 +1520,7 @@ mod tests {
                 q4.estimate.peak_mib,
                 q4.fits
             ),
-            (Checkpointing::Blocks, 8, 256, 4931, true)
+            (Checkpointing::Blocks, 8, 256, 4739, true)
         );
     }
 

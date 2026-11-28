@@ -1,6 +1,6 @@
 use crate::model_builder::Architecture;
 use crate::{Attention, FuseChoice, FusedMode, KVCacheLayer, Linear, RMSNorm, Tensor, MLP};
-use ferrotensor_backend::{ComputeEngine, MemoryCategory, UnifiedTensor};
+use ferrotensor_backend::{ComputeEngine, DType, MemoryCategory, UnifiedTensor};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -359,12 +359,34 @@ impl Lfm2Model {
     /// gathers its rows on the GPU, so it sees each optimizer step; the host
     /// copy is dropped. A tied `lm_head` is a separate copy and does
     /// not follow the table.
+    ///
+    /// A frozen table the builder stored as f16 is uploaded again as f32
+    /// from the host copy, so `embed_tokens.data` is a new buffer: take the
+    /// parameters to train after this call, not before.
     pub fn with_trainable_embedding(mut self, on: bool) -> Self {
+        if on {
+            self.widen_embedding_table();
+        }
         self.embed_tokens.requires_grad = on;
         if on {
             self.clear_host_embeddings();
         }
         self
+    }
+
+    /// Replaces an f16 `embed_tokens` by an f32 upload of the same values,
+    /// the type the gather kernel and the optimizer need.
+    fn widen_embedding_table(&mut self) {
+        if self.embed_tokens.data.dtype != DType::FP16 {
+            return;
+        }
+        let ctx = self.embed_tokens.ctx.clone();
+        let values = match self.embed_host.borrow().as_ref() {
+            Some(host) => host.clone(),
+            None => self.read_table(&ctx),
+        };
+        let shape = self.embed_tokens.data.shape.clone();
+        self.embed_tokens.data = Arc::new(UnifiedTensor::new(&ctx, &values, &shape));
     }
 
     /// Let only the base weights whose [`named_params`](Self::named_params)
@@ -748,10 +770,6 @@ impl Lfm2Model {
     }
 
     /// Embeddings `[rows, seq, hidden]` for equally long rows of ids.
-    #[expect(
-        clippy::expect_used,
-        reason = "a readback fails only on device loss, and the caller has no error path"
-    )]
     fn lookup_embeddings(
         &self,
         engine: &ComputeEngine,
@@ -766,11 +784,33 @@ impl Lfm2Model {
             return Tensor::embedding_gpu(&self.embed_tokens, rows, engine);
         }
         let mut cached = self.embed_host.borrow_mut();
-        let table = cached.get_or_insert_with(|| {
-            pollster::block_on(self.embed_tokens.data.to_vec(ctx))
-                .expect("GPU device lost during readback")
-        });
+        let table = cached.get_or_insert_with(|| self.read_table(ctx));
         Tensor::embedding(&self.embed_tokens, table, rows)
+    }
+
+    /// The values of `embed_tokens` as f32, read back from the GPU. An f16
+    /// table is widened here, since `UnifiedTensor::to_vec` would read its
+    /// words as f32.
+    #[expect(
+        clippy::expect_used,
+        reason = "a readback fails only on device loss, and the callers have no error path"
+    )]
+    fn read_table(&self, ctx: &Arc<ferrotensor_backend::WgpuContext>) -> Vec<f32> {
+        let words = pollster::block_on(self.embed_tokens.data.to_vec(ctx))
+            .expect("GPU device lost during readback");
+        if self.embed_tokens.data.dtype != DType::FP16 {
+            return words;
+        }
+        let len = self.embed_tokens.data.shape.iter().product::<usize>();
+        let bytes: Vec<u8> = words
+            .iter()
+            .flat_map(|word| word.to_bits().to_le_bytes())
+            .collect();
+        bytes
+            .chunks_exact(2)
+            .take(len)
+            .map(|pair| f16_bits_to_f32(u16::from_le_bytes([pair[0], pair[1]])))
+            .collect()
     }
 
     /// Use `table`, the values uploaded as `embed_tokens`, as the host copy
@@ -925,9 +965,43 @@ impl Lfm2Model {
     }
 }
 
+/// The f32 value of the IEEE half-precision number `bits`.
+fn f16_bits_to_f32(bits: u16) -> f32 {
+    let sign = if bits & 0x8000 == 0 { 1.0 } else { -1.0 };
+    let exponent = i32::from((bits >> 10) & 0x1f);
+    let fraction = f32::from(bits & 0x3ff);
+    match exponent {
+        0 => sign * fraction * 2f32.powi(-24),
+        0x1f if fraction == 0.0 => sign * f32::INFINITY,
+        0x1f => f32::NAN,
+        _ => sign * (1.0 + fraction / 1024.0) * 2f32.powi(exponent - 15),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{legacy_llama_name, llama_name_from_legacy};
+    use super::{f16_bits_to_f32, legacy_llama_name, llama_name_from_legacy};
+
+    #[test]
+    fn half_precision_bits_widen_to_their_values() {
+        for (bits, value) in [
+            (0x3c00, 1.0),
+            (0xc000, -2.0),
+            (0x3800, 0.5),
+            (0x4248, 3.140_625),
+            (0x7bff, 65504.0),
+            (0x0400, 2f32.powi(-14)),
+            (0x0001, 2f32.powi(-24)),
+            (0x8001, -(2f32.powi(-24))),
+            (0x7c00, f32::INFINITY),
+            (0xfc00, f32::NEG_INFINITY),
+        ] {
+            assert_eq!(f16_bits_to_f32(bits), value, "{bits:#06x}");
+        }
+        assert_eq!(f16_bits_to_f32(0x0000).to_bits(), 0.0_f32.to_bits());
+        assert_eq!(f16_bits_to_f32(0x8000).to_bits(), (-0.0_f32).to_bits());
+        assert!(f16_bits_to_f32(0x7e00).is_nan());
+    }
 
     #[test]
     fn llama_block_names_map_to_and_from_the_old_names() {

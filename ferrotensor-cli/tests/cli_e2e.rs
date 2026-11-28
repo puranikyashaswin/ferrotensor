@@ -894,11 +894,11 @@ fn plan_without_a_model_lists_the_documented_sizes() {
     assert_eq!(names, ["SmolLM2-135M", "SmolLM2-360M", "SmolLM2-1.7B"]);
     assert_eq!(models[0]["chosen"]["batch_size"], 8);
     assert_eq!(models[0]["chosen"]["seq_len"], 256);
-    assert_eq!(models[0]["estimated_peak_mib"], 6516);
+    assert_eq!(models[0]["estimated_peak_mib"], 6462);
     assert_eq!(models[2]["chosen"]["batch_size"], 4);
     assert_eq!(models[2]["chosen"]["seq_len"], 256);
     assert_eq!(models[2]["chosen"]["checkpoint_blocks"], true);
-    assert_eq!(models[2]["estimated_peak_mib"], 6325);
+    assert_eq!(models[2]["estimated_peak_mib"], 6133);
     assert_eq!(models[2]["fits"], true);
 }
 

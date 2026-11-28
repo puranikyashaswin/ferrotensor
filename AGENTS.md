@@ -171,7 +171,9 @@ A10G and 9 on the T4: these, and batch 2, 4 and 8 runs of SmolLM2 and
 Qwen2.5-0.5B. It is at most 4.6% below them and at most 12% above the 250-step
 and single-pass peaks; 30-step runs that accumulate passes have not reached
 their peak, and it is up to 35% above those. Other GPUs, f32 and 4-bit weights
-and LFM2 models are not calibrated.
+and LFM2 models are not calibrated. Those peaks were measured when the frozen
+embedding table was f32; the estimate now counts it at 2 bytes with f16 or
+4-bit weights, which no GPU run has measured yet.
 
 `finetune` and `plan --data` estimate for the rows the data pads to, not for
 `--seq-len`: the 99th percentile of the tokenized lengths sets the margin

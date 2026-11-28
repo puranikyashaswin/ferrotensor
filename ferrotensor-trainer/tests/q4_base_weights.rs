@@ -400,7 +400,8 @@ fn q4_weights_are_stored_at_four_bits() {
         assert_eq!(4 * q4::packed_words(HIDDEN, HIDDEN, Q4Group::DEFAULT), 576);
         let head = if f16 { DType::FP16 } else { DType::FP32 };
         assert_eq!(model.lm_head.weight.data.dtype, head, "lm_head (f16 {f16})");
-        assert_eq!(model.embed_tokens.data.dtype, DType::FP32);
+        // The frozen embedding follows the linear weight type, never 4-bit.
+        assert_eq!(model.embed_tokens.data.dtype, head, "embedding (f16 {f16})");
         assert_eq!(model.norm_f.weight.data.dtype, DType::FP32);
     }
 }
