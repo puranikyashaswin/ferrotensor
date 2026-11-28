@@ -167,8 +167,8 @@ the frozen weights of every decoder-block projection (`q/k/v/o_proj`,
 input dimension, one f16 scale and one f16 minimum per group, about 4.5
 bits per weight. They are quantised on the host while the model loads,
 from the f16/f32/bf16 safetensors, and the matmul decodes them and
-computes in f32. `lm_head` stays f16; the embedding, the norms and the
-LoRA adapters stay f32.
+computes in f32. `lm_head` stays f16 and the frozen embedding table is f16; the
+norms and the LoRA adapters stay f32.
 
 This is not the same model. It computes with the decoded weights, so its
 logits, loss and gradients differ from the f16 or f32 base, and from
@@ -385,7 +385,7 @@ sequences) and at the highest point seen so far in the run. The rows:
 
 | Row | What it holds |
 |---|---|
-| base weights (frozen) | Model weights uploaded when the model is built, split into f16 (linear layers with the default f16 weights), 4-bit (the weights `--q4-weights` selects, by default the decoder-block projections) and f32 (embedding, norms, or every weight with `--f32-weights`) |
+| base weights (frozen) | Model weights uploaded when the model is built, split into f16 (linear layers and the frozen embedding table with the default f16 weights), 4-bit (the weights `--q4-weights` selects, by default the decoder-block projections) and f32 (norms, or every weight with `--f32-weights`; the embedding too when it trains) |
 | trainable parameters | The LoRA adapters, or the base weights `--train-modules` selects |
 | optimizer state | The AdamW moments, two f32 tensors per trainable tensor |
 | activations | Forward outputs and intermediates, kept by the autograd graph until the step's backward is done |

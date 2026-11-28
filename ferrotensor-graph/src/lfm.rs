@@ -1,6 +1,6 @@
 use crate::model_builder::Architecture;
 use crate::{Attention, FuseChoice, FusedMode, KVCacheLayer, Linear, RMSNorm, Tensor, MLP};
-use ferrotensor_backend::{ComputeEngine, MemoryCategory, UnifiedTensor};
+use ferrotensor_backend::{ComputeEngine, DType, MemoryCategory, UnifiedTensor};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -359,19 +359,58 @@ impl Lfm2Model {
     /// gathers its rows on the GPU, so it sees each optimizer step; the host
     /// copy is dropped. A tied `lm_head` is a separate copy and does
     /// not follow the table.
-    pub fn with_trainable_embedding(mut self, on: bool) -> Self {
+    ///
+    /// A frozen table the builder stored as f16 is uploaded again as f32
+    /// from the host copy, so `embed_tokens.data` is a new buffer: take the
+    /// parameters to train after this call, not before.
+    ///
+    /// # Errors
+    /// When that upload needs a readback of the table and the readback fails.
+    pub fn with_trainable_embedding(mut self, on: bool) -> Result<Self, String> {
+        if on {
+            self.widen_embedding_table()?;
+        }
         self.embed_tokens.requires_grad = on;
         if on {
             self.clear_host_embeddings();
         }
-        self
+        Ok(self)
+    }
+
+    /// Replaces an f16 `embed_tokens` by an f32 upload of the same values,
+    /// the type the gather kernel and the optimizer need.
+    ///
+    /// # Errors
+    /// When the table has to be read back from the GPU and the readback fails.
+    fn widen_embedding_table(&mut self) -> Result<(), String> {
+        if self.embed_tokens.data.dtype != DType::FP16 {
+            return Ok(());
+        }
+        let ctx = self.embed_tokens.ctx.clone();
+        let host = self.embed_host.borrow().clone();
+        let values = match host {
+            Some(host) => host,
+            None => self.read_table(&ctx)?,
+        };
+        let shape = self.embed_tokens.data.shape.clone();
+        self.embed_tokens.data = Arc::new(UnifiedTensor::new(&ctx, &values, &shape));
+        Ok(())
     }
 
     /// Let only the base weights whose [`named_params`](Self::named_params)
     /// name `trains` accepts receive a gradient, and freeze the others; LoRA
     /// adapters keep their setting. A selected embedding trains as with
-    /// [`with_trainable_embedding`](Self::with_trainable_embedding).
-    pub fn with_trainable_base_weights(mut self, trains: impl Fn(&str) -> bool) -> Self {
+    /// [`with_trainable_embedding`](Self::with_trainable_embedding), which
+    /// replaces an f16 table by a new f32 buffer: take the parameters to train
+    /// (`named_params`) after this call, not before, or they point at the old
+    /// buffer, which an optimizer refuses.
+    ///
+    /// # Errors
+    /// As [`with_trainable_embedding`](Self::with_trainable_embedding).
+    pub fn with_trainable_base_weights(
+        mut self,
+        trains: impl Fn(&str) -> bool,
+    ) -> Result<Self, String> {
         // Matched by buffer, so the names are those of `named_params` alone.
         let trainable: HashSet<*const UnifiedTensor> = self
             .named_params()
@@ -766,11 +805,27 @@ impl Lfm2Model {
             return Tensor::embedding_gpu(&self.embed_tokens, rows, engine);
         }
         let mut cached = self.embed_host.borrow_mut();
-        let table = cached.get_or_insert_with(|| {
-            pollster::block_on(self.embed_tokens.data.to_vec(ctx))
-                .expect("GPU device lost during readback")
-        });
-        Tensor::embedding(&self.embed_tokens, table, rows)
+        if cached.is_none() {
+            *cached = Some(
+                self.read_table(ctx)
+                    .expect("GPU device lost during readback"),
+            );
+        }
+        Tensor::embedding(
+            &self.embed_tokens,
+            cached.as_deref().unwrap_or_default(),
+            rows,
+        )
+    }
+
+    /// The values of `embed_tokens` as f32, read back from the GPU (an f16
+    /// table is widened).
+    ///
+    /// # Errors
+    /// When the readback fails, which happens when the GPU device was lost.
+    fn read_table(&self, ctx: &Arc<ferrotensor_backend::WgpuContext>) -> Result<Vec<f32>, String> {
+        pollster::block_on(self.embed_tokens.data.to_vec_widened(ctx))
+            .map_err(|e| format!("reading the embedding table back: {e}"))
     }
 
     /// Use `table`, the values uploaded as `embed_tokens`, as the host copy

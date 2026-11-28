@@ -1500,7 +1500,8 @@ impl Tensor {
     /// itself, for a table that trains: it needs no host copy, so no lookup
     /// waits for the GPU to read the table back, and the gradient is summed
     /// on the GPU too. Same values as [`embedding`](Self::embedding); a table
-    /// that is not `f32` or an empty lookup takes the host path.
+    /// that is not `f32` (an f16 one is widened) or an empty lookup takes the
+    /// host path.
     #[expect(
         clippy::expect_used,
         reason = "a readback fails only on device loss, and the caller has no error path"
@@ -1510,7 +1511,7 @@ impl Tensor {
         let seq_len = rows.first().map_or(0, |r| r.len());
         let (vocab, hidden) = (table.data.shape[0], table.data.shape[1]);
         if table.data.dtype != DType::FP32 || ids.is_empty() || vocab * hidden == 0 {
-            let host = pollster::block_on(table.data.to_vec(&table.ctx))
+            let host = pollster::block_on(table.data.to_vec_widened(&table.ctx))
                 .expect("GPU device lost during readback");
             return Self::embedding(table, &host, rows);
         }
@@ -1771,6 +1772,17 @@ impl AutogradNode for FlashAttentionNode {
 pub trait Optimizer: Send + Sync {
     /// Update `params` from their gradients.
     fn step(&mut self, params: &[Tensor]);
+    /// Like [`step`](Optimizer::step), but an optimizer that cannot update
+    /// some parameter says so instead of reading it wrongly. The default
+    /// calls `step`.
+    ///
+    /// # Errors
+    /// When a parameter that holds a gradient has a type the optimizer
+    /// cannot update.
+    fn try_step(&mut self, params: &[Tensor]) -> Result<(), String> {
+        self.step(params);
+        Ok(())
+    }
     /// Clear the gradients of `params`.
     fn zero_grad(&mut self, params: &[Tensor]);
     /// Whether [`step_flat`](Optimizer::step_flat) works for this optimizer.
@@ -1964,9 +1976,32 @@ impl AdamW {
         }
     }
 
-    /// Take one optimization step.
+    /// Take one optimization step. Every parameter that holds a gradient
+    /// must be [`DType::FP32`]; this call does not check it, so a caller that
+    /// cannot rule out an f16 parameter uses [`try_step`](Self::try_step).
     pub fn step(&mut self, params: &[Tensor]) {
         self.apply_step(params);
+    }
+
+    /// Take one optimization step, after checking once that every parameter
+    /// that holds a gradient is [`DType::FP32`].
+    ///
+    /// # Errors
+    /// When one of them is not: the update kernel reads f32 words, so an f16
+    /// parameter, such as a frozen table that a caller made trainable by hand,
+    /// would be corrupted. Nothing is updated then.
+    pub fn try_step(&mut self, params: &[Tensor]) -> Result<(), String> {
+        if let Some(bad) = params
+            .iter()
+            .find(|p| p.data.dtype != DType::FP32 && p.grad.borrow().is_some())
+        {
+            return Err(format!(
+                "AdamW needs f32 parameters, but a parameter of shape {:?} is {:?}",
+                bad.data.shape, bad.data.dtype
+            ));
+        }
+        self.apply_step(params);
+        Ok(())
     }
 
     fn apply_step(&mut self, params: &[Tensor]) {
@@ -2120,6 +2155,9 @@ impl AdamW {
 impl Optimizer for AdamW {
     fn step(&mut self, params: &[Tensor]) {
         self.apply_step(params);
+    }
+    fn try_step(&mut self, params: &[Tensor]) -> Result<(), String> {
+        AdamW::try_step(self, params)
     }
     fn supports_flat_step(&self) -> bool {
         true

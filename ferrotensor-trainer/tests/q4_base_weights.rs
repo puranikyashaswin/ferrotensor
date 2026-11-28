@@ -400,7 +400,8 @@ fn q4_weights_are_stored_at_four_bits() {
         assert_eq!(4 * q4::packed_words(HIDDEN, HIDDEN, Q4Group::DEFAULT), 576);
         let head = if f16 { DType::FP16 } else { DType::FP32 };
         assert_eq!(model.lm_head.weight.data.dtype, head, "lm_head (f16 {f16})");
-        assert_eq!(model.embed_tokens.data.dtype, DType::FP32);
+        // The frozen embedding follows the linear weight type, never 4-bit.
+        assert_eq!(model.embed_tokens.data.dtype, head, "embedding (f16 {f16})");
         assert_eq!(model.norm_f.weight.data.dtype, DType::FP32);
     }
 }
@@ -841,12 +842,13 @@ fn memory_report_counts_the_q4_weights() {
             .iter()
             .map(|&(k, n)| 4 * q4::packed_words(k, n, Q4Group::DEFAULT) as u64)
             .sum::<u64>();
-    // The tied lm_head [HIDDEN, VOCAB] is the only f16 weight.
-    let f16_bytes = wgpu_buffer_size(((HIDDEN * VOCAB) as u64 * 2).next_multiple_of(4));
+    // The tied lm_head [HIDDEN, VOCAB] and the frozen embedding table
+    // [VOCAB, HIDDEN] are the f16 weights.
+    let f16_bytes = 2 * wgpu_buffer_size(((HIDDEN * VOCAB) as u64 * 2).next_multiple_of(4));
     for s in [&load.peak, &load.live] {
         let b = s.category(MemoryCategory::BaseWeights);
         assert_eq!(b.q4_bytes, q4_bytes, "4-bit base weights");
-        assert_eq!(b.f16_bytes, f16_bytes, "f16 lm_head");
+        assert_eq!(b.f16_bytes, f16_bytes, "f16 lm_head and embedding");
         assert_eq!(s.category(MemoryCategory::Trainable).q4_bytes, 0);
     }
     let row = table

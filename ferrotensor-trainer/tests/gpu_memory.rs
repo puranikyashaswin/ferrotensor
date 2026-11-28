@@ -32,8 +32,8 @@ fn f16_bytes(n: usize) -> u64 {
 }
 
 /// Frozen weights of `write_tiny_llama` built with f16 weights:
-/// `(total, of which f16)`. Linear layers (and the tied head) are f16; the
-/// embedding and the norms stay f32.
+/// `(total, of which f16)`. Linear layers, the tied head and the frozen
+/// embedding are f16; the norms stay f32.
 fn tiny_base_weight_bytes() -> (u64, u64) {
     let kv = HIDDEN / HEADS * KV_HEADS;
     let linears = [
@@ -46,9 +46,8 @@ fn tiny_base_weight_bytes() -> (u64, u64) {
         HIDDEN * FFN,    // down
     ];
     let f16: u64 = LAYERS as u64 * linears.iter().map(|&n| f16_bytes(n)).sum::<u64>()
-        + f16_bytes(VOCAB * HIDDEN);
-    let f32 = f32_bytes(VOCAB * HIDDEN) // embedding
-        + LAYERS as u64 * 2 * f32_bytes(HIDDEN) // two norms per layer
+        + 2 * f16_bytes(VOCAB * HIDDEN); // tied head and embedding
+    let f32 = LAYERS as u64 * 2 * f32_bytes(HIDDEN) // two norms per layer
         + f32_bytes(HIDDEN); // final norm
     (f16 + f32, f16)
 }

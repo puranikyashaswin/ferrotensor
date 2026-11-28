@@ -428,6 +428,21 @@ impl UnifiedTensor {
         Ok(res)
     }
 
+    /// Copies the tensor back to the CPU as f32 values: a [`DType::FP16`]
+    /// buffer is widened, where [`to_vec`](Self::to_vec) would return its
+    /// packed words as if they were f32. A [`DType::Q4`] buffer is returned as
+    /// stored, since its words are not values.
+    ///
+    /// # Errors
+    /// As [`to_vec`](Self::to_vec).
+    pub async fn to_vec_widened(&self, context: &WgpuContext) -> Result<Vec<f32>, ReadbackError> {
+        let words = self.to_vec(context).await?;
+        if self.dtype != DType::FP16 {
+            return Ok(words);
+        }
+        Ok(widen_f16_words(&words, self.shape.iter().product()))
+    }
+
     /// Reads the f32 values of every tensor in `tensors` back to the host
     /// with one copy into one staging buffer, so the queue drains once
     /// however many tensors there are.
@@ -611,6 +626,23 @@ fn write_transposed(src: &[f32], rows: usize, cols: usize, dtype: DType, out: &m
     }
 }
 
+/// The first `len` half-precision values packed two to a word in `words`
+/// (the first in the low half), widened to f32. The words are the bits of a
+/// readback, so each one is taken by its bit pattern.
+fn widen_f16_words(words: &[f32], len: usize) -> Vec<f32> {
+    let bytes: Vec<u8> = words
+        .iter()
+        .flat_map(|word| word.to_bits().to_le_bytes())
+        .collect();
+    bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .take(len)
+        .map(|pair| half::f16::from_bits(u16::from_le_bytes(*pair)).to_f32())
+        .collect()
+}
+
 /// Maps `slice` of a `MAP_READ` staging buffer and returns its bytes,
 /// polling the device until wgpu reports the mapping.
 ///
@@ -641,7 +673,7 @@ fn map_for_read(
 #[cfg(test)]
 #[allow(clippy::panic)]
 mod tests {
-    use super::{upload_len, write_transposed, DType};
+    use super::{upload_len, widen_f16_words, write_transposed, DType};
 
     /// The bytes the model builder uploaded for a transposed linear weight
     /// before `from_f32_transposed`: a transposed f32 copy, then either its
@@ -745,6 +777,47 @@ mod tests {
                 panic!("{dtype:?} [{rows}, {cols}]: first differing byte at {i}");
             }
         }
+    }
+
+    #[test]
+    fn half_edge_cases_widen_exactly() {
+        // Smallest normal, smallest subnormal, its negative, both infinities,
+        // the two zeros and a NaN, two to a word.
+        let bits: [u16; 8] = [
+            0x0400, 0x0001, 0x8001, 0x7c00, 0xfc00, 0x0000, 0x8000, 0x7e00,
+        ];
+        let words: Vec<f32> = bits
+            .chunks(2)
+            .map(|pair| f32::from_bits(u32::from(pair[0]) | (u32::from(pair[1]) << 16)))
+            .collect();
+        let got = widen_f16_words(&words, 8);
+        assert_eq!(
+            got[..5],
+            [
+                2f32.powi(-14),
+                2f32.powi(-24),
+                -(2f32.powi(-24)),
+                f32::INFINITY,
+                f32::NEG_INFINITY
+            ]
+        );
+        assert_eq!(got[5].to_bits(), 0.0_f32.to_bits());
+        assert_eq!(got[6].to_bits(), (-0.0_f32).to_bits());
+        assert!(got[7].is_nan());
+    }
+
+    #[test]
+    fn packed_half_words_widen_to_their_values_without_the_padding() {
+        // 1.0, -2.0, 0.5, 65504, 3.140625 and a zero pad, two to a word with
+        // the first value in the low half.
+        let words: Vec<f32> = [0xc000_3c00_u32, 0x7bff_3800, 0x0000_4248]
+            .map(f32::from_bits)
+            .to_vec();
+        assert_eq!(
+            widen_f16_words(&words, 5),
+            [1.0, -2.0, 0.5, 65504.0, 3.140_625]
+        );
+        assert_eq!(widen_f16_words(&words, 2), [1.0, -2.0]);
     }
 
     #[test]

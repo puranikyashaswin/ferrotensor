@@ -262,8 +262,9 @@ impl<'a> Lfm2ModelBuilder<'a> {
 
     /// Store frozen linear-layer weights (attention, MLP and `lm_head`) as
     /// f16, half the memory; activations, products and LoRA adapters stay
-    /// f32. Ignored when the base weights are trainable. Embeddings and norms
-    /// stay f32.
+    /// f32. Ignored when the base weights are trainable. The frozen embedding
+    /// table is stored as f16 too, since it is looked up from a host copy;
+    /// norms stay f32.
     pub fn with_f16_weights(mut self, f16: bool) -> Self {
         self.f16_weights = f16;
         self
@@ -278,9 +279,9 @@ impl<'a> Lfm2ModelBuilder<'a> {
     ///
     /// Unlike f16 storage, this changes the model: it computes with the
     /// decoded weights, which differ from the checkpoint's. `lm_head` is not
-    /// quantised (it follows [`with_f16_weights`](Self::with_f16_weights));
-    /// embeddings, norms and LoRA adapters stay f32. Quantisation runs on
-    /// the host while the model is built.
+    /// quantised (it follows [`with_f16_weights`](Self::with_f16_weights), as
+    /// does the frozen embedding table); norms and LoRA adapters stay f32.
+    /// Quantisation runs on the host while the model is built.
     ///
     /// [`build`](Self::build) fails when this is combined with
     /// [`with_trainable_base`](Self::with_trainable_base) (4-bit weights
@@ -381,17 +382,24 @@ impl<'a> Lfm2ModelBuilder<'a> {
     }
 
     /// The token embeddings, and, unless they are stored quantized, the f32
-    /// values and shape uploaded for them: the model keeps those as its host
+    /// values and shape read for them: the model keeps those as its host
     /// lookup table, and a tied `lm_head` is made from them, so the
     /// checkpoint's table is read once and never read back from the GPU.
+    ///
+    /// A frozen table is looked up from that host copy only, so its GPU copy
+    /// is stored at the linear weight type ([`linear_dtype`](Self::linear_dtype)):
+    /// half the memory with f16 weights. A table that trains stays f32.
     #[allow(clippy::type_complexity)]
     fn load_embeddings(&self) -> Result<(Tensor, Option<(Vec<f32>, Vec<usize>)>)> {
         if self.has("model.embed_tokens.scales")? {
             return Ok((self.load_tensor("model.embed_tokens")?, None));
         }
         let (data, shape) = self.read("model.embed_tokens.weight")?;
-        let tensor = self.wrap(UnifiedTensor::new(&self.ctx, &data, &shape));
-        Ok((tensor, Some((data, shape))))
+        let table = match self.linear_dtype() {
+            DType::FP16 => UnifiedTensor::from_f32_as_f16(&self.ctx, &data, &shape),
+            _ => UnifiedTensor::new(&self.ctx, &data, &shape),
+        };
+        Ok((self.wrap(table), Some((data, shape))))
     }
 
     fn load_raw_tensor(&self, name: &str) -> Result<Tensor> {

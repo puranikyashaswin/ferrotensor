@@ -238,9 +238,9 @@ struct ModelArgs {
     /// Store the frozen weights of the decoder blocks at 4 bits (affine,
     /// groups of 64, about 4.5 bits per weight; computation stays f32).
     /// This changes the model's outputs: it computes with the decoded
-    /// weights. lm_head stays f16; embeddings, norms and LoRA adapters stay
-    /// f32. Not allowed when base weights train. Use the same setting to
-    /// evaluate or generate with an adapter trained this way. Experimental:
+    /// weights. lm_head and the frozen embedding table stay f16; norms and
+    /// LoRA adapters stay f32. Not allowed when base weights train. Use the
+    /// same setting to evaluate or generate with an adapter trained this way. Experimental:
     /// held-out loss is worse than with f16; --q4-modules, --q4-skip and
     /// --q4-group exist to find out why.
     #[arg(long, conflicts_with = "f32_weights")]
@@ -1694,7 +1694,7 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
     let model = if lora_on {
         model
     } else {
-        model.with_trainable_base_weights(|name| named_params.contains_key(name))
+        model.with_trainable_base_weights(|name| named_params.contains_key(name))?
     };
     let train_params: Vec<_> = {
         let mut names: Vec<&String> = named_params.keys().collect();
@@ -2971,7 +2971,9 @@ mod tests {
         base.weights.set(Some(weights));
         let model = build_model(base, None, true).unwrap();
         let selected = select_train_params(&model, mode).unwrap();
-        let model = model.with_trainable_base_weights(|name| selected.contains_key(name));
+        let model = model
+            .with_trainable_base_weights(|name| selected.contains_key(name))
+            .unwrap();
         (model, selected)
     }
 
