@@ -15,7 +15,7 @@
 mod common;
 
 use common::attention::{cpu_attention, cpu_attention_backward, cpu_attention_lse};
-use ferrotensor_backend::{AttentionOptions, ComputeEngine, UnifiedTensor, WgpuContext};
+use ferrotensor_backend::{AttentionOptions, ComputeEngine, RopeFreqs, UnifiedTensor, WgpuContext};
 use std::sync::OnceLock;
 
 const HEAD: usize = 64;
@@ -354,12 +354,36 @@ fn a_single_query_ignores_the_row_size() {
 // RoPE inside the kernels
 // ---------------------------------------------------------------------------
 
+/// The inverse frequencies of `rope_type: "llama3"` (factor 32, low and high
+/// frequency factors 1 and 4, 8,192 original positions: the Llama-3.2-1B
+/// config) for 64 dimensions, in f64 from the formula of transformers'
+/// `_compute_llama3_parameters`.
+fn llama3_freqs(theta: f64) -> Vec<f32> {
+    let (factor, low, high, original) = (32.0_f64, 1.0_f64, 4.0_f64, 8192.0_f64);
+    (0..HEAD / 2)
+        .map(|d| {
+            let inv = 1.0 / theta.powf(2.0 * d as f64 / HEAD as f64);
+            let wavelen = 2.0 * std::f64::consts::PI / inv;
+            let scaled = if wavelen > original / low {
+                inv / factor
+            } else if wavelen < original / high {
+                inv
+            } else {
+                let smooth = (original / wavelen - low) / (high - low);
+                (1.0 - smooth) * inv / factor + smooth * inv
+            };
+            scaled as f32
+        })
+        .collect()
+}
+
 /// Rotate-half RoPE of a `[batch, seq, heads, 64]` tensor in f64: row `t` is
-/// position `pos + t`, and `inverse` is the transposed rotation.
+/// position `pos + t`, and `inverse` is the transposed rotation. `freqs`, when
+/// given, are the inverse frequencies in place of those of `theta`.
 fn rope_host(
     x: &[f32],
     (b, s, h): (usize, usize, usize),
-    (theta, pos): (f32, u32),
+    (theta, pos, freqs): (f32, u32, Option<&[f32]>),
     inverse: bool,
 ) -> Vec<f32> {
     let half = HEAD / 2;
@@ -369,8 +393,11 @@ fn rope_host(
             for hi in 0..h {
                 let at = ((bi * s + t) * h + hi) * HEAD;
                 for d in 0..half {
-                    let angle = f64::from(pos + t as u32)
-                        * f64::from(theta).powf(-2.0 * d as f64 / HEAD as f64);
+                    let inv = match freqs {
+                        Some(table) => f64::from(table[d]),
+                        None => f64::from(theta).powf(-2.0 * d as f64 / HEAD as f64),
+                    };
+                    let angle = f64::from(pos + t as u32) * inv;
                     let (sin, cos) = angle.sin_cos();
                     let sin = if inverse { -sin } else { sin };
                     let (x1, x2) = (f64::from(x[at + d]), f64::from(x[at + d + half]));
@@ -399,11 +426,23 @@ const ROPE_CASES: &[(Case, f32, u32)] = &[
 /// cooperative kernels, which stage the rotated values as f16.
 fn check_rope(g: &Gpu, rows: u32, coop: bool) {
     g.engine.set_flash_rows(rows);
-    for (n, (c, theta, pos)) in ROPE_CASES.iter().enumerate() {
-        let name = format!("{} theta={theta} pos={pos} rows={rows}", c.name());
+    for (n, (c, theta, pos), scaled) in ROPE_CASES
+        .iter()
+        .enumerate()
+        .flat_map(|(n, case)| [false, true].map(|scaled| (n, case, scaled)))
+    {
+        let name = format!(
+            "{} theta={theta} pos={pos} rows={rows} scaled={scaled}",
+            c.name()
+        );
+        // The scaled calls give the kernels a table that no theta reproduces.
+        let table = scaled.then(|| llama3_freqs(f64::from(*theta)));
+        let device_table = table
+            .as_deref()
+            .map(|t| RopeFreqs::new(&g.ctx, t, HEAD).unwrap());
         let [q, k, v, dout] = c.inputs(900 + 4 * n as u64);
         let (b, sq, sk, h, hkv) = (c.b, c.sq, c.sk, c.h, c.hkv);
-        let rope = (*theta, *pos);
+        let rope = (*theta, *pos, table.as_deref());
         let round = |x: Vec<f32>| if coop { f16_round(&x) } else { x };
         let q_rot = round(rope_host(&q, (b, sq, h), rope, false));
         let k_rot = round(rope_host(&k, (b, sk, hkv), rope, false));
@@ -432,7 +471,7 @@ fn check_rope(g: &Gpu, rows: u32, coop: bool) {
             &out,
             Some(&stats),
             &opts,
-            rope,
+            (*theta, *pos, device_table.as_ref()),
         );
         let got = read(g, &out);
         assert_near(&format!("fwd {name}"), &got, &want, (2e-3, 1e-2));
@@ -454,7 +493,7 @@ fn check_rope(g: &Gpu, rows: u32, coop: bool) {
             [&gq, &gk, &gv],
             &stats,
             &opts,
-            rope,
+            (*theta, *pos, device_table.as_ref()),
         );
         let step = u64::from(coop);
         assert_eq!(

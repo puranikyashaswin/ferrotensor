@@ -3,7 +3,7 @@
 //! Implements FlashAttention-2 algorithm for O(N) memory instead of O(N²).
 //! Uses tiled matrix multiplication with online softmax normalization.
 
-use ferrotensor_backend::{AttentionOptions, ComputeEngine, UnifiedTensor, WgpuContext};
+use ferrotensor_backend::{AttentionOptions, ComputeEngine, RopeFreqs, UnifiedTensor, WgpuContext};
 use std::sync::Arc;
 
 /// Flash Attention layer with tiled computation and online softmax.
@@ -420,9 +420,11 @@ impl GroupedQueryAttention {
 
     /// Forward pass on `q` and `k` before RoPE, rotated inside the kernel.
     ///
-    /// Row `i` of `q` and of `k` is rotated as position `pos + i` with base
-    /// frequency `theta`, so the output is that of `rope_theta` on both
-    /// followed by [`forward`](Self::forward). Returns the output and the
+    /// Row `i` of `q` and of `k` is rotated as position `pos + i` with the
+    /// base frequency `theta` or, when `rope` carries a table, with the
+    /// inverse frequencies of the table (scaled RoPE), so the output is that
+    /// of `rope_freqs` on both followed by [`forward`](Self::forward). `rope`
+    /// is `(theta, pos, table)`. Returns the output and the
     /// log-sum-exp tensor that
     /// [`ComputeEngine::flash_attention_v2_rope_backward_with_stats`] takes.
     ///
@@ -435,7 +437,7 @@ impl GroupedQueryAttention {
     pub fn forward_rope(
         &self,
         (q, k, v): (&UnifiedTensor, &UnifiedTensor, &UnifiedTensor),
-        (theta, pos): (f32, u32),
+        rope: (f32, u32, Option<&RopeFreqs>),
         ctx: &WgpuContext,
         engine: &ComputeEngine,
     ) -> (UnifiedTensor, UnifiedTensor) {
@@ -452,16 +454,7 @@ impl GroupedQueryAttention {
             seed: self.seed,
             ..AttentionOptions::default()
         };
-        engine.flash_attention_v2_rope_with_stats(
-            ctx,
-            q,
-            k,
-            v,
-            &output,
-            Some(&stats),
-            &opts,
-            (theta, pos),
-        );
+        engine.flash_attention_v2_rope_with_stats(ctx, q, k, v, &output, Some(&stats), &opts, rope);
         (output, stats)
     }
 

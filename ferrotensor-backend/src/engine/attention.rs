@@ -3,6 +3,84 @@
 use super::flash_coop::{Rope, Shape};
 use super::{dummy_storage, grid, groups64, uniform, Arg, ComputeEngine, Params, Scratch};
 use crate::{DType, UnifiedTensor, WgpuContext};
+use std::sync::Arc;
+
+/// The inverse frequency of each rotation pair (`head_dim / 2` of them) of a
+/// scaled RoPE such as Llama 3's, in place of `theta^(-2 i / head_dim)`.
+///
+/// Every kernel that rotates takes this table when the model has one: the
+/// scalar `rope` kernels read the device copy, and the flash attention
+/// kernels that rotate as they load build their cosine and sine table from
+/// the host copy. Cloning is cheap.
+#[derive(Debug, Clone)]
+pub struct RopeFreqs {
+    host: Arc<[f32]>,
+    device: UnifiedTensor,
+    head_dim: usize,
+}
+
+/// A table of inverse frequencies that does not fit the head size it was
+/// made for: a head of `head_dim` has `head_dim / 2` rotation pairs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RopeTableError {
+    /// Entries in the table.
+    pub len: usize,
+    /// The head size it was meant for.
+    pub head_dim: usize,
+}
+
+impl std::fmt::Display for RopeTableError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "a RoPE table of {} inverse frequencies does not fit head_dim {}: a head needs {}",
+            self.len,
+            self.head_dim,
+            self.head_dim / 2
+        )
+    }
+}
+
+impl std::error::Error for RopeTableError {}
+
+impl RopeFreqs {
+    /// The table `values` (one inverse frequency per rotation pair) on `ctx`,
+    /// for heads of `head_dim` values.
+    ///
+    /// # Errors
+    ///
+    /// [`RopeTableError`] when `values` does not hold `head_dim / 2` entries,
+    /// which would rotate by wrong angles without any other sign.
+    pub fn new(ctx: &WgpuContext, values: &[f32], head_dim: usize) -> Result<Self, RopeTableError> {
+        let table = Self {
+            host: values.into(),
+            device: UnifiedTensor::new(ctx, values, &[values.len()]),
+            head_dim,
+        };
+        table.check(head_dim)?;
+        Ok(table)
+    }
+
+    /// The inverse frequencies, one per rotation pair.
+    pub fn values(&self) -> &[f32] {
+        &self.host
+    }
+
+    /// Whether this table fits heads of `head_dim` values.
+    ///
+    /// # Errors
+    ///
+    /// [`RopeTableError`] when it does not.
+    pub fn check(&self, head_dim: usize) -> Result<(), RopeTableError> {
+        if head_dim == 0 || self.head_dim != head_dim || self.host.len() * 2 != head_dim {
+            return Err(RopeTableError {
+                len: self.host.len(),
+                head_dim,
+            });
+        }
+        Ok(())
+    }
+}
 
 /// Query or key rows per workgroup of the attention kernels (`FA_TILE_Q` and `FAB_ROWS` in WGSL).
 const ATTENTION_ROWS: u32 = 16;
@@ -26,7 +104,21 @@ impl ComputeEngine {
         pos: usize,
         theta: f32,
     ) {
-        self.rotate(ctx, (tensor, None), head_dim, pos, theta, false);
+        self.rotate(ctx, (tensor, None), head_dim, pos, (theta, None), false);
+    }
+
+    /// [`rope_theta`](Self::rope_theta) with the inverse frequency of each
+    /// rotation pair taken from `inv_freq` instead of derived from `theta`;
+    /// `None` is `rope_theta`. Scaled RoPE (Llama 3) supplies its table here.
+    pub fn rope_freqs(
+        &self,
+        ctx: &WgpuContext,
+        tensor: &UnifiedTensor,
+        head_dim: usize,
+        pos: usize,
+        (theta, inv_freq): (f32, Option<&RopeFreqs>),
+    ) {
+        self.rotate(ctx, (tensor, None), head_dim, pos, (theta, inv_freq), false);
     }
 
     /// The inverse of [`rope_theta`](Self::rope_theta), in place: rotates by
@@ -40,7 +132,19 @@ impl ComputeEngine {
         pos: usize,
         theta: f32,
     ) {
-        self.rotate(ctx, (tensor, None), head_dim, pos, theta, true);
+        self.rotate(ctx, (tensor, None), head_dim, pos, (theta, None), true);
+    }
+
+    /// The inverse of [`rope_freqs`](Self::rope_freqs), in place.
+    pub fn rope_freqs_inverse(
+        &self,
+        ctx: &WgpuContext,
+        tensor: &UnifiedTensor,
+        head_dim: usize,
+        pos: usize,
+        (theta, inv_freq): (f32, Option<&RopeFreqs>),
+    ) {
+        self.rotate(ctx, (tensor, None), head_dim, pos, (theta, inv_freq), true);
     }
 
     /// [`rope_theta`](Self::rope_theta) of `input` written to `out` (same
@@ -53,7 +157,27 @@ impl ComputeEngine {
         pos: usize,
         theta: f32,
     ) {
-        self.rotate(ctx, (input, Some(out)), head_dim, pos, theta, false);
+        self.rotate(ctx, (input, Some(out)), head_dim, pos, (theta, None), false);
+    }
+
+    /// [`rope_freqs`](Self::rope_freqs) of `input` written to `out` (same
+    /// shape), leaving `input` as it is.
+    pub fn rope_freqs_to(
+        &self,
+        ctx: &WgpuContext,
+        (input, out): (&UnifiedTensor, &UnifiedTensor),
+        head_dim: usize,
+        pos: usize,
+        (theta, inv_freq): (f32, Option<&RopeFreqs>),
+    ) {
+        self.rotate(
+            ctx,
+            (input, Some(out)),
+            head_dim,
+            pos,
+            (theta, inv_freq),
+            false,
+        );
     }
 
     /// [`rope_theta_inverse`](Self::rope_theta_inverse) of `input` written
@@ -66,20 +190,48 @@ impl ComputeEngine {
         pos: usize,
         theta: f32,
     ) {
-        self.rotate(ctx, (input, Some(out)), head_dim, pos, theta, true);
+        self.rotate(ctx, (input, Some(out)), head_dim, pos, (theta, None), true);
     }
 
-    /// Shared body of [`rope_theta`](Self::rope_theta) and its inverse: in
-    /// place, or into `out` when it is given.
+    /// [`rope_freqs_inverse`](Self::rope_freqs_inverse) of `input` written
+    /// to `out` (same shape), leaving `input` as it is.
+    pub fn rope_freqs_inverse_to(
+        &self,
+        ctx: &WgpuContext,
+        (input, out): (&UnifiedTensor, &UnifiedTensor),
+        head_dim: usize,
+        pos: usize,
+        (theta, inv_freq): (f32, Option<&RopeFreqs>),
+    ) {
+        self.rotate(
+            ctx,
+            (input, Some(out)),
+            head_dim,
+            pos,
+            (theta, inv_freq),
+            true,
+        );
+    }
+
+    /// Shared body of the rotations above: in place, or into `out` when it
+    /// is given. A table in `inv_freq` replaces the angles derived from
+    /// `theta`.
     fn rotate(
         &self,
         ctx: &WgpuContext,
         (tensor, out): (&UnifiedTensor, Option<&UnifiedTensor>),
         head_dim: usize,
         pos: usize,
-        theta: f32,
+        (theta, inv_freq): (f32, Option<&RopeFreqs>),
         inverse: bool,
     ) {
+        if let Some(table) = inv_freq {
+            assert!(
+                table.check(head_dim).is_ok(),
+                "the RoPE table was made for head_dim {}, not {head_dim}",
+                table.head_dim
+            );
+        }
         let (seq_len, tokens) = match tensor.shape.len() {
             0 | 1 => (1, 1),
             2 => (tensor.shape[0], tensor.shape[0]),
@@ -96,22 +248,35 @@ impl ComputeEngine {
                 heads as u32,
                 theta.to_bits(),
                 inverse as u32,
-                0,
+                // Nonzero: read the inverse frequencies from the table.
+                u32::from(inv_freq.is_some()),
                 0,
             ]),
         );
         let pairs = tensor.shape.iter().product::<usize>() / 2;
+        // The kernels declare the table always; an unused binding gets the
+        // engine's one stub, a plain buffer so the dispatch keeps its cached
+        // bind group.
+        let table = match inv_freq {
+            Some(f) => f.device.buffer(),
+            None => self.rope_stub(ctx),
+        };
         match out {
             None => self.run(
                 ctx,
                 &self.rope,
-                &[(0, tensor.buffer()), (1, &params)],
+                &[(0, tensor.buffer()), (1, table), (2, &params)],
                 groups64(pairs),
             ),
             Some(out) => self.run(
                 ctx,
                 &self.rope_out,
-                &[(0, tensor.buffer()), (1, out.buffer()), (2, &params)],
+                &[
+                    (0, tensor.buffer()),
+                    (1, out.buffer()),
+                    (2, table),
+                    (3, &params),
+                ],
                 groups64(pairs),
             ),
         }
@@ -215,9 +380,10 @@ impl ComputeEngine {
     /// on RoPE-rotated queries and keys, rotating them inside the kernel.
     ///
     /// `q` and `k` are the tensors before RoPE; row `i` of either is
-    /// rotated as position `pos + i` with base frequency `theta`, the same
-    /// rotate-half rotation as [`rope_theta`](Self::rope_theta), and the
-    /// result is that of calling `rope_theta` on both and then
+    /// rotated as position `pos + i` with base frequency `theta` (or the
+    /// inverse frequencies of `inv_freq` when a table is given), the same
+    /// rotate-half rotation as [`rope_freqs`](Self::rope_freqs), and the
+    /// result is that of calling `rope_freqs` on both and then
     /// [`flash_attention_v2_with_stats`](Self::flash_attention_v2_with_stats).
     /// The caller keeps `q` and `k` un-rotated, and
     /// [`flash_attention_v2_rope_backward_with_stats`](Self::flash_attention_v2_rope_backward_with_stats)
@@ -237,9 +403,13 @@ impl ComputeEngine {
         out: &UnifiedTensor,
         stats: Option<&UnifiedTensor>,
         opts: &AttentionOptions,
-        (theta, pos): (f32, u32),
+        (theta, pos, inv_freq): (f32, u32, Option<&RopeFreqs>),
     ) {
-        let rope = Some(Rope { theta, pos });
+        let rope = Some(Rope {
+            theta,
+            pos,
+            inv_freq,
+        });
         self.attention_forward(ctx, q, k, v, out, stats, opts, None, rope);
     }
 
@@ -259,9 +429,17 @@ impl ComputeEngine {
         stats: Option<&UnifiedTensor>,
         opts: &AttentionOptions,
         mask: Option<&UnifiedTensor>,
-        rope: Option<Rope>,
+        rope: Option<Rope<'_>>,
     ) {
         let dims = AttentionDims::new(q, k);
+        if let Some(table) = rope.and_then(|r| r.inv_freq) {
+            assert!(
+                table.check(dims.head_dim as usize).is_ok(),
+                "the RoPE table was made for head_dim {}, not {}",
+                table.head_dim,
+                dims.head_dim
+            );
+        }
         if let Some(s) = stats {
             dims.check_stats(s);
         }
@@ -455,7 +633,7 @@ impl ComputeEngine {
     /// [`flash_attention_v2_rope_with_stats`](Self::flash_attention_v2_rope_with_stats).
     ///
     /// `q` and `k` are the un-rotated tensors that call took, `out` and
-    /// `stats` what it wrote, and `(theta, pos)` the same pair. `grad_q` and
+    /// `stats` what it wrote, and `(theta, pos, inv_freq)` the same triple. `grad_q` and
     /// `grad_k` are the gradients with respect to the un-rotated `q` and `k`,
     /// so the transposed rotation is already applied. `grad_v` is as in
     /// [`flash_attention_v2_backward_with_stats`](Self::flash_attention_v2_backward_with_stats).
@@ -474,9 +652,13 @@ impl ComputeEngine {
         grads: [&UnifiedTensor; 3],
         stats: &UnifiedTensor,
         opts: &AttentionOptions,
-        (theta, pos): (f32, u32),
+        (theta, pos, inv_freq): (f32, u32, Option<&RopeFreqs>),
     ) {
-        let rope = Some(Rope { theta, pos });
+        let rope = Some(Rope {
+            theta,
+            pos,
+            inv_freq,
+        });
         self.attention_backward(
             ctx,
             q,
@@ -499,14 +681,15 @@ impl ComputeEngine {
         ctx: &WgpuContext,
         q: &UnifiedTensor,
         k: &UnifiedTensor,
-        rope: Rope,
+        rope: Rope<'_>,
     ) -> (UnifiedTensor, UnifiedTensor) {
         let head_dim = q.shape.last().copied().unwrap_or(1);
         let q_rot = UnifiedTensor::empty_with_dtype(ctx, &q.shape, q.dtype);
         let k_rot = UnifiedTensor::empty_with_dtype(ctx, &k.shape, k.dtype);
         let pos = rope.pos as usize;
-        self.rope_theta_to(ctx, (q, &q_rot), head_dim, pos, rope.theta);
-        self.rope_theta_to(ctx, (k, &k_rot), head_dim, pos, rope.theta);
+        let theta = (rope.theta, rope.inv_freq);
+        self.rope_freqs_to(ctx, (q, &q_rot), head_dim, pos, theta);
+        self.rope_freqs_to(ctx, (k, &k_rot), head_dim, pos, theta);
         (q_rot, k_rot)
     }
 
@@ -529,9 +712,17 @@ impl ComputeEngine {
         saved: Option<&UnifiedTensor>,
         opts: &AttentionOptions,
         mask: Option<&UnifiedTensor>,
-        rope: Option<Rope>,
+        rope: Option<Rope<'_>>,
     ) {
         let dims = AttentionDims::new(q, k);
+        if let Some(table) = rope.and_then(|r| r.inv_freq) {
+            assert!(
+                table.check(dims.head_dim as usize).is_ok(),
+                "the RoPE table was made for head_dim {}, not {}",
+                table.head_dim,
+                dims.head_dim
+            );
+        }
         if let Some(s) = saved {
             dims.check_stats(s);
         }
@@ -553,8 +744,9 @@ impl ComputeEngine {
                 );
                 let head_dim = q.shape.last().copied().unwrap_or(1);
                 let pos = r.pos as usize;
-                self.rope_theta_inverse_to(ctx, (&gq, grad_q), head_dim, pos, r.theta);
-                self.rope_theta_inverse_to(ctx, (&gk, grad_k), head_dim, pos, r.theta);
+                let theta = (r.theta, r.inv_freq);
+                self.rope_freqs_inverse_to(ctx, (&gq, grad_q), head_dim, pos, theta);
+                self.rope_freqs_inverse_to(ctx, (&gk, grad_k), head_dim, pos, theta);
                 return;
             }
         }

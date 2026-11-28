@@ -418,6 +418,7 @@ impl Attention {
             n_kv_heads: self.num_kv_heads,
             head_dim: self.head_dim,
             theta: self.rope_theta,
+            inv_freq: self.rope_inv_freq.clone(),
             pos: pos as u32,
             dropout_prob,
             seed,

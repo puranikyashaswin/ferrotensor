@@ -17,6 +17,7 @@
 
 use super::coop::immediate_source;
 use super::{attention::AttentionOptions, Arg, ComputeEngine, Kernel, Params};
+use crate::RopeFreqs;
 use crate::{UnifiedTensor, WgpuContext};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -104,25 +105,33 @@ fn rows_for(forced: u32, shape: Shape) -> u32 {
     }
 }
 
-/// RoPE inside the kernels: base frequency and the position of row 0 of Q
-/// and of K (row `j` of either sits at position `pos + j`).
+/// RoPE inside the kernels: base frequency, the position of row 0 of Q
+/// and of K (row `j` of either sits at position `pos + j`), and the table of
+/// inverse frequencies of a scaled RoPE, which replaces `theta` when given.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct Rope {
+pub(super) struct Rope<'a> {
     pub theta: f32,
     pub pos: u32,
+    pub inv_freq: Option<&'a RopeFreqs>,
 }
 
 /// The cos/sin table the kernels read: for each of `len` positions 32
 /// cosines then 32 sines, in f32 with the formula of the scalar `rope`
-/// kernel, `angle = position * theta^(-2 d / head_dim)`.
-fn rope_table(rope: Rope, len: u32) -> Vec<f32> {
+/// kernel, `angle = position * inv_freq(d)` where `inv_freq(d)` is
+/// `theta^(-2 d / head_dim)` or the entry of the scaled table.
+fn rope_table((theta, pos): (f32, u32), inv_freq: Option<&[f32]>, len: u32) -> Vec<f32> {
     let half = HEAD_DIM / 2;
+    // The caller has checked that a scaled table has one entry per pair.
+    let freqs: Vec<f32> = (0..half as usize)
+        .map(|d| match inv_freq {
+            Some(table) => table[d],
+            None => theta.powf(-2.0 * d as f32 / HEAD_DIM as f32),
+        })
+        .collect();
     let mut out = Vec::with_capacity(len as usize * HEAD_DIM as usize);
     for t in 0..len {
-        let position = rope.pos.saturating_add(t) as f32;
-        let angles: Vec<f32> = (0..half)
-            .map(|d| position * rope.theta.powf(-2.0 * d as f32 / HEAD_DIM as f32))
-            .collect();
+        let position = pos.saturating_add(t) as f32;
+        let angles: Vec<f32> = freqs.iter().map(|f| position * f).collect();
         out.extend(angles.iter().map(|a| a.cos()));
         out.extend(angles.iter().map(|a| a.sin()));
     }
@@ -137,9 +146,11 @@ struct Kernels {
 }
 
 /// The table last built for RoPE calls, reused while the call's base
-/// frequency and first position match and it is long enough.
+/// frequency, scaled table and first position match and it is long enough.
 struct RopeTable {
     theta_bits: u32,
+    /// The bits of the scaled table, empty without one.
+    freq_bits: Vec<u32>,
     pos: u32,
     len: u32,
     buffer: Buffer,
@@ -227,7 +238,7 @@ impl FlashCoop {
 
     /// The buffer for binding 18: the cos/sin table of `rope` with at least
     /// `len` positions, or a dummy when the call does not rotate.
-    fn rope_buffer(&self, ctx: &WgpuContext, rope: Option<Rope>, len: u32) -> Buffer {
+    fn rope_buffer(&self, ctx: &WgpuContext, rope: Option<Rope<'_>>, len: u32) -> Buffer {
         let Some(rope) = rope else {
             return self
                 .blank
@@ -241,13 +252,25 @@ impl FlashCoop {
                 })
                 .clone();
         };
+        let freq_bits: Vec<u32> = rope
+            .inv_freq
+            .map(|f| f.values().iter().map(|v| v.to_bits()).collect())
+            .unwrap_or_default();
         let mut slot = self.table.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(t) = slot.as_ref() {
-            if t.theta_bits == rope.theta.to_bits() && t.pos == rope.pos && t.len >= len {
+            if t.theta_bits == rope.theta.to_bits()
+                && t.freq_bits == freq_bits
+                && t.pos == rope.pos
+                && t.len >= len
+            {
                 return t.buffer.clone();
             }
         }
-        let data = rope_table(rope, len);
+        let data = rope_table(
+            (rope.theta, rope.pos),
+            rope.inv_freq.map(RopeFreqs::values),
+            len,
+        );
         let buffer = ctx
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -257,6 +280,7 @@ impl FlashCoop {
             });
         *slot = Some(RopeTable {
             theta_bits: rope.theta.to_bits(),
+            freq_bits,
             pos: rope.pos,
             len,
             buffer: buffer.clone(),
@@ -369,7 +393,7 @@ impl ComputeEngine {
         shape: Shape,
         [q, k, v, out]: [&UnifiedTensor; 4],
         stats: &dyn Arg,
-        params: (&Params, Option<Rope>),
+        params: (&Params, Option<Rope<'_>>),
     ) {
         let Some((coop, flash)) = self
             .coop
@@ -409,7 +433,7 @@ impl ComputeEngine {
         ctx: &WgpuContext,
         shape: Shape,
         [q, k, v, out, grad_out, grad_q]: [&UnifiedTensor; 6],
-        (stats, params, rope): (&dyn Arg, &Params, Option<Rope>),
+        (stats, params, rope): (&dyn Arg, &Params, Option<Rope<'_>>),
     ) {
         let Some((coop, flash)) = self
             .coop
@@ -453,7 +477,7 @@ impl ComputeEngine {
         shape: Shape,
         [q, k, v, grad_out]: [&UnifiedTensor; 4],
         grads: (&dyn Arg, &dyn Arg),
-        (stats, params, rope): (&dyn Arg, &Params, Option<Rope>),
+        (stats, params, rope): (&dyn Arg, &Params, Option<Rope<'_>>),
     ) {
         let Some((coop, flash)) = self
             .coop
@@ -487,9 +511,7 @@ impl ComputeEngine {
 #[cfg(test)]
 #[allow(clippy::panic, clippy::needless_range_loop)]
 mod tests {
-    use super::{
-        enabled_by, immediate_source, rope_table, rows_for, rows_from_env, source, Rope, Shape,
-    };
+    use super::{enabled_by, immediate_source, rope_table, rows_for, rows_from_env, source, Shape};
 
     fn capabilities() -> naga::valid::Capabilities {
         naga::valid::Capabilities::COOPERATIVE_MATRIX
@@ -656,7 +678,7 @@ mod tests {
     #[test]
     fn the_rope_table_holds_cosines_then_sines_per_position() {
         let theta = 10_000.0_f32;
-        let table = rope_table(Rope { theta, pos: 3 }, 5);
+        let table = rope_table((theta, 3), None, 5);
         assert_eq!(table.len(), 5 * 64);
         for t in 0..5usize {
             let row = &table[t * 64..(t + 1) * 64];
@@ -673,8 +695,33 @@ mod tests {
             }
         }
         // Position 0 is the identity.
-        let first = rope_table(Rope { theta, pos: 0 }, 1);
+        let first = rope_table((theta, 0), None, 1);
         assert!(first[..32].iter().all(|&c| c == 1.0));
         assert!(first[32..].iter().all(|&s| s == 0.0));
+    }
+
+    #[test]
+    fn a_scaled_rope_table_uses_the_given_frequencies_not_theta() {
+        // A table that no theta reproduces, so a kernel that ignores it fails.
+        let freqs: Vec<f32> = (0..32).map(|d| 0.5 / (1.0 + d as f32)).collect();
+        let table = rope_table((500_000.0, 7), Some(&freqs), 3);
+        assert_eq!(table.len(), 3 * 64);
+        for t in 0..3usize {
+            let row = &table[t * 64..(t + 1) * 64];
+            for d in 0..32usize {
+                let angle = (7.0 + t as f64) * f64::from(freqs[d]);
+                assert!(
+                    (f64::from(row[d]) - angle.cos()).abs() < 2e-4,
+                    "cos t={t} d={d}"
+                );
+                assert!(
+                    (f64::from(row[32 + d]) - angle.sin()).abs() < 2e-4,
+                    "sin t={t} d={d}"
+                );
+            }
+        }
+        // The same call without the table gives other angles.
+        let plain = rope_table((500_000.0, 7), None, 3);
+        assert!(plain.iter().zip(&table).any(|(a, b)| (a - b).abs() > 0.1));
     }
 }

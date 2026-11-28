@@ -124,6 +124,10 @@ pub struct Lfm2Config {
     /// Longest sequence, in tokens, the model was trained on, if set.
     #[serde(default)]
     pub max_position_embeddings: Option<usize>,
+    /// Top-level `original_max_position_embeddings`, which a Llama 3 RoPE
+    /// object without its own value falls back to.
+    #[serde(default)]
+    pub original_max_position_embeddings: Option<f64>,
     /// MLP activation, e.g. `"silu"`.
     #[serde(default)]
     pub hidden_act: Option<String>,
@@ -156,6 +160,16 @@ pub struct RopeConfig {
     /// Scaling factor of a scaled RoPE, if any.
     #[serde(default)]
     pub factor: Option<f64>,
+    /// Llama 3 scaling: the wavelength ratio below which a frequency is
+    /// divided by `factor`.
+    #[serde(default)]
+    pub low_freq_factor: Option<f64>,
+    /// Llama 3 scaling: the wavelength ratio above which a frequency is kept.
+    #[serde(default)]
+    pub high_freq_factor: Option<f64>,
+    /// Llama 3 scaling: the context length the model was first trained on.
+    #[serde(default)]
+    pub original_max_position_embeddings: Option<f64>,
 }
 
 impl RopeConfig {

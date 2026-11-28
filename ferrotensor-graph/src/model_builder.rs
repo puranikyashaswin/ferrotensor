@@ -26,10 +26,11 @@
 //! rejected.
 
 use crate::lfm::{Lfm2Block, Lfm2Conv, Lfm2LayerOp, Lfm2Model};
+use crate::rope::rope_scaling;
 use crate::{Attention, FusedSlot, Linear, LoRAAdapter, RMSNorm, MLP};
 use ferrotensor_autograd::Tensor;
 use ferrotensor_backend::q4::Q4Group;
-use ferrotensor_backend::{ComputeEngine, DType, UnifiedTensor, WgpuContext};
+use ferrotensor_backend::{ComputeEngine, DType, RopeFreqs, UnifiedTensor, WgpuContext};
 use ferrotensor_loader::{Lfm2Config, WeightsContext};
 use std::ops::RangeInclusive;
 use std::sync::Arc;
@@ -179,8 +180,9 @@ impl Architecture {
 }
 
 /// Refuses `config` when it asks for something the forward pass does not
-/// compute (a non-SiLU activation, scaled RoPE, sliding-window attention),
-/// so such a model fails to load instead of giving wrong logits.
+/// compute (a non-SiLU activation, a RoPE scheme other than `default` and
+/// `llama3`, sliding-window attention), so such a model fails to load
+/// instead of giving wrong logits.
 ///
 /// # Errors
 /// A [`BuildError`] naming the config field and its value.
@@ -194,21 +196,7 @@ pub fn check_supported(config: &Lfm2Config) -> Result<()> {
             "hidden_act {act:?} is not supported: the MLP computes SiLU (silu) only"
         )));
     }
-    for (field, rope) in [
-        ("rope_scaling", &config.rope_scaling),
-        ("rope_parameters", &config.rope_parameters),
-    ] {
-        // An object without a type is plain RoPE unless it scales by a factor.
-        let kind = rope.as_ref().map(|r| match r.kind() {
-            None if r.factor.is_none() => "default",
-            kind => kind.unwrap_or("unnamed"),
-        });
-        if let Some(kind) = kind.filter(|k| *k != "default") {
-            return Err(BuildError(format!(
-                "{field} type {kind:?} is not supported: RoPE runs unscaled"
-            )));
-        }
-    }
+    rope_scaling(config).map_err(BuildError)?;
     // Only `use_sliding_window: true` turns the window on: Hugging Face's
     // Mistral sets `sliding_window` alone and still attends over everything.
     if config.use_sliding_window == Some(true) {
@@ -531,6 +519,20 @@ impl<'a> Lfm2ModelBuilder<'a> {
             Architecture::Lfm2 => "out_proj",
         };
 
+        let rope_theta = self
+            .config
+            .rope_theta
+            .or_else(|| self.config.rope_parameters.as_ref()?.rope_theta)
+            .unwrap_or(10000.0);
+        // The table is built once per layer; it is `head_dim / 2` floats.
+        let rope_inv_freq = rope_scaling(&self.config)
+            .map_err(BuildError)?
+            .map(|scaling| {
+                RopeFreqs::new(&self.ctx, &scaling.inv_freq(head_dim, rope_theta), head_dim)
+            })
+            .transpose()
+            .map_err(|e| BuildError(e.to_string()))?;
+
         Ok(Attention {
             q_proj: self.build_linear(&format!("{prefix}.q_proj"), "q_proj", seed)?,
             k_proj: self.build_linear(&format!("{prefix}.k_proj"), "k_proj", seed)?,
@@ -540,11 +542,8 @@ impl<'a> Lfm2ModelBuilder<'a> {
             head_dim,
             num_kv_heads,
             dropout_prob: self.config.attention_dropout.unwrap_or(0.0),
-            rope_theta: self
-                .config
-                .rope_theta
-                .or_else(|| self.config.rope_parameters.as_ref()?.rope_theta)
-                .unwrap_or(10000.0) as f32,
+            rope_theta: rope_theta as f32,
+            rope_inv_freq,
             q_norm: self.build_head_norm(&format!("{prefix}.q_norm"), head_dim)?,
             k_norm: self.build_head_norm(&format!("{prefix}.k_norm"), head_dim)?,
             fused: FusedSlot::default(),
@@ -824,6 +823,14 @@ mod tests {
             check_with(serde_json::json!({"use_sliding_window": null, "sliding_window": 4096})),
             Ok(())
         );
+        // The Llama 3.2 scaling object loads.
+        assert_eq!(
+            check_with(serde_json::json!({"rope_scaling": {
+                "rope_type": "llama3", "factor": 32.0, "low_freq_factor": 1.0,
+                "high_freq_factor": 4.0, "original_max_position_embeddings": 8192
+            }})),
+            Ok(())
+        );
         // A RoPE object with neither a type nor a factor is plain RoPE.
         assert_eq!(
             check_with(serde_json::json!({"rope_scaling": {"rope_theta": 1000000.0}})),
@@ -840,15 +847,30 @@ mod tests {
             ),
             (
                 serde_json::json!({"rope_scaling": {"rope_type": "llama3", "factor": 8.0}}),
-                "rope_scaling type \"llama3\" is not supported: RoPE runs unscaled",
+                "rope_scaling type \"llama3\" needs a positive number for low_freq_factor",
+            ),
+            (
+                serde_json::json!({"rope_scaling": {
+                    "rope_type": "llama3", "factor": 8.0, "low_freq_factor": 4.0,
+                    "high_freq_factor": 1.0, "original_max_position_embeddings": 8192
+                }}),
+                "rope_scaling type \"llama3\" needs high_freq_factor above low_freq_factor, got 1 and 4",
             ),
             (
                 serde_json::json!({"rope_scaling": {"type": "linear", "factor": 2.0}}),
-                "rope_scaling type \"linear\" is not supported: RoPE runs unscaled",
+                "rope_scaling type \"linear\" is not supported: only \"default\" and \"llama3\" RoPE are",
+            ),
+            (
+                serde_json::json!({"rope_scaling": {"rope_type": "dynamic", "factor": 2.0}}),
+                "rope_scaling type \"dynamic\" is not supported: only \"default\" and \"llama3\" RoPE are",
             ),
             (
                 serde_json::json!({"rope_parameters": {"rope_type": "yarn", "rope_theta": 1e6}}),
-                "rope_parameters type \"yarn\" is not supported: RoPE runs unscaled",
+                "rope_parameters type \"yarn\" is not supported: only \"default\" and \"llama3\" RoPE are",
+            ),
+            (
+                serde_json::json!({"rope_scaling": {"rope_type": "longrope", "factor": 2.0}}),
+                "rope_scaling type \"longrope\" is not supported: only \"default\" and \"llama3\" RoPE are",
             ),
             (
                 serde_json::json!({"use_sliding_window": true}),
@@ -856,7 +878,7 @@ mod tests {
             ),
             (
                 serde_json::json!({"rope_scaling": {"factor": 4.0}}),
-                "rope_scaling type \"unnamed\" is not supported: RoPE runs unscaled",
+                "rope_scaling type \"unnamed\" is not supported: only \"default\" and \"llama3\" RoPE are",
             ),
         ];
         for (changes, message) in cases {

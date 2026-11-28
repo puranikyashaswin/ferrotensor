@@ -509,8 +509,13 @@ training normally (losses 1.4960 and 1.6540).
   A10G: held-out loss 1.3359, greedy `generate` answers "The capital of France
   is Paris.", and a 30-step `finetune` took the loss to 1.2682 (one run,
   [results](../../benchmarks/RESULTS.md#real-hardware-run-16-november-2026)).
-  Config features the forward pass lacks (an activation other than SiLU,
-  scaled RoPE, `use_sliding_window: true`) are refused with exit code 2.
+  Llama 3 RoPE scaling (`rope_type: "llama3"`, as in Llama 3.1 and 3.2) is
+  supported: Llama-3.2-1B logits are within 4.4e-5 of transformers' on 8
+  prompts, and a 250-step run reached held-out loss 1.3300 against 1.3221 for
+  PyTorch + PEFT (one run on an A10G). Config features the forward pass lacks (an activation other than
+  SiLU, linear, dynamic, yarn or longrope scaling, `use_sliding_window: true`)
+  are refused with exit code 2. Llama 3 tokenizers have no ChatML tokens, so
+  train with `--no-chat-template`; `chat` refuses them.
   Qwen3-style attention (per-head
   RMSNorm of queries and keys before RoPE, `q_norm`/`k_norm`) is implemented
   and checked on a small synthetic model against a CPU reference of the

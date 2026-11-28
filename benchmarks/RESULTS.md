@@ -575,3 +575,24 @@ because the thin kernel adds in a different order. The tracked peak was
 Greedy generation is unchanged, since one-row products already run the
 matrix-vector kernel: 108.9 and 110.9 tokens per second on SmolLM2-135M,
 57.0 and 57.2 on 1.7B.
+
+# Real hardware run, 23 November 2026: Llama 3 RoPE scaling
+
+One NVIDIA A10G (24 GB), Vulkan backend, release build of the Llama 3 RoPE
+branch at commit `00cb78e` (before it was rebased onto `main`). The checkpoint
+is Llama-3.2-1B from the unsloth mirror, revision `9535bd9b`, with
+`rope_type: "llama3"` (factor 32, `low_freq_factor` 1, `high_freq_factor` 4,
+`original_max_position_embeddings` 8192). The reference is torch 2.15.0 and
+transformers 5.23.0. Each number is from one run.
+
+- Logits: Ferrotensor's f32 logits on 8 fixed prompts against transformers in
+  float32. The largest absolute difference is 4.4e-5 (4.386902e-5) and the
+  mean is 2.8e-6.
+- Held-out loss: `finetune` with 250 steps, batch 1 x 8 accumulation and
+  `--no-chat-template` (the Llama 3 tokenizer has no ChatML tokens) on an
+  Alpaca SFT set, with `--eval-data`. The loss went from 1.8367 to 1.3300.
+  The PyTorch + PEFT twin (bf16 weights, the same data and settings) went from
+  1.8371 to 1.3221, a difference of 0.0079.
+- Peak GPU memory by Ferrotensor's count was 4,853 MiB.
+- Tests on the same box: `cargo fmt` clean, clippy with `-D warnings` clean,
+  467 host tests and 209 GPU tests passed.

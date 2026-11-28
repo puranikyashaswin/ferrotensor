@@ -615,7 +615,7 @@ leaves out the leading `▁` where llama.cpp puts one, before text that starts
 with a space and, with `prepend_scheme` `first`, after a special token. An
 existing `--out`, any other
 `model_type`, a scaled `rope_scaling` or `rope_parameters` (Llama 3.1 and
-later), `use_sliding_window: true`, any other bias (every bias of a `llama`
+later: the training and `generate` paths run it, the GGUF file does not carry it), `use_sliding_window: true`, any other bias (every bias of a `llama`
 model), a quantized base and tensors without a llama.cpp name are refused too,
 with exit code 2. The file is written to the GGUF v3 specification.
 On the A10G run of 16 November 2026, llama.cpp (commit `9fba51d`, CPU build,
