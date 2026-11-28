@@ -593,6 +593,40 @@ impl AutogradNode for ReluNode {
     }
 }
 
+/// Backward node of [`Tensor::gelu_tanh`].
+pub struct GeluTanhNode {
+    /// Input of the activation.
+    pub input: Tensor,
+}
+impl AutogradNode for GeluTanhNode {
+    fn inputs(&self) -> Vec<Tensor> {
+        vec![self.input.clone()]
+    }
+    /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
+    fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
+        let grad_in = UnifiedTensor::empty(&self.input.ctx, &self.input.data.shape);
+        engine.gelu_tanh_backward(&self.input.ctx, grad, &self.input.data, &grad_in);
+        vec![grad_in]
+    }
+}
+
+/// Backward node of [`Tensor::gelu_erf`].
+pub struct GeluErfNode {
+    /// Input of the activation.
+    pub input: Tensor,
+}
+impl AutogradNode for GeluErfNode {
+    fn inputs(&self) -> Vec<Tensor> {
+        vec![self.input.clone()]
+    }
+    /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
+    fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
+        let grad_in = UnifiedTensor::empty(&self.input.ctx, &self.input.data.shape);
+        engine.gelu_erf_backward(&self.input.ctx, grad, &self.input.data, &grad_in);
+        vec![grad_in]
+    }
+}
+
 /// Backward node of [`Tensor::softmax`] (row-wise over the last dim).
 pub struct SoftmaxNode {
     /// Input logits.
@@ -812,6 +846,47 @@ impl AutogradNode for RMSNormNode {
             self.weight.accumulate_grad(engine, grad_w);
         }
         true
+    }
+}
+
+/// Backward node of [`Tensor::layer_norm`].
+pub struct LayerNormNode {
+    /// Normalized input.
+    pub input: Tensor,
+    /// Per-feature scale.
+    pub weight: Tensor,
+    /// Per-feature shift.
+    pub bias: Tensor,
+    /// Each row's mean and reciprocal standard deviation, `[rows, 2]`, from
+    /// the forward pass.
+    pub stats: UnifiedTensor,
+}
+impl AutogradNode for LayerNormNode {
+    fn inputs(&self) -> Vec<Tensor> {
+        vec![self.input.clone(), self.weight.clone(), self.bias.clone()]
+    }
+    /// Gradients for each of [`inputs`](AutogradNode::inputs), in order.
+    fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
+        let ctx = &self.input.ctx;
+        let grad_x = UnifiedTensor::empty(ctx, &self.input.data.shape);
+        // A frozen parameter's gradient is never read, so its sum over rows
+        // is skipped; its slot in the result is a one-element placeholder.
+        let slot = |t: &Tensor| {
+            let shape: &[usize] = if t.requires_grad { &t.data.shape } else { &[1] };
+            UnifiedTensor::empty(ctx, shape)
+        };
+        let (grad_w, grad_b) = (slot(&self.weight), slot(&self.bias));
+        engine.layer_norm_backward(
+            ctx,
+            &self.input.data,
+            &self.weight.data,
+            grad,
+            &self.stats,
+            &grad_x,
+            self.weight.requires_grad.then_some(&grad_w),
+            self.bias.requires_grad.then_some(&grad_b),
+        );
+        vec![grad_x, grad_w, grad_b]
     }
 }
 
@@ -1404,6 +1479,28 @@ impl Tensor {
         Tensor::with_creator(input.ctx.clone(), out_data, node)
     }
 
+    /// GELU in the tanh form, `0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3)))`
+    /// (GPT-2 `gelu_new`, BLOOM, Gemma).
+    pub fn gelu_tanh(input: &Tensor, engine: &ComputeEngine) -> Tensor {
+        let out_data = UnifiedTensor::empty(&input.ctx, &input.data.shape);
+        engine.gelu_tanh(&input.ctx, &input.data, &out_data);
+        let node = Arc::new(GeluTanhNode {
+            input: input.clone(),
+        });
+        Tensor::with_creator(input.ctx.clone(), out_data, node)
+    }
+
+    /// GELU in the exact form, `x * Phi(x)` with `Phi` the standard normal
+    /// CDF (GPT-NeoX); the kernel approximates `erf` to 1.5e-7.
+    pub fn gelu_erf(input: &Tensor, engine: &ComputeEngine) -> Tensor {
+        let out_data = UnifiedTensor::empty(&input.ctx, &input.data.shape);
+        engine.gelu_erf(&input.ctx, &input.data, &out_data);
+        let node = Arc::new(GeluErfNode {
+            input: input.clone(),
+        });
+        Tensor::with_creator(input.ctx.clone(), out_data, node)
+    }
+
     /// Softmax over the last dimension.
     pub fn softmax(input: &Tensor, engine: &ComputeEngine) -> Tensor {
         let out_data = UnifiedTensor::empty(&input.ctx, &input.data.shape);
@@ -1464,6 +1561,40 @@ impl Tensor {
             input: input.clone(),
             weight: weight.clone(),
             eps,
+        });
+        Tensor::with_creator(input.ctx.clone(), out_data, node)
+    }
+
+    /// Layer normalization over the last dimension:
+    /// `(x - mean) / sqrt(var + eps) * weight + bias`.
+    ///
+    /// `weight` and `bias` have the length of the last dimension. A frozen
+    /// `weight` or `bias` gets no gradient.
+    pub fn layer_norm(
+        input: &Tensor,
+        weight: &Tensor,
+        bias: &Tensor,
+        eps: f32,
+        engine: &ComputeEngine,
+    ) -> Tensor {
+        let out_data = UnifiedTensor::empty(&input.ctx, &input.data.shape);
+        let size = input.data.shape.last().copied().unwrap_or(1).max(1);
+        let rows = input.data.shape.iter().product::<usize>() / size;
+        let stats = UnifiedTensor::empty(&input.ctx, &[rows, 2]);
+        engine.layer_norm(
+            &input.ctx,
+            &input.data,
+            &weight.data,
+            &bias.data,
+            &out_data,
+            &stats,
+            eps,
+        );
+        let node = Arc::new(LayerNormNode {
+            input: input.clone(),
+            weight: weight.clone(),
+            bias: bias.clone(),
+            stats,
         });
         Tensor::with_creator(input.ctx.clone(), out_data, node)
     }

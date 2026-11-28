@@ -209,6 +209,107 @@ fn rms_norm_backward_weight(@builtin(global_invocation_id) gid: vec3<u32>, @buil
     }
     rmsw_gw[i] = acc;
 }
+// --- 3b. LayerNorm ---
+// y = (x - mean) * rstd * w + b over each row, one workgroup per row. The
+// variance is the mean of (x - mean)^2 from a second pass over the row: the
+// one-pass form E[x^2] - mean^2 loses every digit of it when the mean is
+// large against the spread. Each row's mean and rstd = 1 / sqrt(var + eps) go
+// to ln_stats at [2 * row] and [2 * row + 1] for the backward kernels.
+@group(0) @binding(0) var<storage, read> ln_input: array<f32>;
+@group(0) @binding(1) var<storage, read> ln_weight: array<f32>;
+@group(0) @binding(2) var<storage, read> ln_bias: array<f32>;
+@group(0) @binding(3) var<storage, read_write> ln_out: array<f32>;
+@group(0) @binding(4) var<storage, read_write> ln_stats: array<f32>;
+@group(0) @binding(5) var<uniform> ln_params: vec4<u32>; // size, rows, eps bits, 0
+
+@compute @workgroup_size(256)
+fn layer_norm(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wg: vec3<u32>,
+              @builtin(num_workgroups) nwg: vec3<u32>) {
+    let row = row_index(wg, nwg);
+    let size = ln_params.x;
+    if (row >= ln_params.y) { return; } // uniform: whole workgroup exits
+    let off = row * size;
+    var total = 0.0;
+    for (var i = lid; i < size; i += ROW_WG) {
+        total += ln_input[off + i];
+    }
+    let mean = row_sum(lid, total) / f32(size);
+    var sq = 0.0;
+    for (var i = lid; i < size; i += ROW_WG) {
+        let d = ln_input[off + i] - mean;
+        sq += d * d;
+    }
+    let rstd = 1.0 / sqrt(row_sum(lid, sq) / f32(size) + bitcast<f32>(ln_params.z));
+    for (var i = lid; i < size; i += ROW_WG) {
+        ln_out[off + i] = (ln_input[off + i] - mean) * rstd * ln_weight[i] + ln_bias[i];
+    }
+    if (lid == 0u) {
+        ln_stats[2u * row] = mean;
+        ln_stats[2u * row + 1u] = rstd;
+    }
+}
+
+// LayerNorm backward for the input, one workgroup per row. With xhat =
+// (x - mean) * rstd and gw = g * w:
+// grad_x = rstd * (gw - mean(gw) - xhat * mean(gw * xhat)).
+@group(0) @binding(0) var<storage, read> lnb_x: array<f32>;
+@group(0) @binding(1) var<storage, read> lnb_g: array<f32>;
+@group(0) @binding(2) var<storage, read> lnb_w: array<f32>;
+@group(0) @binding(3) var<storage, read> lnb_stats: array<f32>;
+@group(0) @binding(4) var<storage, read_write> lnb_gx: array<f32>;
+@group(0) @binding(5) var<uniform> lnb_params: vec4<u32>; // size, rows, 0, 0
+
+@compute @workgroup_size(256)
+fn layer_norm_backward(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wg: vec3<u32>,
+                       @builtin(num_workgroups) nwg: vec3<u32>) {
+    let row = row_index(wg, nwg);
+    let size = lnb_params.x;
+    if (row >= lnb_params.y) { return; } // uniform: whole workgroup exits
+    let off = row * size;
+    let mean = lnb_stats[2u * row];
+    let rstd = lnb_stats[2u * row + 1u];
+    var s1 = 0.0;
+    var s2 = 0.0;
+    for (var i = lid; i < size; i += ROW_WG) {
+        let gw = lnb_g[off + i] * lnb_w[i];
+        s1 += gw;
+        s2 += gw * (lnb_x[off + i] - mean) * rstd;
+    }
+    s1 = row_sum(lid, s1) / f32(size);
+    s2 = row_sum(lid, s2) / f32(size);
+    for (var i = lid; i < size; i += ROW_WG) {
+        let gw = lnb_g[off + i] * lnb_w[i];
+        let xhat = (lnb_x[off + i] - mean) * rstd;
+        lnb_gx[off + i] = rstd * (gw - s1 - xhat * s2);
+    }
+}
+
+// grad_w[i] = sum over rows of g * xhat and grad_b[i] = sum over rows of g,
+// one thread per feature. Bit 0 of params.z asks for grad_w and bit 1 for
+// grad_b; a frozen one is not written.
+@group(0) @binding(0) var<storage, read> lnw_x: array<f32>;
+@group(0) @binding(1) var<storage, read> lnw_g: array<f32>;
+@group(0) @binding(2) var<storage, read> lnw_stats: array<f32>;
+@group(0) @binding(3) var<storage, read_write> lnw_gw: array<f32>;
+@group(0) @binding(4) var<storage, read_write> lnw_gb: array<f32>;
+@group(0) @binding(5) var<uniform> lnw_params: vec4<u32>; // size, rows, flags, 0
+
+@compute @workgroup_size(64)
+fn layer_norm_backward_affine(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = gid.x + gid.y * nwg.x * 64u;
+    let size = lnw_params.x;
+    if (i >= size) { return; }
+    var acc_w = 0.0;
+    var acc_b = 0.0;
+    for (var r = 0u; r < lnw_params.y; r += 1u) {
+        let g = lnw_g[r * size + i];
+        acc_w += g * (lnw_x[r * size + i] - lnw_stats[2u * r]) * lnw_stats[2u * r + 1u];
+        acc_b += g;
+    }
+    if ((lnw_params.z & 1u) != 0u) { lnw_gw[i] = acc_w; }
+    if ((lnw_params.z & 2u) != 0u) { lnw_gb[i] = acc_b; }
+}
+
 // --- 4. SiLU ---
 @group(0) @binding(0) var<storage, read> silu_input: array<f32>;
 @group(0) @binding(1) var<storage, read_write> silu_out: array<f32>;
@@ -397,6 +498,92 @@ fn silu_backward_real(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(nu
     let x = silu_bk_input[i];
     let s = 1.0 / (1.0 + exp(-x));
     silu_bk_grad_in[i] = silu_bk_grad_out[i] * s * (1.0 + x * (1.0 - s));
+}
+
+// --- 4b. GELU ---
+// Both forms are element-wise.
+// tanh form (GPT-2 "gelu_new", BLOOM, Gemma): 0.5 x (1 + tanh(u)) with
+// u = sqrt(2/pi) (x + 0.044715 x^3). WGSL's tanh becomes HLSL tanh on DX12,
+// which WARP computes about 1e-3 off, so tanh is built from exp alone. The
+// argument of the polynomial is clamped to +-50, far past the point where tanh
+// is exactly +-1 in f32, so x^3 and x^2 never overflow.
+// erf form (GPT-NeoX, "gelu"): x * Phi(x) with Phi the standard normal CDF.
+// WGSL has no erf, so Phi comes from Abramowitz and Stegun 7.1.26 (erfc(z) =
+// (a1 t + ... + a5 t^5) exp(-z^2), t = 1 / (1 + p z), z >= 0), whose absolute
+// error is at most 1.5e-7. The tail is formed from erfc directly, so a large
+// negative x does not lose digits to 1 + erf(x). Measured against an f64 erf,
+// Phi is within 7e-8 and x * Phi within 2.1e-7 on [-12, 12] (before f32 rounding).
+fn gelu_tanh_exp(x: f32) -> f32 {
+    let ax = abs(x);
+    if (ax < 0.0625) {
+        // Taylor series; (1 - e) / (1 + e) loses relative precision near 0.
+        let x2 = x * x;
+        return x * (1.0 - x2 * (1.0 / 3.0 - x2 * (2.0 / 15.0)));
+    }
+    let e = exp(-2.0 * ax);
+    return sign(x) * (1.0 - e) / (1.0 + e);
+}
+
+fn gelu_tanh_value(x: f32) -> f32 {
+    let xc = clamp(x, -50.0, 50.0);
+    return 0.5 * x * (1.0 + gelu_tanh_exp(0.7978845608028654 * (xc + 0.044715 * xc * xc * xc)));
+}
+
+fn gelu_tanh_slope(x: f32) -> f32 {
+    let xc = clamp(x, -50.0, 50.0);
+    let t = gelu_tanh_exp(0.7978845608028654 * (xc + 0.044715 * xc * xc * xc));
+    let dt = (1.0 - t * t) * 0.7978845608028654 * (1.0 + 3.0 * 0.044715 * xc * xc);
+    return 0.5 * (1.0 + t) + 0.5 * x * dt;
+}
+
+fn gelu_phi(x: f32) -> f32 {
+    let z = abs(x) * 0.7071067811865476;
+    let t = 1.0 / (1.0 + 0.3275911 * z);
+    let poly = (((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t);
+    let tail = 0.5 * poly * exp(-z * z); // 1 - Phi(|x|)
+    return select(tail, 1.0 - tail, x >= 0.0);
+}
+
+@group(0) @binding(0) var<storage, read> gelu_tanh_input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> gelu_tanh_out: array<f32>;
+@compute @workgroup_size(64)
+fn gelu_tanh(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = gid.x + gid.y * nwg.x * 64u;
+    if (i >= arrayLength(&gelu_tanh_out)) { return; }
+    gelu_tanh_out[i] = gelu_tanh_value(gelu_tanh_input[i]);
+}
+
+@group(0) @binding(3) var<storage, read> gelu_tanh_bk_grad_out: array<f32>;
+@group(0) @binding(4) var<storage, read> gelu_tanh_bk_input: array<f32>;
+@group(0) @binding(5) var<storage, read_write> gelu_tanh_bk_grad_in: array<f32>;
+@compute @workgroup_size(64)
+fn gelu_tanh_backward(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = gid.x + gid.y * nwg.x * 64u;
+    if (i >= arrayLength(&gelu_tanh_bk_grad_out)) { return; }
+    gelu_tanh_bk_grad_in[i] = gelu_tanh_bk_grad_out[i] * gelu_tanh_slope(gelu_tanh_bk_input[i]);
+}
+
+@group(0) @binding(0) var<storage, read> gelu_erf_input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> gelu_erf_out: array<f32>;
+@compute @workgroup_size(64)
+fn gelu_erf(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = gid.x + gid.y * nwg.x * 64u;
+    if (i >= arrayLength(&gelu_erf_out)) { return; }
+    let x = gelu_erf_input[i];
+    gelu_erf_out[i] = x * gelu_phi(x);
+}
+
+// d/dx x Phi(x) = Phi(x) + x phi(x), phi the standard normal density.
+@group(0) @binding(3) var<storage, read> gelu_erf_bk_grad_out: array<f32>;
+@group(0) @binding(4) var<storage, read> gelu_erf_bk_input: array<f32>;
+@group(0) @binding(5) var<storage, read_write> gelu_erf_bk_grad_in: array<f32>;
+@compute @workgroup_size(64)
+fn gelu_erf_backward(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = gid.x + gid.y * nwg.x * 64u;
+    if (i >= arrayLength(&gelu_erf_bk_grad_out)) { return; }
+    let x = gelu_erf_bk_input[i];
+    let pdf = 0.3989422804014327 * exp(-0.5 * x * x);
+    gelu_erf_bk_grad_in[i] = gelu_erf_bk_grad_out[i] * (gelu_phi(x) + x * pdf);
 }
 
 // --- 10. Optimizer Kernels ---

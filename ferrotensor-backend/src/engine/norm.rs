@@ -133,6 +133,119 @@ impl ComputeEngine {
         );
     }
 
+    /// LayerNorm over the last dimension:
+    /// `out = (x - mean) / sqrt(var + eps) * weight + bias`, with the
+    /// variance taken about the row's mean in a second pass.
+    ///
+    /// `stats` is `[rows, 2]`: the kernel writes each row's mean and
+    /// reciprocal standard deviation there for
+    /// [`layer_norm_backward`](Self::layer_norm_backward).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the input, both parameters, the output and the saved statistics are separate buffers"
+    )]
+    pub fn layer_norm(
+        &self,
+        ctx: &WgpuContext,
+        input: &UnifiedTensor,
+        weight: &UnifiedTensor,
+        bias: &UnifiedTensor,
+        out: &UnifiedTensor,
+        stats: &UnifiedTensor,
+        eps: f32,
+    ) {
+        let size = *input.shape.last().unwrap_or(&1);
+        let rows = input.shape.iter().product::<usize>() / size.max(1);
+        if rows == 0 || size == 0 {
+            return;
+        }
+        let params = uniform(
+            ctx,
+            bytemuck::cast_slice(&[size as u32, rows as u32, eps.to_bits(), 0]),
+        );
+        self.run(
+            ctx,
+            &self.layer_norm,
+            &[
+                (0, input.buffer()),
+                (1, weight.buffer()),
+                (2, bias.buffer()),
+                (3, out.buffer()),
+                (4, stats.buffer()),
+                (5, &params),
+            ],
+            grid(rows as u32),
+        );
+    }
+
+    /// Gradients of [`layer_norm`](Self::layer_norm) with respect to `input`,
+    /// `weight` and `bias`, given the output gradient `grad_out` and the
+    /// `stats` the forward pass wrote.
+    ///
+    /// `grad_input` has `input`'s shape; `grad_weight` and `grad_bias` have
+    /// the shape of the parameters and are summed over all rows. `None`
+    /// skips that gradient (a frozen parameter); both `None` skips the
+    /// kernel that sums over rows.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the saved tensors and the three gradients are separate buffers, as in rms_norm_backward"
+    )]
+    pub fn layer_norm_backward(
+        &self,
+        ctx: &WgpuContext,
+        input: &UnifiedTensor,
+        weight: &UnifiedTensor,
+        grad_out: &UnifiedTensor,
+        stats: &UnifiedTensor,
+        grad_input: &UnifiedTensor,
+        grad_weight: Option<&UnifiedTensor>,
+        grad_bias: Option<&UnifiedTensor>,
+    ) {
+        let size = *input.shape.last().unwrap_or(&1);
+        let rows = input.shape.iter().product::<usize>() / size.max(1);
+        if rows == 0 || size == 0 {
+            return;
+        }
+        let params = uniform(ctx, bytemuck::cast_slice(&[size as u32, rows as u32, 0, 0]));
+        self.run(
+            ctx,
+            &self.layer_norm_bw,
+            &[
+                (0, input.buffer()),
+                (1, grad_out.buffer()),
+                (2, weight.buffer()),
+                (3, stats.buffer()),
+                (4, grad_input.buffer()),
+                (5, &params),
+            ],
+            grid(rows as u32),
+        );
+        if grad_weight.is_none() && grad_bias.is_none() {
+            return;
+        }
+        // The kernel binds both outputs; one that is not wanted gets a
+        // one-element buffer it never writes.
+        let unused = UnifiedTensor::empty(ctx, &[1]);
+        let flags = u32::from(grad_weight.is_some()) | (u32::from(grad_bias.is_some()) << 1);
+        let params = uniform(
+            ctx,
+            bytemuck::cast_slice(&[size as u32, rows as u32, flags, 0]),
+        );
+        self.run(
+            ctx,
+            &self.layer_norm_bw_affine,
+            &[
+                (0, input.buffer()),
+                (1, grad_out.buffer()),
+                (2, stats.buffer()),
+                (3, grad_weight.unwrap_or(&unused).buffer()),
+                (4, grad_bias.unwrap_or(&unused).buffer()),
+                (5, &params),
+            ],
+            groups64(size),
+        );
+    }
+
     /// Fused RMSNorm + Residual: out = RMSNorm(x + residual) * weight
     pub fn rms_norm_residual(
         &self,

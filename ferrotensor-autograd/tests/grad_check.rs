@@ -88,6 +88,17 @@ fn cases() -> Vec<Case> {
             vec![input(&[2, 6], 5), input(&[6], 6)],
             |x, e| Tensor::rms_norm(&x[0], &x[1], 0.1, e),
         ),
+        case(
+            "layer_norm",
+            vec![input(&[2, 6], 5), input(&[6], 6), input(&[6], 7)],
+            |x, e| Tensor::layer_norm(&x[0], &x[1], &x[2], 1e-3, e),
+        ),
+        case("gelu_tanh", vec![input(&[8], 3)], |x, e| {
+            Tensor::gelu_tanh(&x[0], e)
+        }),
+        case("gelu_erf", vec![input(&[8], 3)], |x, e| {
+            Tensor::gelu_erf(&x[0], e)
+        }),
         case("rope_one_head", vec![input(&[1, 3, 4], 7)], |x, e| {
             Tensor::rope(&x[0], 4, 2, e)
         }),
