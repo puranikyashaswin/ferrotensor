@@ -3,8 +3,7 @@
 Python bindings for [ferrotensor](https://github.com/puranikyashaswin/ferrotensor),
 a pure-Rust ML framework: PyTorch-style tensors, autograd, `nn` layers and
 optimizers that run on the CPU or on a GPU through wgpu (Metal, Vulkan, DX12)
-with hand-written WGSL kernels. No CUDA, no NumPy, no other runtime
-dependencies.
+with hand-written WGSL kernels. The wheel has no runtime dependencies.
 
 This package is the tensor and autograd API. LoRA fine-tuning of language
 models, with `plan`, `finetune`, `eval`, `chat` and `merge`, is in the

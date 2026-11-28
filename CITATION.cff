@@ -4,8 +4,8 @@ type: software
 title: "Ferrotensor: LoRA fine-tuning in Rust on portable GPU APIs through wgpu"
 abstract: >-
   Ferrotensor is a Rust machine learning framework that trains and fine-tunes
-  models through wgpu (Vulkan, Metal or DX12) with hand-written WGSL kernels
-  and no CUDA toolchain. It runs LoRA fine-tuning of Llama-style language
+  models through wgpu (Vulkan, Metal or DX12) with hand-written WGSL kernels.
+  It runs LoRA fine-tuning of Llama-style language
   models from 135M to 1.7B parameters. Its LoRA loss and gradients are checked
   against PyTorch autograd in CI, and it writes adapters in the PEFT format.
   It has been tested on an NVIDIA A10G, an Apple M2 and software Vulkan;
