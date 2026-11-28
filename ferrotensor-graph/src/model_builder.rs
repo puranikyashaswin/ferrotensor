@@ -527,7 +527,11 @@ impl<'a> Lfm2ModelBuilder<'a> {
         // The table is built once per layer; it is `head_dim / 2` floats.
         let rope_inv_freq = rope_scaling(&self.config)
             .map_err(BuildError)?
-            .map(|scaling| RopeFreqs::new(&self.ctx, &scaling.inv_freq(head_dim, rope_theta)));
+            .map(|scaling| {
+                RopeFreqs::new(&self.ctx, &scaling.inv_freq(head_dim, rope_theta), head_dim)
+            })
+            .transpose()
+            .map_err(|e| BuildError(e.to_string()))?;
 
         Ok(Attention {
             q_proj: self.build_linear(&format!("{prefix}.q_proj"), "q_proj", seed)?,

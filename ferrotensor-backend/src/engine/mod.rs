@@ -23,7 +23,7 @@ mod skinny;
 mod small_m;
 mod training;
 
-pub use attention::{AttentionOptions, RopeFreqs};
+pub use attention::{AttentionOptions, RopeFreqs, RopeTableError};
 pub(crate) use coop::autotune_requested;
 pub use coop::{AutotuneReport, CoopConfig, CoopTile, AUTOTUNE_ENV};
 pub use flash_coop::FLASH_COOP_ENV;
@@ -437,9 +437,26 @@ pub struct ComputeEngine {
     lora_group: Mutex<HashMap<lora_group::Key, Arc<Kernel>>>,
     /// Whether the kernels read their parameters from immediates.
     immediates: bool,
+    /// The buffer bound to the RoPE table slot of a rotation without a table,
+    /// created the first time one runs.
+    rope_stub: std::sync::OnceLock<Buffer>,
 }
 
 impl ComputeEngine {
+    /// The 4-byte buffer for the table binding of an unscaled rotation. It
+    /// is one buffer for the engine's life, so those dispatches stay
+    /// cacheable.
+    fn rope_stub(&self, ctx: &WgpuContext) -> &Buffer {
+        self.rope_stub.get_or_init(|| {
+            ctx.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("RoPE Table Stub"),
+                    contents: &[0u8; 4],
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+        })
+    }
+
     /// Compiles every kernel for `ctx`'s device, reading its parameters from
     /// immediates when [`WgpuContext::uses_immediates`] says so.
     pub fn new(ctx: &WgpuContext) -> Self {
@@ -524,6 +541,7 @@ impl ComputeEngine {
             fused_ref: Mutex::new(HashMap::new()),
             lora_group: Mutex::new(HashMap::new()),
             immediates,
+            rope_stub: std::sync::OnceLock::new(),
         }
     }
 

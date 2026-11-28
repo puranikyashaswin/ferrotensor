@@ -16,15 +16,49 @@ use std::sync::Arc;
 pub struct RopeFreqs {
     host: Arc<[f32]>,
     device: UnifiedTensor,
+    head_dim: usize,
 }
 
+/// A table of inverse frequencies that does not fit the head size it was
+/// made for: a head of `head_dim` has `head_dim / 2` rotation pairs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RopeTableError {
+    /// Entries in the table.
+    pub len: usize,
+    /// The head size it was meant for.
+    pub head_dim: usize,
+}
+
+impl std::fmt::Display for RopeTableError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "a RoPE table of {} inverse frequencies does not fit head_dim {}: a head needs {}",
+            self.len,
+            self.head_dim,
+            self.head_dim / 2
+        )
+    }
+}
+
+impl std::error::Error for RopeTableError {}
+
 impl RopeFreqs {
-    /// The table `values` (one inverse frequency per rotation pair) on `ctx`.
-    pub fn new(ctx: &WgpuContext, values: &[f32]) -> Self {
-        Self {
+    /// The table `values` (one inverse frequency per rotation pair) on `ctx`,
+    /// for heads of `head_dim` values.
+    ///
+    /// # Errors
+    ///
+    /// [`RopeTableError`] when `values` does not hold `head_dim / 2` entries,
+    /// which would rotate by wrong angles without any other sign.
+    pub fn new(ctx: &WgpuContext, values: &[f32], head_dim: usize) -> Result<Self, RopeTableError> {
+        let table = Self {
             host: values.into(),
             device: UnifiedTensor::new(ctx, values, &[values.len()]),
-        }
+            head_dim,
+        };
+        table.check(head_dim)?;
+        Ok(table)
     }
 
     /// The inverse frequencies, one per rotation pair.
@@ -32,20 +66,19 @@ impl RopeFreqs {
         &self.host
     }
 
-    /// Stops a rotation of `head_dim` wide vectors with a table of another
-    /// length, which would rotate by wrong angles without an error.
-    #[expect(
-        clippy::panic,
-        reason = "shape precondition of an op that returns no Result"
-    )]
-    fn check(&self, head_dim: usize) {
-        if self.host.len() * 2 != head_dim {
-            panic!(
-                "RoPE table has {} inverse frequencies for head_dim {head_dim}: expected {}",
-                self.host.len(),
-                head_dim / 2
-            );
+    /// Whether this table fits heads of `head_dim` values.
+    ///
+    /// # Errors
+    ///
+    /// [`RopeTableError`] when it does not.
+    pub fn check(&self, head_dim: usize) -> Result<(), RopeTableError> {
+        if head_dim == 0 || self.head_dim != head_dim || self.host.len() * 2 != head_dim {
+            return Err(RopeTableError {
+                len: self.host.len(),
+                head_dim,
+            });
         }
+        Ok(())
     }
 }
 
@@ -193,7 +226,11 @@ impl ComputeEngine {
         inverse: bool,
     ) {
         if let Some(table) = inv_freq {
-            table.check(head_dim);
+            assert!(
+                table.check(head_dim).is_ok(),
+                "the RoPE table was made for head_dim {}, not {head_dim}",
+                table.head_dim
+            );
         }
         let (seq_len, tokens) = match tensor.shape.len() {
             0 | 1 => (1, 1),
@@ -217,11 +254,12 @@ impl ComputeEngine {
             ]),
         );
         let pairs = tensor.shape.iter().product::<usize>() / 2;
-        // The kernels declare the table always; an unused binding gets a stub.
-        let stub = dummy_storage(ctx);
-        let table: &dyn Arg = match inv_freq {
+        // The kernels declare the table always; an unused binding gets the
+        // engine's one stub, a plain buffer so the dispatch keeps its cached
+        // bind group.
+        let table = match inv_freq {
             Some(f) => f.device.buffer(),
-            None => &stub,
+            None => self.rope_stub(ctx),
         };
         match out {
             None => self.run(
@@ -395,7 +433,12 @@ impl ComputeEngine {
     ) {
         let dims = AttentionDims::new(q, k);
         if let Some(table) = rope.and_then(|r| r.inv_freq) {
-            table.check(dims.head_dim as usize);
+            assert!(
+                table.check(dims.head_dim as usize).is_ok(),
+                "the RoPE table was made for head_dim {}, not {}",
+                table.head_dim,
+                dims.head_dim
+            );
         }
         if let Some(s) = stats {
             dims.check_stats(s);
@@ -673,7 +716,12 @@ impl ComputeEngine {
     ) {
         let dims = AttentionDims::new(q, k);
         if let Some(table) = rope.and_then(|r| r.inv_freq) {
-            table.check(dims.head_dim as usize);
+            assert!(
+                table.check(dims.head_dim as usize).is_ok(),
+                "the RoPE table was made for head_dim {}, not {}",
+                table.head_dim,
+                dims.head_dim
+            );
         }
         if let Some(s) = saved {
             dims.check_stats(s);

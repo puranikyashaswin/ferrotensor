@@ -408,6 +408,45 @@ fn bind_group_cache_follows_reused_and_freed_buffers() {
     assert_eq!(read(&ctx, &sum), vec![30.0, 60.0, 90.0, 120.0], "z's data");
 }
 
+/// A rotation without a RoPE table binds the engine's one stub buffer, so its
+/// second call finds the bind group the first one made, in place and out of
+/// place. (Without immediates the parameters are a uniform buffer made per
+/// call, which no group can be cached for.)
+#[test]
+#[ignore = "needs a GPU"]
+fn unscaled_rope_dispatches_hit_the_bind_group_cache() {
+    let ctx = pollster::block_on(WgpuContext::new());
+    if !ctx.uses_immediates() {
+        eprintln!(
+            "skipped: {} has no immediates, so rope's parameters are a uniform buffer",
+            ctx.adapter_info()
+        );
+        return;
+    }
+    let engine = ComputeEngine::new(&ctx);
+    let x = UnifiedTensor::new(&ctx, &[1.0; 16], &[1, 1, 16]);
+    let out = UnifiedTensor::empty(&ctx, &[1, 1, 16]);
+
+    let before = ctx.gpu_counters();
+    engine.rope_theta(&ctx, &x, 16, 0, 10_000.0);
+    assert_eq!(bind_counts(&ctx, &before), (1, 0, 1), "the first call");
+    let before = ctx.gpu_counters();
+    engine.rope_theta(&ctx, &x, 16, 3, 10_000.0);
+    assert_eq!(bind_counts(&ctx, &before), (0, 1, 0), "in place, cached");
+
+    let before = ctx.gpu_counters();
+    engine.rope_theta_to(&ctx, (&x, &out), 16, 0, 10_000.0);
+    assert_eq!(bind_counts(&ctx, &before), (1, 0, 1), "the first call");
+    let before = ctx.gpu_counters();
+    engine.rope_theta_to(&ctx, (&x, &out), 16, 5, 10_000.0);
+    assert_eq!(
+        bind_counts(&ctx, &before),
+        (0, 1, 0),
+        "out of place, cached"
+    );
+    ctx.synchronize();
+}
+
 /// 100 and 101 rows of 10 floats are 4000 and 4040 bytes, which are the same
 /// size class, so the pool hands a buffer of one to the other.
 const ROWS_A: usize = 100;

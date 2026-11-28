@@ -437,7 +437,9 @@ fn check_rope(g: &Gpu, rows: u32, coop: bool) {
         );
         // The scaled calls give the kernels a table that no theta reproduces.
         let table = scaled.then(|| llama3_freqs(f64::from(*theta)));
-        let device_table = table.as_deref().map(|t| RopeFreqs::new(&g.ctx, t));
+        let device_table = table
+            .as_deref()
+            .map(|t| RopeFreqs::new(&g.ctx, t, HEAD).unwrap());
         let [q, k, v, dout] = c.inputs(900 + 4 * n as u64);
         let (b, sq, sk, h, hkv) = (c.b, c.sq, c.sk, c.h, c.hkv);
         let rope = (*theta, *pos, table.as_deref());
