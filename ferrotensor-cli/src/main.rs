@@ -1132,18 +1132,17 @@ async fn evaluate(
         let chunk_rows = head_chunk_rows(ex.input_ids.len(), base.config.vocab_size)
             .filter(|_| model.supports_head_input());
         let scored = if let Some(chunk_rows) = chunk_rows {
-            no_grad(|| model.forward_head_input(&base.engine, &ex.input_ids, None, None)).and_then(
-                |hidden| {
-                    chunked_head_loss(
-                        &model.lm_head,
-                        &hidden,
-                        &ex.target_ids,
-                        &ex.loss_mask,
-                        chunk_rows,
-                        &base.engine,
-                    )
-                },
-            )
+            let hidden =
+                no_grad(|| model.forward_head_input(&base.engine, &ex.input_ids, None, None))
+                    .ok_or("the model gave no hidden states for the chunked evaluation")?;
+            chunked_head_loss(
+                &model.lm_head,
+                &hidden,
+                &ex.target_ids,
+                &ex.loss_mask,
+                chunk_rows,
+                &base.engine,
+            )?
         } else {
             let logits = no_grad(|| model.forward(&base.engine, &ex.input_ids, 0, None, None));
             let host = logits.data.to_vec(&base.ctx).await?;

@@ -157,7 +157,8 @@ fn run(gpu: &Gpu, kind: Head, mask: &[u8], chunk: Option<usize>) -> Outcome {
             SEQUENCES,
             rows,
             &gpu.engine,
-        ),
+        )
+        .expect("valid arguments"),
         None => {
             let logits = case.head.forward(&gpu.engine, &case.hidden);
             masked_cross_entropy_batch(&logits, &targets(), mask, SEQUENCES, &gpu.engine)
@@ -453,7 +454,7 @@ fn chunked_eval_loss_equals_the_whole_one() {
             8,
             &gpu.engine,
         );
-        assert!(none.is_none());
+        assert!(matches!(none, Ok(None)));
         for (name, t) in case.tensors() {
             assert!(t.grad.borrow().is_none(), "{name} has a gradient");
         }
@@ -484,6 +485,7 @@ fn peak_logit_bytes(gpu: &Gpu, rows: usize, classes: usize, chunk: Option<usize>
     let loss = match chunk {
         Some(chunk_rows) => {
             chunked_head_cross_entropy(&head, &hidden, &targets, &mask, 1, chunk_rows, &gpu.engine)
+                .expect("valid arguments")
         }
         None => {
             let logits = head.forward(&gpu.engine, &hidden);
@@ -571,4 +573,49 @@ fn the_most_whole_rows_are_the_last_ones_that_do_not_chunk() {
     assert_eq!(max_whole_head_rows(151_936), 883);
     assert_eq!(max_whole_head_rows(262_208), HEAD_CHUNK_ROWS);
     assert_eq!(max_whole_head_rows(usize::MAX), HEAD_CHUNK_ROWS);
+}
+
+/// Arguments the chunked head cannot run are errors; only "nothing
+/// supervised" is `Ok(None)`. The mismatch between a spec and the rows is
+/// tested next to `run_chunked_head`, which the trainer's loss step uses.
+#[test]
+#[ignore = "needs a GPU"]
+fn bad_arguments_are_errors_not_an_empty_step() {
+    let gpu = gpu();
+    let case = Case::new(&gpu, Head::Everything);
+    let mask = mixed_mask();
+    let loss = |mask: &[u8], sequences: usize, chunk_rows: usize| {
+        chunked_head_cross_entropy(
+            &case.head,
+            &case.hidden,
+            &targets(),
+            mask,
+            sequences,
+            chunk_rows,
+            &gpu.engine,
+        )
+        .map(|loss| loss.is_some())
+    };
+    assert!(matches!(loss(&mask, SEQUENCES, 8), Ok(true)));
+    assert!(matches!(loss(&[0; ROWS], SEQUENCES, 8), Ok(false)));
+    // 39 rows do not split into 2 sequences, nor into 0.
+    assert!(loss(&mask, 2, 8).is_err());
+    assert!(loss(&mask, 0, 8).is_err());
+    // A chunk of no rows cannot run.
+    assert!(loss(&mask, SEQUENCES, 0).is_err());
+    let eval = |chunk_rows: usize| {
+        chunked_head_loss(
+            &case.head,
+            &case.hidden,
+            &targets(),
+            &mask,
+            chunk_rows,
+            &gpu.engine,
+        )
+    };
+    assert!(eval(0).is_err());
+    assert!(matches!(eval(8), Ok(Some(_))));
+    for (name, t) in case.tensors() {
+        assert!(t.grad.borrow().is_none(), "{name} has a gradient");
+    }
 }

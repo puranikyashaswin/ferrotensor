@@ -22,7 +22,7 @@ use ferrotensor_backend::{
 use ferrotensor_graph::lfm::Lfm2Model;
 use std::sync::Arc;
 
-use head_loss::run_chunked_head;
+use head_loss::{check_row_split, run_chunked_head};
 
 pub mod checkpoint;
 pub mod classify;
@@ -526,15 +526,33 @@ impl Trainer {
                 let vocab = head.weight.data.shape.last().copied().unwrap_or(0);
                 let width = hidden.data.shape.last().copied().unwrap_or(1).max(1);
                 let rows = hidden.data.shape.iter().product::<usize>() / width;
+                // A spec that does not fit the rows is an error. After
+                // these checks `None` means that nothing is supervised.
+                check_row_split(rows, vocab, sequences)?;
                 let spec = match labels {
                     Labels::Full(targets, masks) => {
                         masked_ce_rows(rows, vocab, targets, masks, sequences, seed)
                     }
-                    Labels::Gathered(head_rows) => head_rows.ce_rows(rows, seed),
+                    Labels::Gathered(head_rows) => {
+                        if head_rows.positions.len() != rows {
+                            return Err(TrainError(format!(
+                                "{} head rows for {rows} rows of hidden states",
+                                head_rows.positions.len()
+                            )));
+                        }
+                        head_rows.ce_rows(rows, seed)
+                    }
                 };
-                spec.and_then(|spec| {
-                    run_chunked_head(head, hidden, spec, *chunk_rows, &self.engine)
-                })
+                match spec {
+                    Some(spec) => Some(run_chunked_head(
+                        head,
+                        hidden,
+                        spec,
+                        *chunk_rows,
+                        &self.engine,
+                    )?),
+                    None => None,
+                }
             }
         };
         if let Some(ce) = ce {

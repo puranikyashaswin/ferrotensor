@@ -15,7 +15,8 @@
 //! when `backward` is called on the loss.
 
 use crate::{
-    ce_kernel, ce_loss_tensor, masked_ce_rows, BatchLoss, CeRows, GpuCrossEntropy, MASKED_CE_SKIP,
+    ce_kernel, ce_loss_tensor, masked_ce_rows, BatchLoss, CeRows, GpuCrossEntropy, TrainError,
+    MASKED_CE_SKIP,
 };
 use ferrotensor_autograd::{no_grad, Tensor};
 use ferrotensor_backend::{ComputeEngine, DType, MemoryCategory, UnifiedTensor};
@@ -62,6 +63,53 @@ pub fn max_whole_head_rows(vocab: usize) -> usize {
     by_size.max(HEAD_CHUNK_ROWS)
 }
 
+/// The width of `hidden`, the number of classes of `head` and the number of
+/// rows of `hidden`, or the reason the head cannot run over chunks of
+/// `chunk_rows` rows of `hidden`.
+fn head_dims(
+    head: &Linear,
+    hidden: &Tensor,
+    chunk_rows: usize,
+) -> Result<(usize, usize, usize), TrainError> {
+    let width = hidden.data.shape.last().copied().unwrap_or(0);
+    let vocab = head.weight.data.shape.last().copied().unwrap_or(0);
+    if chunk_rows == 0 {
+        return Err(TrainError("a chunk needs at least one row".into()));
+    }
+    if width == 0 || head.weight.data.shape.first() != Some(&width) {
+        return Err(TrainError(format!(
+            "hidden states of width {width} do not fit a head of shape {:?}",
+            head.weight.data.shape
+        )));
+    }
+    if hidden.data.dtype != DType::FP32 {
+        return Err(TrainError(
+            "the chunked head needs f32 hidden states".into(),
+        ));
+    }
+    let rows = hidden.data.shape.iter().product::<usize>() / width;
+    Ok((width, vocab, rows))
+}
+
+/// Whether `rows` rows of a head over `vocab` classes make up `sequences`
+/// equally long sequences. A caller that has passed this knows that a
+/// `None` from [`masked_ce_rows`] means that no row is supervised.
+pub(crate) fn check_row_split(
+    rows: usize,
+    vocab: usize,
+    sequences: usize,
+) -> Result<(), TrainError> {
+    if vocab == 0 {
+        return Err(TrainError("the head has no classes".into()));
+    }
+    if sequences == 0 || !rows.is_multiple_of(sequences) {
+        return Err(TrainError(format!(
+            "{rows} rows do not split into {sequences} equally long sequences"
+        )));
+    }
+    Ok(())
+}
+
 /// Runs `head` and the weighted cross-entropy `spec` over chunks of
 /// `chunk_rows` rows of `hidden` (`[.., width]`, f32, one row per entry of
 /// `spec`). The returned `grad` is `d loss / d hidden`, shaped like `hidden`
@@ -72,20 +120,25 @@ pub fn max_whole_head_rows(vocab: usize) -> usize {
 /// A chunk whose rows are all left out of the loss is skipped: its gradient
 /// is zero.
 ///
-/// `None` when `spec` does not have one target and one weight for each row
-/// of `hidden`.
+/// # Errors
+/// If `spec` does not have one target and one weight for each row of
+/// `hidden`.
 pub(crate) fn run_chunked_head(
     head: &Linear,
     hidden: &Tensor,
     spec: CeRows,
     chunk_rows: usize,
     engine: &ComputeEngine,
-) -> Option<GpuCrossEntropy> {
+) -> Result<GpuCrossEntropy, TrainError> {
     let ctx = &hidden.ctx;
     let width = hidden.data.shape.last().copied().unwrap_or(1).max(1);
     let rows = hidden.data.shape.iter().product::<usize>() / width;
     if spec.targets.len() != rows || spec.weights.len() != rows {
-        return None;
+        return Err(TrainError(format!(
+            "{} targets and {} weights for {rows} rows of hidden states",
+            spec.targets.len(),
+            spec.weights.len()
+        )));
     }
     let chunk_rows = chunk_rows.max(1);
     // Everything but a chunk's logits and their gradient is scratch: the
@@ -121,7 +174,7 @@ pub(crate) fn run_chunked_head(
         }
         start = end;
     }
-    Some(GpuCrossEntropy {
+    Ok(GpuCrossEntropy {
         grad,
         row_loss,
         ranges: spec.ranges,
@@ -181,9 +234,11 @@ fn run_chunk(
 /// gradients of the head's weight, bias and LoRA adapter are added to their
 /// `grad` slots by this call, whatever happens to the returned tensor; call
 /// `backward` on it (with its default seed of 1) to send the gradient on to
-/// `hidden`. Returns `None` when no position is supervised, `chunk_rows` is
-/// 0, `hidden` is not f32 or does not match the head's width, or the rows do
-/// not split into `sequences`.
+/// `hidden`. Returns `Ok(None)` when no position is supervised.
+///
+/// # Errors
+/// If `chunk_rows` is 0, `hidden` is not f32 or does not match the head's
+/// width, or the rows do not split into `sequences`.
 #[expect(
     clippy::expect_used,
     reason = "a readback fails only on device loss, and the caller has no error path"
@@ -196,18 +251,12 @@ pub fn chunked_head_cross_entropy(
     sequences: usize,
     chunk_rows: usize,
     engine: &ComputeEngine,
-) -> Option<BatchLoss> {
-    let width = *hidden.data.shape.last()?;
-    let vocab = *head.weight.data.shape.last()?;
-    if chunk_rows == 0
-        || width == 0
-        || hidden.data.dtype != DType::FP32
-        || head.weight.data.shape.first() != Some(&width)
-    {
-        return None;
-    }
-    let rows = hidden.data.shape.iter().product::<usize>() / width;
-    let spec = masked_ce_rows(rows, vocab, target_ids, loss_mask, sequences, 1.0)?;
+) -> Result<Option<BatchLoss>, TrainError> {
+    let (_, vocab, rows) = head_dims(head, hidden, chunk_rows)?;
+    check_row_split(rows, vocab, sequences)?;
+    let Some(spec) = masked_ce_rows(rows, vocab, target_ids, loss_mask, sequences, 1.0) else {
+        return Ok(None);
+    };
     let ce = run_chunked_head(head, hidden, spec, chunk_rows, engine)?;
     let ctx = &hidden.ctx;
     let losses =
@@ -216,10 +265,10 @@ pub fn chunked_head_cross_entropy(
     let total: f32 = per_sequence.iter().map(|&(l, _)| l).sum();
     let data = UnifiedTensor::new(ctx, &[total], &[1]);
     let tensor = ce_loss_tensor(hidden, ce.grad, data, Some(1.0));
-    Some(BatchLoss {
+    Ok(Some(BatchLoss {
         tensor,
         per_sequence,
-    })
+    }))
 }
 
 /// Average cross-entropy of `head` applied to `hidden` (`[.., width]`, f32)
@@ -227,9 +276,12 @@ pub fn chunked_head_cross_entropy(
 /// the logits formed `chunk_rows` rows at a time: the loss of
 /// [`masked_cross_entropy_from_logits`](crate::masked_cross_entropy_from_logits)
 /// for the logits `head.forward(hidden)`, without the whole logits on the
-/// GPU or on the host. Returns the mean and the number of supervised rows;
-/// `None` when no row is supervised, `chunk_rows` is 0, or `hidden` is not
-/// f32 or does not match the head's width.
+/// GPU or on the host. Returns the mean and the number of supervised rows,
+/// or `Ok(None)` when no row is supervised.
+///
+/// # Errors
+/// If `chunk_rows` is 0, or `hidden` is not f32 or does not match the
+/// head's width.
 ///
 /// A chunk whose rows are all left out is skipped. The kernel still writes
 /// a gradient for the rows of a chunk, which is dropped with it.
@@ -244,19 +296,13 @@ pub fn chunked_head_loss(
     loss_mask: &[u8],
     chunk_rows: usize,
     engine: &ComputeEngine,
-) -> Option<(f32, usize)> {
-    let width = *hidden.data.shape.last()?;
-    let vocab = *head.weight.data.shape.last()?;
-    if chunk_rows == 0
-        || width == 0
-        || hidden.data.dtype != DType::FP32
-        || head.weight.data.shape.first() != Some(&width)
-    {
-        return None;
-    }
+) -> Result<Option<(f32, usize)>, TrainError> {
+    let (width, vocab, rows) = head_dims(head, hidden, chunk_rows)?;
+    check_row_split(rows, vocab, 1)?;
     let ctx = &hidden.ctx;
-    let rows = hidden.data.shape.iter().product::<usize>() / width;
-    let spec = masked_ce_rows(rows, vocab, target_ids, loss_mask, 1, 1.0)?;
+    let Some(spec) = masked_ce_rows(rows, vocab, target_ids, loss_mask, 1, 1.0) else {
+        return Ok(None);
+    };
     let table = hidden.data.reshaped(&[rows, width]);
     let row_loss = UnifiedTensor::zeros_on_gpu(ctx, &[rows]);
     let f32_bytes = std::mem::size_of::<f32>();
@@ -288,5 +334,49 @@ pub fn chunked_head_loss(
     let losses = pollster::block_on(row_loss.to_vec(ctx)).expect("GPU device lost during readback");
     let tokens: usize = spec.tokens.iter().sum();
     let sum: f64 = losses.iter().map(|&l| f64::from(l)).sum();
-    Some(((sum / tokens as f64) as f32, tokens))
+    Ok(Some(((sum / tokens as f64) as f32, tokens)))
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use ferrotensor_backend::WgpuContext;
+    use std::sync::Arc;
+
+    fn leaf(ctx: &Arc<WgpuContext>, data: &[f32], shape: &[usize], trainable: bool) -> Tensor {
+        let data = UnifiedTensor::new(ctx, data, shape);
+        if trainable {
+            Tensor::new(ctx.clone(), data)
+        } else {
+            Tensor::frozen(ctx.clone(), data)
+        }
+    }
+
+    /// A spec with a number of targets or weights other than the number of
+    /// rows is an error, so that `loss_and_step` cannot take it for a step
+    /// with no supervised token.
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn a_spec_that_does_not_fit_the_rows_is_an_error() {
+        let ctx = Arc::new(pollster::block_on(WgpuContext::new()));
+        let engine = ComputeEngine::new(&ctx);
+        let head = Linear::new(leaf(&ctx, &[0.1; 6], &[2, 3], false));
+        let hidden = leaf(&ctx, &[0.5; 8], &[4, 2], true);
+        let spec = |targets: usize, weights: usize| CeRows {
+            targets: vec![1; targets],
+            weights: vec![0.25; weights],
+            ranges: vec![0..4],
+            tokens: vec![4],
+        };
+        for (targets, weights) in [(3, 4), (4, 3), (5, 4), (4, 5), (0, 0)] {
+            let result = run_chunked_head(&head, &hidden, spec(targets, weights), 2, &engine);
+            assert!(
+                result.is_err(),
+                "{targets} targets and {weights} weights for 4 rows"
+            );
+        }
+        let ce = run_chunked_head(&head, &hidden, spec(4, 4), 2, &engine).expect("a fitting spec");
+        assert_eq!(ce.tokens, [4]);
+    }
 }
