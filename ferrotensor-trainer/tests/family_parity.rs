@@ -392,7 +392,9 @@ fn lora_gradients_match_transformers(family: &Family) {
 
 /// The builder reads every tensor of the checkpoint except the ones the
 /// family lists as unread, so a family that loads and runs cannot drop a
-/// weight unseen: the failure names the tensor.
+/// weight unseen: the failure names the tensor. This checks that a tensor was
+/// read, not that it was kept: a tensor that is read and then thrown away is
+/// caught by the logits comparison, not here.
 fn every_weight_is_used(family: &Family) {
     let Some(fixture) = Fixture::load(family.name) else {
         return;
