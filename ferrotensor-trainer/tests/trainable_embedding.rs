@@ -47,7 +47,9 @@ fn build_base(gpu: &Gpu, dir: &Path, trainable: bool) -> Lfm2Model {
 /// The model `--train-modules embed` trains: a trainable base whose
 /// embedding is selected.
 fn embed_model(gpu: &Gpu, dir: &Path) -> Lfm2Model {
-    build_base(gpu, dir, true).with_trainable_embedding(true)
+    build_base(gpu, dir, true)
+        .with_trainable_embedding(true)
+        .expect("trainable embedding")
 }
 
 /// The loss tensor and value of [`INPUT`] against [`TARGET`], every position
@@ -94,7 +96,9 @@ fn embedding_gradient_matches_finite_differences() {
     write_tiny_llama(dir.path());
     let gpu = gpu();
     // A frozen base, so only the table records a gradient.
-    let model = build_base(&gpu, dir.path(), false).with_trainable_embedding(true);
+    let model = build_base(&gpu, dir.path(), false)
+        .with_trainable_embedding(true)
+        .expect("trainable embedding");
     let (loss_tensor, _) = loss(&gpu, &model);
     loss_tensor.backward(&gpu.engine);
     let grad = model

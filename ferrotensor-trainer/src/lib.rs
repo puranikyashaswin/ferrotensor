@@ -619,10 +619,7 @@ impl Trainer {
             let _tag = self.ctx.memory().scope(MemoryCategory::OptimizerState);
             let stepped = match &packed {
                 Some(packed) => self.optimizer.step_flat(train_params, packed),
-                None => {
-                    self.optimizer.step(train_params);
-                    Ok(())
-                }
+                None => self.optimizer.try_step(train_params),
             };
             stepped.map_err(TrainError)?;
         }

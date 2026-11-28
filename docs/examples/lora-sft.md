@@ -280,9 +280,13 @@ the release:
   SmolLM2-1.7B with `--checkpoint-blocks` gave 5,245 MiB in the earlier
   session, and 5,313 MiB and 5,281 MiB (with `--memory-report`) in the
   confirmation run.
-- `train --memory-report` shows where the memory goes. For SmolLM2-1.7B,
-  the frozen base weights hold 3,648 MiB throughout; the adapters,
-  their gradients and the AdamW state together stay under 50 MiB.
+- `train --memory-report` shows where the memory goes. In this run, for
+  SmolLM2-1.7B, the frozen base weights held 3,648 MiB throughout; the
+  adapters, their gradients and the AdamW state together stayed under 50 MiB.
+  That run stored the embedding table as f32. A frozen table is now stored
+  as f16, which takes 192 MiB less, so the current build reports 3,456 MiB
+  of frozen base weights (worked out from the table size; this run has not
+  been repeated on the GPU).
   [What each row means](../../ferrotensor-cli/README.md#where-gpu-memory-goes---memory-report).
 
 ## One command, then use the result (16 November 2026)

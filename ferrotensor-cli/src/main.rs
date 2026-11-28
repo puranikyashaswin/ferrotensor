@@ -1694,7 +1694,7 @@ async fn train(mut args: TrainArgs) -> Result<TrainSummary> {
     let model = if lora_on {
         model
     } else {
-        model.with_trainable_base_weights(|name| named_params.contains_key(name))
+        model.with_trainable_base_weights(|name| named_params.contains_key(name))?
     };
     let train_params: Vec<_> = {
         let mut names: Vec<&String> = named_params.keys().collect();
@@ -2971,7 +2971,9 @@ mod tests {
         base.weights.set(Some(weights));
         let model = build_model(base, None, true).unwrap();
         let selected = select_train_params(&model, mode).unwrap();
-        let model = model.with_trainable_base_weights(|name| selected.contains_key(name));
+        let model = model
+            .with_trainable_base_weights(|name| selected.contains_key(name))
+            .unwrap();
         (model, selected)
     }
 

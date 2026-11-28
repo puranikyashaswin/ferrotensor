@@ -9,13 +9,16 @@
 //! The host copy of the embedding table that the builder hands the model
 //! is compared with the table read back from the GPU. A frozen table is
 //! stored at the linear weight type (f16 with f16 weights) and is uploaded
-//! as f32 again when it becomes trainable.
+//! as f32 again when it becomes trainable; an f16 table a caller marks as
+//! trainable by hand is gathered by value, and the optimizer refuses a
+//! parameter that still points at the f16 buffer.
 //! These tests need a GPU adapter, so they are `#[ignore]`d.
 
 #![allow(clippy::expect_used, clippy::panic)]
 
 use crate::lfm::{Lfm2LayerOp, Lfm2Model};
 use crate::model_builder::Lfm2ModelBuilder;
+use ferrotensor_autograd::{AdamW, Tensor};
 use ferrotensor_backend::{ComputeEngine, DType, UnifiedTensor, WgpuContext};
 use ferrotensor_loader::{ModelLoader, WeightsContext};
 use safetensors::Dtype;
@@ -394,7 +397,7 @@ fn a_frozen_f16_table_becomes_f32_when_it_trains() {
         let (table, _) = weights
             .read_f32_tensor("model.embed_tokens.weight")
             .expect("read");
-        let model = model.with_trainable_embedding(true);
+        let model = model.with_trainable_embedding(true).expect("widen");
         let case = format!("{dtype:?}");
         assert!(model.embed_tokens.requires_grad, "{case}");
         assert_eq!(model.embed_tokens.data.dtype, DType::FP32, "{case}");
@@ -409,6 +412,87 @@ fn a_frozen_f16_table_becomes_f32_when_it_trains() {
         let got = gpu_bytes(&gpu.ctx, &model.lm_head.weight.data);
         assert_bytes_eq(&format!("lm_head ({case})"), &got, &want);
     }
+}
+
+/// Values that f16 holds exactly and that are not all alike: multiples of
+/// 0.25 from -0.75 to 0.75.
+fn exact_f16_bytes(n: usize, _seed: u64) -> Vec<u8> {
+    (0..n)
+        .flat_map(|i| (0.25 * ((i % 7) as f32 - 3.0)).to_le_bytes())
+        .collect()
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn a_parameter_taken_before_the_table_widens_is_refused_by_the_optimizer() {
+    let gpu = gpu();
+    let dir = TempDir::new("embed-stale");
+    write_checkpoint_with(&dir.0, Dtype::F32, true, exact_f16_bytes);
+    let (model, weights) = build(&gpu, &dir.0, true);
+    let (table, _) = weights
+        .read_f32_tensor("model.embed_tokens.weight")
+        .expect("read");
+    // The order the CLI uses, with the other calls swapped: the parameter
+    // is taken first, so it points at the f16 buffer.
+    let stale = model.named_params()["model.embed_tokens.weight"].clone();
+    assert_eq!(stale.data.dtype, DType::FP16);
+    let model = model
+        .with_trainable_base_weights(|name| name == "model.embed_tokens.weight")
+        .expect("trainable");
+    assert_eq!(model.embed_tokens.data.dtype, DType::FP32);
+    assert_eq!(stale.data.dtype, DType::FP16);
+
+    let ones = vec![1.0; VOCAB * HIDDEN];
+    let shape = [VOCAB, HIDDEN];
+    *stale.grad.borrow_mut() = Some(UnifiedTensor::new(&gpu.ctx, &ones, &shape));
+    let mut optimizer = AdamW::new(gpu.engine.clone(), 0.1);
+    let err = optimizer
+        .try_step(std::slice::from_ref(&stale))
+        .expect_err("an f16 parameter is refused");
+    assert!(err.contains("f32 parameters"), "{err}");
+    assert!(err.contains("FP16"), "{err}");
+    // Nothing was written into the f16 buffer.
+    let kept = pollster::block_on(stale.data.to_vec_widened(&gpu.ctx)).expect("GPU readback");
+    assert_values_eq("refused table", &kept, &table);
+
+    // The model's own table is f32 and takes the step. The gradient is one
+    // everywhere, so the first AdamW step moves each value by lr (0.1) and
+    // by the decay lr * weight_decay (0.01) * value.
+    let current = model.embed_tokens.clone();
+    *current.grad.borrow_mut() = Some(UnifiedTensor::new(&gpu.ctx, &ones, &shape));
+    optimizer
+        .try_step(std::slice::from_ref(&current))
+        .expect("an f32 parameter steps");
+    let updated = pollster::block_on(current.data.to_vec(&gpu.ctx)).expect("GPU readback");
+    for (i, (got, old)) in updated.iter().zip(&table).enumerate() {
+        let want = old - 0.1 * (1.0 + 0.01 * old);
+        assert!((got - want).abs() < 1e-5, "[{i}]: {got} against {want}");
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn an_f16_table_marked_trainable_by_hand_is_gathered_by_value() {
+    let gpu = gpu();
+    let dir = TempDir::new("embed-by-hand");
+    write_checkpoint(&dir.0, Dtype::F32, true);
+    let (mut model, weights) = build(&gpu, &dir.0, true);
+    let (table, _) = weights
+        .read_f32_tensor("model.embed_tokens.weight")
+        .expect("read");
+    assert_eq!(model.embed_tokens.data.dtype, DType::FP16);
+    // `embed_tokens` is public: this sends the lookup to the GPU path, which
+    // takes the host path for a table that is not f32.
+    model.embed_tokens.requires_grad = true;
+    let out = Tensor::embedding_gpu(&model.embed_tokens, &[&[3_u32, 0, 12][..]], &gpu.engine);
+    let got = pollster::block_on(out.data.to_vec(&gpu.ctx)).expect("GPU readback");
+    let rounded = through_f16(&table);
+    let want: Vec<f32> = [3, 0, 12]
+        .iter()
+        .flat_map(|&id| rounded[id * HIDDEN..(id + 1) * HIDDEN].iter().copied())
+        .collect();
+    assert_eq!(out.data.shape, vec![1, 3, HIDDEN]);
+    assert_values_eq("gathered rows", &got, &want);
 }
 
 #[test]
@@ -439,7 +523,7 @@ fn models_assembled_by_hand_still_read_the_table_back_on_first_use() {
 
             // Made trainable with no host copy, it is widened from the GPU.
             model.clear_host_embeddings();
-            let model = model.with_trainable_embedding(true);
+            let model = model.with_trainable_embedding(true).expect("widen");
             assert_eq!(model.embed_tokens.data.dtype, DType::FP32);
             let widened =
                 pollster::block_on(model.embed_tokens.data.to_vec(&gpu.ctx)).expect("GPU readback");
