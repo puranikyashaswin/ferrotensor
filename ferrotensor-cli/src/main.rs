@@ -958,6 +958,9 @@ fn export_adapter(args: ExportAdapterArgs) -> Result<()> {
     let config_path = resolve_model(&args.model)?.join("config.json");
     let config = ModelLoader::load_config(&config_path)
         .map_err(|e| unmet(format!("cannot read {}: {e}", config_path.display())))?;
+    // The refusal is the builder's, so the exit code is 2 as for every other
+    // command; `export_peft_adapter` repeats it for library callers.
+    family_spec(&config).map_err(|e| unmet(format!("{}: {e}", config_path.display())))?;
     let ckpt = load_lora_checkpoint(&args.lora)?;
     if let Some(modules) = ckpt
         .metadata

@@ -766,4 +766,31 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn export_refuses_a_config_the_builder_refuses_before_writing() {
+        let config: Lfm2Config = serde_json::from_value(serde_json::json!({
+            "hidden_act": "gelu",
+            "hidden_size": 8,
+            "intermediate_size": 16,
+            "max_position_embeddings": 128,
+            "model_type": "llama",
+            "num_attention_heads": 2,
+            "num_hidden_layers": LAYERS,
+            "num_key_value_heads": 2,
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 10000.0,
+            "vocab_size": 32,
+        }))
+        .expect("config");
+        let dir = temp_dir("refused_config");
+        let error = export_peft_adapter(&checkpoint(false), &config, "tiny", &dir)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("hidden_act \"gelu\" is not supported"),
+            "{error}"
+        );
+        assert!(!dir.exists(), "nothing is written");
+    }
 }
