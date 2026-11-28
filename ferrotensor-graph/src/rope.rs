@@ -53,7 +53,10 @@ impl Llama3Scaling {
 ///
 /// # Errors
 /// A message naming the field when the scheme is any other one, or when a
-/// Llama 3 field is missing or out of range.
+/// Llama 3 field is missing or out of range. A Llama 3 object without
+/// `original_max_position_embeddings` takes the config's own
+/// `original_max_position_embeddings`, else its `max_position_embeddings`, as
+/// `transformers` does.
 pub fn rope_scaling(config: &Lfm2Config) -> Result<Option<Llama3Scaling>, String> {
     let mut found = None;
     for (field, rope) in [
@@ -69,7 +72,7 @@ pub fn rope_scaling(config: &Lfm2Config) -> Result<Option<Llama3Scaling>, String
         match kind {
             "default" => {}
             "llama3" => {
-                let scaling = llama3_of(field, rope)?;
+                let scaling = llama3_of(field, rope, original_context(config))?;
                 found = found.or(Some(scaling));
             }
             other => {
@@ -82,8 +85,20 @@ pub fn rope_scaling(config: &Lfm2Config) -> Result<Option<Llama3Scaling>, String
     Ok(found)
 }
 
-/// Reads the four Llama 3 fields of `rope` and checks them.
-fn llama3_of(field: &str, rope: &RopeConfig) -> Result<Llama3Scaling, String> {
+/// The context length a Llama 3 object falls back to when it names none.
+fn original_context(config: &Lfm2Config) -> Option<f64> {
+    config
+        .original_max_position_embeddings
+        .or(config.max_position_embeddings.map(|n| n as f64))
+}
+
+/// Reads the four Llama 3 fields of `rope` and checks them; `fallback` stands
+/// in for a missing `original_max_position_embeddings`.
+fn llama3_of(
+    field: &str,
+    rope: &RopeConfig,
+    fallback: Option<f64>,
+) -> Result<Llama3Scaling, String> {
     let need = |name: &str, value: Option<f64>| {
         value
             .filter(|v| v.is_finite() && *v > 0.0)
@@ -95,7 +110,7 @@ fn llama3_of(field: &str, rope: &RopeConfig) -> Result<Llama3Scaling, String> {
         high_freq_factor: need("high_freq_factor", rope.high_freq_factor)?,
         original_max_position_embeddings: need(
             "original_max_position_embeddings",
-            rope.original_max_position_embeddings,
+            rope.original_max_position_embeddings.or(fallback),
         )?,
     };
     if scaling.high_freq_factor <= scaling.low_freq_factor {
@@ -334,6 +349,41 @@ mod tests {
             rope_scaling(&missing),
             Err("rope_scaling type \"llama3\" needs a positive number for original_max_position_embeddings".to_owned())
         );
+    }
+
+    #[test]
+    fn a_missing_original_context_falls_back_as_transformers_does() {
+        let object = serde_json::json!({
+            "rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0,
+            "high_freq_factor": 4.0
+        });
+        let want = |original: f64| {
+            Ok(Some(Llama3Scaling {
+                factor: 8.0,
+                low_freq_factor: 1.0,
+                high_freq_factor: 4.0,
+                original_max_position_embeddings: original,
+            }))
+        };
+        // The config's own `original_max_position_embeddings` comes first.
+        let top = config(serde_json::json!({
+            "rope_scaling": object, "original_max_position_embeddings": 4096,
+            "max_position_embeddings": 131_072
+        }));
+        assert_eq!(rope_scaling(&top), want(4096.0));
+        // Then `max_position_embeddings`.
+        let max = config(serde_json::json!({
+            "rope_scaling": object, "max_position_embeddings": 131_072
+        }));
+        assert_eq!(rope_scaling(&max), want(131_072.0));
+        // The object's own value beats both.
+        let mut own = object;
+        own["original_max_position_embeddings"] = serde_json::json!(8192);
+        let both = config(serde_json::json!({
+            "rope_scaling": own, "original_max_position_embeddings": 4096,
+            "max_position_embeddings": 131_072
+        }));
+        assert_eq!(rope_scaling(&both), want(8192.0));
     }
 
     #[test]

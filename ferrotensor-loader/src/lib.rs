@@ -124,6 +124,10 @@ pub struct Lfm2Config {
     /// Longest sequence, in tokens, the model was trained on, if set.
     #[serde(default)]
     pub max_position_embeddings: Option<usize>,
+    /// Top-level `original_max_position_embeddings`, which a Llama 3 RoPE
+    /// object without its own value falls back to.
+    #[serde(default)]
+    pub original_max_position_embeddings: Option<f64>,
     /// MLP activation, e.g. `"silu"`.
     #[serde(default)]
     pub hidden_act: Option<String>,

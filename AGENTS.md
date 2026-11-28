@@ -113,7 +113,9 @@ checkpoint the model builder cannot load (a missing or misshapen weight, or a
 `config.json` feature the forward pass lacks: a `hidden_act` other than SiLU,
 a `rope_scaling` or `rope_parameters` type other than `default` and `llama3`
 (linear, dynamic, yarn and longrope are refused), a `llama3` object without
-its four numbers, `use_sliding_window: true`, a head size above 128); a model
+`factor`, `low_freq_factor` or `high_freq_factor`, or with no context length
+(`original_max_position_embeddings` in the object or the config, else
+`max_position_embeddings`), `use_sliding_window: true`, a head size above 128); a model
 id that is not in the Hugging Face cache or whose snapshot has no `config.json` (`error` names the cache and
 `hf download <id>`); a flag
 value out of range; a `--q4-modules` / `--q4-skip` selection that matches no
