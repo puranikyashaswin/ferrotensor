@@ -44,8 +44,8 @@ pub use scaler::{GradScaler, GradScalerStats};
 
 pub use distributed::FileGradSyncConfig;
 pub use head_loss::{
-    chunked_head_cross_entropy, head_chunk_rows, max_whole_head_rows, HEAD_CHUNK_MIN_BYTES,
-    HEAD_CHUNK_ROWS, HEAD_LOGIT_BYTES_PER_VALUE,
+    chunked_head_cross_entropy, chunked_head_loss, head_chunk_rows, max_whole_head_rows,
+    HEAD_CHUNK_MIN_BYTES, HEAD_CHUNK_ROWS, HEAD_LOGIT_BYTES_PER_VALUE,
 };
 
 /// Result of one [`Trainer::train_step_masked`] call.

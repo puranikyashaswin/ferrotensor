@@ -17,7 +17,7 @@
 use crate::{
     ce_kernel, ce_loss_tensor, masked_ce_rows, BatchLoss, CeRows, GpuCrossEntropy, MASKED_CE_SKIP,
 };
-use ferrotensor_autograd::Tensor;
+use ferrotensor_autograd::{no_grad, Tensor};
 use ferrotensor_backend::{ComputeEngine, DType, MemoryCategory, UnifiedTensor};
 use ferrotensor_graph::Linear;
 
@@ -220,4 +220,73 @@ pub fn chunked_head_cross_entropy(
         tensor,
         per_sequence,
     })
+}
+
+/// Average cross-entropy of `head` applied to `hidden` (`[.., width]`, f32)
+/// against `target_ids` where `loss_mask` is not 0, with no gradient and
+/// the logits formed `chunk_rows` rows at a time: the loss of
+/// [`masked_cross_entropy_from_logits`](crate::masked_cross_entropy_from_logits)
+/// for the logits `head.forward(hidden)`, without the whole logits on the
+/// GPU or on the host. Returns the mean and the number of supervised rows;
+/// `None` when no row is supervised, `chunk_rows` is 0, or `hidden` is not
+/// f32 or does not match the head's width.
+///
+/// A chunk whose rows are all left out is skipped. The kernel still writes
+/// a gradient for the rows of a chunk, which is dropped with it.
+#[expect(
+    clippy::expect_used,
+    reason = "a readback fails only on device loss, and the caller has no error path"
+)]
+pub fn chunked_head_loss(
+    head: &Linear,
+    hidden: &Tensor,
+    target_ids: &[u32],
+    loss_mask: &[u8],
+    chunk_rows: usize,
+    engine: &ComputeEngine,
+) -> Option<(f32, usize)> {
+    let width = *hidden.data.shape.last()?;
+    let vocab = *head.weight.data.shape.last()?;
+    if chunk_rows == 0
+        || width == 0
+        || hidden.data.dtype != DType::FP32
+        || head.weight.data.shape.first() != Some(&width)
+    {
+        return None;
+    }
+    let ctx = &hidden.ctx;
+    let rows = hidden.data.shape.iter().product::<usize>() / width;
+    let spec = masked_ce_rows(rows, vocab, target_ids, loss_mask, 1, 1.0)?;
+    let table = hidden.data.reshaped(&[rows, width]);
+    let row_loss = UnifiedTensor::zeros_on_gpu(ctx, &[rows]);
+    let f32_bytes = std::mem::size_of::<f32>();
+    let mut start = 0;
+    while start < rows {
+        let end = (start + chunk_rows).min(rows);
+        if spec.targets[start..end]
+            .iter()
+            .any(|&t| t != MASKED_CE_SKIP)
+        {
+            let ids: Vec<u32> = (start as u32..end as u32).collect();
+            let id_buf = UnifiedTensor::from_bytes(ctx, bytemuck::cast_slice(&ids), &[ids.len()]);
+            let part = UnifiedTensor::empty(ctx, &[ids.len(), width]);
+            engine.embedding_gather(ctx, &table, &id_buf, &part);
+            let chunk_loss = no_grad(|| {
+                let logits = head.forward(engine, &Tensor::frozen(ctx.clone(), part));
+                let (_grad, loss) = ce_kernel(
+                    &logits,
+                    &spec.targets[start..end],
+                    &spec.weights[start..end],
+                    engine,
+                );
+                loss
+            });
+            engine.copy_tensor(ctx, &chunk_loss, &row_loss, start * f32_bytes);
+        }
+        start = end;
+    }
+    let losses = pollster::block_on(row_loss.to_vec(ctx)).expect("GPU device lost during readback");
+    let tokens: usize = spec.tokens.iter().sum();
+    let sum: f64 = losses.iter().map(|&l| f64::from(l)).sum();
+    Some(((sum / tokens as f64) as f32, tokens))
 }

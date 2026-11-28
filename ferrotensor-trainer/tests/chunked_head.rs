@@ -16,8 +16,9 @@ use ferrotensor_autograd::Tensor;
 use ferrotensor_backend::UnifiedTensor;
 use ferrotensor_graph::{Linear, LoRAAdapter};
 use ferrotensor_trainer::{
-    chunked_head_cross_entropy, head_chunk_rows, masked_cross_entropy_batch, max_whole_head_rows,
-    HEAD_CHUNK_MIN_BYTES, HEAD_CHUNK_ROWS, HEAD_LOGIT_BYTES_PER_VALUE,
+    chunked_head_cross_entropy, chunked_head_loss, head_chunk_rows, masked_cross_entropy_batch,
+    masked_cross_entropy_from_logits, max_whole_head_rows, HEAD_CHUNK_MIN_BYTES, HEAD_CHUNK_ROWS,
+    HEAD_LOGIT_BYTES_PER_VALUE,
 };
 
 const WIDTH: usize = 16;
@@ -407,6 +408,55 @@ fn chunked_gradients_match_a_host_computation() {
         assert!(worst <= 1e-5, "{name} gradient differs by {worst}");
         let largest = want.iter().map(|w| w.abs()).fold(0.0f64, f64::max);
         assert!(largest > 1e-3, "{name} reference gradient is all zero");
+    }
+}
+
+/// The loss `ferrotensor eval` reports: the mean over the supervised rows of
+/// the whole logits, read to the host, against the same mean with the logits
+/// formed over chunks (forward only). The chunk sizes cut the 39 rows at the
+/// sequence borders, across them and into a short last chunk, and the mask
+/// leaves a whole chunk out.
+#[test]
+#[ignore = "needs a GPU"]
+fn chunked_eval_loss_equals_the_whole_one() {
+    let gpu = gpu();
+    for kind in [Head::Everything, Head::FrozenWeight] {
+        let case = Case::new(&gpu, kind);
+        let mask = mixed_mask();
+        let logits = ferrotensor_autograd::no_grad(|| case.head.forward(&gpu.engine, &case.hidden));
+        let host_logits = host(&gpu, &logits);
+        let (want, want_rows) =
+            masked_cross_entropy_from_logits(&host_logits, CLASSES, &targets(), &mask)
+                .expect("supervised rows");
+        for rows in [1, 8, 13, 38, 39, 100] {
+            let (got, got_rows) = chunked_head_loss(
+                &case.head,
+                &case.hidden,
+                &targets(),
+                &mask,
+                rows,
+                &gpu.engine,
+            )
+            .expect("supervised rows");
+            assert_eq!(got_rows, want_rows, "chunks of {rows}");
+            assert!(
+                (got - want).abs() <= 1e-5,
+                "chunks of {rows}: loss {got} vs {want}"
+            );
+        }
+        // No supervised row, no loss; no gradient was made on the way.
+        let none = chunked_head_loss(
+            &case.head,
+            &case.hidden,
+            &targets(),
+            &[0; ROWS],
+            8,
+            &gpu.engine,
+        );
+        assert!(none.is_none());
+        for (name, t) in case.tensors() {
+            assert!(t.grad.borrow().is_none(), "{name} has a gradient");
+        }
     }
 }
 
