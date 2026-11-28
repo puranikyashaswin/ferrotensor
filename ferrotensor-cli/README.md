@@ -340,8 +340,14 @@ on an A10G (24 GB) and 9 on a T4 (16 GB) (SmolLM2 135M, 360M and 1.7B and
 Qwen2.5-0.5B, f16 weights, sequence length 256 and 128). The estimate is at
 most 4.6% below each of them and at most 12% above the 250-step and
 single-pass peaks; it is up to 35% above 30-step runs that accumulate
-passes, which have not reached their peak. Other GPUs, f32 and 4-bit
-weights and LFM2 models are not calibrated.
+passes, which have not reached their peak. When the logits and their
+gradient would take more than 1 GiB (rows x vocabulary x 8 bytes, for more
+than 512 rows), the trainer runs `lm_head` and the loss over 512 rows at a
+time. It counts the rows of the head, which are the response rows, so the
+estimate counts the most rows it still forms whole (883 for Qwen's 151,936
+classes, at least 512); the two Qwen2.5-0.5B peaks above were measured
+before that and are not a check on it. Other GPUs, f32 and 4-bit weights and
+LFM2 models are not calibrated.
 
 ## Less GPU memory: `--checkpoint-blocks`
 

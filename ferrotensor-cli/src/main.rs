@@ -47,8 +47,8 @@ use ferrotensor_trainer::checkpoint::{
 };
 use ferrotensor_trainer::peft::{export_peft_adapter, is_peft_adapter_dir, load_peft_adapter};
 use ferrotensor_trainer::{
-    build_sft_example, masked_cross_entropy_from_logits, DataLoader, Dataset, FileGradSyncConfig,
-    GradScaler, TextDataset, Trainer,
+    build_sft_example, chunked_head_loss, head_chunk_rows, masked_cross_entropy_from_logits,
+    DataLoader, Dataset, FileGradSyncConfig, GradScaler, TextDataset, Trainer,
 };
 use model_id::resolve_model;
 use std::collections::HashMap;
@@ -1126,14 +1126,34 @@ async fn evaluate(
     let mut loss_sum = 0.0f64;
     let mut tokens = 0usize;
     for ex in ds.examples().iter().take(limit) {
-        let logits = no_grad(|| model.forward(&base.engine, &ex.input_ids, 0, None, None));
-        let host = logits.data.to_vec(&base.ctx).await?;
-        if let Some((loss, n)) = masked_cross_entropy_from_logits(
-            &host,
-            base.config.vocab_size,
-            &ex.target_ids,
-            &ex.loss_mask,
-        ) {
+        // As in training, a head whose logits and gradient would pass 1 GiB
+        // runs over row chunks, so a long example over a large vocabulary
+        // neither fills the GPU nor reads all its logits to the host.
+        let chunk_rows = head_chunk_rows(ex.input_ids.len(), base.config.vocab_size)
+            .filter(|_| model.supports_head_input());
+        let scored = if let Some(chunk_rows) = chunk_rows {
+            let hidden =
+                no_grad(|| model.forward_head_input(&base.engine, &ex.input_ids, None, None))
+                    .ok_or("the model gave no hidden states for the chunked evaluation")?;
+            chunked_head_loss(
+                &model.lm_head,
+                &hidden,
+                &ex.target_ids,
+                &ex.loss_mask,
+                chunk_rows,
+                &base.engine,
+            )?
+        } else {
+            let logits = no_grad(|| model.forward(&base.engine, &ex.input_ids, 0, None, None));
+            let host = logits.data.to_vec(&base.ctx).await?;
+            masked_cross_entropy_from_logits(
+                &host,
+                base.config.vocab_size,
+                &ex.target_ids,
+                &ex.loss_mask,
+            )
+        };
+        if let Some((loss, n)) = scored {
             loss_sum += loss as f64 * n as f64;
             tokens += n;
         }

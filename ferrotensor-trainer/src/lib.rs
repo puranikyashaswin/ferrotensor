@@ -22,12 +22,15 @@ use ferrotensor_backend::{
 use ferrotensor_graph::lfm::Lfm2Model;
 use std::sync::Arc;
 
+use head_loss::{check_row_split, run_chunked_head};
+
 pub mod checkpoint;
 pub mod classify;
 pub mod data;
 pub mod demo;
 pub mod distributed;
 pub mod gguf;
+mod head_loss;
 pub mod memory;
 pub mod merge;
 pub mod peft;
@@ -40,6 +43,10 @@ pub use demo::{print_banner, run_demo, DemoConfig};
 pub use scaler::{GradScaler, GradScalerStats};
 
 pub use distributed::FileGradSyncConfig;
+pub use head_loss::{
+    chunked_head_cross_entropy, chunked_head_loss, head_chunk_rows, max_whole_head_rows,
+    HEAD_CHUNK_MIN_BYTES, HEAD_CHUNK_ROWS, HEAD_LOGIT_BYTES_PER_VALUE,
+};
 
 /// Result of one [`Trainer::train_step_masked`] call.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -113,6 +120,11 @@ pub struct Trainer {
     /// backward (see
     /// [`with_supervised_head_rows`](Self::with_supervised_head_rows)).
     pub head_on_supervised_rows: bool,
+    /// Rows per chunk when `lm_head` and the loss run over row chunks:
+    /// `Some(rows)` always chunks, `None` (the default) chunks by
+    /// [`head_chunk_rows`] only when the logits would be large (see
+    /// [`with_head_chunk_rows`](Self::with_head_chunk_rows)).
+    pub head_chunk_rows: Option<usize>,
     /// Run seed for attention dropout. Each forward pass draws its masks
     /// from this seed, the rank, the optimizer step and the position in the
     /// accumulation window (see
@@ -195,6 +207,7 @@ impl Trainer {
             lr_scheduler: None,
             length_bucket: 0,
             head_on_supervised_rows: true,
+            head_chunk_rows: None,
             dropout_seed: 0,
             defer_loss_readback: false,
             optimizer_step_count: 0,
@@ -230,6 +243,18 @@ impl Trainer {
     /// the logits shrink.
     pub fn with_supervised_head_rows(mut self, enabled: bool) -> Self {
         self.head_on_supervised_rows = enabled;
+        self
+    }
+
+    /// Run `lm_head` and the loss over chunks of `rows` rows, whatever the
+    /// size of the logits, so that only one chunk's logits and their
+    /// gradient exist at a time. The loss and every gradient are those of
+    /// the unchunked computation; only the memory and the number of
+    /// vocab-sized kernel launches change. 0 restores the default, which
+    /// chunks by [`head_chunk_rows`] when the logits and their gradient
+    /// would take more than [`HEAD_CHUNK_MIN_BYTES`].
+    pub fn with_head_chunk_rows(mut self, rows: usize) -> Self {
+        self.head_chunk_rows = (rows > 0).then_some(rows);
         self
     }
 
@@ -361,30 +386,20 @@ impl Trainer {
 
         let dropout_seed = Some(self.attention_dropout_seed());
         let head = self.supervised_head_rows(&targets, &mask, 1);
-        let logits = {
+        let out = {
             let _tag = self.ctx.memory().scope(MemoryCategory::Activations);
-            match &head {
-                Some(head) => self.model.forward_head_rows(
-                    &self.engine,
-                    &inputs,
-                    dropout_seed,
-                    &head.positions,
-                ),
-                None => self.model.forward_with_dropout(
-                    &self.engine,
-                    &inputs,
-                    0,
-                    None,
-                    None,
-                    dropout_seed,
-                ),
-            }
+            self.forward_to_head(
+                Tokens::One(&inputs),
+                dropout_seed,
+                head.as_ref(),
+                padded_len,
+            )?
         };
         let labels = match &head {
             Some(head) => Labels::Gathered(head),
             None => Labels::Full(targets.as_slice(), mask.as_slice()),
         };
-        self.loss_and_step(&logits, labels, 1, true, train_params)
+        self.loss_and_step(&out, labels, 1, true, train_params)
     }
 
     /// The supervised positions of `sequences` equally long padded
@@ -404,19 +419,91 @@ impl Trainer {
         HeadRows::select(targets, masks, sequences, vocab)
     }
 
+    /// Rows per chunk for a head of `rows` rows over `vocab` classes, or
+    /// `None` when the logits are formed whole.
+    fn head_chunk(&self, rows: usize, vocab: usize) -> Option<usize> {
+        match self.head_chunk_rows {
+            Some(chunk) => (rows > chunk).then_some(chunk),
+            None => head_chunk_rows(rows, vocab),
+        }
+    }
+
+    /// The forward pass up to the loss: the logits, or, when the head runs
+    /// over row chunks, the hidden states that `lm_head` projects. `head`
+    /// picks the rows as in [`forward_head_rows`](Lfm2Model::forward_head_rows);
+    /// `positions` is the number of rows without it. The blocks run once:
+    /// whether the head is chunked is decided before they do.
+    ///
+    /// # Errors
+    /// If the model cannot give its hidden states for a chunked head, which
+    /// [`Lfm2Model::supports_head_input`] rules out before the blocks run.
+    fn forward_to_head(
+        &self,
+        tokens: Tokens<'_>,
+        dropout_seed: Option<u64>,
+        head: Option<&HeadRows>,
+        positions: usize,
+    ) -> Result<HeadOut, TrainError> {
+        let rows = head.map_or(positions, |h| h.positions.len());
+        let vocab = self.model.lm_head.weight.data.shape.last().copied();
+        let head_rows = head.map(|h| h.positions.as_slice());
+        let chunk_rows = vocab
+            .filter(|_| self.model.supports_head_input())
+            .and_then(|v| self.head_chunk(rows, v));
+        if let Some(chunk_rows) = chunk_rows {
+            let hidden = match tokens {
+                Tokens::One(ids) => {
+                    self.model
+                        .forward_head_input(&self.engine, ids, dropout_seed, head_rows)
+                }
+                Tokens::Batch(batch) => self.model.forward_batch_head_input(
+                    &self.engine,
+                    batch,
+                    dropout_seed,
+                    head_rows,
+                ),
+            };
+            let hidden = hidden.ok_or_else(|| {
+                TrainError("the model gave no hidden states for the chunked head".into())
+            })?;
+            return Ok(HeadOut::Hidden { hidden, chunk_rows });
+        }
+        let logits = match (tokens, head_rows) {
+            (Tokens::One(ids), Some(rows)) => {
+                self.model
+                    .forward_head_rows(&self.engine, ids, dropout_seed, rows)
+            }
+            (Tokens::One(ids), None) => {
+                self.model
+                    .forward_with_dropout(&self.engine, ids, 0, None, None, dropout_seed)
+            }
+            (Tokens::Batch(batch), Some(rows)) => {
+                self.model
+                    .forward_batch_head_rows(&self.engine, batch, dropout_seed, rows)
+            }
+            (Tokens::Batch(batch), None) => {
+                self.model
+                    .forward_batch_with_dropout(&self.engine, batch, dropout_seed)
+            }
+        };
+        Ok(HeadOut::Logits(logits))
+    }
+
     /// The loss of a forward pass over `sequences` sequences of `logits`,
     /// its backward pass, and an optimizer step when the window is full.
     /// Each sequence's stats go to `self.deferred` with its loss left on the
     /// GPU; `empty_stats` records zero stats when no token is supervised.
     fn loss_and_step(
         &mut self,
-        logits: &Tensor,
+        out: &HeadOut,
         labels: Labels<'_>,
         sequences: usize,
         empty_stats: bool,
         train_params: &[Tensor],
     ) -> Result<(), TrainError> {
-        memory::tag_loss(logits);
+        if let HeadOut::Logits(logits) = out {
+            memory::tag_loss(logits);
+        }
         let tag = self.ctx.memory().scope(MemoryCategory::Loss);
         // Seed backward with d(total)/d(loss): the accumulation average
         // times the loss scale. The kernel applies it to the gradient, so
@@ -425,11 +512,48 @@ impl Trainer {
         if let Some(scaler) = self.scaler.as_ref() {
             seed *= scaler.scale_factor();
         }
-        let ce = match labels {
-            Labels::Full(targets, masks) => {
+        let ce = match (out, labels) {
+            (HeadOut::Logits(logits), Labels::Full(targets, masks)) => {
                 masked_ce_on_gpu(logits, targets, masks, sequences, seed, &self.engine)
             }
-            Labels::Gathered(head) => head.cross_entropy(logits, seed, &self.engine),
+            (HeadOut::Logits(logits), Labels::Gathered(head)) => {
+                head.cross_entropy(logits, seed, &self.engine)
+            }
+            // The head's own gradients are added here, chunk by chunk; the
+            // loss node below carries the hidden states' gradient.
+            (HeadOut::Hidden { hidden, chunk_rows }, labels) => {
+                let head = &self.model.lm_head;
+                let vocab = head.weight.data.shape.last().copied().unwrap_or(0);
+                let width = hidden.data.shape.last().copied().unwrap_or(1).max(1);
+                let rows = hidden.data.shape.iter().product::<usize>() / width;
+                // A spec that does not fit the rows is an error. After
+                // these checks `None` means that nothing is supervised.
+                check_row_split(rows, vocab, sequences)?;
+                let spec = match labels {
+                    Labels::Full(targets, masks) => {
+                        masked_ce_rows(rows, vocab, targets, masks, sequences, seed)
+                    }
+                    Labels::Gathered(head_rows) => {
+                        if head_rows.positions.len() != rows {
+                            return Err(TrainError(format!(
+                                "{} head rows for {rows} rows of hidden states",
+                                head_rows.positions.len()
+                            )));
+                        }
+                        head_rows.ce_rows(rows, seed)
+                    }
+                };
+                match spec {
+                    Some(spec) => Some(run_chunked_head(
+                        head,
+                        hidden,
+                        spec,
+                        *chunk_rows,
+                        &self.engine,
+                    )?),
+                    None => None,
+                }
+            }
         };
         if let Some(ce) = ce {
             let index = self.pending_rows.len();
@@ -446,7 +570,7 @@ impl Trainer {
             // Nothing reads the loss tensor's value: only the gradient
             // flows back from it.
             let value = UnifiedTensor::new(&self.ctx, &[0.0], &[1]);
-            let loss = ce_loss_tensor(logits, ce.grad, value, Some(seed));
+            let loss = ce_loss_tensor(out.input(), ce.grad, value, Some(seed));
             *loss.grad.borrow_mut() = Some(UnifiedTensor::new(&self.ctx, &[seed], &[1]));
             // Without a readback the host can run several micro-batches
             // ahead of a busy GPU, and the pool can trim none of their idle
@@ -462,7 +586,9 @@ impl Trainer {
                 self.backward_mark = Some(self.ctx.submission_mark());
             }
             memory::tag_gradients(train_params);
-            memory::tag_loss(logits);
+            if let HeadOut::Logits(logits) = out {
+                memory::tag_loss(logits);
+            }
         } else if empty_stats {
             self.deferred.push(DeferredStats {
                 stats: EMPTY_STATS,
@@ -720,25 +846,20 @@ impl Trainer {
         let rows: Vec<&[u32]> = inputs.iter().map(Vec::as_slice).collect();
         let dropout_seed = Some(self.attention_dropout_seed());
         let head = self.supervised_head_rows(&targets, &masks, chunk.len());
-        let logits = {
+        let out = {
             let _tag = self.ctx.memory().scope(MemoryCategory::Activations);
-            match &head {
-                Some(head) => self.model.forward_batch_head_rows(
-                    &self.engine,
-                    &rows,
-                    dropout_seed,
-                    &head.positions,
-                ),
-                None => self
-                    .model
-                    .forward_batch_with_dropout(&self.engine, &rows, dropout_seed),
-            }
+            self.forward_to_head(
+                Tokens::Batch(&rows),
+                dropout_seed,
+                head.as_ref(),
+                padded_len * chunk.len(),
+            )?
         };
         let labels = match &head {
             Some(head) => Labels::Gathered(head),
             None => Labels::Full(targets.as_slice(), masks.as_slice()),
         };
-        self.loss_and_step(&logits, labels, chunk.len(), false, train_params)
+        self.loss_and_step(&out, labels, chunk.len(), false, train_params)
     }
 }
 
@@ -814,12 +935,13 @@ pub struct MaskedLoss {
     pub tokens: usize,
 }
 
-/// Backward node of [`masked_cross_entropy`]: holds `d loss / d logits`,
-/// computed on the GPU together with the loss.
+/// Backward node of [`masked_cross_entropy`]: holds `d loss / d input`,
+/// computed on the GPU together with the loss. The input is the logits, or
+/// the hidden states when the head ran over row chunks.
 struct MaskedCrossEntropyNode {
-    logits: Tensor,
-    grad_logits: UnifiedTensor,
-    /// The factor the kernel already applied to `grad_logits`: backward is
+    input: Tensor,
+    grad_input: UnifiedTensor,
+    /// The factor the kernel already applied to `grad_input`: backward is
     /// then seeded with exactly this value and returns the gradient as it
     /// is, without reading the seed back. `None` reads the seed and scales.
     applied_seed: Option<f32>,
@@ -827,7 +949,7 @@ struct MaskedCrossEntropyNode {
 
 impl AutogradNode for MaskedCrossEntropyNode {
     fn inputs(&self) -> Vec<Tensor> {
-        vec![self.logits.clone()]
+        vec![self.input.clone()]
     }
 
     #[expect(
@@ -836,17 +958,17 @@ impl AutogradNode for MaskedCrossEntropyNode {
     )]
     fn backward(&self, grad: &UnifiedTensor, engine: &ComputeEngine) -> Vec<UnifiedTensor> {
         if self.applied_seed.is_some() {
-            return vec![self.grad_logits.clone()];
+            return vec![self.grad_input.clone()];
         }
-        let ctx = &self.logits.ctx;
+        let ctx = &self.input.ctx;
         let upstream = pollster::block_on(grad.to_vec(ctx))
             .expect("GPU device lost during readback")
             .first()
             .copied()
             .unwrap_or(1.0);
-        let scaled = UnifiedTensor::empty(ctx, &self.grad_logits.shape);
+        let scaled = UnifiedTensor::empty(ctx, &self.grad_input.shape);
         scaled.set_memory_category(MemoryCategory::Loss);
-        engine.copy_tensor(ctx, &self.grad_logits, &scaled, 0);
+        engine.copy_tensor(ctx, &self.grad_input, &scaled, 0);
         if (upstream - 1.0).abs() > f32::EPSILON {
             engine.gradient_scale(ctx, &scaled, upstream);
         }
@@ -857,7 +979,8 @@ impl AutogradNode for MaskedCrossEntropyNode {
 /// The masked cross-entropy of a batch of sequences as the kernel leaves
 /// it on the GPU, before anything is read back.
 struct GpuCrossEntropy {
-    /// `d loss / d logits`, times the seed it was computed for.
+    /// `d loss / d logits` (`d loss / d hidden states` when the head ran
+    /// over row chunks), times the seed it was computed for.
     grad: UnifiedTensor,
     /// The loss of each row (0 for a row left out).
     row_loss: UnifiedTensor,
@@ -888,6 +1011,34 @@ enum Labels<'a> {
     Full(&'a [u32], &'a [u8]),
     /// Logits of the supervised positions alone.
     Gathered(&'a HeadRows),
+}
+
+/// The tokens of a forward pass.
+#[derive(Clone, Copy)]
+enum Tokens<'a> {
+    /// One sequence.
+    One(&'a [u32]),
+    /// Equally long sequences, as for `forward_batch`.
+    Batch(&'a [&'a [u32]]),
+}
+
+/// What a forward pass leaves for the loss.
+enum HeadOut {
+    /// The logits, one row per head row.
+    Logits(Tensor),
+    /// The hidden states `lm_head` projects, when the head and the loss run
+    /// over row chunks of `chunk_rows` rows (see [`head_loss`]).
+    Hidden { hidden: Tensor, chunk_rows: usize },
+}
+
+impl HeadOut {
+    /// The tensor the loss node's gradient goes to.
+    fn input(&self) -> &Tensor {
+        match self {
+            Self::Logits(logits) => logits,
+            Self::Hidden { hidden, .. } => hidden,
+        }
+    }
 }
 
 /// The supervised positions of a micro-batch, for running `lm_head` on those
@@ -936,6 +1087,26 @@ impl HeadRows {
         })
     }
 
+    /// The targets and gradient weights of `rows` gathered rows: each row's
+    /// weight is `seed / supervised tokens of its sequence`, as in
+    /// [`masked_ce_rows`]. `None` when `rows` is not one per position.
+    fn ce_rows(&self, rows: usize, seed: f32) -> Option<CeRows> {
+        if rows != self.positions.len() {
+            return None;
+        }
+        let tokens: Vec<usize> = self.ranges.iter().map(|r| r.len()).collect();
+        let mut weights = Vec::with_capacity(rows);
+        for (range, &t) in self.ranges.iter().zip(&tokens) {
+            weights.extend(range.clone().map(|_| seed / t as f32));
+        }
+        Some(CeRows {
+            targets: self.targets.clone(),
+            weights,
+            ranges: self.ranges.clone(),
+            tokens,
+        })
+    }
+
     /// The cross-entropy kernel over the gathered `logits`
     /// (`[positions, vocab]`), each row's gradient weighted by
     /// `seed / supervised tokens of its sequence` as in [`masked_ce_on_gpu`].
@@ -948,35 +1119,43 @@ impl HeadRows {
     ) -> Option<GpuCrossEntropy> {
         let vocab = *logits.data.shape.last()?;
         let rows = logits.data.shape.iter().product::<usize>() / vocab.max(1);
-        if vocab == 0 || rows != self.positions.len() {
+        if vocab == 0 {
             return None;
         }
-        let tokens: Vec<usize> = self.ranges.iter().map(|r| r.len()).collect();
-        let mut weights = Vec::with_capacity(rows);
-        for (range, &t) in self.ranges.iter().zip(&tokens) {
-            weights.extend(range.clone().map(|_| seed / t as f32));
-        }
+        let spec = self.ce_rows(rows, seed)?;
         Some(run_ce_kernel(
             logits,
-            &self.targets,
-            &weights,
-            self.ranges.clone(),
-            tokens,
+            &spec.targets,
+            &spec.weights,
+            spec.ranges,
+            spec.tokens,
             engine,
         ))
     }
 }
 
+/// One target and one gradient weight for each row of a head, and which rows
+/// belong to which sequence.
+struct CeRows {
+    /// The target of each row, [`MASKED_CE_SKIP`] for a row left out.
+    targets: Vec<u32>,
+    /// The weight of each row's gradient, 0 for a row left out.
+    weights: Vec<f32>,
+    /// The rows of each sequence.
+    ranges: Vec<std::ops::Range<usize>>,
+    /// Supervised tokens of each sequence.
+    tokens: Vec<usize>,
+}
+
 /// Runs the masked cross-entropy kernel over the rows of `logits`, with one
-/// target and one gradient weight per row.
-fn run_ce_kernel(
+/// target and one gradient weight per row: `(d loss / d logits, loss of each
+/// row)`.
+fn ce_kernel(
     logits: &Tensor,
     targets: &[u32],
     weights: &[f32],
-    ranges: Vec<std::ops::Range<usize>>,
-    tokens: Vec<usize>,
     engine: &ComputeEngine,
-) -> GpuCrossEntropy {
+) -> (UnifiedTensor, UnifiedTensor) {
     let rows = targets.len();
     let ctx = &logits.ctx;
     let target_buf = UnifiedTensor::from_bytes(ctx, bytemuck::cast_slice(targets), &[rows]);
@@ -991,6 +1170,20 @@ fn run_ce_kernel(
         &grad,
         &row_loss,
     );
+    (grad, row_loss)
+}
+
+/// [`ce_kernel`] as a [`GpuCrossEntropy`] of the sequences `ranges`, with
+/// `tokens` supervised tokens each.
+fn run_ce_kernel(
+    logits: &Tensor,
+    targets: &[u32],
+    weights: &[f32],
+    ranges: Vec<std::ops::Range<usize>>,
+    tokens: Vec<usize>,
+    engine: &ComputeEngine,
+) -> GpuCrossEntropy {
+    let (grad, row_loss) = ce_kernel(logits, targets, weights, engine);
     GpuCrossEntropy {
         grad,
         row_loss,
@@ -999,20 +1192,19 @@ fn run_ce_kernel(
     }
 }
 
-/// Runs the masked cross-entropy kernel over `sequences` equally long
-/// sequences of `logits`, with each supervised row's gradient weighted by
-/// `seed / supervised tokens of its sequence`. Returns `None` when no
-/// position is supervised or the rows do not split into `sequences`.
-fn masked_ce_on_gpu(
-    logits: &Tensor,
+/// The targets and gradient weights of `rows` rows of `vocab` classes that
+/// make up `sequences` equally long sequences: each supervised row's weight
+/// is `seed / supervised tokens of its sequence`, and a row left out gets
+/// [`MASKED_CE_SKIP`] and weight 0. Returns `None` when no position is
+/// supervised or the rows do not split into `sequences`.
+fn masked_ce_rows(
+    rows: usize,
+    vocab: usize,
     target_ids: &[u32],
     loss_mask: &[u8],
     sequences: usize,
     seed: f32,
-    engine: &ComputeEngine,
-) -> Option<GpuCrossEntropy> {
-    let vocab = *logits.data.shape.last()?;
-    let rows = logits.data.shape.iter().product::<usize>() / vocab.max(1);
+) -> Option<CeRows> {
     if vocab == 0 || sequences == 0 || !rows.is_multiple_of(sequences) {
         return None;
     }
@@ -1048,27 +1240,56 @@ fn masked_ce_on_gpu(
     let ranges = (0..sequences)
         .map(|s| s * seq_len..(s + 1) * seq_len)
         .collect();
+    Some(CeRows {
+        targets,
+        weights,
+        ranges,
+        tokens,
+    })
+}
+
+/// Runs the masked cross-entropy kernel over `sequences` equally long
+/// sequences of `logits`, with each supervised row's gradient weighted by
+/// `seed / supervised tokens of its sequence`. Returns `None` when no
+/// position is supervised or the rows do not split into `sequences`.
+fn masked_ce_on_gpu(
+    logits: &Tensor,
+    target_ids: &[u32],
+    loss_mask: &[u8],
+    sequences: usize,
+    seed: f32,
+    engine: &ComputeEngine,
+) -> Option<GpuCrossEntropy> {
+    let vocab = *logits.data.shape.last()?;
+    let rows = logits.data.shape.iter().product::<usize>() / vocab.max(1);
+    let spec = masked_ce_rows(rows, vocab, target_ids, loss_mask, sequences, seed)?;
     Some(run_ce_kernel(
-        logits, &targets, &weights, ranges, tokens, engine,
+        logits,
+        &spec.targets,
+        &spec.weights,
+        spec.ranges,
+        spec.tokens,
+        engine,
     ))
 }
 
 /// The scalar loss tensor `[1]` holding `value`, whose backward gives
-/// `ce.grad` to `logits`; `applied_seed` as in [`MaskedCrossEntropyNode`].
+/// `grad` to `input` (the logits, or the hidden states of a chunked head);
+/// `applied_seed` as in [`MaskedCrossEntropyNode`].
 // Autograd nodes are shared through `Arc` but used on one thread.
 #[allow(clippy::arc_with_non_send_sync)]
 fn ce_loss_tensor(
-    logits: &Tensor,
+    input: &Tensor,
     grad: UnifiedTensor,
     value: UnifiedTensor,
     applied_seed: Option<f32>,
 ) -> Tensor {
     let node = Arc::new(MaskedCrossEntropyNode {
-        logits: logits.clone(),
-        grad_logits: grad,
+        input: input.clone(),
+        grad_input: grad,
         applied_seed,
     });
-    Tensor::with_creator(logits.ctx.clone(), value, node)
+    Tensor::with_creator(input.ctx.clone(), value, node)
 }
 
 /// Mean cross-entropy of `logits` (`[.., seq, vocab]`) against `target_ids`

@@ -660,6 +660,72 @@ impl Lfm2Model {
         Tensor::gather_rows(&logits, head_rows, engine).unwrap_or(logits)
     }
 
+    /// Whether [`forward_head_input`](Self::forward_head_input) can give the
+    /// hidden states of a non-empty pass: they are always `f32` (an `f16`
+    /// table or weight is only a storage format, see
+    /// [`DType`](ferrotensor_backend::DType)), so this is true unless the
+    /// model has no hidden size. A caller that picks the chunked head asks
+    /// this before it runs the blocks, so the blocks run once.
+    pub fn supports_head_input(&self) -> bool {
+        self.embed_tokens
+            .data
+            .shape
+            .last()
+            .is_some_and(|&hidden| hidden > 0)
+    }
+
+    /// What `lm_head` projects in [`forward_with_dropout`](Self::forward_with_dropout)
+    /// (or in [`forward_head_rows`](Self::forward_head_rows) with `Some`
+    /// `head_rows`): the final-normed hidden states `[rows, hidden]`, before
+    /// the vocab-sized matmul. A loss that runs the head over chunks of rows
+    /// projects them itself and never forms all the logits at once.
+    ///
+    /// `None` when the rows cannot be gathered: an empty `head_rows`, or
+    /// hidden states that are not `f32` (see
+    /// [`supports_head_input`](Self::supports_head_input)).
+    pub fn forward_head_input(
+        &self,
+        engine: &ComputeEngine,
+        input_ids: &[u32],
+        dropout_seed: Option<u64>,
+        head_rows: Option<&[u32]>,
+    ) -> Option<Tensor> {
+        let x = self.blocks_output(engine, input_ids, 0, None, None, dropout_seed);
+        self.head_input(engine, x, head_rows)
+    }
+
+    /// [`forward_head_input`](Self::forward_head_input) for the equally long
+    /// `rows` of [`forward_batch_with_dropout`](Self::forward_batch_with_dropout).
+    ///
+    /// # Panics
+    /// As [`forward_batch`](Self::forward_batch).
+    pub fn forward_batch_head_input(
+        &self,
+        engine: &ComputeEngine,
+        rows: &[&[u32]],
+        dropout_seed: Option<u64>,
+        head_rows: Option<&[u32]>,
+    ) -> Option<Tensor> {
+        let x = self.batch_blocks_output(engine, rows, dropout_seed);
+        self.head_input(engine, x, head_rows)
+    }
+
+    /// The flattened hidden states `x` (or its `head_rows`), normed, as
+    /// `[rows, hidden]`; see [`forward_head_input`](Self::forward_head_input).
+    fn head_input(
+        &self,
+        engine: &ComputeEngine,
+        x: Tensor,
+        head_rows: Option<&[u32]>,
+    ) -> Option<Tensor> {
+        let rows = match head_rows {
+            Some(rows) => Tensor::gather_rows(&x, rows, engine)?,
+            None if x.data.dtype == ferrotensor_backend::DType::FP32 => Tensor::reshape_2d(&x),
+            None => return None,
+        };
+        Some(self.norm_f.forward(engine, &rows))
+    }
+
     /// Whether [`forward_batch`](Self::forward_batch) can run: every block is
     /// attention (conv blocks would mix the sequences of a batch).
     pub fn supports_batching(&self) -> bool {

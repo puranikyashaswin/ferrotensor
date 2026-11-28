@@ -176,10 +176,15 @@ The `plan` estimate is fitted to 24 peaks with 8 sequences per step, 15 on the
 A10G and 9 on the T4: these, and batch 2, 4 and 8 runs of SmolLM2 and
 Qwen2.5-0.5B. It is at most 4.6% below them and at most 12% above the 250-step
 and single-pass peaks; 30-step runs that accumulate passes have not reached
-their peak, and it is up to 35% above those. Other GPUs, f32 and 4-bit weights
-and LFM2 models are not calibrated. Those peaks were measured when the frozen
-embedding table was f32; the estimate now counts it at 2 bytes with f16 or
-4-bit weights, which no GPU run has measured yet.
+their peak, and it is up to 35% above those. Above 1 GiB of logits and gradient
+(rows x vocabulary x 8 bytes, more than 512 rows) the trainer runs `lm_head`
+and the loss over 512 rows at a time. It counts the rows of the head, which
+are the response rows, so the estimate counts the most rows it still forms
+whole (883 for Qwen's 151,936 classes, 512 at least); the two Qwen2.5-0.5B
+peaks were measured before that. Other GPUs, f32 and 4-bit weights and LFM2
+models are not calibrated. Those peaks were measured when the frozen embedding
+table was f32; the estimate now counts it at 2 bytes with f16 or 4-bit weights,
+which no GPU run has measured yet.
 
 `finetune` and `plan --data` estimate for the rows the data pads to, not for
 `--seq-len`: the 99th percentile of the tokenized lengths sets the margin
