@@ -215,7 +215,7 @@ fn qwen2_sliding_layers(config: &Lfm2Config) -> Result<(Option<usize>, Vec<bool>
             "sliding_attention" => {
                 return Err(BuildError(format!(
                     "layer {index} is \"sliding_attention\" but the config has no window: \
-                     use_sliding_window is not true or sliding_window is unset"
+                     use_sliding_window is not true or sliding_window is null"
                 )))
             }
             other => {
@@ -278,12 +278,9 @@ pub fn family_spec(config: &Lfm2Config) -> Result<FamilySpec, BuildError> {
     };
     let reads_window = matches!(model_type, Some("mistral" | "qwen2"));
     if config.use_sliding_window == Some(true) && !reads_window {
-        let window = config
-            .sliding_window
-            .map_or_else(|| "unset".to_owned(), |w| w.to_string());
         let family = model_type.map_or_else(|| "(none)".to_owned(), |t| format!("{t:?}"));
         return Err(BuildError(format!(
-            "sliding_window {window} is not supported for model_type {family}: \
+            "use_sliding_window is not supported for model_type {family}: \
              only mistral and qwen2 apply a window"
         )));
     }
@@ -592,7 +589,7 @@ mod tests {
     }
 
     #[test]
-    fn mistral_without_sliding_window_gets_no_window() {
+    fn mistral_with_a_null_sliding_window_gets_no_window() {
         // Mistral-7B-v0.2 and v0.3 set `sliding_window` to null.
         let null = spec_of(with(
             mistral_config(),
@@ -602,14 +599,47 @@ mod tests {
         assert_eq!(null.window(0), None);
         assert_eq!(null.window(31), None);
         assert_eq!(null.layer(31), Ok(LayerKind::Attention));
-        // A config without the key is the same.
-        let mut json = mistral_config();
-        let removed = json
+    }
+
+    #[test]
+    fn a_missing_sliding_window_is_4096_as_in_transformers() {
+        // `MistralConfig` and `Qwen2Config` (transformers 5.20.2) both default
+        // `sliding_window` to 4096 when the key is absent. Qwen2 then keeps it
+        // only with `use_sliding_window`.
+        let mut mistral = mistral_config();
+        let removed = mistral
             .as_object_mut()
             .expect("object")
             .remove("sliding_window");
         assert!(removed.is_some());
-        assert_eq!(spec_of(json), null);
+        let spec = spec_of(mistral);
+        assert_eq!(spec.window(0), Some(4096));
+        assert_eq!(spec.window(31), Some(4096));
+
+        let mut qwen2 = with(
+            qwen2_5_config(),
+            serde_json::json!({
+                "num_hidden_layers": 4, "max_window_layers": 2, "use_sliding_window": true
+            }),
+        );
+        let removed = qwen2
+            .as_object_mut()
+            .expect("object")
+            .remove("sliding_window");
+        assert!(removed.is_some());
+        let spec = spec_of(qwen2.clone());
+        let windows: Vec<_> = (0..4).map(|l| spec.window(l)).collect();
+        assert_eq!(windows, [None, None, Some(4096), Some(4096)]);
+        // An explicit null is no window, as in transformers.
+        qwen2["sliding_window"] = serde_json::Value::Null;
+        assert!(!spec_of(qwen2.clone()).has_window());
+        // Without `use_sliding_window` the default is dropped.
+        qwen2["use_sliding_window"] = false.into();
+        qwen2
+            .as_object_mut()
+            .expect("object")
+            .remove("sliding_window");
+        assert!(!spec_of(qwen2).has_window());
     }
 
     #[test]
@@ -649,7 +679,7 @@ mod tests {
         let spec = spec_of(qwen2_5_config());
         assert!(!spec.has_window());
         assert_eq!(spec.window(23), None);
-        // `use_sliding_window` true with no `sliding_window` has none either.
+        // `use_sliding_window` true with a null `sliding_window` has none either.
         let unset = spec_of(with(
             qwen2_5_config(),
             serde_json::json!({"use_sliding_window": true, "sliding_window": null}),
@@ -831,7 +861,7 @@ mod tests {
                     "num_hidden_layers": 2,
                     "layer_types": ["full_attention", "sliding_attention"]
                 }),
-                "layer 1 is \"sliding_attention\" but the config has no window: use_sliding_window is not true or sliding_window is unset",
+                "layer 1 is \"sliding_attention\" but the config has no window: use_sliding_window is not true or sliding_window is null",
             ),
             (
                 serde_json::json!({"rope_scaling": {"factor": 4.0}}),
@@ -855,7 +885,7 @@ mod tests {
                 llama_config(),
                 serde_json::json!({"use_sliding_window": true, "sliding_window": 128})
             )),
-            "sliding_window 128 is not supported for model_type \"llama\": \
+            "use_sliding_window is not supported for model_type \"llama\": \
              only mistral and qwen2 apply a window"
         );
         assert_eq!(
@@ -863,7 +893,7 @@ mod tests {
                 qwen3_config(),
                 serde_json::json!({"use_sliding_window": true})
             )),
-            "sliding_window unset is not supported for model_type \"qwen3\": \
+            "use_sliding_window is not supported for model_type \"qwen3\": \
              only mistral and qwen2 apply a window"
         );
         assert_eq!(
@@ -871,7 +901,7 @@ mod tests {
                 llama_config(),
                 serde_json::json!({"model_type": null, "use_sliding_window": true})
             )),
-            "sliding_window unset is not supported for model_type (none): \
+            "use_sliding_window is not supported for model_type (none): \
              only mistral and qwen2 apply a window"
         );
         // Their `sliding_window` alone, as in Qwen3-0.6B, is no window.
