@@ -38,12 +38,15 @@ fn leaf(gpu: &Gpu, data: &[f32], shape: &[usize], trainable: bool) -> Tensor {
 }
 
 /// What the head has: a trainable weight, a bias and a LoRA adapter whose
-/// two matrices are both non-zero, or a frozen weight alone (the usual
-/// `lm_head` of a LoRA run).
+/// two matrices are both non-zero, a trainable weight and bias, or a frozen
+/// weight alone (the usual `lm_head` of a LoRA run).
 #[derive(Clone, Copy)]
 enum Head {
     Everything,
     FrozenWeight,
+    /// A trainable weight and bias, no adapter: the head whose gradients
+    /// have a short closed form (see [`host_gradients`]).
+    WeightAndBias,
 }
 
 /// The head and the hidden states it projects: `[SEQUENCES, SEQ_LEN, WIDTH]`.
@@ -63,6 +66,11 @@ impl Case {
         );
         let head = match kind {
             Head::FrozenWeight => Linear::new(leaf(gpu, &weight, &[WIDTH, CLASSES], false)),
+            Head::WeightAndBias => {
+                let mut head = Linear::new(leaf(gpu, &weight, &[WIDTH, CLASSES], true));
+                head.bias = Some(leaf(gpu, &pseudo_random(CLASSES, 3, 0.2), &[CLASSES], true));
+                head
+            }
             Head::Everything => {
                 let mut head = Linear::new(leaf(gpu, &weight, &[WIDTH, CLASSES], true));
                 head.bias = Some(leaf(gpu, &pseudo_random(CLASSES, 3, 0.2), &[CLASSES], true));
@@ -318,6 +326,87 @@ fn chunked_loss_matches_a_host_computation() {
             "sequence {s}: {} vs {w}",
             g.0
         );
+    }
+}
+
+/// The gradients of the summed mean losses of the sequences with respect to
+/// the hidden states, the head weight and the bias, for a head of a weight
+/// and a bias alone, in f64 from the host values of the case. For a
+/// supervised row `r` of sequence `s` with `n_s` supervised rows,
+/// `dz = (softmax(z) - onehot(target)) / n_s`; the hidden gradient is
+/// `dz W^T`, the weight gradient `sum x^T dz` and the bias gradient `sum dz`.
+/// A row left out of the loss has a zero gradient.
+fn host_gradients(mask: &[u8]) -> [Vec<f64>; 3] {
+    let x = pseudo_random(ROWS * WIDTH, 1, 1.0);
+    let w = pseudo_random(WIDTH * CLASSES, 2, 0.5);
+    let bias = pseudo_random(CLASSES, 3, 0.2);
+    let targets = targets();
+    let mut tokens = [0usize; SEQUENCES];
+    for (row, &supervised) in mask.iter().enumerate().take(ROWS) {
+        tokens[row / SEQ_LEN] += usize::from(supervised != 0);
+    }
+    let mut d_hidden = vec![0.0f64; ROWS * WIDTH];
+    let mut d_weight = vec![0.0f64; WIDTH * CLASSES];
+    let mut d_bias = vec![0.0f64; CLASSES];
+    for (row, &supervised) in mask.iter().enumerate().take(ROWS) {
+        if supervised == 0 {
+            continue;
+        }
+        let xr = &x[row * WIDTH..(row + 1) * WIDTH];
+        let logits: Vec<f64> = (0..CLASSES)
+            .map(|c| {
+                let dot: f64 = (0..WIDTH)
+                    .map(|k| f64::from(xr[k]) * f64::from(w[k * CLASSES + c]))
+                    .sum();
+                dot + f64::from(bias[c])
+            })
+            .collect();
+        let max = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let total: f64 = logits.iter().map(|l| (l - max).exp()).sum();
+        let n = tokens[row / SEQ_LEN] as f64;
+        let dz: Vec<f64> = (0..CLASSES)
+            .map(|c| {
+                let p = (logits[c] - max).exp() / total;
+                (p - f64::from(u8::from(c == targets[row] as usize))) / n
+            })
+            .collect();
+        for (k, &xk) in xr.iter().enumerate() {
+            d_hidden[row * WIDTH + k] = (0..CLASSES)
+                .map(|c| dz[c] * f64::from(w[k * CLASSES + c]))
+                .sum();
+            for (c, &dzc) in dz.iter().enumerate() {
+                d_weight[k * CLASSES + c] += f64::from(xk) * dzc;
+            }
+        }
+        for (b, &dzc) in d_bias.iter_mut().zip(&dz) {
+            *b += dzc;
+        }
+    }
+    [d_hidden, d_weight, d_bias]
+}
+
+/// The gradients of the hidden states, the head weight and the bias against
+/// an f64 computation on the host, independent of every kernel the head
+/// uses. 39 rows in chunks of 8: a skipped chunk of masked rows, masked rows
+/// inside chunks and a last chunk of 7.
+#[test]
+#[ignore = "needs a GPU"]
+fn chunked_gradients_match_a_host_computation() {
+    let gpu = gpu();
+    let mask = mixed_mask();
+    let want = host_gradients(&mask);
+    let got = run(&gpu, Head::WeightAndBias, &mask, Some(8));
+    assert_eq!(got.grads.len(), 3);
+    for ((name, grad), want) in got.grads.iter().zip(&want) {
+        assert_eq!(grad.len(), want.len(), "{name} gradient size");
+        let worst = grad
+            .iter()
+            .zip(want)
+            .map(|(g, w)| (f64::from(*g) - w).abs())
+            .fold(0.0f64, f64::max);
+        assert!(worst <= 1e-5, "{name} gradient differs by {worst}");
+        let largest = want.iter().map(|w| w.abs()).fold(0.0f64, f64::max);
+        assert!(largest > 1e-3, "{name} reference gradient is all zero");
     }
 }
 
