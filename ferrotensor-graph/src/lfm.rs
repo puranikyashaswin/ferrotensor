@@ -807,9 +807,11 @@ impl Lfm2Model {
             .flat_map(|word| word.to_bits().to_le_bytes())
             .collect();
         bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .take(len)
-            .map(|pair| f16_bits_to_f32(u16::from_le_bytes([pair[0], pair[1]])))
+            .map(|pair| f16_bits_to_f32(u16::from_le_bytes(*pair)))
             .collect()
     }
 
