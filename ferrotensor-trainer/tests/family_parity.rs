@@ -1,6 +1,7 @@
 //! Tiny random checkpoints of each supported model family against Hugging
-//! Face transformers: Qwen2 (biased query, key and value projections) and
-//! Llama 3 (scaled RoPE).
+//! Face transformers: Qwen2 (biased query, key and value projections), Qwen2
+//! with a sliding window on its second layer, Mistral (a sliding window on
+//! every layer) and Llama 3 (scaled RoPE).
 //!
 //! `scripts/gen_family_fixtures.py` builds one tiny random model per family,
 //! saves it, and records its logits and the gradients of a cross-entropy
@@ -62,6 +63,8 @@ struct Family {
     biased: &'static [&'static str],
     /// Entries of each layer's RoPE table when the family scales RoPE.
     rope_table: Option<usize>,
+    /// The attention window of each layer, in tokens.
+    windows: &'static [Option<u32>],
     /// Switches off the feature the row tests, so the logits test can show
     /// that the comparison depends on it.
     control: fn(&mut Lfm2Model),
@@ -87,17 +90,50 @@ fn drop_rope_scaling(model: &mut Lfm2Model) {
     }
 }
 
+fn drop_windows(model: &mut Lfm2Model) {
+    for layer in &mut model.layers {
+        if let Lfm2LayerOp::Attention(attn) = &mut layer.op {
+            attn.window = None;
+        }
+    }
+}
+
 const QWEN2: Family = Family {
     name: "qwen2",
     biased: &["q_proj", "k_proj", "v_proj"],
     rope_table: None,
+    // `use_sliding_window` is false, so the config's `sliding_window` of 128
+    // is dropped, as transformers drops it.
+    windows: &[None, None],
     control: drop_biases,
+    unread: &[],
+};
+
+/// `use_sliding_window` with `max_window_layers` 1: layer 0 attends to the
+/// whole sequence and layer 1 to the last 4 tokens.
+const QWEN2_WINDOW: Family = Family {
+    name: "qwen2_window",
+    biased: &["q_proj", "k_proj", "v_proj"],
+    rope_table: None,
+    windows: &[None, Some(4)],
+    control: drop_windows,
+    unread: &[],
+};
+
+/// Mistral windows every layer to 4 tokens.
+const MISTRAL: Family = Family {
+    name: "mistral",
+    biased: &[],
+    rope_table: None,
+    windows: &[Some(4), Some(4)],
+    control: drop_windows,
     unread: &[],
 };
 
 const LLAMA3: Family = Family {
     name: "llama3",
     biased: &[],
+    windows: &[None, None],
     // One entry per rotation pair of the 16-wide head.
     rope_table: Some(8),
     control: drop_rope_scaling,
@@ -239,13 +275,16 @@ fn logits_match_transformers(family: &Family) {
         let biased = family.biased.iter().any(|p| name.contains(p));
         assert_eq!(linear.bias.is_some(), biased, "bias of {name}");
     }
+    let mut windows = Vec::new();
     for layer in &model.layers {
         let Lfm2LayerOp::Attention(attn) = &layer.op else {
             panic!("every layer should be attention");
         };
         let table = attn.rope_inv_freq.as_ref().map(|t| t.values().len());
         assert_eq!(table, family.rope_table, "RoPE table length");
+        windows.push(attn.window);
     }
+    assert_eq!(windows, family.windows, "attention window of each layer");
     // Tied: no lm_head.weight in the file, so the head is embed_tokens^T.
     assert_eq!(model.lm_head.weight.data.shape, vec![64, 96]);
 
@@ -461,15 +500,16 @@ macro_rules! family {
 }
 
 family!(qwen2, QWEN2);
+family!(qwen2_window, QWEN2_WINDOW);
+family!(mistral, MISTRAL);
 family!(llama3, LLAMA3);
 
 /// The fused q/k/v attention rotates Q and K inside its own kernels, so it
-/// reads the scaled table too: its logits and loss stay with transformers, and
-/// they leave transformers when the table is dropped.
-#[test]
-#[ignore = "needs a GPU; skipped without FERROTENSOR_FAMILY_FIXTURES"]
-fn llama3_fused_attention_applies_the_scaling() {
-    let Some(fixture) = Fixture::load(LLAMA3.name) else {
+/// reads the scaled table and the window too: its logits and loss stay with
+/// transformers, and they leave transformers when the family's feature is
+/// switched off. Only bias-free projections fuse, so the Qwen2 rows are out.
+fn fused_attention_applies_the_feature(family: &Family) {
+    let Some(fixture) = Fixture::load(family.name) else {
         return;
     };
     let gpu = gpu();
@@ -504,13 +544,26 @@ fn llama3_fused_attention_applies_the_scaling() {
         fixture.case.loss
     );
 
-    drop_rope_scaling(&mut model);
+    (family.control)(&mut model);
     let unscaled = host(
         &gpu,
         &model.forward_with_dropout(&gpu.engine, ids, 0, None, None, None),
     );
     assert!(
         max_abs_diff(&unscaled, expected) > 0.05,
-        "dropping the table barely changes the fused logits"
+        "switching off the feature of {} barely changes the fused logits",
+        family.name
     );
+}
+
+#[test]
+#[ignore = "needs a GPU; skipped without FERROTENSOR_FAMILY_FIXTURES"]
+fn llama3_fused_attention_applies_the_scaling() {
+    fused_attention_applies_the_feature(&LLAMA3);
+}
+
+#[test]
+#[ignore = "needs a GPU; skipped without FERROTENSOR_FAMILY_FIXTURES"]
+fn mistral_fused_attention_applies_the_window() {
+    fused_attention_applies_the_feature(&MISTRAL);
 }

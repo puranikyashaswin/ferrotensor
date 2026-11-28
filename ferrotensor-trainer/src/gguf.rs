@@ -694,7 +694,16 @@ pub fn export_gguf(
             config.model_type.as_deref().unwrap_or("(none)")
         )
     })?;
-    family_spec(&config).map_err(|e| format!("{}: {e}", config_path.display()))?;
+    let spec = family_spec(&config).map_err(|e| format!("{}: {e}", config_path.display()))?;
+    // The file carries no attention window, so a llama.cpp run would attend
+    // to the whole sequence and give wrong logits past the window.
+    if spec.has_window() {
+        return Err(format!(
+            "{}: sliding-window attention is not supported: the GGUF export writes full attention",
+            config_path.display()
+        )
+        .into());
+    }
     // The file carries no rotary scaling, so a scaled RoPE would load and
     // give wrong logits.
     if rope_scaling(&config)
@@ -1448,6 +1457,26 @@ mod tests {
             err,
             "tensor model.layers.0.self_attn.q_proj.bias is a bias; the only biases export-gguf \
              writes are the query, key and value biases of model_type qwen2"
+        );
+    }
+
+    #[test]
+    fn refuses_a_sliding_window() {
+        // Qwen2 with `use_sliding_window` runs here (its layers from
+        // `max_window_layers` on use the window), but the file has no window.
+        let err = refusal("window", |dir| {
+            let mut config = tiny_config();
+            config["model_type"] = "qwen2".into();
+            config["use_sliding_window"] = true.into();
+            config["sliding_window"] = 4.into();
+            config["max_window_layers"] = 0.into();
+            write_json(&dir.join("config.json"), &config);
+        });
+        assert!(
+            err.ends_with(
+                "config.json: sliding-window attention is not supported: the GGUF export writes full attention"
+            ),
+            "{err}"
         );
     }
 

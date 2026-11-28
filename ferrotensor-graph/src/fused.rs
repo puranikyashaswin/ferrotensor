@@ -420,6 +420,7 @@ impl Attention {
             theta: self.rope_theta,
             inv_freq: self.rope_inv_freq.clone(),
             pos: pos as u32,
+            window: self.window.unwrap_or(0),
             dropout_prob,
             seed,
         };

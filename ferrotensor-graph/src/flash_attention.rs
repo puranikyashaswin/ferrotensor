@@ -312,6 +312,9 @@ pub struct GroupedQueryAttention {
     /// Dropout seed (default 0). The mask is a pure function of the seed,
     /// so callers that train with dropout should set a new one per step.
     pub seed: u64,
+    /// Sliding-window size in tokens (see [`with_window`](Self::with_window));
+    /// 0 attends to every earlier position.
+    pub window: u32,
 }
 
 impl GroupedQueryAttention {
@@ -354,7 +357,17 @@ impl GroupedQueryAttention {
             scale,
             dropout_prob,
             seed: 0,
+            window: 0,
         }
+    }
+
+    /// Limits every query to the last `window` positions, itself included
+    /// (0 lifts the limit). A decoded token against a KV cache sees only
+    /// those positions of the cache.
+    #[must_use]
+    pub fn with_window(mut self, window: u32) -> Self {
+        self.window = window;
+        self
     }
 
     /// Forward pass with grouped query attention.
@@ -409,6 +422,7 @@ impl GroupedQueryAttention {
         let opts = AttentionOptions {
             causal: self.causal,
             causal_offset: pos as u32,
+            window: self.window,
             dropout_prob: self.dropout_prob,
             seed: self.seed,
             ..AttentionOptions::default()
@@ -450,6 +464,7 @@ impl GroupedQueryAttention {
         let stats = UnifiedTensor::empty(ctx, &[batch_size, self.num_heads, seq_q, 2]);
         let opts = AttentionOptions {
             causal: self.causal,
+            window: self.window,
             dropout_prob: self.dropout_prob,
             seed: self.seed,
             ..AttentionOptions::default()

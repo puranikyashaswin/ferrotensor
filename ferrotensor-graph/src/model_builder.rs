@@ -10,8 +10,9 @@
 //!   and `model.norm`. A projection with a `<name>.bias` tensor (Qwen2) gets
 //!   that bias. When a checkpoint has `self_attn.q_norm` / `self_attn.k_norm`
 //!   (Qwen3), they are loaded as per-head query/key norms
-//!   ([`Attention::q_norm`]). Config features the forward pass lacks are
-//!   refused ([`family_spec`]).
+//!   ([`Attention::q_norm`]). Mistral and Qwen2 sliding-window attention is
+//!   applied per layer ([`Attention::window`]). Config features the forward
+//!   pass lacks are refused ([`family_spec`]).
 //! * **LFM2** (see [`family_spec`]): blocks are short convolutions or
 //!   attention, named `operator_norm`, `ffn_norm`, `feed_forward.w{1,2,3}`,
 //!   with the final norm stored as `model.embedding_norm`.
@@ -437,7 +438,13 @@ impl<'a> Lfm2ModelBuilder<'a> {
         })
     }
 
-    fn build_attention(&self, spec: &FamilySpec, prefix: &str, seed: u64) -> Result<Attention> {
+    fn build_attention(
+        &self,
+        spec: &FamilySpec,
+        layer_idx: usize,
+        prefix: &str,
+        seed: u64,
+    ) -> Result<Attention> {
         let n_heads = self.config.num_attention_heads;
         let num_kv_heads = self.config.num_key_value_heads.unwrap_or(n_heads);
         let head_dim = self
@@ -485,6 +492,7 @@ impl<'a> Lfm2ModelBuilder<'a> {
             rope_inv_freq,
             q_norm: self.build_head_norm(&format!("{prefix}.{q_norm}"), head_dim)?,
             k_norm: self.build_head_norm(&format!("{prefix}.{k_norm}"), head_dim)?,
+            window: spec.window(layer_idx),
             fused: FusedSlot::default(),
         })
     }
@@ -510,6 +518,7 @@ impl<'a> Lfm2ModelBuilder<'a> {
             LayerKind::Conv => Lfm2LayerOp::Conv(self.build_conv(&format!("{prefix}.conv"), seed)?),
             LayerKind::Attention => Lfm2LayerOp::Attention(self.build_attention(
                 spec,
+                layer_idx,
                 &format!("{prefix}.{}", names.attn),
                 seed,
             )?),

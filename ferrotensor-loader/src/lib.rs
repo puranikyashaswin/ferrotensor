@@ -137,12 +137,17 @@ pub struct Lfm2Config {
     /// RoPE type and base (`transformers` 5 layout).
     #[serde(default)]
     pub rope_parameters: Option<RopeConfig>,
-    /// Attention window of sliding-window layers, if set.
+    /// Attention window of sliding-window layers, in tokens, if set. Mistral
+    /// applies it to every layer; Qwen2 only with `use_sliding_window`.
     #[serde(default)]
     pub sliding_window: Option<usize>,
     /// Whether `sliding_window` applies (Qwen2 sets it to `false`).
     #[serde(default)]
     pub use_sliding_window: Option<bool>,
+    /// Qwen2: the first layer that uses `sliding_window` when the config has
+    /// no `layer_types` (layers before it attend to the whole sequence).
+    #[serde(default)]
+    pub max_window_layers: Option<usize>,
 }
 
 /// A `rope_scaling` or `rope_parameters` object of `config.json`.

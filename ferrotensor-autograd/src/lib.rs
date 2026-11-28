@@ -1635,11 +1635,30 @@ impl Tensor {
         seed: u64,
         engine: &ComputeEngine,
     ) -> Tensor {
+        Self::flash_attention_windowed(q, k, v, mask, (causal, 0), dropout_prob, seed, engine)
+    }
+
+    /// [`flash_attention`](Self::flash_attention) with a sliding window:
+    /// `(causal, window)` where each query sees the last `window` positions,
+    /// itself included (0 means all of them). The backward pass applies the
+    /// same window.
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attention_windowed(
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        mask: Option<&Tensor>,
+        (causal, window): (bool, u32),
+        dropout_prob: f32,
+        seed: u64,
+        engine: &ComputeEngine,
+    ) -> Tensor {
         // Output shape same as Query
         let out_data = UnifiedTensor::empty(&q.ctx, &q.data.shape);
         let mask_data = mask.map(|m| &*m.data);
         let opts = AttentionOptions {
             causal,
+            window,
             dropout_prob,
             seed,
             ..Default::default()
@@ -1669,6 +1688,7 @@ impl Tensor {
             v: v.clone(),
             mask: mask.cloned(),
             causal,
+            window,
             dropout_prob,
             seed,
             out: out_data.clone(),
@@ -1691,6 +1711,8 @@ pub struct FlashAttentionNode {
     pub mask: Option<Tensor>,
     /// Whether future positions are masked.
     pub causal: bool,
+    /// Sliding-window size in tokens; 0 means unlimited.
+    pub window: u32,
     /// Attention dropout probability.
     pub dropout_prob: f32,
     /// Dropout RNG seed.
@@ -1722,6 +1744,7 @@ impl AutogradNode for FlashAttentionNode {
         let mask_data = self.mask.as_ref().map(|m| &*m.data);
         let opts = AttentionOptions {
             causal: self.causal,
+            window: self.window,
             dropout_prob: self.dropout_prob,
             seed: self.seed,
             ..Default::default()

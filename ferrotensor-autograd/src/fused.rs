@@ -503,6 +503,8 @@ pub struct AttentionGeometry {
     pub inv_freq: Option<RopeFreqs>,
     /// Position of the first token.
     pub pos: u32,
+    /// Sliding-window size in tokens; 0 means unlimited.
+    pub window: u32,
     /// Attention dropout probability.
     pub dropout_prob: f32,
     /// Dropout seed.
@@ -513,6 +515,7 @@ impl AttentionGeometry {
     fn options(&self) -> AttentionOptions {
         AttentionOptions {
             causal: true,
+            window: self.window,
             dropout_prob: self.dropout_prob,
             seed: self.seed,
             ..Default::default()

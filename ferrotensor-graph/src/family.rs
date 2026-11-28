@@ -104,6 +104,9 @@ pub struct FamilySpec {
     pub rope_theta: f64,
     /// The `layer_types` of the config, one per layer, or empty.
     layer_types: Vec<String>,
+    /// The attention window of each layer, in tokens; empty when no layer has
+    /// one. A layer past the end of the list has none.
+    windows: Vec<Option<u32>>,
 }
 
 impl FamilySpec {
@@ -111,14 +114,19 @@ impl FamilySpec {
     ///
     /// # Errors
     /// A [`BuildError`] naming the layer when its type is not one this
-    /// family can run: a Llama-style layer that is not full attention (a
-    /// sliding-window layer would need a windowed mask the attention path
-    /// lacks), or an LFM2 layer of an unknown type.
+    /// family can run: a Llama-style layer of a family that has no window
+    /// (see [`window`](Self::window)) and is not full attention, or an LFM2
+    /// layer of an unknown type.
     pub fn layer(&self, index: usize) -> Result<LayerKind, BuildError> {
         let layer_type = self.layer_types.get(index).map(String::as_str);
         match self.architecture {
             Architecture::Llama => match layer_type.filter(|t| *t != "full_attention") {
                 None => Ok(LayerKind::Attention),
+                // Only a family that reads the window gets here with a window
+                // set; `family_spec` has checked the type against it.
+                Some("sliding_attention") if self.window(index).is_some() => {
+                    Ok(LayerKind::Attention)
+                }
                 Some(t) => Err(BuildError(format!(
                     "layer {index} is {t:?}; only full attention is supported"
                 ))),
@@ -132,11 +140,100 @@ impl FamilySpec {
             },
         }
     }
+
+    /// How many tokens the attention of layer `index` covers, itself
+    /// included: a token sees the last `window` positions. `None` means the
+    /// whole sequence.
+    pub fn window(&self, index: usize) -> Option<u32> {
+        self.windows.get(index).copied().flatten()
+    }
+
+    /// Whether any layer has an attention window.
+    pub fn has_window(&self) -> bool {
+        self.windows.iter().any(Option::is_some)
+    }
 }
+
+/// The window of each layer, as `transformers` 5.20.2 decides it, for the
+/// families that apply one: Mistral and Qwen2. Other families get an empty
+/// list, and `family_spec` refuses their `use_sliding_window: true`.
+///
+/// Mistral windows every layer whenever `sliding_window` is set
+/// (`modeling_mistral.py`: the attention and the mask both read the config
+/// value); it has no `use_sliding_window` and ignores `layer_types`. Qwen2
+/// has the window only when `use_sliding_window` is true, and then on the
+/// layers its `layer_types` call `sliding_attention`; without `layer_types`
+/// these are the layers from `max_window_layers` on.
+fn layer_windows(config: &Lfm2Config) -> Result<Vec<Option<u32>>, BuildError> {
+    let (window, sliding) = match config.model_type.as_deref() {
+        Some("mistral") => (config.sliding_window, vec![true; config.num_hidden_layers]),
+        Some("qwen2") => qwen2_sliding_layers(config)?,
+        _ => return Ok(Vec::new()),
+    };
+    let Some(window) = window else {
+        return Ok(Vec::new());
+    };
+    let window = match u32::try_from(window) {
+        Ok(window) if window > 0 => window,
+        _ => {
+            return Err(BuildError(format!(
+                "sliding_window {window} is not supported: it must be between 1 and {}",
+                u32::MAX
+            )))
+        }
+    };
+    Ok(sliding.into_iter().map(|s| s.then_some(window)).collect())
+}
+
+/// The window of a Qwen2 config, and which of its layers use it.
+///
+/// # Errors
+/// A [`BuildError`] where `transformers` raises: `layer_types` that is not
+/// one entry per layer, an entry that is neither `full_attention` nor
+/// `sliding_attention`, or a `sliding_attention` layer in a config with no
+/// window.
+fn qwen2_sliding_layers(config: &Lfm2Config) -> Result<(Option<usize>, Vec<bool>), BuildError> {
+    let layers = config.num_hidden_layers;
+    let window = config
+        .sliding_window
+        .filter(|_| config.use_sliding_window == Some(true));
+    if config.layer_types.is_empty() {
+        let first = config.max_window_layers.unwrap_or(QWEN2_MAX_WINDOW_LAYERS);
+        return Ok((window, (0..layers).map(|i| i >= first).collect()));
+    }
+    if config.layer_types.len() != layers {
+        return Err(BuildError(format!(
+            "layer_types has {} entries for {layers} layers",
+            config.layer_types.len()
+        )));
+    }
+    let mut sliding = Vec::with_capacity(layers);
+    for (index, layer_type) in config.layer_types.iter().enumerate() {
+        sliding.push(match layer_type.as_str() {
+            "full_attention" => false,
+            "sliding_attention" if window.is_some() => true,
+            "sliding_attention" => {
+                return Err(BuildError(format!(
+                    "layer {index} is \"sliding_attention\" but the config has no window: \
+                     use_sliding_window is not true or sliding_window is unset"
+                )))
+            }
+            other => {
+                return Err(BuildError(format!(
+                    "layer {index} is {other:?}; only full and sliding attention are supported"
+                )))
+            }
+        });
+    }
+    Ok((window, sliding))
+}
+
+/// `max_window_layers` of a Qwen2 config that does not set it.
+const QWEN2_MAX_WINDOW_LAYERS: usize = 28;
 
 /// Reads the family of `config` and refuses what the forward pass does not
 /// compute: a non-SiLU activation, a RoPE scheme other than `default` and
-/// `llama3`, sliding-window attention.
+/// `llama3`, a window for a family other than Mistral and Qwen2.
 ///
 /// `model_type: lfm2`, a `conv` entry in `layer_types`, or `layer_types`
 /// without a `model_type` mean LFM2; everything else is Llama-style.
@@ -172,14 +269,22 @@ pub fn family_spec(config: &Lfm2Config) -> Result<FamilySpec, BuildError> {
         .or_else(|| config.rope_parameters.as_ref()?.rope_theta)
         .unwrap_or(10000.0);
 
-    // Only `use_sliding_window: true` turns the window on: Hugging Face's
-    // Mistral sets `sliding_window` alone and still attends over everything.
-    if config.use_sliding_window == Some(true) {
+    // Mistral and Qwen2 get their windows here. Another family that asks for
+    // one is refused, since it would otherwise attend to the whole sequence.
+    let windows = if lfm2 {
+        Vec::new()
+    } else {
+        layer_windows(config)?
+    };
+    let reads_window = matches!(model_type, Some("mistral" | "qwen2"));
+    if config.use_sliding_window == Some(true) && !reads_window {
         let window = config
             .sliding_window
             .map_or_else(|| "unset".to_owned(), |w| w.to_string());
+        let family = model_type.map_or_else(|| "(none)".to_owned(), |t| format!("{t:?}"));
         return Err(BuildError(format!(
-            "sliding_window {window} is not supported: attention always covers the whole sequence"
+            "sliding_window {window} is not supported for model_type {family}: \
+             only mistral and qwen2 apply a window"
         )));
     }
 
@@ -190,6 +295,7 @@ pub fn family_spec(config: &Lfm2Config) -> Result<FamilySpec, BuildError> {
         rope,
         rope_theta,
         layer_types: config.layer_types.clone(),
+        windows,
     })
 }
 
@@ -292,7 +398,7 @@ mod tests {
         })
     }
 
-    /// The `config.json` of Mistral-7B-v0.1: a window that is set and not used.
+    /// The `config.json` of Mistral-7B-v0.1: a window of 4096 tokens.
     fn mistral_config() -> serde_json::Value {
         serde_json::json!({
             "architectures": ["MistralForCausalLM"],
@@ -458,18 +564,125 @@ mod tests {
     }
 
     #[test]
-    fn mistral_without_a_window_is_llama() {
-        // Hugging Face applies no window here either.
+    fn mistral_windows_every_layer() {
+        // transformers 5.20.2 applies the window of a Mistral config whenever
+        // `sliding_window` is set (modeling_mistral.py, the attention and the
+        // mask both read it): Mistral-7B-v0.1 attends over 4096 tokens.
         let spec = spec_of(mistral_config());
         assert_eq!(spec.architecture, Architecture::Llama);
         assert_eq!(spec.names, LLAMA_NAMES);
         assert_eq!(spec.rope_theta, 10000.0);
-        assert_eq!(spec.layer(31), Ok(LayerKind::Attention));
+        assert!(spec.has_window());
+        for layer in 0..32 {
+            assert_eq!(spec.window(layer), Some(4096), "layer {layer}");
+            assert_eq!(spec.layer(layer), Ok(LayerKind::Attention));
+        }
+        assert_eq!(spec.window(32), None);
+        // Mistral has no `use_sliding_window` and ignores `layer_types`.
+        let ignored = spec_of(with(
+            mistral_config(),
+            serde_json::json!({
+                "use_sliding_window": false,
+                "layer_types": vec!["full_attention"; 32]
+            }),
+        ));
+        assert_eq!(ignored.window(0), Some(4096));
+        assert_eq!(ignored.window(31), Some(4096));
+        assert_eq!(ignored.layer(31), Ok(LayerKind::Attention));
+    }
+
+    #[test]
+    fn mistral_without_sliding_window_gets_no_window() {
+        // Mistral-7B-v0.2 and v0.3 set `sliding_window` to null.
         let null = spec_of(with(
             mistral_config(),
-            serde_json::json!({"use_sliding_window": null}),
+            serde_json::json!({"sliding_window": null}),
         ));
-        assert_eq!(null, spec);
+        assert!(!null.has_window());
+        assert_eq!(null.window(0), None);
+        assert_eq!(null.window(31), None);
+        assert_eq!(null.layer(31), Ok(LayerKind::Attention));
+        // A config without the key is the same.
+        let mut json = mistral_config();
+        let removed = json
+            .as_object_mut()
+            .expect("object")
+            .remove("sliding_window");
+        assert!(removed.is_some());
+        assert_eq!(spec_of(json), null);
+    }
+
+    #[test]
+    fn qwen2_window_starts_at_max_window_layers() {
+        // transformers derives `layer_types` as sliding_attention for the
+        // layers from `max_window_layers` on, when the window is on.
+        let on = with(
+            qwen2_5_config(),
+            serde_json::json!({
+                "num_hidden_layers": 4, "max_window_layers": 2,
+                "use_sliding_window": true, "sliding_window": 8
+            }),
+        );
+        let spec = spec_of(on.clone());
+        assert!(spec.has_window());
+        let windows: Vec<_> = (0..5).map(|l| spec.window(l)).collect();
+        assert_eq!(windows, [None, None, Some(8), Some(8), None]);
+        assert_eq!(spec.layer(1), Ok(LayerKind::Attention));
+        assert_eq!(spec.layer(2), Ok(LayerKind::Attention));
+        // The default of `max_window_layers` is 28.
+        let long = spec_of(with(
+            on.clone(),
+            serde_json::json!({"num_hidden_layers": 30, "max_window_layers": null}),
+        ));
+        assert_eq!(long.window(27), None);
+        assert_eq!(long.window(28), Some(8));
+        assert_eq!(long.window(29), Some(8));
+        // Layer 0 windowed: every layer is.
+        let all = spec_of(with(on, serde_json::json!({"max_window_layers": 0})));
+        assert_eq!((0..4).filter_map(|l| all.window(l)).count(), 4);
+    }
+
+    #[test]
+    fn qwen2_without_use_sliding_window_has_no_window() {
+        // Qwen2.5-0.5B: `sliding_window` is set and `use_sliding_window` is
+        // false, so transformers drops the window.
+        let spec = spec_of(qwen2_5_config());
+        assert!(!spec.has_window());
+        assert_eq!(spec.window(23), None);
+        // `use_sliding_window` true with no `sliding_window` has none either.
+        let unset = spec_of(with(
+            qwen2_5_config(),
+            serde_json::json!({"use_sliding_window": true, "sliding_window": null}),
+        ));
+        assert!(!unset.has_window());
+        // The same for a config that lists only full attention.
+        let full = spec_of(with(
+            qwen2_5_config(),
+            serde_json::json!({"layer_types": vec!["full_attention"; 24]}),
+        ));
+        assert!(!full.has_window());
+    }
+
+    #[test]
+    fn qwen2_layer_types_override_max_window_layers() {
+        // With `max_window_layers` 1 the derived types would be [full,
+        // sliding, sliding, sliding]; the listed ones win, as in
+        // modeling_qwen2.py (the layer reads `config.layer_types[i]`).
+        let spec = spec_of(with(
+            qwen2_5_config(),
+            serde_json::json!({
+                "num_hidden_layers": 4, "max_window_layers": 1,
+                "use_sliding_window": true, "sliding_window": 8,
+                "layer_types": [
+                    "sliding_attention", "full_attention", "full_attention", "sliding_attention"
+                ]
+            }),
+        ));
+        let windows: Vec<_> = (0..4).map(|l| spec.window(l)).collect();
+        assert_eq!(windows, [Some(8), None, None, Some(8)]);
+        for layer in 0..4 {
+            assert_eq!(spec.layer(layer), Ok(LayerKind::Attention));
+        }
     }
 
     #[test]
@@ -557,11 +770,10 @@ mod tests {
             let spec = refused(serde_json::json!({"hidden_act": act})).expect("silu");
             assert_eq!(spec.act, Act::Silu);
         }
-        // Mistral-7B-v0.1 sets a window without use_sliding_window.
-        assert!(
-            refused(serde_json::json!({"use_sliding_window": null, "sliding_window": 4096}))
-                .is_ok()
-        );
+        // A Qwen2 window that is set and switched off is dropped.
+        let off = refused(serde_json::json!({"use_sliding_window": null, "sliding_window": 4096}))
+            .expect("no window");
+        assert!(!off.has_window());
     }
 
     #[test]
@@ -599,12 +811,27 @@ mod tests {
                 "rope_scaling type \"longrope\" is not supported: only \"default\" and \"llama3\" RoPE are",
             ),
             (
-                serde_json::json!({"use_sliding_window": true}),
-                "sliding_window 32768 is not supported: attention always covers the whole sequence",
+                serde_json::json!({"use_sliding_window": true, "sliding_window": 0}),
+                "sliding_window 0 is not supported: it must be between 1 and 4294967295",
             ),
             (
-                serde_json::json!({"use_sliding_window": true, "sliding_window": null}),
-                "sliding_window unset is not supported: attention always covers the whole sequence",
+                serde_json::json!({"use_sliding_window": true, "sliding_window": 4294967296u64}),
+                "sliding_window 4294967296 is not supported: it must be between 1 and 4294967295",
+            ),
+            (
+                serde_json::json!({"layer_types": ["full_attention"]}),
+                "layer_types has 1 entries for 24 layers",
+            ),
+            (
+                serde_json::json!({"num_hidden_layers": 2, "layer_types": ["full_attention", "chunked"]}),
+                "layer 1 is \"chunked\"; only full and sliding attention are supported",
+            ),
+            (
+                serde_json::json!({
+                    "num_hidden_layers": 2,
+                    "layer_types": ["full_attention", "sliding_attention"]
+                }),
+                "layer 1 is \"sliding_attention\" but the config has no window: use_sliding_window is not true or sliding_window is unset",
             ),
             (
                 serde_json::json!({"rope_scaling": {"factor": 4.0}}),
@@ -618,6 +845,41 @@ mod tests {
                 "{changes}"
             );
         }
+    }
+
+    #[test]
+    fn a_window_is_refused_for_the_families_that_do_not_read_one() {
+        let message = |json: serde_json::Value| family_spec(&config(json)).expect_err("refused").0;
+        assert_eq!(
+            message(with(
+                llama_config(),
+                serde_json::json!({"use_sliding_window": true, "sliding_window": 128})
+            )),
+            "sliding_window 128 is not supported for model_type \"llama\": \
+             only mistral and qwen2 apply a window"
+        );
+        assert_eq!(
+            message(with(
+                qwen3_config(),
+                serde_json::json!({"use_sliding_window": true})
+            )),
+            "sliding_window unset is not supported for model_type \"qwen3\": \
+             only mistral and qwen2 apply a window"
+        );
+        assert_eq!(
+            message(with(
+                llama_config(),
+                serde_json::json!({"model_type": null, "use_sliding_window": true})
+            )),
+            "sliding_window unset is not supported for model_type (none): \
+             only mistral and qwen2 apply a window"
+        );
+        // Their `sliding_window` alone, as in Qwen3-0.6B, is no window.
+        let qwen3 = spec_of(with(
+            qwen3_config(),
+            serde_json::json!({"sliding_window": 4096}),
+        ));
+        assert!(!qwen3.has_window());
     }
 
     #[test]

@@ -330,6 +330,9 @@ pub struct Attention {
     pub q_norm: Option<RMSNorm>,
     /// The same for every key head (Qwen3 `k_norm`).
     pub k_norm: Option<RMSNorm>,
+    /// How many positions a token attends to, itself included (Mistral and
+    /// Qwen2 sliding-window layers); `None` attends to the whole sequence.
+    pub window: Option<u32>,
     /// The fused q, k and v group of a training run, empty unless
     /// [`Lfm2Model::enable_fused_projections`] gave the layer one.
     pub fused: FusedSlot,
@@ -428,12 +431,12 @@ impl Attention {
                 Some(seed) => (self.dropout_prob, seed),
                 None => (0.0, 0),
             };
-            let out = Tensor::flash_attention(
+            let out = Tensor::flash_attention_windowed(
                 &q_4d,
                 &k_4d,
                 &v_4d,
                 mask.as_ref(),
-                true,
+                (true, self.window.unwrap_or(0)),
                 dropout_prob,
                 seed,
                 engine,
@@ -452,7 +455,8 @@ impl Attention {
             self.num_kv_heads,
             true, // causal
             0.0,  // no dropout at inference
-        );
+        )
+        .with_window(self.window.unwrap_or(0));
 
         // Write the new keys/values at `pos` (cache is `[1, max_seq, kv * head_dim]`).
         let offset = pos * self.num_kv_heads * self.head_dim * 4;

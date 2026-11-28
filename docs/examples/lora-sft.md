@@ -517,8 +517,10 @@ training normally (losses 1.4960 and 1.6540).
   supported: Llama-3.2-1B logits are within 4.4e-5 of transformers' on 8
   prompts, and a 250-step run reached held-out loss 1.3300 against 1.3221 for
   PyTorch + PEFT (one run on an A10G). Config features the forward pass lacks (an activation other than
-  SiLU, linear, dynamic, yarn or longrope scaling, `use_sliding_window: true`)
-  are refused with exit code 2. Llama 3 tokenizers have no ChatML tokens, so
+  SiLU, linear, dynamic, yarn or longrope scaling, `use_sliding_window: true`
+  on a model other than Mistral or Qwen2) are refused with exit code 2. Mistral
+  and Qwen2 sliding-window attention is supported: a token attends to the last
+  `sliding_window` tokens, in training, `generate` and `chat`. Llama 3 tokenizers have no ChatML tokens, so
   train with `--no-chat-template`; `chat` refuses them.
   Qwen3-style attention (per-head
   RMSNorm of queries and keys before RoPE, `q_norm`/`k_norm`) is implemented

@@ -41,6 +41,7 @@ with these.
 """
 
 import argparse
+import copy
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -85,6 +86,12 @@ BASE_CONFIG = {
 QWEN2_THETA = 1_000_000.0
 QWEN2_EPS = 1e-6
 
+# A window of 4 tokens over the 12 of IDS: from the 5th token on, a token
+# cannot see the whole sequence.
+WINDOW = 4
+
+MISTRAL_THETA = 10_000.0
+
 LLAMA3_THETA = 500_000.0
 LLAMA3_SCALING = {
     "factor": 8.0,
@@ -124,6 +131,61 @@ def check_llama3(model, config):
     assert (ratio[1].item() - 1.0 / LLAMA3_SCALING["factor"]) > 0.05 and ratio[1].item() < 0.95, ratio
 
 
+def logits_without_window(model, window_layers):
+    """The logits of `model` and of a copy with the window switched off.
+
+    `window_layers` are the layers whose window must be live. The asserts
+    read the window off the transformers layers themselves, and the second
+    forward pass shows that it changes the output, so a config key that
+    transformers ignored cannot pass."""
+    for index, layer in enumerate(model.model.layers):
+        expected = WINDOW if index in window_layers else None
+        # Mistral's attention reads the window from the config at each call.
+        actual = getattr(layer.self_attn, "sliding_window", model.config.sliding_window)
+        assert actual == expected, (index, actual)
+    ids = torch.tensor([IDS])
+    with torch.no_grad():
+        with_window = model(input_ids=ids).logits
+        plain = copy.deepcopy(model)
+        plain.config.sliding_window = None
+        plain.config.use_sliding_window = False
+        plain.config.layer_types = ["full_attention"] * LAYERS
+        for layer in plain.model.layers:
+            layer.self_attn.sliding_window = None
+            if hasattr(layer, "attention_type"):
+                layer.attention_type = "full_attention"
+        if hasattr(plain.model, "has_sliding_layers"):
+            plain.model.has_sliding_layers = False
+        full = plain(input_ids=ids).logits
+    moved = (with_window - full).abs().max().item()
+    assert moved > 0.05, f"the window of {WINDOW} tokens does not change the logits ({moved})"
+    # The first WINDOW tokens see everything either way.
+    torch.testing.assert_close(with_window[0, :WINDOW], full[0, :WINDOW])
+    return moved
+
+
+def check_mistral(model, config):
+    """No biases, and a window of 4 tokens on every layer: Mistral applies
+    `sliding_window` whenever it is set."""
+    attn = model.model.layers[0].self_attn
+    assert attn.q_proj.bias is None and attn.o_proj.bias is None
+    assert config.sliding_window == WINDOW
+    expected_inv_freq = 1.0 / MISTRAL_THETA ** (
+        torch.arange(0, HEAD_DIM, 2, dtype=torch.float32) / HEAD_DIM)
+    torch.testing.assert_close(model.model.rotary_emb.inv_freq, expected_inv_freq)
+    logits_without_window(model, window_layers=set(range(LAYERS)))
+
+
+def check_qwen2_window(model, config):
+    """Qwen2 with `use_sliding_window` and `max_window_layers` 1: layer 0
+    attends to the whole sequence and layer 1 to a window of 4 tokens."""
+    assert config.use_sliding_window and config.sliding_window == WINDOW
+    assert list(config.layer_types) == ["full_attention", "sliding_attention"], config.layer_types
+    attn = model.model.layers[0].self_attn
+    assert attn.q_proj.bias is not None and attn.q_proj.bias.abs().max() > 0.1
+    logits_without_window(model, window_layers={1})
+
+
 @dataclass
 class Row:
     """One family: its transformers class, config and live-feature check."""
@@ -152,6 +214,42 @@ FAMILIES = {
             "use_sliding_window": False,
         },
         check=check_qwen2,
+    ),
+    # Qwen2 with the sliding window on: `max_window_layers` 1 leaves layer 0
+    # on full attention and puts layer 1 on a window of 4 tokens, which
+    # transformers derives as `layer_types`.
+    "qwen2_window": Row(
+        cls="Qwen2ForCausalLM",
+        config={
+            **BASE_CONFIG,
+            "architectures": ["Qwen2ForCausalLM"],
+            "max_position_embeddings": 128,
+            "max_window_layers": 1,
+            "model_type": "qwen2",
+            "rms_norm_eps": QWEN2_EPS,
+            "rope_theta": QWEN2_THETA,
+            "sliding_window": WINDOW,
+            "use_sliding_window": True,
+        },
+        check=check_qwen2_window,
+        seed=1,
+    ),
+    # Mistral: no biases, untied-style layout of Mistral-7B-v0.1 (here tied),
+    # a RoPE base of 1e4 and a window of 4 tokens on every layer.
+    "mistral": Row(
+        cls="MistralForCausalLM",
+        config={
+            **BASE_CONFIG,
+            "architectures": ["MistralForCausalLM"],
+            "head_dim": HEAD_DIM,
+            "max_position_embeddings": 128,
+            "model_type": "mistral",
+            "rms_norm_eps": 1e-5,
+            "rope_theta": MISTRAL_THETA,
+            "sliding_window": WINDOW,
+        },
+        check=check_mistral,
+        seed=2,
     ),
     # The Llama 3 RoPE scaling and a RoPE base of 500000, as in Llama-3.2-1B.
     # `original_max_position_embeddings` 64 puts the 8 frequency pairs of a

@@ -58,6 +58,7 @@ fn main() {
                 rope_inv_freq: None,
                 q_norm: None,
                 k_norm: None,
+                window: None,
                 fused: FusedSlot::default(),
             },
             norm2: RMSNorm::new(w_norm.clone(), 1e-5),

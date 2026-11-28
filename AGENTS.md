@@ -115,7 +115,8 @@ a `rope_scaling` or `rope_parameters` type other than `default` and `llama3`
 (linear, dynamic, yarn and longrope are refused), a `llama3` object without
 `factor`, `low_freq_factor` or `high_freq_factor`, or with no context length
 (`original_max_position_embeddings` in the object or the config, else
-`max_position_embeddings`), `use_sliding_window: true`, a head size above 128); a model
+`max_position_embeddings`), `use_sliding_window: true` for a `model_type` other than
+`mistral` and `qwen2`, a `sliding_attention` layer without a window, a head size above 128); a model
 id that is not in the Hugging Face cache or whose snapshot has no `config.json` (`error` names the cache and
 `hf download <id>`); a flag
 value out of range; a `--q4-modules` / `--q4-skip` selection that matches no
@@ -128,7 +129,8 @@ refusing its input (a non-empty `--out`, a quantized base, an adapter that
 does not match the base); `export-gguf` refusing its input (an `--out` that
 exists, a `model_type` other than `llama` or `qwen2`, a config `family_spec`
 refuses such as scaled RoPE (Llama 3.1 and later: the
-model builder accepts it, the GGUF file cannot carry it), a bias other than the query, key and value biases of a
+model builder accepts it, the GGUF file cannot carry it), a sliding window (Qwen2
+with `use_sliding_window`: the builder runs it, the file has no window), a bias other than the query, key and value biases of a
 `qwen2` model, a quantized base, a tokenizer that
 is neither byte-level BPE with the GPT-2, SmolLM or Qwen2 pre-tokenizer nor SentencePiece in
 TinyLlama's form, an adapter that
