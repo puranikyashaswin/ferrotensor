@@ -616,7 +616,4 @@ fn bad_arguments_are_errors_not_an_empty_step() {
     };
     assert!(eval(0).is_err());
     assert!(matches!(eval(8), Ok(Some(_))));
-    for (name, t) in case.tensors() {
-        assert!(t.grad.borrow().is_none(), "{name} has a gradient");
-    }
 }

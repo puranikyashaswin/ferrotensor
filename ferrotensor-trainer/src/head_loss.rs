@@ -366,7 +366,7 @@ mod tests {
         let spec = |targets: usize, weights: usize| CeRows {
             targets: vec![1; targets],
             weights: vec![0.25; weights],
-            ranges: vec![0..4],
+            ranges: std::iter::once(0..4).collect(),
             tokens: vec![4],
         };
         for (targets, weights) in [(3, 4), (4, 3), (5, 4), (4, 5), (0, 0)] {
