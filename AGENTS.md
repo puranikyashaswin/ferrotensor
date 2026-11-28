@@ -2,7 +2,7 @@
 
 Ferrotensor is a Rust framework for tensors, autograd and LoRA fine-tuning of
 small language models on the GPU, through wgpu and hand-written WGSL kernels
-(Vulkan, Metal or DX12; no CUDA). The `ferrotensor` command (crate
+(Vulkan, Metal or DX12). The `ferrotensor` command (crate
 `ferrotensor-cli`) plans, trains, evaluates, samples and merges LoRA adapters
 for Llama-style models such as SmolLM2, TinyLlama and Qwen2, and trains a small
 model from scratch with a byte-level or a learned BPE tokenizer. One A10G run

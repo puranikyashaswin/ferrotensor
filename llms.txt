@@ -1,6 +1,6 @@
 # Ferrotensor
 
-> Ferrotensor is a Rust framework for tensors, autograd and LoRA fine-tuning of small language models on the GPU through wgpu and WGSL kernels (Vulkan, Metal or DX12, no CUDA). The `ferrotensor` command plans, fine-tunes, chats with, merges and evaluates LoRA adapters for Llama-style models, exports them as GGUF files for llama.cpp and Ollama, and trains a small model from scratch with a byte-level or a learned BPE tokenizer (`pretrain --tokenizer bpe`); `plan`, `finetune`, `train`, `eval`, `generate`, `chat`, `merge`, `export-gguf`, `pretrain`, `q4-report` and `info` take `--json`, and every command uses the same exit codes.
+> Ferrotensor is a Rust framework for tensors, autograd and LoRA fine-tuning of small language models on the GPU through wgpu and WGSL kernels (Vulkan, Metal or DX12). The `ferrotensor` command plans, fine-tunes, chats with, merges and evaluates LoRA adapters for Llama-style models, exports them as GGUF files for llama.cpp and Ollama, and trains a small model from scratch with a byte-level or a learned BPE tokenizer (`pretrain --tokenizer bpe`); `plan`, `finetune`, `train`, `eval`, `generate`, `chat`, `merge`, `export-gguf`, `pretrain`, `q4-report` and `info` take `--json`, and every command uses the same exit codes.
 
 ## Start here
 

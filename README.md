@@ -1,6 +1,6 @@
 <h1 align="center">Ferrotensor</h1>
 
-<p align="center"><strong>A pure-Rust GPU ML framework: no CUDA, no Python, no C++ toolchain.</strong></p>
+<p align="center"><strong>A pure-Rust GPU ML framework that runs on Vulkan, Metal and DX12.</strong></p>
 
 <p align="center">
   <a href="https://github.com/puranikyashaswin/ferrotensor/actions/workflows/ci.yml"><img src="https://github.com/puranikyashaswin/ferrotensor/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
@@ -21,8 +21,7 @@ It has been tested on an NVIDIA A10G (24 GB) through Vulkan, an Apple M2
 suite also runs in CI through Metal on GitHub's Apple silicon runners (a
 virtualised GPU) and through DX12 on WARP, Microsoft's software adapter;
 neither is a real-hardware result. Other GPUs are untested, and
-[reports are welcome](docs/testing-on-your-gpu.md). There is no CUDA, cuDNN or libtorch to install and no Python at runtime:
-`cargo build` is the whole toolchain. The same tensor API also runs on a CPU
+[reports are welcome](docs/testing-on-your-gpu.md). `cargo build` is the whole toolchain, with no Python at runtime. The same tensor API also runs on a CPU
 device, which the test suite uses as the reference for the GPU. It is built
 for anyone who wants to read, and change, every layer from the API down to
 the shader. It is young: pre-1.0, one maintainer, small-scale by design.
@@ -73,15 +72,15 @@ sequences per optimizer step.
   A10G). It runs on every pull request
   on software Vulkan. The model is tiny, so it does not catch effects that
   only appear at scale.
-- **Speed and held-out loss against PyTorch + PEFT on CUDA.** On one NVIDIA
+- **Speed and held-out loss against PyTorch + PEFT on the same GPU.** On one NVIDIA
   A10G with the same recipe (SmolLM2, LoRA rank 8, batch 1 × 8, 250 steps,
   median of three repeats), the code in this release trains 1.87× as fast
   as eager PyTorch + PEFT for SmolLM2-135M, 1.83× for 360M and 1.13× for
   1.7B. Its held-out loss is within 0.004 of PyTorch's at all three sizes.
-  PyTorch with `torch.compile` and CUDA graphs is still faster: for 135M at
+  PyTorch with `torch.compile` and graph capture is still faster: for 135M at
   batch 1 × 8, Ferrotensor runs at 0.26× of its speed. No matched memory
   comparison with PyTorch has been run since 0.6
-  ([comparison](docs/examples/lora-sft.md#against-pytorch--peft-on-cuda-same-gpu)).
+  ([comparison](docs/examples/lora-sft.md#against-pytorch--peft-on-the-same-gpu)).
 - **Less GPU memory for LoRA.** Peak GPU memory (`nvidia-smi`, MiB) for 30
   optimizer steps with f16 base weights, batch 1 × 8-step accumulation
   unless noted, all measured in one session on one A10G: 0.6 is the
@@ -239,7 +238,6 @@ tested, incomplete, or only checked on one machine.
 | GPU report and kernel self-check (`ferrotensor info`) | **Experimental** | Lists adapters and checks matmul, softmax and RMSNorm against the CPU; passes on an Apple M2 (Metal), an NVIDIA A10G and a Tesla T4 (Vulkan; the T4 at the commit in [benchmarks/RESULTS.md](benchmarks/RESULTS.md#nvidia-gpus-through-vulkan)), and software Vulkan in CI; also passes in CI through Metal on a virtualised Apple GPU and through DX12 on the software adapter WARP. AMD and Intel GPUs, and DX12 on real hardware, are untested ([help test it](docs/testing-on-your-gpu.md)) |
 | Op fusion in the `ferrotensor` API | **Experimental** | Off by default; `FERROTENSOR_FUSION=1` runs chains of same-size element-wise ops as one dispatch, bit-identical to unfused ([design](docs/design/op-fusion.md)) |
 | Multi-GPU / distributed training | Planned | `ferrotensor-cli` has a file-based gradient sync flag (`--world-size`) that is a prototype |
-| A CUDA backend | Not planned | wgpu is the point of the project |
 
 ## Architecture
 
@@ -355,16 +353,15 @@ they compare as of this writing:
 | | Ferrotensor | [candle](https://github.com/huggingface/candle) | [burn](https://github.com/tracel-ai/burn) | [tch-rs](https://github.com/LaurentMazare/tch-rs) |
 |---|---|---|---|---|
 | What it is | Small pure-Rust framework on wgpu | Minimalist Rust ML framework from Hugging Face | Full Rust deep-learning framework with swappable backends | Rust bindings to libtorch (PyTorch's C++ library) |
-| GPU story | wgpu only: Metal, Vulkan, DX12 | CUDA and Metal, plus CPU | wgpu, CUDA, Metal, CPU and others through backends | Whatever libtorch supports, notably CUDA |
-| Needs a C++/CUDA toolchain | No | For CUDA builds | Depends on backend | Yes, libtorch |
+| GPU story | wgpu: Metal, Vulkan, DX12 | NVIDIA and Apple GPUs, plus CPU | wgpu, NVIDIA, Metal, CPU and others through backends | Whatever libtorch supports, mainly NVIDIA |
 | Maturity | Young, pre-1.0, one maintainer | Widely used, many reference model implementations | Widely used, training-focused, large API | Mature, full PyTorch op coverage |
 | Model zoo / ecosystem | Tiny | Large | Growing | The whole PyTorch ecosystem via TorchScript/weights |
 
 Choose candle for inference of popular models, burn for a mature all-Rust
-training framework, tch-rs when you need exact PyTorch semantics and CUDA.
+training framework, tch-rs when you need exact PyTorch semantics.
 Choose Ferrotensor to learn how the stack works end to end, when you want a
 dependency-light wgpu-only codebase you can read and modify, or to
-experiment on a consumer GPU without installing CUDA. Ferrotensor does not match
+experiment on a consumer GPU. Ferrotensor does not match
 their op coverage, model support or hardening, and it has not been benchmarked
 against them. Kernel-level numbers for Ferrotensor alone are in
 [benchmarks/RESULTS.md](benchmarks/RESULTS.md).
