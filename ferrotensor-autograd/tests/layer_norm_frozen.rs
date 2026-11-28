@@ -8,7 +8,7 @@
 //! cargo test -p ferrotensor-autograd --test layer_norm_frozen -- --ignored --test-threads=1
 //! ```
 
-#![allow(clippy::expect_used, clippy::arc_with_non_send_sync)]
+#![allow(clippy::expect_used, clippy::panic, clippy::arc_with_non_send_sync)]
 
 use std::sync::{Arc, OnceLock};
 
