@@ -980,7 +980,8 @@ impl Lfm2Model {
 
 #[cfg(test)]
 mod tests {
-    use super::{legacy_llama_name, llama_name_from_legacy};
+    use super::{block_names, legacy_llama_name, llama_name_from_legacy, LLAMA_RENAMES};
+    use crate::model_builder::Architecture;
 
     /// The block names `named_params_as` writes and the legacy renames are
     /// two views of the family tables in `family.rs`; they must agree.
