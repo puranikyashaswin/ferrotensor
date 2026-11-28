@@ -425,7 +425,6 @@ impl GroupedQueryAttention {
             window: self.window,
             dropout_prob: self.dropout_prob,
             seed: self.seed,
-            ..AttentionOptions::default()
         };
         engine.flash_attention_v2_with(ctx, q, k, v, &output, &opts, mask);
 
