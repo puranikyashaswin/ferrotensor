@@ -1414,6 +1414,372 @@ fn rms_norm_residual_matches_cpu() {
     assert_close("rms_norm_residual", &read(&out), &want, 1e-5, 1e-4);
 }
 
+// --- LayerNorm and GELU against f64 references ---
+
+/// LayerNorm of every row of `len` in f64, from the f32 inputs the kernel
+/// reads: `(out, mean, rstd)` per row, the variance taken about the mean.
+fn f64_layer_norm(
+    x: &[f32],
+    w: &[f32],
+    b: &[f32],
+    len: usize,
+    eps: f64,
+) -> (Vec<f64>, Vec<(f64, f64)>) {
+    let mut out = Vec::with_capacity(x.len());
+    let mut stats = Vec::new();
+    for row in x.chunks(len) {
+        let mean = row.iter().map(|&v| f64::from(v)).sum::<f64>() / len as f64;
+        let var = row
+            .iter()
+            .map(|&v| (f64::from(v) - mean).powi(2))
+            .sum::<f64>()
+            / len as f64;
+        let rstd = 1.0 / (var + eps).sqrt();
+        for i in 0..len {
+            out.push((f64::from(row[i]) - mean) * rstd * f64::from(w[i]) + f64::from(b[i]));
+        }
+        stats.push((mean, rstd));
+    }
+    (out, stats)
+}
+
+/// `(grad_x, grad_w, grad_b)` of LayerNorm in f64:
+/// `rstd * (gw - mean(gw) - xhat * mean(gw * xhat))` with `gw = g * w`.
+fn f64_layer_norm_backward(
+    x: &[f32],
+    g: &[f32],
+    w: &[f32],
+    len: usize,
+    eps: f64,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    let (_, stats) = f64_layer_norm(x, w, &vec![0.0; len], len, eps);
+    let mut gx = Vec::with_capacity(x.len());
+    let mut gw = vec![0.0f64; len];
+    let mut gb = vec![0.0f64; len];
+    for ((xr, gr), &(mean, rstd)) in x.chunks(len).zip(g.chunks(len)).zip(&stats) {
+        let xhat: Vec<f64> = xr.iter().map(|&v| (f64::from(v) - mean) * rstd).collect();
+        let gwv: Vec<f64> = (0..len)
+            .map(|i| f64::from(gr[i]) * f64::from(w[i]))
+            .collect();
+        let m1 = gwv.iter().sum::<f64>() / len as f64;
+        let m2 = gwv.iter().zip(&xhat).map(|(a, b)| a * b).sum::<f64>() / len as f64;
+        for i in 0..len {
+            gx.push(rstd * (gwv[i] - m1 - xhat[i] * m2));
+            gw[i] += f64::from(gr[i]) * xhat[i];
+            gb[i] += f64::from(gr[i]);
+        }
+    }
+    (gx, gw, gb)
+}
+
+fn to_f32(v: &[f64]) -> Vec<f32> {
+    v.iter().map(|&x| x as f32).collect()
+}
+
+/// Forward and backward of the GPU LayerNorm for `rows` rows of `len`, row
+/// `r` shifted by `offsets[r % offsets.len()]`, against the f64 reference.
+#[track_caller]
+fn check_layer_norm(rows: usize, len: usize, eps: f32, spread: f32, offsets: &[f32], tol: f32) {
+    let g = gpu();
+    let e = &g.engine;
+    let name = format!("layer_norm {rows}x{len} eps {eps} offsets {offsets:?}");
+    let seed = (rows * 1000 + len) as u64;
+    let mut x = rand_vec(rows * len, seed);
+    for (r, row) in x.chunks_mut(len).enumerate() {
+        for v in row {
+            *v = *v * spread + offsets[r % offsets.len()];
+        }
+    }
+    let w: Vec<f32> = rand_vec(len, seed + 1)
+        .iter()
+        .map(|v| 1.0 + 0.25 * v)
+        .collect();
+    let b: Vec<f32> = rand_vec(len, seed + 2).iter().map(|v| 0.5 * v).collect();
+    let go = rand_vec(rows * len, seed + 3);
+    let (tx, tw, tb, tgo) = (
+        upload(&x, &[rows, len]),
+        upload(&w, &[len]),
+        upload(&b, &[len]),
+        upload(&go, &[rows, len]),
+    );
+
+    let out = zeros(&[rows, len]);
+    let stats = zeros(&[rows, 2]);
+    e.layer_norm(&g.ctx, &tx, &tw, &tb, &out, &stats, eps)
+        .unwrap();
+    let (want, want_stats) = f64_layer_norm(&x, &w, &b, len, f64::from(eps));
+    assert_close(
+        &format!("{name} out"),
+        &read(&out),
+        &to_f32(&want),
+        tol,
+        tol,
+    );
+    let got_stats = read(&stats);
+    let want_mean: Vec<f32> = want_stats.iter().map(|s| s.0 as f32).collect();
+    let want_rstd: Vec<f32> = want_stats.iter().map(|s| s.1 as f32).collect();
+    let (got_mean, got_rstd): (Vec<f32>, Vec<f32>) =
+        got_stats.chunks(2).map(|s| (s[0], s[1])).unzip();
+    assert_close(&format!("{name} mean"), &got_mean, &want_mean, tol, tol);
+    assert_close(&format!("{name} rstd"), &got_rstd, &want_rstd, tol, tol);
+
+    let gx = zeros(&[rows, len]);
+    let gw = zeros(&[len]);
+    let gb = zeros(&[len]);
+    e.layer_norm_backward(&g.ctx, &tx, &tw, &tgo, &stats, &gx, Some(&gw), Some(&gb));
+    let (want_x, want_w, want_b) = f64_layer_norm_backward(&x, &go, &w, len, f64::from(eps));
+    // grad_w and grad_b add up every row, so their tolerance grows with them.
+    let sum_tol = tol * (rows as f32).sqrt().max(1.0);
+    assert_close(
+        &format!("{name} grad_x"),
+        &read(&gx),
+        &to_f32(&want_x),
+        tol,
+        tol,
+    );
+    assert_close(
+        &format!("{name} grad_w"),
+        &read(&gw),
+        &to_f32(&want_w),
+        sum_tol,
+        tol,
+    );
+    assert_close(
+        &format!("{name} grad_b"),
+        &read(&gb),
+        &to_f32(&want_b),
+        sum_tol,
+        tol,
+    );
+
+    // A frozen weight or bias is not written and changes nothing else.
+    let bits = |t: &UnifiedTensor| read(t).iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    let (gx2, gb2) = (zeros(&[rows, len]), zeros(&[len]));
+    e.layer_norm_backward(&g.ctx, &tx, &tw, &tgo, &stats, &gx2, None, Some(&gb2));
+    assert_eq!(bits(&gx2), bits(&gx), "{name} grad_x without grad_w");
+    assert_eq!(bits(&gb2), bits(&gb), "{name} grad_b without grad_w");
+    let (gx3, gw3) = (zeros(&[rows, len]), zeros(&[len]));
+    e.layer_norm_backward(&g.ctx, &tx, &tw, &tgo, &stats, &gx3, Some(&gw3), None);
+    assert_eq!(bits(&gx3), bits(&gx), "{name} grad_x without grad_b");
+    assert_eq!(bits(&gw3), bits(&gw), "{name} grad_w without grad_b");
+    let gx4 = zeros(&[rows, len]);
+    e.layer_norm_backward(&g.ctx, &tx, &tw, &tgo, &stats, &gx4, None, None);
+    assert_eq!(bits(&gx4), bits(&gx), "{name} grad_x with both frozen");
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn layer_norm_matches_f64_reference() {
+    for &rows in &[1, 3, 40] {
+        for &len in &[64, 768, 97] {
+            check_layer_norm(rows, len, 1e-5, 2.0, &[0.0, 0.3], 5e-5);
+        }
+    }
+}
+
+/// With a spread of 0.01 the variance is below eps, so eps decides the
+/// result; with a large eps the output is nearly the centred row.
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn layer_norm_eps_matters() {
+    for &(rows, len, eps, spread) in &[
+        (3, 64, 1e-2, 0.01),
+        (3, 97, 1e-5, 0.003),
+        (1, 768, 0.5, 1.0),
+        (40, 768, 1e-6, 1.0),
+    ] {
+        check_layer_norm(rows, len, eps, spread, &[0.0], 1e-4);
+    }
+}
+
+/// A one-pass variance, `E[x^2] - mean^2`, is off by about 1e-3 of the
+/// variance when the mean is 100 times the spread in f32; the two-pass
+/// kernel must stay within f32 rounding of the f64 reference.
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn layer_norm_keeps_precision_with_a_large_mean() {
+    for &len in &[64, 768, 97] {
+        check_layer_norm(3, len, 1e-5, 1.0, &[0.0, 100.0, -60.0], 1e-4);
+    }
+}
+
+/// A weight or bias whose length is not the last dimension is refused before
+/// any kernel runs, and the output is left untouched.
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn layer_norm_refuses_parameters_of_the_wrong_length() {
+    let g = gpu();
+    let e = &g.engine;
+    let (rows, len) = (3, 64);
+    let tx = upload(&rand_vec(rows * len, 1), &[rows, len]);
+    let good = upload(&rand_vec(len, 2), &[len]);
+    let short = upload(&rand_vec(len - 1, 3), &[len - 1]);
+    let long = upload(&rand_vec(len + 1, 4), &[len + 1]);
+    let out = zeros(&[rows, len]);
+    let stats = zeros(&[rows, 2]);
+    let run = |w, b| e.layer_norm(&g.ctx, &tx, w, b, &out, &stats, 1e-5);
+    assert!(run(&good, &good).is_ok());
+    for (name, w, b) in [
+        ("short weight", &short, &good),
+        ("long weight", &long, &good),
+        ("short bias", &good, &short),
+        ("long bias", &good, &long),
+        ("a weight and bias that match each other", &short, &short),
+    ] {
+        let err = run(w, b).unwrap_err();
+        assert_eq!(err.size, len, "{name}");
+        assert_eq!(err.weight_len, w.shape.iter().product::<usize>(), "{name}");
+        assert_eq!(err.bias_len, b.shape.iter().product::<usize>(), "{name}");
+    }
+    // The refused calls wrote nothing: the output still holds the good run.
+    let want = read(&out);
+    assert!(run(&short, &long).is_err());
+    assert_eq!(read(&out), want);
+}
+
+/// `erf` in f64, from the Taylor series below 2.5 and the continued fraction
+/// of `erfc` above, so it shares nothing with the kernel's approximation.
+fn f64_erf(x: f64) -> f64 {
+    let ax = x.abs();
+    let value = if ax < 2.5 {
+        let mut term = ax;
+        let mut sum = ax;
+        for n in 1..80 {
+            term *= -ax * ax / n as f64;
+            sum += term / (2 * n + 1) as f64;
+        }
+        2.0 / std::f64::consts::PI.sqrt() * sum
+    } else {
+        let mut t = ax;
+        for k in (1..=120).rev() {
+            t = ax + (k as f64 / 2.0) / t;
+        }
+        1.0 - (-ax * ax).exp() / (std::f64::consts::PI.sqrt() * t)
+    };
+    value.copysign(x)
+}
+
+fn f64_gelu_tanh(x: f64) -> f64 {
+    let c = (2.0 / std::f64::consts::PI).sqrt();
+    0.5 * x * (1.0 + (c * (x + 0.044715 * x * x * x)).tanh())
+}
+
+fn f64_gelu_tanh_slope(x: f64) -> f64 {
+    let c = (2.0 / std::f64::consts::PI).sqrt();
+    let t = (c * (x + 0.044715 * x * x * x)).tanh();
+    0.5 * (1.0 + t) + 0.5 * x * (1.0 - t * t) * c * (1.0 + 3.0 * 0.044715 * x * x)
+}
+
+fn f64_gelu_erf(x: f64) -> f64 {
+    0.5 * x * (1.0 + f64_erf(x / std::f64::consts::SQRT_2))
+}
+
+fn f64_gelu_erf_slope(x: f64) -> f64 {
+    let phi = (-0.5 * x * x).exp() / (2.0 * std::f64::consts::PI).sqrt();
+    0.5 * (1.0 + f64_erf(x / std::f64::consts::SQRT_2)) + x * phi
+}
+
+/// Points of the GELU tests: around 0, the bend near 1 to 3, both tails far
+/// past where the activation is 0 or `x`, and a pseudo-random spread.
+fn gelu_points() -> Vec<f32> {
+    let mut v: Vec<f32> = vec![
+        0.0, 1e-4, -1e-4, 1e-3, -1e-3, 0.05, -0.05, 0.06, -0.07, 0.5, -0.5, 1.0, -1.0, 2.0, -2.0,
+        3.0, -3.0, 4.5, -4.5, 6.0, -6.0, 8.0, -8.0, 12.0, -12.0, 20.0, -20.0, 40.0, -40.0, 100.0,
+        -100.0, 1e4, -1e4,
+    ];
+    v.extend(rand_vec(300, 5150).iter().map(|r| r * 5.0));
+    v
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn gelu_matches_f64_reference() {
+    let g = gpu();
+    let e = &g.engine;
+    let x = gelu_points();
+    let n = x.len();
+    let go = rand_vec(n, 5151);
+    let (tx, tgo) = (upload(&x, &[n]), upload(&go, &[n]));
+    type Form = (&'static str, fn(f64) -> f64, fn(f64) -> f64);
+    let forms: [Form; 2] = [
+        ("gelu_tanh", f64_gelu_tanh, f64_gelu_tanh_slope),
+        ("gelu_erf", f64_gelu_erf, f64_gelu_erf_slope),
+    ];
+    for (name, value, slope) in forms {
+        let out = zeros(&[n]);
+        let gi = zeros(&[n]);
+        if name == "gelu_tanh" {
+            e.gelu_tanh(&g.ctx, &tx, &out);
+            e.gelu_tanh_backward(&g.ctx, &tgo, &tx, &gi);
+        } else {
+            e.gelu_erf(&g.ctx, &tx, &out);
+            e.gelu_erf_backward(&g.ctx, &tgo, &tx, &gi);
+        }
+        let want: Vec<f32> = x.iter().map(|&v| value(f64::from(v)) as f32).collect();
+        let want_grad: Vec<f32> = x
+            .iter()
+            .zip(&go)
+            .map(|(&v, &g)| (f64::from(g) * slope(f64::from(v))) as f32)
+            .collect();
+        // 1e-6 is the bound the erf approximation is held to; the rest is f32
+        // rounding, which grows with the value in the tails.
+        assert_close(&format!("{name} forward"), &read(&out), &want, 1e-6, 2e-6);
+        assert_close(
+            &format!("{name} backward"),
+            &read(&gi),
+            &want_grad,
+            1e-6,
+            2e-6,
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn gelu_worked_values() {
+    let g = gpu();
+    let e = &g.engine;
+    let x = [0.0f32, 1.0, -1.0, 10.0, -10.0];
+    let ones = upload(&[1.0; 5], &[5]);
+    let tx = upload(&x, &[5]);
+    let (out, gi) = (zeros(&[5]), zeros(&[5]));
+    // gelu(1) = 0.8413447460685429 (Phi(1) = 0.8413447460685429), gelu'(0) = 0.5,
+    // gelu'(1) = Phi(1) + phi(1) = 0.8413447460685429 + 0.24197072451914337.
+    e.gelu_erf(&g.ctx, &tx, &out);
+    e.gelu_erf_backward(&g.ctx, &ones, &tx, &gi);
+    assert_close(
+        "gelu_erf",
+        &read(&out),
+        &to_f32(&[0.0, 0.8413447460685429, -0.15865525393145705, 10.0, 0.0]),
+        1e-6,
+        1e-6,
+    );
+    let slopes = read(&gi);
+    assert_close(
+        "gelu_erf slope",
+        &slopes[..3],
+        &to_f32(&[0.5, 1.0833154705876864, -0.08331547058768632]),
+        1e-6,
+        1e-6,
+    );
+    assert_close(
+        "gelu_erf slope tails",
+        &slopes[3..],
+        &[1.0, 0.0],
+        1e-6,
+        1e-6,
+    );
+    // The tanh form at 1 is 0.8411919906082768.
+    e.gelu_tanh(&g.ctx, &tx, &out);
+    assert_close(
+        "gelu_tanh",
+        &read(&out),
+        &to_f32(&[0.0, 0.8411919906082768, -0.1588080093917233, 10.0, 0.0]),
+        1e-6,
+        1e-6,
+    );
+}
+
 #[test]
 #[ignore = "needs a GPU; run with --ignored --test-threads=1"]
 fn masked_cross_entropy_matches_cpu() {

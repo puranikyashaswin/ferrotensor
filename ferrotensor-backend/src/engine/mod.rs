@@ -30,6 +30,7 @@ pub use flash_coop::FLASH_COOP_ENV;
 pub use lora_group::{LoraGrad, LoraMirror, LoraProj, LORA_GROUP_MAX, LORA_GROUP_MAX_RANK};
 pub use matmul::{Epilogue, MatmulPath};
 pub use matmul_fused::{FusedA, FusedOut, FusedSpec};
+pub use norm::LayerNormError;
 pub use skinny::SkinnyTile;
 pub use small_m::{SmallMLaunch, SmallMTile};
 pub use training::{AdamParams, FlatLayout, FLAT_MAX_ELEMS, MASKED_CE_SKIP, SUM_SQUARES_CHUNK};
@@ -185,7 +186,7 @@ fn q4_b_matmul(src: &str) -> String {
 /// Entry points of kernels.wgsl that call `arrayLength`, so they must be
 /// bound to exactly their tensors' bytes (see [`needs_exact_size`]). A test
 /// checks this list against the shader source.
-const EXACT_SIZE_ENTRIES: [&str; 29] = [
+const EXACT_SIZE_ENTRIES: [&str; 33] = [
     "rope",
     "rope_out",
     "silu",
@@ -196,6 +197,10 @@ const EXACT_SIZE_ENTRIES: [&str; 29] = [
     "add_backward",
     "mul_backward",
     "silu_backward_real",
+    "gelu_tanh",
+    "gelu_tanh_backward",
+    "gelu_erf",
+    "gelu_erf_backward",
     "sgd_update",
     "adamw_update",
     "sub",
@@ -379,6 +384,13 @@ pub struct ComputeEngine {
     rms_norm: Kernel,
     rms_norm_bw: Kernel,
     rms_norm_bw_weight: Kernel,
+    layer_norm: Kernel,
+    layer_norm_bw: Kernel,
+    layer_norm_bw_affine: Kernel,
+    gelu_tanh: Kernel,
+    gelu_tanh_bw: Kernel,
+    gelu_erf: Kernel,
+    gelu_erf_bw: Kernel,
     silu: Kernel,
     softmax: Kernel,
     add: Kernel,
@@ -488,6 +500,13 @@ impl ComputeEngine {
             rms_norm: k("rms_norm"),
             rms_norm_bw: k("rms_norm_backward"),
             rms_norm_bw_weight: k("rms_norm_backward_weight"),
+            layer_norm: k("layer_norm"),
+            layer_norm_bw: k("layer_norm_backward"),
+            layer_norm_bw_affine: k("layer_norm_backward_affine"),
+            gelu_tanh: k("gelu_tanh"),
+            gelu_tanh_bw: k("gelu_tanh_backward"),
+            gelu_erf: k("gelu_erf"),
+            gelu_erf_bw: k("gelu_erf_backward"),
             silu: k("silu"),
             softmax: k("softmax"),
             add: k("add"),

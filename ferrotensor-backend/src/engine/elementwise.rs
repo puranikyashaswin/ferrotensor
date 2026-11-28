@@ -148,6 +148,73 @@ impl ComputeEngine {
         );
     }
 
+    /// `out = 0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3)))`, element-wise:
+    /// GELU in the tanh form of GPT-2 (`gelu_new`), BLOOM and Gemma.
+    pub fn gelu_tanh(&self, ctx: &WgpuContext, input: &UnifiedTensor, out: &UnifiedTensor) {
+        self.run(
+            ctx,
+            &self.gelu_tanh,
+            &[(0, input.buffer()), (1, out.buffer())],
+            groups64(input.shape.iter().product()),
+        );
+    }
+
+    /// Gradient of [`gelu_tanh`](Self::gelu_tanh): `grad_out` times the
+    /// derivative of the activation at `input`.
+    pub fn gelu_tanh_backward(
+        &self,
+        ctx: &WgpuContext,
+        grad_out: &UnifiedTensor,
+        input: &UnifiedTensor,
+        grad_in: &UnifiedTensor,
+    ) {
+        self.run(
+            ctx,
+            &self.gelu_tanh_bw,
+            &[
+                (3, grad_out.buffer()),
+                (4, input.buffer()),
+                (5, grad_in.buffer()),
+            ],
+            groups64(grad_out.shape.iter().product()),
+        );
+    }
+
+    /// `out = x * Phi(x)` with `Phi` the standard normal CDF, element-wise:
+    /// GELU in the exact (erf) form of GPT-NeoX.
+    ///
+    /// The kernel has no `erf` to call; it uses the approximation of
+    /// Abramowitz and Stegun 7.1.26, with an absolute error of at most 1.5e-7.
+    pub fn gelu_erf(&self, ctx: &WgpuContext, input: &UnifiedTensor, out: &UnifiedTensor) {
+        self.run(
+            ctx,
+            &self.gelu_erf,
+            &[(0, input.buffer()), (1, out.buffer())],
+            groups64(input.shape.iter().product()),
+        );
+    }
+
+    /// Gradient of [`gelu_erf`](Self::gelu_erf): `grad_out * (Phi(x) + x * phi(x))`
+    /// with `phi` the standard normal density.
+    pub fn gelu_erf_backward(
+        &self,
+        ctx: &WgpuContext,
+        grad_out: &UnifiedTensor,
+        input: &UnifiedTensor,
+        grad_in: &UnifiedTensor,
+    ) {
+        self.run(
+            ctx,
+            &self.gelu_erf_bw,
+            &[
+                (3, grad_out.buffer()),
+                (4, input.buffer()),
+                (5, grad_in.buffer()),
+            ],
+            groups64(grad_out.shape.iter().product()),
+        );
+    }
+
     /// `out = max(x, 0)`, element-wise.
     pub fn relu(&self, ctx: &WgpuContext, input: &UnifiedTensor, out: &UnifiedTensor) {
         self.run(
