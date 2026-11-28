@@ -266,8 +266,8 @@ fn host_losses(mask: &[u8]) -> Vec<f64> {
     let b = pseudo_random(RANK * CLASSES, 5, 0.5);
     let scale = f64::from(ALPHA) / RANK as f64;
     let targets = targets();
-    let mut losses = vec![0.0f64; SEQUENCES];
-    let mut tokens = vec![0usize; SEQUENCES];
+    let mut losses = [0.0f64; SEQUENCES];
+    let mut tokens = [0usize; SEQUENCES];
     for (row, &supervised) in mask.iter().enumerate().take(ROWS) {
         if supervised == 0 {
             continue;
@@ -363,13 +363,14 @@ fn peak_logit_bytes(gpu: &Gpu, rows: usize, classes: usize, chunk: Option<usize>
 }
 
 /// 64 rows over 512 classes: the whole logits and their gradient are 256 KiB
-/// and a chunk of 16 rows is 64 KiB.
+/// and a chunk of 20 rows is 80 KiB.
 #[test]
 #[ignore = "needs a GPU"]
 fn a_chunked_head_holds_one_chunk_of_logits() {
     const ROWS_BIG: usize = 64;
     const CLASSES_BIG: usize = 512;
-    const CHUNK: usize = 16;
+    // Not the hidden width, which the buffer filter tells the head weight by.
+    const CHUNK: usize = 20;
     let gpu = gpu();
     // Tracking has to be on before the buffers are made to list them.
     gpu.ctx.memory().set_detailed(true);
