@@ -10,7 +10,6 @@ use std::sync::Arc;
 
 pub mod classifier;
 pub mod dropout;
-/// The family of a checkpoint as data.
 pub mod family;
 pub mod flash_attention;
 pub mod fused;
