@@ -597,8 +597,8 @@ fn bad_arguments_are_errors_not_an_empty_step() {
         )
         .map(|loss| loss.is_some())
     };
-    assert!(matches!(loss(&mask, SEQUENCES, 8), Ok(true)));
-    assert!(matches!(loss(&[0; ROWS], SEQUENCES, 8), Ok(false)));
+    // The error cases come first. A successful `loss` adds the head's
+    // gradients while its chunks run, so these checks need a clean head.
     // 39 rows do not split into 2 sequences, nor into 0.
     assert!(loss(&mask, 2, 8).is_err());
     assert!(loss(&mask, 0, 8).is_err());
@@ -615,5 +615,16 @@ fn bad_arguments_are_errors_not_an_empty_step() {
         )
     };
     assert!(eval(0).is_err());
+    // An error must leave no gradient behind.
+    for (name, t) in case.tensors() {
+        assert!(t.grad.borrow().is_none(), "{name} has a gradient");
+    }
+    // The evaluation runs forward only, so it adds none either.
     assert!(matches!(eval(8), Ok(Some(_))));
+    for (name, t) in case.tensors() {
+        assert!(t.grad.borrow().is_none(), "{name} has a gradient");
+    }
+    // The cases that run a step come last, because they add gradients.
+    assert!(matches!(loss(&mask, SEQUENCES, 8), Ok(true)));
+    assert!(matches!(loss(&[0; ROWS], SEQUENCES, 8), Ok(false)));
 }
