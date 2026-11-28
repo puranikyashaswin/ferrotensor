@@ -72,13 +72,33 @@ struct Setup {
 /// Per-step stats and the final LoRA parameters of a short run: one-sequence
 /// steps and batched steps, with accumulation and clipping.
 fn run(gpu: &Gpu, dir: &Path, setup: Setup) -> (Vec<StepStats>, Vec<Vec<f32>>) {
-    let model = build_model(gpu, dir);
+    run_with(gpu, dir, setup, 0, false)
+}
+
+/// [`run`] with `lm_head` and the loss over chunks of `chunk_rows` rows (0:
+/// the default, which does not chunk a head this small) and, with
+/// `head_lora`, a LoRA adapter on `lm_head` that trains too.
+fn run_with(
+    gpu: &Gpu,
+    dir: &Path,
+    setup: Setup,
+    chunk_rows: usize,
+    head_lora: bool,
+) -> (Vec<StepStats>, Vec<Vec<f32>>) {
+    let model = if head_lora {
+        let mut lora = lora_config();
+        lora.target_modules.push("lm_head".into());
+        build_model_with_lora(gpu, dir, lora)
+    } else {
+        build_model(gpu, dir)
+    };
     let (_, params) = sorted_lora_params(&model);
     let mut trainer = trainer(gpu, model, 1e-2)
         .with_grad_accum_steps(2)
         .with_clip_grad_norm(0.5)
         .with_length_bucket(setup.bucket)
-        .with_supervised_head_rows(setup.head_rows);
+        .with_supervised_head_rows(setup.head_rows)
+        .with_head_chunk_rows(chunk_rows);
     let seqs = sequences();
     let batch = masked_batch(&seqs);
     let mut stats = Vec::new();
@@ -232,6 +252,34 @@ fn defaults_match_the_bucketed_full_head() {
     }
     let values = params.iter().map(|p| host(&gpu, p)).collect();
     assert_same_run(&(stats, values), &reference, "defaults");
+}
+
+/// Running `lm_head` and the loss over chunks of 3 rows must train as the
+/// whole head does, with and without a LoRA adapter on `lm_head`, on all
+/// positions and on the supervised ones. The micro-batches have 5 to 100
+/// rows, so the last chunk is shorter than the rest, and on all positions
+/// the first chunk of a prompt has no supervised row.
+#[test]
+#[ignore = "needs a GPU"]
+fn chunked_head_trains_like_the_whole_head() {
+    let dir = TempDir::new("chunked-head-run");
+    write_tiny_llama(dir.path());
+    let gpu = gpu();
+    for head_lora in [false, true] {
+        for head_rows in [false, true] {
+            let setup = Setup {
+                bucket: 1,
+                head_rows,
+            };
+            let whole = run_with(&gpu, dir.path(), setup, 0, head_lora);
+            let chunked = run_with(&gpu, dir.path(), setup, 3, head_lora);
+            assert_same_run(
+                &chunked,
+                &whole,
+                &format!("chunked head (head lora {head_lora}, supervised rows {head_rows})"),
+            );
+        }
+    }
 }
 
 /// Row `i` of the gathered logits is row `positions[i]` of the full ones.

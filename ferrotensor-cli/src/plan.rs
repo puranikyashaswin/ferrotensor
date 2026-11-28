@@ -321,7 +321,13 @@ fn estimate_with_embedding(
         1.0
     };
     let activations = tokens * values_per_token * 4.0 * ACTIVATION_SCALE * overlap;
-    let logits = LOGIT_FLOATS_PER_VOCAB * tokens * vocab * 4.0;
+    // The trainer runs lm_head and the loss over row chunks when the logits
+    // and their gradient would pass a size it names, so only one chunk of
+    // them exists at a time. The planner counts every padded token as a row
+    // of the head, which is at least the rows the trainer gathers.
+    let logit_rows = ferrotensor_trainer::head_chunk_rows(tokens as usize, shape.vocab)
+        .map_or(tokens, |chunk| chunk as f64);
+    let logits = LOGIT_FLOATS_PER_VOCAB * logit_rows * vocab * 4.0;
 
     let parts = [
         ceil_mib(weights),
@@ -838,7 +844,8 @@ fn push_common_notes(notes: &mut Vec<String>, budget: &Budget) {
          Qwen2.5-0.5B, f16 weights, 8 sequences per step, an A10G and a T4); it is at \
          most 4.6% below them, at most 12% above the 250-step and single-pass peaks, \
          and up to 35% above the shorter runs that accumulate passes, which have not \
-         reached their peak"
+         reached their peak; a head with more than 1 GiB of logits runs in chunks of \
+         512 rows and is counted at that size, which no run has measured"
             .into(),
     );
     notes.push("replace train.jsonl in the train command with your dataset".into());
@@ -1109,6 +1116,14 @@ mod tests {
             if batch_size * grad_accum != SEQUENCES_PER_STEP {
                 continue;
             }
+            // The two Qwen2.5-0.5B peaks (2,048 rows over 151,936 classes)
+            // were measured with the whole logits; the trainer now chunks
+            // that head and the estimate counts the chunk.
+            if ferrotensor_trainer::head_chunk_rows(batch_size * seq_len, shape(name).vocab)
+                .is_some()
+            {
+                continue;
+            }
             let config = TrainConfig {
                 batch_size,
                 grad_accum,
@@ -1199,12 +1214,51 @@ mod tests {
 
     #[test]
     fn logits_use_the_model_vocabulary() {
+        // Up to 512 rows the whole logits count, whatever the vocabulary.
         let qwen = shape("Qwen2.5-0.5B-Instruct");
-        // 2 x 2,048 tokens x 151,936 x 4 bytes.
+        let mut c = config(4, Checkpointing::Off);
+        c.padded_len = 128;
+        // 4 x 128 tokens: 2 x 512 x 151,936 x 4 bytes.
+        assert_eq!(estimate_peak_mib(&qwen, &c).logits_mib, 594);
+    }
+
+    #[test]
+    fn a_chunked_head_counts_one_chunk_of_logits() {
+        // 2,048 tokens over 151,936 classes need 2.32 GiB whole. The head
+        // runs in chunks of 512 rows: 2 x 512 x 151,936 x 4 bytes.
+        let qwen = shape("Qwen2.5-0.5B-Instruct");
         assert_eq!(
             estimate_peak_mib(&qwen, &config(8, Checkpointing::Off)).logits_mib,
-            2374
+            594
         );
+        // One sequence of 4,096 tokens counts the same 512 rows.
+        let mut long = config(1, Checkpointing::Off);
+        long.padded_len = 4096;
+        assert_eq!(estimate_peak_mib(&qwen, &long).logits_mib, 594);
+        // Gemma's 262,208 classes at 512 rows: 2 x 512 x 262,208 x 4 bytes.
+        let mut gemma = qwen.clone();
+        gemma.vocab = 262_208;
+        assert_eq!(
+            estimate_peak_mib(&gemma, &config(8, Checkpointing::Off)).logits_mib,
+            1025
+        );
+    }
+
+    #[test]
+    fn smollm2_at_the_speed_gate_keeps_its_whole_logits() {
+        // 2,048 tokens over 49,152 classes are 0.75 GiB of logits and
+        // gradient, under the 1 GiB that turns chunking on: 2 x 2,048 x
+        // 49,152 x 4 bytes. A pass of 256 tokens needs 96 MiB.
+        for name in ["SmolLM2-135M", "SmolLM2-360M", "SmolLM2-1.7B"] {
+            for batch in [1, 8] {
+                assert_eq!(
+                    estimate_peak_mib(&smollm2(name), &config(batch, Checkpointing::Off))
+                        .logits_mib,
+                    if batch == 8 { 768 } else { 96 },
+                    "{name} batch {batch}"
+                );
+            }
+        }
     }
 
     #[test]
