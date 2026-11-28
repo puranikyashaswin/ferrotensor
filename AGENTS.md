@@ -126,7 +126,7 @@ refusing a tokenizer without ChatML tokens or a message longer than the
 model's context; and `merge`
 refusing its input (a non-empty `--out`, a quantized base, an adapter that
 does not match the base); `export-gguf` refusing its input (an `--out` that
-exists, a `model_type` other than `llama` or `qwen2`, a config `check_supported`
+exists, a `model_type` other than `llama` or `qwen2`, a config `family_spec`
 refuses such as scaled RoPE (Llama 3.1 and later: the
 model builder accepts it, the GGUF file cannot carry it), a bias other than the query, key and value biases of a
 `qwen2` model, a quantized base, a tokenizer that
@@ -251,8 +251,10 @@ the group once.
   the `ferrotensor-cli` tests, which take too long, and on pull requests only
   the backend kernel and parity tests; the rest runs on `main`, weekly and by
   `workflow_dispatch`).
-  The four Qwen2 parity tests also read `FERROTENSOR_QWEN2_FIXTURE` (CI sets
-  it) and skip with a message when it is unset.
+  The family parity tests (`ferrotensor-trainer/tests/family_parity.rs`, one
+  set per row of `scripts/gen_family_fixtures.py`) also read
+  `FERROTENSOR_FAMILY_FIXTURES` (CI sets it) and skip with a message when it
+  is unset.
 - No `unwrap`, `expect` or `panic!` outside tests; propagate errors with `?`.
   No `let _ =`, `.ok()` or `unwrap_or_default()` to silence a `Result`.
 - In library code a lint is suppressed with `#[expect(lint, reason = "...")]`.

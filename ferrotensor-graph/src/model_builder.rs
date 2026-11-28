@@ -11,8 +11,8 @@
 //!   that bias. When a checkpoint has `self_attn.q_norm` / `self_attn.k_norm`
 //!   (Qwen3), they are loaded as per-head query/key norms
 //!   ([`Attention::q_norm`]). Config features the forward pass lacks are
-//!   refused ([`check_supported`]).
-//! * **LFM2** (see [`Architecture::detect`]): blocks are short convolutions or
+//!   refused ([`family_spec`]).
+//! * **LFM2** (see [`family_spec`]): blocks are short convolutions or
 //!   attention, named `operator_norm`, `ffn_norm`, `feed_forward.w{1,2,3}`,
 //!   with the final norm stored as `model.embedding_norm`.
 //!
@@ -25,8 +25,8 @@
 //! outputs). Pre-quantized checkpoints (`<name>.scales` tensors) are
 //! rejected.
 
+use crate::family::{family_spec, FamilySpec, LayerKind};
 use crate::lfm::{Lfm2Block, Lfm2Conv, Lfm2LayerOp, Lfm2Model};
-use crate::rope::rope_scaling;
 use crate::{Attention, FusedSlot, Linear, LoRAAdapter, RMSNorm, MLP};
 use ferrotensor_autograd::Tensor;
 use ferrotensor_backend::q4::Q4Group;
@@ -34,6 +34,8 @@ use ferrotensor_backend::{ComputeEngine, DType, RopeFreqs, UnifiedTensor, WgpuCo
 use ferrotensor_loader::{Lfm2Config, WeightsContext};
 use std::ops::RangeInclusive;
 use std::sync::Arc;
+
+pub use crate::family::Architecture;
 
 /// Whether the parameter `name` (a Hugging Face name such as
 /// `model.layers.3.mlp.up_proj.weight`) belongs to the module group `key`.
@@ -148,67 +150,6 @@ impl std::fmt::Display for BuildError {
 impl std::error::Error for BuildError {}
 
 type Result<T> = std::result::Result<T, BuildError>;
-
-/// Weight-naming family of a checkpoint.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Architecture {
-    /// Llama / Mistral / SmolLM2 / Qwen2 / Qwen3 naming; every block is attention.
-    Llama,
-    /// Liquid LFM2 naming; conv and attention blocks per `layer_types`.
-    Lfm2,
-}
-
-impl Architecture {
-    /// Infer the family from a config: `model_type: lfm2`, a `conv` entry
-    /// in `layer_types`, or `layer_types` without a `model_type` mean LFM2;
-    /// everything else is treated as Llama.
-    ///
-    /// `layer_types` alone does not mean LFM2: recent `transformers`
-    /// versions also write it (`full_attention` / `sliding_attention`) into
-    /// Qwen3 and other configs.
-    pub fn detect(config: &Lfm2Config) -> Self {
-        let model_type = config.model_type.as_deref();
-        let lfm = model_type.is_some_and(|t| t.eq_ignore_ascii_case("lfm2"))
-            || config.layer_types.iter().any(|t| t == "conv")
-            || (model_type.is_none() && !config.layer_types.is_empty());
-        if lfm {
-            Self::Lfm2
-        } else {
-            Self::Llama
-        }
-    }
-}
-
-/// Refuses `config` when it asks for something the forward pass does not
-/// compute (a non-SiLU activation, a RoPE scheme other than `default` and
-/// `llama3`, sliding-window attention), so such a model fails to load
-/// instead of giving wrong logits.
-///
-/// # Errors
-/// A [`BuildError`] naming the config field and its value.
-pub fn check_supported(config: &Lfm2Config) -> Result<()> {
-    if let Some(act) = config
-        .hidden_act
-        .as_deref()
-        .filter(|a| !matches!(*a, "silu" | "swish"))
-    {
-        return Err(BuildError(format!(
-            "hidden_act {act:?} is not supported: the MLP computes SiLU (silu) only"
-        )));
-    }
-    rope_scaling(config).map_err(BuildError)?;
-    // Only `use_sliding_window: true` turns the window on: Hugging Face's
-    // Mistral sets `sliding_window` alone and still attends over everything.
-    if config.use_sliding_window == Some(true) {
-        let window = config
-            .sliding_window
-            .map_or_else(|| "unset".to_owned(), |w| w.to_string());
-        return Err(BuildError(format!(
-            "sliding_window {window} is not supported: attention always covers the whole sequence"
-        )));
-    }
-    Ok(())
-}
 
 /// Builds an [`Lfm2Model`] from loaded weights.
 pub struct Lfm2ModelBuilder<'a> {
@@ -486,12 +427,8 @@ impl<'a> Lfm2ModelBuilder<'a> {
         Ok(Some(norm))
     }
 
-    fn build_mlp(&self, prefix: &str, arch: Architecture, seed: u64) -> Result<MLP> {
-        // LFM2 names its SwiGLU projections w1 (gate), w3 (up), w2 (down).
-        let [gate, up, down] = match arch {
-            Architecture::Llama => ["gate_proj", "up_proj", "down_proj"],
-            Architecture::Lfm2 => ["w1", "w3", "w2"],
-        };
+    fn build_mlp(&self, spec: &FamilySpec, prefix: &str, seed: u64) -> Result<MLP> {
+        let [gate, up, down] = spec.names.mlp_proj;
         Ok(MLP {
             gate_proj: self.build_linear(&format!("{prefix}.{gate}"), gate, seed)?,
             up_proj: self.build_linear(&format!("{prefix}.{up}"), up, seed)?,
@@ -500,7 +437,7 @@ impl<'a> Lfm2ModelBuilder<'a> {
         })
     }
 
-    fn build_attention(&self, prefix: &str, arch: Architecture, seed: u64) -> Result<Attention> {
+    fn build_attention(&self, spec: &FamilySpec, prefix: &str, seed: u64) -> Result<Attention> {
         let n_heads = self.config.num_attention_heads;
         let num_kv_heads = self.config.num_key_value_heads.unwrap_or(n_heads);
         let head_dim = self
@@ -522,19 +459,13 @@ impl<'a> Lfm2ModelBuilder<'a> {
                 "LFM2 per-head q/k layernorm is not supported yet".into(),
             ));
         }
-        let o_name = match arch {
-            Architecture::Llama => "o_proj",
-            Architecture::Lfm2 => "out_proj",
-        };
+        let [q_name, k_name, v_name, o_name] = spec.names.attn_proj;
+        let [q_norm, k_norm] = spec.names.head_norms;
 
-        let rope_theta = self
-            .config
-            .rope_theta
-            .or_else(|| self.config.rope_parameters.as_ref()?.rope_theta)
-            .unwrap_or(10000.0);
+        let rope_theta = spec.rope_theta;
         // The table is built once per layer; it is `head_dim / 2` floats.
-        let rope_inv_freq = rope_scaling(&self.config)
-            .map_err(BuildError)?
+        let rope_inv_freq = spec
+            .rope
             .map(|scaling| {
                 RopeFreqs::new(&self.ctx, &scaling.inv_freq(head_dim, rope_theta), head_dim)
             })
@@ -542,9 +473,9 @@ impl<'a> Lfm2ModelBuilder<'a> {
             .map_err(|e| BuildError(e.to_string()))?;
 
         Ok(Attention {
-            q_proj: self.build_linear(&format!("{prefix}.q_proj"), "q_proj", seed)?,
-            k_proj: self.build_linear(&format!("{prefix}.k_proj"), "k_proj", seed)?,
-            v_proj: self.build_linear(&format!("{prefix}.v_proj"), "v_proj", seed)?,
+            q_proj: self.build_linear(&format!("{prefix}.{q_name}"), q_name, seed)?,
+            k_proj: self.build_linear(&format!("{prefix}.{k_name}"), k_name, seed)?,
+            v_proj: self.build_linear(&format!("{prefix}.{v_name}"), v_name, seed)?,
             o_proj: self.build_linear(&format!("{prefix}.{o_name}"), o_name, seed)?,
             n_heads,
             head_dim,
@@ -552,8 +483,8 @@ impl<'a> Lfm2ModelBuilder<'a> {
             dropout_prob: self.config.attention_dropout.unwrap_or(0.0),
             rope_theta: rope_theta as f32,
             rope_inv_freq,
-            q_norm: self.build_head_norm(&format!("{prefix}.q_norm"), head_dim)?,
-            k_norm: self.build_head_norm(&format!("{prefix}.k_norm"), head_dim)?,
+            q_norm: self.build_head_norm(&format!("{prefix}.{q_norm}"), head_dim)?,
+            k_norm: self.build_head_norm(&format!("{prefix}.{k_norm}"), head_dim)?,
             fused: FusedSlot::default(),
         })
     }
@@ -571,60 +502,24 @@ impl<'a> Lfm2ModelBuilder<'a> {
         })
     }
 
-    fn build_layer(&self, layer_idx: usize, arch: Architecture) -> Result<Lfm2Block> {
-        let prefix = format!("model.layers.{layer_idx}");
+    fn build_layer(&self, spec: &FamilySpec, layer_idx: usize) -> Result<Lfm2Block> {
+        let names = &spec.names;
+        let prefix = format!("{}.{layer_idx}", names.layers);
         let seed = layer_idx as u64 + 1;
-        match arch {
-            Architecture::Llama => {
-                // Qwen3 configs list every layer; sliding-window layers
-                // would need a windowed mask the attention path lacks.
-                if let Some(t) = self
-                    .config
-                    .layer_types
-                    .get(layer_idx)
-                    .filter(|t| t.as_str() != "full_attention")
-                {
-                    return Err(BuildError(format!(
-                        "layer {layer_idx} is {t:?}; only full attention is supported"
-                    )));
-                }
-                Ok(Lfm2Block {
-                    operator_norm: self.build_rms_norm(&format!("{prefix}.input_layernorm"))?,
-                    op: Lfm2LayerOp::Attention(self.build_attention(
-                        &format!("{prefix}.self_attn"),
-                        arch,
-                        seed,
-                    )?),
-                    ffn_norm: self.build_rms_norm(&format!("{prefix}.post_attention_layernorm"))?,
-                    mlp: self.build_mlp(&format!("{prefix}.mlp"), arch, seed)?,
-                })
-            }
-            Architecture::Lfm2 => {
-                let layer_type = self
-                    .config
-                    .layer_types
-                    .get(layer_idx)
-                    .map(String::as_str)
-                    .unwrap_or("full_attention");
-                let op = match layer_type {
-                    "conv" => Lfm2LayerOp::Conv(self.build_conv(&format!("{prefix}.conv"), seed)?),
-                    "full_attention" | "attention" => Lfm2LayerOp::Attention(
-                        self.build_attention(&format!("{prefix}.self_attn"), arch, seed)?,
-                    ),
-                    other => {
-                        return Err(BuildError(format!(
-                            "unknown layer type {other:?} at layer {layer_idx}"
-                        )))
-                    }
-                };
-                Ok(Lfm2Block {
-                    operator_norm: self.build_rms_norm(&format!("{prefix}.operator_norm"))?,
-                    op,
-                    ffn_norm: self.build_rms_norm(&format!("{prefix}.ffn_norm"))?,
-                    mlp: self.build_mlp(&format!("{prefix}.feed_forward"), arch, seed)?,
-                })
-            }
-        }
+        let op = match spec.layer(layer_idx)? {
+            LayerKind::Conv => Lfm2LayerOp::Conv(self.build_conv(&format!("{prefix}.conv"), seed)?),
+            LayerKind::Attention => Lfm2LayerOp::Attention(self.build_attention(
+                spec,
+                &format!("{prefix}.{}", names.attn),
+                seed,
+            )?),
+        };
+        Ok(Lfm2Block {
+            operator_norm: self.build_rms_norm(&format!("{prefix}.{}", names.operator_norm))?,
+            op,
+            ffn_norm: self.build_rms_norm(&format!("{prefix}.{}", names.ffn_norm))?,
+            mlp: self.build_mlp(spec, &format!("{prefix}.{}", names.mlp), seed)?,
+        })
     }
 
     /// Build the complete model, or explain which weight or setting is
@@ -637,27 +532,33 @@ impl<'a> Lfm2ModelBuilder<'a> {
                     .into(),
             ));
         }
-        check_supported(&self.config)?;
-        let arch = Architecture::detect(&self.config);
+        let spec = family_spec(&self.config)?;
+        let arch = spec.architecture;
         let n_layers = self.config.num_hidden_layers;
         log::info!("building {arch:?} model with {n_layers} layers");
 
         let (embed_tokens, embed_table) = self.load_embeddings()?;
         let mut layers = Vec::with_capacity(n_layers);
         for i in 0..n_layers {
-            layers.push(self.build_layer(i, arch)?);
+            layers.push(self.build_layer(&spec, i)?);
         }
 
-        // Hugging Face LFM2 applies `embedding_norm` after the last block.
-        let norm_f = if self.has("model.norm.weight")? {
-            self.build_rms_norm("model.norm")?
-        } else if self.has("model.embedding_norm.weight")? {
-            self.build_rms_norm("model.embedding_norm")?
-        } else {
-            return Err(BuildError(
-                "no final norm (model.norm.weight or model.embedding_norm.weight)".into(),
-            ));
-        };
+        let mut final_norm = None;
+        for name in spec.names.final_norms {
+            if self.has(&format!("{name}.weight"))? {
+                final_norm = Some(self.build_rms_norm(name)?);
+                break;
+            }
+        }
+        let norm_f = final_norm.ok_or_else(|| {
+            let tried: Vec<String> = spec
+                .names
+                .final_norms
+                .iter()
+                .map(|name| format!("{name}.weight"))
+                .collect();
+            BuildError(format!("no final norm ({})", tried.join(" or ")))
+        })?;
 
         let lm_head = if self.has("lm_head.weight")? {
             self.build_linear("lm_head", "lm_head", 0)?
@@ -770,133 +671,7 @@ fn lora_seed(layer_seed: u64, module_name: &str) -> u64 {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use super::{
-        check_supported, lora_seed, module_matches, BuildError, Lfm2ModelBuilder, Q4Group,
-        Q4Selection,
-    };
-    use ferrotensor_loader::Lfm2Config;
-
-    /// The `config.json` of Qwen2.5-0.5B on the Hugging Face hub.
-    fn qwen2_5_config() -> serde_json::Value {
-        serde_json::json!({
-            "architectures": ["Qwen2ForCausalLM"],
-            "attention_dropout": 0.0,
-            "bos_token_id": 151643,
-            "eos_token_id": 151643,
-            "hidden_act": "silu",
-            "hidden_size": 896,
-            "initializer_range": 0.02,
-            "intermediate_size": 4864,
-            "max_position_embeddings": 32768,
-            "max_window_layers": 24,
-            "model_type": "qwen2",
-            "num_attention_heads": 14,
-            "num_hidden_layers": 24,
-            "num_key_value_heads": 2,
-            "rms_norm_eps": 1e-06,
-            "rope_theta": 1000000.0,
-            "sliding_window": 32768,
-            "tie_word_embeddings": true,
-            "torch_dtype": "bfloat16",
-            "use_cache": true,
-            "use_sliding_window": false,
-            "vocab_size": 151936
-        })
-    }
-
-    fn check_with(changes: serde_json::Value) -> Result<(), BuildError> {
-        let mut json = qwen2_5_config();
-        let fields = json.as_object_mut().expect("object");
-        for (key, value) in changes.as_object().expect("object") {
-            fields.insert(key.clone(), value.clone());
-        }
-        let config: Lfm2Config = serde_json::from_value(json).expect("config");
-        check_supported(&config)
-    }
-
-    #[test]
-    fn qwen2_5_config_is_supported() {
-        assert_eq!(check_with(serde_json::json!({})), Ok(()));
-        // transformers 5 writes the RoPE base inside rope_parameters.
-        assert_eq!(
-            check_with(serde_json::json!({
-                "rope_theta": null,
-                "rope_parameters": {"rope_type": "default", "rope_theta": 1000000.0}
-            })),
-            Ok(())
-        );
-        // Mistral-7B-v0.1 sets a window without use_sliding_window; Hugging
-        // Face does not apply it either.
-        assert_eq!(
-            check_with(serde_json::json!({"use_sliding_window": null, "sliding_window": 4096})),
-            Ok(())
-        );
-        // The Llama 3.2 scaling object loads.
-        assert_eq!(
-            check_with(serde_json::json!({"rope_scaling": {
-                "rope_type": "llama3", "factor": 32.0, "low_freq_factor": 1.0,
-                "high_freq_factor": 4.0, "original_max_position_embeddings": 8192
-            }})),
-            Ok(())
-        );
-        // A RoPE object with neither a type nor a factor is plain RoPE.
-        assert_eq!(
-            check_with(serde_json::json!({"rope_scaling": {"rope_theta": 1000000.0}})),
-            Ok(())
-        );
-    }
-
-    #[test]
-    fn unsupported_config_features_are_named() {
-        let cases = [
-            (
-                serde_json::json!({"hidden_act": "gelu_pytorch_tanh"}),
-                "hidden_act \"gelu_pytorch_tanh\" is not supported: the MLP computes SiLU (silu) only",
-            ),
-            (
-                serde_json::json!({"rope_scaling": {"rope_type": "llama3", "factor": 8.0}}),
-                "rope_scaling type \"llama3\" needs a positive number for low_freq_factor",
-            ),
-            (
-                serde_json::json!({"rope_scaling": {
-                    "rope_type": "llama3", "factor": 8.0, "low_freq_factor": 4.0,
-                    "high_freq_factor": 1.0, "original_max_position_embeddings": 8192
-                }}),
-                "rope_scaling type \"llama3\" needs high_freq_factor above low_freq_factor, got 1 and 4",
-            ),
-            (
-                serde_json::json!({"rope_scaling": {"type": "linear", "factor": 2.0}}),
-                "rope_scaling type \"linear\" is not supported: only \"default\" and \"llama3\" RoPE are",
-            ),
-            (
-                serde_json::json!({"rope_scaling": {"rope_type": "dynamic", "factor": 2.0}}),
-                "rope_scaling type \"dynamic\" is not supported: only \"default\" and \"llama3\" RoPE are",
-            ),
-            (
-                serde_json::json!({"rope_parameters": {"rope_type": "yarn", "rope_theta": 1e6}}),
-                "rope_parameters type \"yarn\" is not supported: only \"default\" and \"llama3\" RoPE are",
-            ),
-            (
-                serde_json::json!({"rope_scaling": {"rope_type": "longrope", "factor": 2.0}}),
-                "rope_scaling type \"longrope\" is not supported: only \"default\" and \"llama3\" RoPE are",
-            ),
-            (
-                serde_json::json!({"use_sliding_window": true}),
-                "sliding_window 32768 is not supported: attention always covers the whole sequence",
-            ),
-            (
-                serde_json::json!({"rope_scaling": {"factor": 4.0}}),
-                "rope_scaling type \"unnamed\" is not supported: only \"default\" and \"llama3\" RoPE are",
-            ),
-        ];
-        for (changes, message) in cases {
-            assert_eq!(
-                check_with(changes.clone()),
-                Err(BuildError(message.into())),
-                "{changes}"
-            );
-        }
-    }
+    use super::{lora_seed, module_matches, Lfm2ModelBuilder, Q4Group, Q4Selection};
 
     #[test]
     fn lora_seed_is_pinned() {

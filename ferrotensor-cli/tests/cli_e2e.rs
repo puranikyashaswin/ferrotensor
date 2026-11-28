@@ -145,6 +145,35 @@ fn json_errors_are_one_object_on_stdout() {
     }
 }
 
+/// `export-adapter` reads only `config.json`, and refuses a config the model
+/// builder refuses with exit code 2, naming the file and the field.
+#[test]
+fn export_adapter_refuses_an_unsupported_config_with_2() {
+    let model = model_dir("unsupported-act-export");
+    let config_path = model.path().join("config.json");
+    let mut config = read_json(&config_path);
+    config["hidden_act"] = serde_json::json!("gelu");
+    std::fs::write(&config_path, config.to_string()).expect("write config");
+    let out = model.path().join("peft");
+    let run = ferrotensor(&[
+        "export-adapter",
+        "--lora",
+        s(&model.path().join("lora_adapters.safetensors")),
+        "--model",
+        s(model.path()),
+        "--output",
+        s(&out),
+    ]);
+    let stderr = text(&run.stderr);
+    assert_eq!(run.status.code(), Some(2), "stderr: {stderr}");
+    assert!(stderr.contains("config.json"), "{stderr}");
+    assert!(
+        stderr.contains("hidden_act \"gelu\" is not supported"),
+        "{stderr}"
+    );
+    assert!(!out.exists(), "nothing is written");
+}
+
 /// A config feature the forward pass lacks is refused before the GPU is
 /// touched, with exit code 2 and the field named, for every model command.
 #[test]

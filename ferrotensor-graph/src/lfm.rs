@@ -223,10 +223,8 @@ impl Lfm2Block {
 
 /// Block-level module names of `arch`: operator norm, MLP norm, MLP.
 fn block_names(arch: Architecture) -> [&'static str; 3] {
-    match arch {
-        Architecture::Llama => ["input_layernorm", "post_attention_layernorm", "mlp"],
-        Architecture::Lfm2 => ["operator_norm", "ffn_norm", "feed_forward"],
-    }
+    let names = arch.names();
+    [names.operator_norm, names.ffn_norm, names.mlp]
 }
 
 /// Pairs of (Hugging Face Llama name, name earlier releases used) for the
@@ -983,6 +981,38 @@ impl Lfm2Model {
 #[cfg(test)]
 mod tests {
     use super::{legacy_llama_name, llama_name_from_legacy};
+
+    /// The block names `named_params_as` writes and the legacy renames are
+    /// two views of the family tables in `family.rs`; they must agree.
+    #[test]
+    fn block_names_and_legacy_renames_agree_with_the_family_tables() {
+        use crate::family::{LFM2_NAMES, LLAMA_NAMES};
+        assert_eq!(
+            block_names(Architecture::Llama),
+            [
+                LLAMA_NAMES.operator_norm,
+                LLAMA_NAMES.ffn_norm,
+                LLAMA_NAMES.mlp
+            ]
+        );
+        assert_eq!(
+            block_names(Architecture::Lfm2),
+            [
+                LFM2_NAMES.operator_norm,
+                LFM2_NAMES.ffn_norm,
+                LFM2_NAMES.mlp
+            ]
+        );
+        let renames = [
+            (LLAMA_NAMES.operator_norm, LFM2_NAMES.operator_norm),
+            (LLAMA_NAMES.ffn_norm, LFM2_NAMES.ffn_norm),
+            (LLAMA_NAMES.mlp, LFM2_NAMES.mlp),
+        ]
+        .map(|(new, old)| (format!(".{new}."), format!(".{old}.")));
+        for ((new, old), (want_new, want_old)) in LLAMA_RENAMES.iter().zip(&renames) {
+            assert_eq!((*new, *old), (want_new.as_str(), want_old.as_str()));
+        }
+    }
 
     #[test]
     fn llama_block_names_map_to_and_from_the_old_names() {

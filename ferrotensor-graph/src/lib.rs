@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 pub mod classifier;
 pub mod dropout;
+pub mod family;
 pub mod flash_attention;
 pub mod fused;
 /// LFM2 (Liquid foundation model) blocks.

@@ -13,8 +13,8 @@
 mod common;
 
 use common::*;
+use ferrotensor_graph::family::{family_spec, Architecture};
 use ferrotensor_graph::lfm::{Lfm2LayerOp, Lfm2Model};
-use ferrotensor_graph::model_builder::Architecture;
 use ferrotensor_graph::Attention;
 use ferrotensor_loader::ModelLoader;
 use std::collections::HashMap;
@@ -300,7 +300,10 @@ fn qwen3_config_with_layer_types_is_llama_style() {
     write_tiny_qwen3(dir.path());
     let config = ModelLoader::load_config(dir.path().join("config.json")).expect("config");
     assert_eq!(config.layer_types.len(), LAYERS);
-    assert_eq!(Architecture::detect(&config), Architecture::Llama);
+    assert_eq!(
+        family_spec(&config).expect("supported").architecture,
+        Architecture::Llama
+    );
 }
 
 #[test]

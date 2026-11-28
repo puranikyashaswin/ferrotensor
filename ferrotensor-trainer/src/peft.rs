@@ -23,8 +23,8 @@
 
 use crate::checkpoint::{LoraCheckpoint, LoraMetadata};
 use ferrotensor_backend::WgpuContext;
+use ferrotensor_graph::family::{family_spec, Architecture};
 use ferrotensor_graph::lfm::{llama_name_from_legacy, Lfm2LayerOp, Lfm2Model};
-use ferrotensor_graph::model_builder::Architecture;
 use ferrotensor_graph::Linear;
 use ferrotensor_loader::Lfm2Config;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -336,8 +336,9 @@ fn write_peft(
 ///
 /// `base_model` goes into `base_model_name_or_path` (a Hub id or the path
 /// of the base model). Adapters written with the old Llama-block names load
-/// too. Fails, writing nothing, when the model is not Llama-style, the file
-/// has no LoRA metadata, or a tensor is not one PEFT can represent.
+/// too. Fails, writing nothing, when the model is not Llama-style or its
+/// config is one the builder refuses, the file has no LoRA metadata, or a
+/// tensor is not one PEFT can represent.
 pub fn export_peft_adapter(
     checkpoint: &LoraCheckpoint,
     config: &Lfm2Config,
@@ -349,7 +350,7 @@ pub fn export_peft_adapter(
     )?;
     write_peft_checked(
         checkpoint,
-        Architecture::detect(config),
+        family_spec(config)?.architecture,
         config.num_hidden_layers,
         meta,
         base_model,
@@ -764,5 +765,32 @@ mod tests {
             assert!(load_peft_adapter(&dir).is_err(), "{key} should be rejected");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_refuses_a_config_the_builder_refuses_before_writing() {
+        let config: Lfm2Config = serde_json::from_value(serde_json::json!({
+            "hidden_act": "gelu",
+            "hidden_size": 8,
+            "intermediate_size": 16,
+            "max_position_embeddings": 128,
+            "model_type": "llama",
+            "num_attention_heads": 2,
+            "num_hidden_layers": LAYERS,
+            "num_key_value_heads": 2,
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 10000.0,
+            "vocab_size": 32,
+        }))
+        .expect("config");
+        let dir = temp_dir("refused_config");
+        let error = export_peft_adapter(&checkpoint(false), &config, "tiny", &dir)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("hidden_act \"gelu\" is not supported"),
+            "{error}"
+        );
+        assert!(!dir.exists(), "nothing is written");
     }
 }

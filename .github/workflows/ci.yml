@@ -116,22 +116,20 @@ jobs:
           cargo run --release -p ferrotensor-trainer --example resume_training
           cargo run --release -p ferrotensor-trainer --example generate_with_kv_cache
       # PyTorch and transformers (CPU wheels) for the checks against them. The
-      # Qwen2 and Llama 3 fixtures are generated here rather than committed: a
-      # tiny random Qwen2ForCausalLM and LlamaForCausalLM with their logits and
-      # gradients, read by ferrotensor-trainer/tests/qwen2_family.rs and
-      # llama3_rope.rs in the next step.
-      - name: PyTorch venv and the Qwen2 and Llama 3 fixtures
+      # family fixtures are generated here rather than committed: a tiny random
+      # checkpoint per family in scripts/gen_family_fixtures.py, with its logits
+      # and gradients, read by ferrotensor-trainer/tests/family_parity.rs in the
+      # next step.
+      - name: PyTorch venv and the family fixtures
         run: |
           venv="$RUNNER_TEMP/peft-venv"
           python3 -m venv "$venv"
           "$venv/bin/pip" install -q --index-url https://download.pytorch.org/whl/cpu torch==2.14.1
           "$venv/bin/pip" install -q transformers==5.20.2 peft==0.21.2 safetensors==0.8.0
-          "$venv/bin/python" scripts/gen_qwen2_fixture.py "$RUNNER_TEMP/qwen2-fixture"
-          "$venv/bin/python" scripts/gen_llama3_fixture.py "$RUNNER_TEMP/llama3-fixture"
+          "$venv/bin/python" scripts/gen_family_fixtures.py "$RUNNER_TEMP/family-fixtures"
       - name: GPU suites (ignored tests)
         env:
-          FERROTENSOR_QWEN2_FIXTURE: ${{ runner.temp }}/qwen2-fixture
-          FERROTENSOR_LLAMA3_FIXTURE: ${{ runner.temp }}/llama3-fixture
+          FERROTENSOR_FAMILY_FIXTURES: ${{ runner.temp }}/family-fixtures
         run: cargo test --release --workspace -- --ignored --test-threads=1
       # A LoRA adapter trained here, exported with `export-adapter --format
       # peft`, must give the same logits in PyTorch + PEFT (CPU wheels), and
@@ -183,8 +181,8 @@ jobs:
     # runners expose Metal on a paravirtualised Apple GPU; Windows runners have
     # no GPU, but DX12 lists WARP, Microsoft's software adapter, and wgpu picks
     # it when nothing else is there (as Vulkan picks lavapipe above). Neither
-    # is real hardware and neither says anything about speed. The Qwen2
-    # and Llama 3 fixtures are not generated here, so those tests skip.
+    # is real hardware and neither says anything about speed. The family
+    # fixtures are not generated here, so those tests skip.
     runs-on: ${{ matrix.os }}
     # 360 minutes is the most a hosted runner allows. On WARP with the zeroing
     # of workgroup memory on, the 0.7.2 kernels (the skinny and small-M tests)

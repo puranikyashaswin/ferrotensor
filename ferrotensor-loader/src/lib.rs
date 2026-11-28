@@ -10,11 +10,11 @@ use memmap2::MmapOptions;
 use safetensors::SafeTensors;
 use serde::de::Error as _;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Component, Path};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use thiserror::Error;
 
 mod release;
@@ -409,6 +409,8 @@ pub struct WeightsContext {
     mmaps: HashMap<String, memmap2::Mmap>, // filename -> mmap
     // We can also parse the index.json if it exists to know which file has which weight
     weight_map: HashMap<String, String>, // weight_name -> filename
+    // Names handed to `read_bytes`, for `tensors_read`.
+    read: Mutex<BTreeSet<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -437,6 +439,7 @@ impl WeightsContext {
         Self {
             mmaps: HashMap::new(),
             weight_map: HashMap::new(),
+            read: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -522,6 +525,13 @@ impl WeightsContext {
         self.weight_map.keys().map(String::as_str)
     }
 
+    /// The names of the tensors read so far, sorted: a test checks with it
+    /// that a model build uses every weight of a checkpoint.
+    pub fn tensors_read(&self) -> Vec<String> {
+        let read = self.read.lock().unwrap_or_else(PoisonError::into_inner);
+        read.iter().cloned().collect()
+    }
+
     /// Returns the shape and dtype of a tensor, or `None` when no loaded file
     /// holds it; use it to probe for optional tensors.
     ///
@@ -574,6 +584,10 @@ impl WeightsContext {
         F: FnOnce(&[u8], &[usize]),
     {
         if let Some(filename) = self.weight_map.get(name) {
+            self.read
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(name.to_string());
             let mmap = self
                 .mmaps
                 .get(filename)
