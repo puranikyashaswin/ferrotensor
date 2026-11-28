@@ -438,6 +438,7 @@ fn chunked_eval_loss_equals_the_whole_one() {
                 rows,
                 &gpu.engine,
             )
+            .expect("valid arguments")
             .expect("supervised rows");
             assert_eq!(got_rows, want_rows, "chunks of {rows}");
             assert!(
