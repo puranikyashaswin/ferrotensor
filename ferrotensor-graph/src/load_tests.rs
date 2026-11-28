@@ -315,14 +315,32 @@ fn uploaded_weights_match_the_old_path_in_every_dtype() {
                 assert_bytes_eq(&format!("lm_head ({case})"), &got, &want);
                 assert_eq!(model.lm_head.weight.data.shape, vec![HIDDEN, VOCAB]);
 
-                let name = "model.layers.0.self_attn.q_proj.weight";
-                let (values, shape) = weights.read_f32_tensor(name).expect("read");
-                let want = old_upload_bytes(&values, shape[0], shape[1], f16);
+                // Every 2-D linear weight of the block: square ones and the
+                // wide and tall MLP matrices, whose transposes differ in shape.
                 let Lfm2LayerOp::Attention(attn) = &model.layers[0].op else {
                     panic!("layer 0 is not attention");
                 };
-                let got = gpu_bytes(&gpu.ctx, &attn.q_proj.weight.data);
-                assert_bytes_eq(&format!("q_proj ({case})"), &got, &want);
+                let mlp = &model.layers[0].mlp;
+                let linears = [
+                    ("self_attn.q_proj", &attn.q_proj, [HIDDEN, HIDDEN]),
+                    ("self_attn.k_proj", &attn.k_proj, [HIDDEN, HIDDEN]),
+                    ("self_attn.v_proj", &attn.v_proj, [HIDDEN, HIDDEN]),
+                    ("self_attn.o_proj", &attn.o_proj, [HIDDEN, HIDDEN]),
+                    ("mlp.gate_proj", &mlp.gate_proj, [HIDDEN, FFN]),
+                    ("mlp.up_proj", &mlp.up_proj, [HIDDEN, FFN]),
+                    ("mlp.down_proj", &mlp.down_proj, [FFN, HIDDEN]),
+                ];
+                for (name, linear, uploaded_shape) in linears {
+                    let (values, shape) = weights
+                        .read_f32_tensor(&format!("model.layers.0.{name}.weight"))
+                        .expect("read");
+                    let want = old_upload_bytes(&values, shape[0], shape[1], f16);
+                    let got = gpu_bytes(&gpu.ctx, &linear.weight.data);
+                    assert_bytes_eq(&format!("{name} ({case})"), &got, &want);
+                    assert_eq!(linear.weight.data.shape, uploaded_shape, "{name}");
+                    let dtype = if f16 { DType::FP16 } else { DType::FP32 };
+                    assert_eq!(linear.weight.data.dtype, dtype, "{name} ({case})");
+                }
             }
         }
     }

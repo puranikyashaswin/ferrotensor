@@ -327,6 +327,34 @@ impl<'a> Lfm2ModelBuilder<'a> {
         })
     }
 
+    /// Uploads the transpose of the PyTorch `[out, in]` weight `name`, held
+    /// row-major in `data` as `rows` x `cols`, as an `[in, out]` tensor of
+    /// the type [`upload_linear`](Self::upload_linear) would choose.
+    ///
+    /// A weight that is not 4-bit is transposed and converted while it is
+    /// written to the upload bytes, so the host holds no transposed f32 copy
+    /// of it. Quantising needs the logical `[in, out]` order, so a 4-bit
+    /// weight still makes that copy.
+    fn upload_linear_transposed(
+        &self,
+        name: &str,
+        data: &[f32],
+        rows: usize,
+        cols: usize,
+    ) -> Result<UnifiedTensor> {
+        if !self.trainable_base && self.q4_for(name, &[cols, rows]).is_some() {
+            let transposed = Self::transpose_2d(data, rows, cols);
+            return self.upload_linear(name, &transposed, &[cols, rows]);
+        }
+        Ok(UnifiedTensor::from_f32_transposed(
+            &self.ctx,
+            data,
+            rows,
+            cols,
+            self.linear_dtype(),
+        ))
+    }
+
     /// The element type [`upload_linear`](Self::upload_linear) stores for a
     /// weight the 4-bit selection leaves out.
     fn linear_dtype(&self) -> DType {
@@ -411,12 +439,12 @@ impl<'a> Lfm2ModelBuilder<'a> {
     fn load_linear_weight_tensor(&self, prefix: &str) -> Result<Tensor> {
         let name = format!("{prefix}.weight");
         let (data, shape) = self.read(&name)?;
-        let (data, shape) = if let [rows, cols] = shape[..] {
-            (Self::transpose_2d(&data, rows, cols), vec![cols, rows])
+        let weight = if let [rows, cols] = shape[..] {
+            self.upload_linear_transposed(&name, &data, rows, cols)?
         } else {
-            (data, shape)
+            self.upload_linear(&name, &data, &shape)?
         };
-        Ok(self.wrap(self.upload_linear(&name, &data, &shape)?))
+        Ok(self.wrap(weight))
     }
 
     fn maybe_add_lora(&self, linear: Linear, module_name: &str, seed: u64) -> Linear {
@@ -677,23 +705,7 @@ impl<'a> Lfm2ModelBuilder<'a> {
                     "model.embed_tokens.weight must be 2-D, got {shape:?}"
                 )));
             };
-            let head = "lm_head.weight";
-            let weight = if self.q4_for(head, &[hidden, vocab]).is_some() {
-                // Quantising needs the logical [hidden, vocab] order, so this
-                // path holds one transposed copy of the table on the host.
-                let transposed = Self::transpose_2d(data, vocab, hidden);
-                self.upload_linear(head, &transposed, &[hidden, vocab])?
-            } else {
-                // Transposed and converted while it is written to the GPU
-                // buffer: no transposed copy of the table on the host.
-                UnifiedTensor::from_f32_transposed(
-                    &self.ctx,
-                    data,
-                    vocab,
-                    hidden,
-                    self.linear_dtype(),
-                )
-            };
+            let weight = self.upload_linear_transposed("lm_head.weight", data, vocab, hidden)?;
             self.maybe_add_lora(Linear::new(self.wrap(weight)), "lm_head", 0)
         };
 
