@@ -322,11 +322,12 @@ fn estimate_with_embedding(
     };
     let activations = tokens * values_per_token * 4.0 * ACTIVATION_SCALE * overlap;
     // The trainer runs lm_head and the loss over row chunks when the logits
-    // and their gradient would pass a size it names, so only one chunk of
-    // them exists at a time. The planner counts every padded token as a row
-    // of the head, which is at least the rows the trainer gathers.
-    let logit_rows = ferrotensor_trainer::head_chunk_rows(tokens as usize, shape.vocab)
-        .map_or(tokens, |chunk| chunk as f64);
+    // and their gradient would pass a size it names. It counts the rows of
+    // the head itself: the supervised rows of the micro-batch, which the
+    // planner cannot know, at most every padded token. So the planner counts
+    // the most rows the trainer can still form whole, or every token when
+    // there are fewer. Above that size the trainer chunks and holds fewer.
+    let logit_rows = tokens.min(ferrotensor_trainer::max_whole_head_rows(shape.vocab) as f64);
     let logits = LOGIT_FLOATS_PER_VOCAB * logit_rows * vocab * 4.0;
 
     let parts = [
@@ -844,8 +845,9 @@ fn push_common_notes(notes: &mut Vec<String>, budget: &Budget) {
          Qwen2.5-0.5B, f16 weights, 8 sequences per step, an A10G and a T4); it is at \
          most 4.6% below them, at most 12% above the 250-step and single-pass peaks, \
          and up to 35% above the shorter runs that accumulate passes, which have not \
-         reached their peak; a head with more than 1 GiB of logits runs in chunks of \
-         512 rows and is counted at that size, which no run has measured"
+         reached their peak; a head with more than 1 GiB of logits and gradient runs in \
+         chunks of 512 rows, and the logits are counted at the most rows it can form \
+         whole, which no run has measured"
             .into(),
     );
     notes.push("replace train.jsonl in the train command with your dataset".into());
@@ -1223,19 +1225,25 @@ mod tests {
     }
 
     #[test]
-    fn a_chunked_head_counts_one_chunk_of_logits() {
-        // 2,048 tokens over 151,936 classes need 2.32 GiB whole. The head
-        // runs in chunks of 512 rows: 2 x 512 x 151,936 x 4 bytes.
+    fn the_logits_count_the_most_rows_the_trainer_forms_whole() {
+        // The trainer chunks the head only above 1 GiB of logits and
+        // gradient, counted over the supervised rows it gathers. The
+        // planner does not know how many those are, so for Qwen's 151,936
+        // classes it counts 883 rows (883 x 151,936 x 8 bytes is just under
+        // 1 GiB): 2 x 883 x 151,936 x 4 bytes.
         let qwen = shape("Qwen2.5-0.5B-Instruct");
-        assert_eq!(
-            estimate_peak_mib(&qwen, &config(8, Checkpointing::Off)).logits_mib,
-            594
-        );
-        // One sequence of 4,096 tokens counts the same 512 rows.
+        let whole = estimate_peak_mib(&qwen, &config(8, Checkpointing::Off)).logits_mib;
+        assert_eq!(whole, 1024);
+        // 8 x 256 tokens with about 850 supervised rows: the trainer forms
+        // 850 rows whole, 986 MiB. The estimate must hold that.
+        assert!(ferrotensor_trainer::head_chunk_rows(850, qwen.vocab).is_none());
+        assert!(whole >= 986, "{whole} MiB for 850 whole rows");
+        // A longer pass counts the same rows.
         let mut long = config(1, Checkpointing::Off);
         long.padded_len = 4096;
-        assert_eq!(estimate_peak_mib(&qwen, &long).logits_mib, 594);
-        // Gemma's 262,208 classes at 512 rows: 2 x 512 x 262,208 x 4 bytes.
+        assert_eq!(estimate_peak_mib(&qwen, &long).logits_mib, 1024);
+        // Gemma's 262,208 classes: 512 rows is the least a chunk holds, and
+        // 2 x 512 x 262,208 x 4 bytes is 1,025 MiB.
         let mut gemma = qwen.clone();
         gemma.vocab = 262_208;
         assert_eq!(

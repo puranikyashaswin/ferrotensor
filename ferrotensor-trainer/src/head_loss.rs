@@ -49,6 +49,19 @@ pub fn head_chunk_rows(rows: usize, vocab: usize) -> Option<usize> {
     (bytes > HEAD_CHUNK_MIN_BYTES && rows > HEAD_CHUNK_ROWS).then_some(HEAD_CHUNK_ROWS)
 }
 
+/// The most rows of a head over `vocab` classes that [`head_chunk_rows`]
+/// leaves unchunked: whatever the number of rows, the logits of a head never
+/// hold more rows than this at once. A planner that does not know how many
+/// rows the trainer gathers (the supervised rows of a micro-batch, at most
+/// all of its positions) counts this many at most.
+pub fn max_whole_head_rows(vocab: usize) -> usize {
+    let per_row = (vocab as u64)
+        .saturating_mul(HEAD_LOGIT_BYTES_PER_VALUE)
+        .max(1);
+    let by_size = usize::try_from(HEAD_CHUNK_MIN_BYTES / per_row).unwrap_or(usize::MAX);
+    by_size.max(HEAD_CHUNK_ROWS)
+}
+
 /// Runs `head` and the weighted cross-entropy `spec` over chunks of
 /// `chunk_rows` rows of `hidden` (`[.., width]`, f32, one row per entry of
 /// `spec`). The returned `grad` is `d loss / d hidden`, shaped like `hidden`
@@ -58,17 +71,22 @@ pub fn head_chunk_rows(rows: usize, vocab: usize) -> Option<usize> {
 ///
 /// A chunk whose rows are all left out of the loss is skipped: its gradient
 /// is zero.
+///
+/// `None` when `spec` does not have one target and one weight for each row
+/// of `hidden`.
 pub(crate) fn run_chunked_head(
     head: &Linear,
     hidden: &Tensor,
     spec: CeRows,
     chunk_rows: usize,
     engine: &ComputeEngine,
-) -> GpuCrossEntropy {
+) -> Option<GpuCrossEntropy> {
     let ctx = &hidden.ctx;
     let width = hidden.data.shape.last().copied().unwrap_or(1).max(1);
     let rows = hidden.data.shape.iter().product::<usize>() / width;
-    debug_assert_eq!(spec.targets.len(), rows, "one target per hidden row");
+    if spec.targets.len() != rows || spec.weights.len() != rows {
+        return None;
+    }
     let chunk_rows = chunk_rows.max(1);
     // Everything but a chunk's logits and their gradient is scratch: the
     // memory report then shows the logits alone as loss.
@@ -103,12 +121,12 @@ pub(crate) fn run_chunked_head(
         }
         start = end;
     }
-    GpuCrossEntropy {
+    Some(GpuCrossEntropy {
         grad,
         row_loss,
         ranges: spec.ranges,
         tokens: spec.tokens,
-    }
+    })
 }
 
 /// One chunk: the logits of rows `rows` of `table` (`[all rows, width]`),
@@ -190,7 +208,7 @@ pub fn chunked_head_cross_entropy(
     }
     let rows = hidden.data.shape.iter().product::<usize>() / width;
     let spec = masked_ce_rows(rows, vocab, target_ids, loss_mask, sequences, 1.0)?;
-    let ce = run_chunked_head(head, hidden, spec, chunk_rows, engine);
+    let ce = run_chunked_head(head, hidden, spec, chunk_rows, engine)?;
     let ctx = &hidden.ctx;
     let losses =
         pollster::block_on(ce.row_loss.to_vec(ctx)).expect("GPU device lost during readback");

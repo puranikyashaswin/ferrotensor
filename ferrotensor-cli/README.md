@@ -343,9 +343,11 @@ single-pass peaks; it is up to 35% above 30-step runs that accumulate
 passes, which have not reached their peak. When the logits and their
 gradient would take more than 1 GiB (rows x vocabulary x 8 bytes, for more
 than 512 rows), the trainer runs `lm_head` and the loss over 512 rows at a
-time and the estimate counts 512 rows of logits; the two Qwen2.5-0.5B peaks
-above were measured before that and are not a check on it. Other GPUs, f32
-and 4-bit weights and LFM2 models are not calibrated.
+time. It counts the rows of the head, which are the response rows, so the
+estimate counts the most rows it still forms whole (883 for Qwen's 151,936
+classes, at least 512); the two Qwen2.5-0.5B peaks above were measured
+before that and are not a check on it. Other GPUs, f32 and 4-bit weights and
+LFM2 models are not calibrated.
 
 ## Less GPU memory: `--checkpoint-blocks`
 

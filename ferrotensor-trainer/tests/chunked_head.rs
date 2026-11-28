@@ -16,8 +16,8 @@ use ferrotensor_autograd::Tensor;
 use ferrotensor_backend::UnifiedTensor;
 use ferrotensor_graph::{Linear, LoRAAdapter};
 use ferrotensor_trainer::{
-    chunked_head_cross_entropy, head_chunk_rows, masked_cross_entropy_batch, HEAD_CHUNK_MIN_BYTES,
-    HEAD_CHUNK_ROWS, HEAD_LOGIT_BYTES_PER_VALUE,
+    chunked_head_cross_entropy, head_chunk_rows, masked_cross_entropy_batch, max_whole_head_rows,
+    HEAD_CHUNK_MIN_BYTES, HEAD_CHUNK_ROWS, HEAD_LOGIT_BYTES_PER_VALUE,
 };
 
 const WIDTH: usize = 16;
@@ -413,4 +413,23 @@ fn chunking_starts_above_one_gib_of_logits_and_gradient() {
     assert_eq!(head_chunk_rows(513, 1_000_000), Some(512));
     // A product that overflows u64 still chunks.
     assert_eq!(head_chunk_rows(usize::MAX, usize::MAX), Some(512));
+}
+
+/// No GPU: the most rows the head can hold whole is the largest row count
+/// `head_chunk_rows` leaves alone, so a planner can count on it.
+#[test]
+fn the_most_whole_rows_are_the_last_ones_that_do_not_chunk() {
+    for vocab in [1, 49_152, 65_536, 128_256, 151_936, 262_208, 1_000_000] {
+        let most = max_whole_head_rows(vocab);
+        assert_eq!(head_chunk_rows(most, vocab), None, "{vocab} classes");
+        // One more row chunks, unless the chunk is no smaller than the rows.
+        assert_eq!(
+            head_chunk_rows(most + 1, vocab).is_none(),
+            most < HEAD_CHUNK_ROWS,
+            "{vocab} classes"
+        );
+    }
+    assert_eq!(max_whole_head_rows(151_936), 883);
+    assert_eq!(max_whole_head_rows(262_208), HEAD_CHUNK_ROWS);
+    assert_eq!(max_whole_head_rows(usize::MAX), HEAD_CHUNK_ROWS);
 }
