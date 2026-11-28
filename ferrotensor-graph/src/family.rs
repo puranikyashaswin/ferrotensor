@@ -4,8 +4,17 @@
 //! [`family_spec`] reads a `config.json` once and either returns a
 //! [`FamilySpec`] or refuses the config, so a model the forward pass cannot
 //! compute fails to load instead of giving wrong logits. Every refusal sits
-//! next to the field it guards. The model builder reads names and settings
-//! from the spec and holds no per-family `match` of its own.
+//! next to the field it guards. The model builder reads the layer, attention,
+//! MLP and norm names and the settings from the spec, and
+//! [`Architecture::names`] gives the same table to the code that names
+//! checkpoint and PEFT tensors (`Lfm2Block::named_params_as`).
+//!
+//! Some names are the same for every family and stay in the builder: the
+//! embedding table and head (`model.embed_tokens`, `lm_head`), the probe for
+//! `q_layernorm` that refuses LFM2's per-head norms, and the conv names
+//! (`conv`, `in_proj`, `out_proj`). The legacy Llama names in
+//! `lfm::legacy_llama_name` are a second table, and a unit test there checks
+//! that it agrees with `LLAMA_NAMES` and `LFM2_NAMES`.
 
 use crate::model_builder::BuildError;
 use crate::rope::{rope_scaling, Llama3Scaling};
@@ -18,6 +27,17 @@ pub enum Architecture {
     Llama,
     /// Liquid LFM2 naming; conv and attention blocks per `layer_types`.
     Lfm2,
+}
+
+impl Architecture {
+    /// The tensor names of this family.
+    #[must_use]
+    pub fn names(self) -> &'static Names {
+        match self {
+            Self::Llama => &LLAMA_NAMES,
+            Self::Lfm2 => &LFM2_NAMES,
+        }
+    }
 }
 
 /// The MLP activation of a family.
@@ -61,7 +81,7 @@ pub struct Names {
 }
 
 /// Llama, Mistral, SmolLM2, Qwen2 and Qwen3 names.
-const LLAMA_NAMES: Names = Names {
+pub(crate) const LLAMA_NAMES: Names = Names {
     layers: "model.layers",
     operator_norm: "input_layernorm",
     ffn_norm: "post_attention_layernorm",
@@ -77,7 +97,7 @@ const LLAMA_NAMES: Names = Names {
 
 /// LFM2 names: the SwiGLU projections are `w1` (gate), `w3` (up) and `w2`
 /// (down).
-const LFM2_NAMES: Names = Names {
+pub(crate) const LFM2_NAMES: Names = Names {
     layers: "model.layers",
     operator_norm: "operator_norm",
     ffn_norm: "ffn_norm",
