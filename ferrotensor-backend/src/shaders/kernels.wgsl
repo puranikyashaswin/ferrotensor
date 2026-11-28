@@ -510,9 +510,12 @@ fn silu_backward_real(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(nu
 // erf form (GPT-NeoX, "gelu"): x * Phi(x) with Phi the standard normal CDF.
 // WGSL has no erf, so Phi comes from Abramowitz and Stegun 7.1.26 (erfc(z) =
 // (a1 t + ... + a5 t^5) exp(-z^2), t = 1 / (1 + p z), z >= 0), whose absolute
-// error is at most 1.5e-7. The tail is formed from erfc directly, so a large
-// negative x does not lose digits to 1 + erf(x). Measured against an f64 erf,
-// Phi is within 7e-8 and x * Phi within 2.1e-7 on [-12, 12] (before f32 rounding).
+// error is at most 1.5e-7. The tail is formed from erfc directly, which avoids
+// the cancellation of 1 + erf(x) for a large negative x. The fit has only
+// absolute accuracy, so the relative error of Phi grows in the tail: about
+// 4.7e-4 at -4, 1e-2 at -8 and 3.1e-2 at -12. Measured against an f64 erf
+// (before f32 rounding), Phi is within 7e-8 and x * Phi within 2.1e-7 in
+// absolute terms on [-12, 12].
 fn gelu_tanh_exp(x: f32) -> f32 {
     let ax = abs(x);
     if (ax < 0.0625) {

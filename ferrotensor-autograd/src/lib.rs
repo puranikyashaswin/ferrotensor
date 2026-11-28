@@ -14,8 +14,8 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
 use ferrotensor_backend::{
-    AdamParams, AttentionOptions, ComputeEngine, DType, Epilogue, FlatLayout, RopeFreqs,
-    UnifiedTensor, WgpuContext,
+    AdamParams, AttentionOptions, ComputeEngine, DType, Epilogue, FlatLayout, LayerNormError,
+    RopeFreqs, UnifiedTensor, WgpuContext,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -1570,13 +1570,18 @@ impl Tensor {
     ///
     /// `weight` and `bias` have the length of the last dimension. A frozen
     /// `weight` or `bias` gets no gradient.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`LayerNormError`] when `weight` or `bias` does not have as
+    /// many elements as the last dimension of `input`.
     pub fn layer_norm(
         input: &Tensor,
         weight: &Tensor,
         bias: &Tensor,
         eps: f32,
         engine: &ComputeEngine,
-    ) -> Tensor {
+    ) -> Result<Tensor, LayerNormError> {
         let out_data = UnifiedTensor::empty(&input.ctx, &input.data.shape);
         let size = input.data.shape.last().copied().unwrap_or(1).max(1);
         let rows = input.data.shape.iter().product::<usize>() / size;
@@ -1589,14 +1594,14 @@ impl Tensor {
             &out_data,
             &stats,
             eps,
-        );
+        )?;
         let node = Arc::new(LayerNormNode {
             input: input.clone(),
             weight: weight.clone(),
             bias: bias.clone(),
             stats,
         });
-        Tensor::with_creator(input.ctx.clone(), out_data, node)
+        Ok(Tensor::with_creator(input.ctx.clone(), out_data, node))
     }
 
     /// Rows of `table` `[vocab, hidden]` for equally long `rows` of ids, as

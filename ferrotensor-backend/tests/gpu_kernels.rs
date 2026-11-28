@@ -1505,7 +1505,8 @@ fn check_layer_norm(rows: usize, len: usize, eps: f32, spread: f32, offsets: &[f
 
     let out = zeros(&[rows, len]);
     let stats = zeros(&[rows, 2]);
-    e.layer_norm(&g.ctx, &tx, &tw, &tb, &out, &stats, eps);
+    e.layer_norm(&g.ctx, &tx, &tw, &tb, &out, &stats, eps)
+        .unwrap();
     let (want, want_stats) = f64_layer_norm(&x, &w, &b, len, f64::from(eps));
     assert_close(
         &format!("{name} out"),
@@ -1600,6 +1601,40 @@ fn layer_norm_keeps_precision_with_a_large_mean() {
     for &len in &[64, 768, 97] {
         check_layer_norm(3, len, 1e-5, 1.0, &[0.0, 100.0, -60.0], 1e-4);
     }
+}
+
+/// A weight or bias whose length is not the last dimension is refused before
+/// any kernel runs, and the output is left untouched.
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn layer_norm_refuses_parameters_of_the_wrong_length() {
+    let g = gpu();
+    let e = &g.engine;
+    let (rows, len) = (3, 64);
+    let tx = upload(&rand_vec(rows * len, 1), &[rows, len]);
+    let good = upload(&rand_vec(len, 2), &[len]);
+    let short = upload(&rand_vec(len - 1, 3), &[len - 1]);
+    let long = upload(&rand_vec(len + 1, 4), &[len + 1]);
+    let out = zeros(&[rows, len]);
+    let stats = zeros(&[rows, 2]);
+    let run = |w, b| e.layer_norm(&g.ctx, &tx, w, b, &out, &stats, 1e-5);
+    assert!(run(&good, &good).is_ok());
+    for (name, w, b) in [
+        ("short weight", &short, &good),
+        ("long weight", &long, &good),
+        ("short bias", &good, &short),
+        ("long bias", &good, &long),
+        ("a weight and bias that match each other", &short, &short),
+    ] {
+        let err = run(w, b).unwrap_err();
+        assert_eq!(err.size, len, "{name}");
+        assert_eq!(err.weight_len, w.shape.iter().product::<usize>(), "{name}");
+        assert_eq!(err.bias_len, b.shape.iter().product::<usize>(), "{name}");
+    }
+    // The refused calls wrote nothing: the output still holds the good run.
+    let want = read(&out);
+    assert!(run(&short, &long).is_err());
+    assert_eq!(read(&out), want);
 }
 
 /// `erf` in f64, from the Taylor series below 2.5 and the continued fraction

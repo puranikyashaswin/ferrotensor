@@ -3,6 +3,31 @@
 use super::{grid, groups64, uniform, ComputeEngine};
 use crate::{UnifiedTensor, WgpuContext};
 
+/// A LayerNorm weight or bias whose length is not the input's last dimension,
+/// or a weight and a bias of different lengths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayerNormError {
+    /// The last dimension of the input: the length both parameters need.
+    pub size: usize,
+    /// Elements in the weight.
+    pub weight_len: usize,
+    /// Elements in the bias.
+    pub bias_len: usize,
+}
+
+impl std::fmt::Display for LayerNormError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "layer_norm needs a weight and a bias of {} elements, the input's last dimension; \
+             the weight has {} and the bias has {}",
+            self.size, self.weight_len, self.bias_len
+        )
+    }
+}
+
+impl std::error::Error for LayerNormError {}
+
 impl ComputeEngine {
     /// RMSNorm over the last dimension with eps = 1e-5:
     /// `out = x / sqrt(mean(x^2) + eps) * weight`.
@@ -140,6 +165,11 @@ impl ComputeEngine {
     /// `stats` is `[rows, 2]`: the kernel writes each row's mean and
     /// reciprocal standard deviation there for
     /// [`layer_norm_backward`](Self::layer_norm_backward).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`LayerNormError`] when `weight` or `bias` does not have as
+    /// many elements as the last dimension of `input`. Nothing runs then.
     #[expect(
         clippy::too_many_arguments,
         reason = "the input, both parameters, the output and the saved statistics are separate buffers"
@@ -153,11 +183,20 @@ impl ComputeEngine {
         out: &UnifiedTensor,
         stats: &UnifiedTensor,
         eps: f32,
-    ) {
+    ) -> Result<(), LayerNormError> {
         let size = *input.shape.last().unwrap_or(&1);
+        let weight_len = weight.shape.iter().product::<usize>();
+        let bias_len = bias.shape.iter().product::<usize>();
+        if weight_len != size || bias_len != size {
+            return Err(LayerNormError {
+                size,
+                weight_len,
+                bias_len,
+            });
+        }
         let rows = input.shape.iter().product::<usize>() / size.max(1);
         if rows == 0 || size == 0 {
-            return;
+            return Ok(());
         }
         let params = uniform(
             ctx,
@@ -176,6 +215,7 @@ impl ComputeEngine {
             ],
             grid(rows as u32),
         );
+        Ok(())
     }
 
     /// Gradients of [`layer_norm`](Self::layer_norm) with respect to `input`,

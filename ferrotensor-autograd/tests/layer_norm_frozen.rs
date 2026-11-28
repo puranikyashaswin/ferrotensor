@@ -55,7 +55,7 @@ fn run(freeze_weight: bool, freeze_bias: bool) -> [Option<Vec<f32>>; 3] {
     let x = leaf(&rand_vec(ROWS * HIDDEN, 1), &[ROWS, HIDDEN], false);
     let w = leaf(&rand_vec(HIDDEN, 2), &[HIDDEN], freeze_weight);
     let b = leaf(&rand_vec(HIDDEN, 3), &[HIDDEN], freeze_bias);
-    let out = Tensor::layer_norm(&x, &w, &b, 1e-5, engine);
+    let out = Tensor::layer_norm(&x, &w, &b, 1e-5, engine).expect("layer_norm");
     let seed = UnifiedTensor::new(ctx, &rand_vec(ROWS * HIDDEN, 4), &[ROWS, HIDDEN]);
     out.accumulate_grad(engine, &seed);
     out.backward(engine);
@@ -101,4 +101,45 @@ fn a_frozen_weight_or_bias_gets_no_gradient() {
     let [fx, fw, fb] = run(true, true);
     assert_eq!(fx.as_ref(), Some(&x), "input gradient with both frozen");
     assert!(fw.is_none() && fb.is_none());
+}
+
+/// A weight or bias of the wrong length is an error, not a read past the
+/// parameter into whatever the buffer pool holds.
+#[test]
+#[ignore = "needs a GPU; run with --ignored --test-threads=1"]
+fn a_parameter_of_the_wrong_length_is_an_error() {
+    let (ctx, engine) = gpu();
+    let leaf = |len: usize| {
+        Tensor::new(
+            ctx.clone(),
+            UnifiedTensor::new(ctx, &rand_vec(len, 7), &[len]),
+        )
+    };
+    let x = Tensor::new(
+        ctx.clone(),
+        UnifiedTensor::new(ctx, &rand_vec(ROWS * HIDDEN, 1), &[ROWS, HIDDEN]),
+    );
+    let layer_norm = |w: &Tensor, b: &Tensor| Tensor::layer_norm(&x, w, b, 1e-5, engine);
+
+    let (good_w, good_b) = (leaf(HIDDEN), leaf(HIDDEN));
+    assert!(layer_norm(&good_w, &good_b).is_ok());
+
+    let short = leaf(HIDDEN - 1);
+    let long = leaf(HIDDEN + 1);
+    for (name, result) in [
+        ("short weight", layer_norm(&short, &good_b)),
+        ("long weight", layer_norm(&long, &good_b)),
+        ("short bias", layer_norm(&good_w, &short)),
+        ("long bias", layer_norm(&good_w, &long)),
+        (
+            "weight and bias that match each other",
+            layer_norm(&short, &short),
+        ),
+    ] {
+        let err = result
+            .err()
+            .unwrap_or_else(|| panic!("{name} was accepted"));
+        assert_eq!(err.size, HIDDEN, "{name}");
+        assert!(err.to_string().contains(&HIDDEN.to_string()), "{name}");
+    }
 }

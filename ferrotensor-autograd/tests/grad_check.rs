@@ -91,7 +91,7 @@ fn cases() -> Vec<Case> {
         case(
             "layer_norm",
             vec![input(&[2, 6], 5), input(&[6], 6), input(&[6], 7)],
-            |x, e| Tensor::layer_norm(&x[0], &x[1], &x[2], 1e-3, e),
+            |x, e| Tensor::layer_norm(&x[0], &x[1], &x[2], 1e-3, e).expect("layer_norm"),
         ),
         case("gelu_tanh", vec![input(&[8], 3)], |x, e| {
             Tensor::gelu_tanh(&x[0], e)

@@ -30,6 +30,7 @@ pub use flash_coop::FLASH_COOP_ENV;
 pub use lora_group::{LoraGrad, LoraMirror, LoraProj, LORA_GROUP_MAX, LORA_GROUP_MAX_RANK};
 pub use matmul::{Epilogue, MatmulPath};
 pub use matmul_fused::{FusedA, FusedOut, FusedSpec};
+pub use norm::LayerNormError;
 pub use skinny::SkinnyTile;
 pub use small_m::{SmallMLaunch, SmallMTile};
 pub use training::{AdamParams, FlatLayout, FLAT_MAX_ELEMS, MASKED_CE_SKIP, SUM_SQUARES_CHUNK};
