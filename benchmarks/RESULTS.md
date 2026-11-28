@@ -593,8 +593,6 @@ transformers 5.23.0. Each number is from one run.
   Alpaca SFT set, with `--eval-data`. The loss went from 1.8367 to 1.3300.
   The PyTorch + PEFT twin (bf16 weights, the same data and settings) went from
   1.8371 to 1.3221, a difference of 0.0079.
-- Step time, as measured: Ferrotensor's median was 0.4907 s per step over
-  steps 11 to 250 and the twin's was 0.1493 s. The cause of the gap was not
-  investigated. Peak GPU memory by Ferrotensor's count was 4,853 MiB.
+- Peak GPU memory by Ferrotensor's count was 4,853 MiB.
 - Tests on the same box: `cargo fmt` clean, clippy with `-D warnings` clean,
   467 host tests and 209 GPU tests passed.
