@@ -1553,7 +1553,7 @@ fn check_layer_norm(rows: usize, len: usize, eps: f32, spread: f32, offsets: &[f
 
     // A frozen weight or bias is not written and changes nothing else.
     let bits = |t: &UnifiedTensor| read(t).iter().map(|v| v.to_bits()).collect::<Vec<_>>();
-    let (gx2, gw2, gb2) = (zeros(&[rows, len]), zeros(&[len]), zeros(&[len]));
+    let (gx2, gb2) = (zeros(&[rows, len]), zeros(&[len]));
     e.layer_norm_backward(&g.ctx, &tx, &tw, &tgo, &stats, &gx2, None, Some(&gb2));
     assert_eq!(bits(&gx2), bits(&gx), "{name} grad_x without grad_w");
     assert_eq!(bits(&gb2), bits(&gb), "{name} grad_b without grad_w");
@@ -1715,7 +1715,7 @@ fn gelu_worked_values() {
     assert_close(
         "gelu_erf",
         &read(&out),
-        &[0.0, 0.841_344_75, -0.158_655_25, 10.0, 0.0],
+        &to_f32(&[0.0, 0.8413447460685429, -0.15865525393145705, 10.0, 0.0]),
         1e-6,
         1e-6,
     );
@@ -1723,7 +1723,7 @@ fn gelu_worked_values() {
     assert_close(
         "gelu_erf slope",
         &slopes[..3],
-        &[0.5, 1.083_315_5, -0.083_315_5],
+        &to_f32(&[0.5, 1.0833154705876864, -0.08331547058768632]),
         1e-6,
         1e-6,
     );
@@ -1739,7 +1739,7 @@ fn gelu_worked_values() {
     assert_close(
         "gelu_tanh",
         &read(&out),
-        &[0.0, 0.841_192, -0.158_808, 10.0, 0.0],
+        &to_f32(&[0.0, 0.8411919906082768, -0.1588080093917233, 10.0, 0.0]),
         1e-6,
         1e-6,
     );
