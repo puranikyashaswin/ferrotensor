@@ -13,7 +13,7 @@
 
 use crate::checkpoint::LoraCheckpoint;
 use crate::merge::{adapters_by_target, write_through_temp_file, Float, LowRank};
-use ferrotensor_graph::model_builder::check_supported;
+use ferrotensor_graph::family::family_spec;
 use ferrotensor_graph::rope::rope_scaling;
 use ferrotensor_loader::{Lfm2Config, ModelLoader, WeightsContext};
 use serde_json::Value as Json;
@@ -694,7 +694,7 @@ pub fn export_gguf(
             config.model_type.as_deref().unwrap_or("(none)")
         )
     })?;
-    check_supported(&config).map_err(|e| format!("{}: {e}", config_path.display()))?;
+    family_spec(&config).map_err(|e| format!("{}: {e}", config_path.display()))?;
     // The file carries no rotary scaling, so a scaled RoPE would load and
     // give wrong logits.
     if rope_scaling(&config)

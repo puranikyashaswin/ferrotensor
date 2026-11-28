@@ -93,22 +93,24 @@ cargo run -p ferrotensor-benchmarks --release --bin tensor-api
 The first command runs the GPU test suites on your GPU, which compare the kernels with CPU references and the LoRA gradients with PyTorch fixtures.
 The second prints CPU and GPU timings for the Tensor API.
 
-### The Qwen2 fixture (four tests)
+### The family fixtures
 
-The four tests in `ferrotensor-trainer/tests/qwen2_family.rs` compare a tiny
-random Qwen2 model with Hugging Face transformers. They need a fixture that
-`scripts/gen_qwen2_fixture.py` writes, which needs PyTorch and Transformers
+The tests in `ferrotensor-trainer/tests/family_parity.rs` compare a tiny
+random model of each supported family (Qwen2 and Llama 3 so far) with Hugging
+Face transformers: logits, the KV cache, f16 weights, LoRA gradients, and that
+every weight of the checkpoint is read. They need fixtures that
+`scripts/gen_family_fixtures.py` writes, which needs PyTorch and Transformers
 (`pip install torch transformers safetensors`):
 
 ```bash
-python scripts/gen_qwen2_fixture.py /tmp/qwen2-fixture
-FERROTENSOR_QWEN2_FIXTURE=/tmp/qwen2-fixture \
-  cargo test --release -p ferrotensor-trainer --test qwen2_family -- --ignored --test-threads=1
+python scripts/gen_family_fixtures.py /tmp/family-fixtures
+FERROTENSOR_FAMILY_FIXTURES=/tmp/family-fixtures \
+  cargo test --release -p ferrotensor-trainer --test family_parity -- --ignored --test-threads=1
 ```
 
-Without `FERROTENSOR_QWEN2_FIXTURE` the four tests print a skip message and
+Without `FERROTENSOR_FAMILY_FIXTURES` these tests print a skip message and
 pass, so the rest of the suite still runs. A path that is set but wrong makes
-them fail. CI generates the fixture and sets the variable.
+them fail. CI generates the fixtures and sets the variable.
 
 ## 4. Or measure everything in one go
 

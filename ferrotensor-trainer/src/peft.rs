@@ -23,8 +23,8 @@
 
 use crate::checkpoint::{LoraCheckpoint, LoraMetadata};
 use ferrotensor_backend::WgpuContext;
+use ferrotensor_graph::family::{family_spec, Architecture};
 use ferrotensor_graph::lfm::{llama_name_from_legacy, Lfm2LayerOp, Lfm2Model};
-use ferrotensor_graph::model_builder::Architecture;
 use ferrotensor_graph::Linear;
 use ferrotensor_loader::Lfm2Config;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -336,8 +336,9 @@ fn write_peft(
 ///
 /// `base_model` goes into `base_model_name_or_path` (a Hub id or the path
 /// of the base model). Adapters written with the old Llama-block names load
-/// too. Fails, writing nothing, when the model is not Llama-style, the file
-/// has no LoRA metadata, or a tensor is not one PEFT can represent.
+/// too. Fails, writing nothing, when the model is not Llama-style or its
+/// config is one the builder refuses, the file has no LoRA metadata, or a
+/// tensor is not one PEFT can represent.
 pub fn export_peft_adapter(
     checkpoint: &LoraCheckpoint,
     config: &Lfm2Config,
@@ -349,7 +350,7 @@ pub fn export_peft_adapter(
     )?;
     write_peft_checked(
         checkpoint,
-        Architecture::detect(config),
+        family_spec(config)?.architecture,
         config.num_hidden_layers,
         meta,
         base_model,

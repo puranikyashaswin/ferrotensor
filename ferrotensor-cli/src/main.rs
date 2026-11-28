@@ -35,10 +35,9 @@ use ferrotensor_backend::q4::Q4Group;
 use ferrotensor_backend::{
     ComputeEngine, ContextError, DType, KernelTiming, MemoryCategory, UnifiedTensor, WgpuContext,
 };
+use ferrotensor_graph::family::family_spec;
 use ferrotensor_graph::lfm::{legacy_llama_name, Lfm2Model};
-use ferrotensor_graph::model_builder::{
-    check_supported, module_matches, Lfm2ModelBuilder, LoRaConfig, Q4Selection,
-};
+use ferrotensor_graph::model_builder::{module_matches, Lfm2ModelBuilder, LoRaConfig, Q4Selection};
 use ferrotensor_graph::{FuseChoice, FusedMode, KVCache, KVCacheLayer};
 use ferrotensor_loader::{Lfm2Config, ModelLoader, Sampler, Tokenizer, WeightsContext};
 use ferrotensor_trainer::checkpoint::{
@@ -700,7 +699,7 @@ async fn load_base(args: &ModelArgs, timing: KernelTiming) -> Result<Loaded> {
     let config_path = dir.join("config.json");
     let config = ModelLoader::load_config(&config_path)
         .map_err(|e| unmet(format!("cannot read {}: {e}", config_path.display())))?;
-    check_supported(&config).map_err(|e| unmet(format!("{}: {e}", config_path.display())))?;
+    family_spec(&config).map_err(|e| unmet(format!("{}: {e}", config_path.display())))?;
     let tok_path = dir.join("tokenizer.json");
     let tokenizer = Tokenizer::from_file(&tok_path)
         .map_err(|e| format!("cannot load {}: {e}", tok_path.display()))?;
